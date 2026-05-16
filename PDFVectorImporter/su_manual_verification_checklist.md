@@ -17,13 +17,13 @@ Generated from `qa_results_auto_local_full_combined.json` + workbook `SketchUp T
 
 - SU-T019 | P0 | Geometry | Lines import correctly
   Input: 1071 - Rev 0.pdf
-  Steps: Import with Full preset
+  Steps: Import with mode=auto
   Expected: Straight lines present matching PDF
   Metrics: Edge count > 1000
 
 - SU-T020 | P0 | Geometry | Arcs reconstructed from polyline segments
   Input: 1071 - Rev 0.pdf
-  Steps: Import with Full preset. Zoom to pipe bends.
+  Steps: Import with mode=auto. Zoom to pipe bends.
   Expected: Smooth arcs, not faceted polylines
   Metrics: Arc count > 10. Radius deviation < 2% RMS
 
@@ -35,7 +35,7 @@ Generated from `qa_results_auto_local_full_combined.json` + workbook `SketchUp T
 
 - SU-T027 | P0 | Geometry | Faces created from closed paths
   Input: 1071 - Rev 0.pdf
-  Steps: Import with Full preset (import_fills=Yes)
+  Steps: Import with mode=auto
   Expected: Faces present on closed filled paths
   Metrics: Face count > 0
 
@@ -45,15 +45,15 @@ Generated from `qa_results_auto_local_full_combined.json` + workbook `SketchUp T
   Expected: Text objects placed near geometry. Readable.
   Metrics: Text count > 50
 
-- SU-T041 | P1 | Preset | Fast preset — edges only, no text, fast
+- SU-T041 | P1 | Mode | Auto mode keeps fidelity invariant
   Input: 1071 - Rev 0.pdf
-  Steps: Import with Fast preset
-  Expected: Edges only. No faces. No text. Fast import.
-  Metrics: Import time < 5s
+  Steps: Import with mode=auto and default text settings
+  Expected: Geometry, faces, and text preserve source fidelity.
+  Metrics: Record import time and geometry/text counts
 
 - SU-T044 | P0 | Core-1071 | Complete shop drawing import
   Input: 1071 - Rev 0.pdf
-  Steps: Import with Full preset
+  Steps: Import with mode=auto
   Expected: Geometry complete. Dimensions readable. Part marks visible.
   Metrics: Edges>1000, Arcs>10, Text>50
 
@@ -89,13 +89,13 @@ Generated from `qa_results_auto_local_full_combined.json` + workbook `SketchUp T
 
 - SU-T067 | P0 | Perf | Shop drawing runtime
   Input: 1071 - Rev 0.pdf
-  Steps: Time Full preset import
+  Steps: Time mode=auto import
   Expected: < 15 seconds
   Metrics: Record time
 
 - SU-T068 | P0 | Perf | Topo map runtime
   Input: TX_Alvord topo
-  Steps: Time Full preset import
+  Steps: Time mode=auto import
   Expected: < 120 seconds
   Metrics: Record time
 

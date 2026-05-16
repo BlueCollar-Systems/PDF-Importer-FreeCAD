@@ -16,6 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKBENCH_DIR = REPO_ROOT / "PDFVectorImporter"
 SRC_DIR = WORKBENCH_DIR / "src"
 ADAPTERS_DIR = WORKBENCH_DIR / "adapters"
+EMBEDDED_CORE_CONFIG = WORKBENCH_DIR / "pdfcadcore" / "import_config.py"
 
 for p in (str(SRC_DIR), str(WORKBENCH_DIR)):
     if p not in sys.path:
@@ -75,6 +76,7 @@ class TestImportConfigCleanBreak(unittest.TestCase):
         self.assertTrue(cfg.map_dashes)
         self.assertTrue(cfg.make_faces)
         self.assertTrue(cfg.import_text)
+        self.assertEqual(cfg.text_mode, "3d_text")
         self.assertTrue(cfg.strict_text_fidelity)
         self.assertEqual(cfg.hatch_mode, "group")
         self.assertEqual(cfg.lineweight_mode, "preserve")
@@ -91,6 +93,12 @@ class TestDialogCleanBreak(unittest.TestCase):
     """
 
     PRESET_NAMES = (
+        "Fast",
+        "Balanced",
+        "Full",
+        "Max Fidelity",
+        "Raster Image",
+        "Custom...",
         "Fast Preview",
         "General Vector",
         "Technical Drawing",
@@ -126,6 +134,12 @@ class TestDialogCleanBreak(unittest.TestCase):
         self.assertIn('["Labels", "3D Text", "Glyphs", "Geometry"]', self.source,
                       "Dialog text-mode combo must list Labels/3D Text/Glyphs/Geometry.")
 
+    def test_text_default_is_scale_stable(self):
+        self.assertIn('self.text_combo.setCurrentText("3D Text")', self.source)
+        self.assertNotIn('self.text_combo.setCurrentText("Labels")', self.source)
+        self.assertIn('"TextDefaultMigratedV407"', self.source)
+        self.assertNotIn("fast, editable", self.source)
+
     def test_import_text_checkbox_present(self):
         self.assertIn("import_text_chk", self.source,
                       "Dialog must have a separate import-text QCheckBox.")
@@ -154,6 +168,15 @@ class TestDialogCleanBreak(unittest.TestCase):
                 f"Dialog still defines quality-tier widget {w!r} (BCS-ARCH-001 Rule 5).")
 
 
+class TestTextDefaults(unittest.TestCase):
+    """Core config defaults must not silently return to Labels."""
+
+    def test_embedded_core_config_defaults_to_3d_text(self):
+        source = EMBEDDED_CORE_CONFIG.read_text(encoding="utf-8")
+        self.assertIn('text_mode: str = "3d_text"', source)
+        self.assertNotIn('text_mode: str = "labels"', source)
+
+
 class TestBlenderAdapterCleanBreak(unittest.TestCase):
     """QA adapter for the BL CLI must pass --mode, not --preset."""
 
@@ -171,6 +194,21 @@ class TestBlenderAdapterCleanBreak(unittest.TestCase):
     def test_mode_default_is_auto(self):
         self.assertIn('default="auto"', self.source,
                       "blender_adapter --mode default must be 'auto'.")
+
+
+class TestSketchUpHarnessCleanBreak(unittest.TestCase):
+    """SketchUp QA harness must use modes, not legacy preset tables."""
+
+    def setUp(self):
+        self.source = (ADAPTERS_DIR / "sketchup_harness.rb").read_text(encoding="utf-8")
+
+    def test_uses_modes_table(self):
+        self.assertIn("ImportDialog::MODES", self.source)
+        self.assertNotIn("ImportDialog::PRESETS", self.source)
+
+    def test_result_reports_mode(self):
+        self.assertIn('result["mode"]', self.source)
+        self.assertNotIn('result["preset"]', self.source)
 
 
 if __name__ == "__main__":

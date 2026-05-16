@@ -6,7 +6,7 @@
 # Runs inside SketchUp (for example via -RubyStartup) and:
 # 1) reads payload from ENV["BC_PDF_QA_PAYLOAD"]
 # 2) loads extension entry points
-# 3) runs pipeline import with selected preset/pages
+# 3) runs pipeline import with selected mode/pages
 # 4) writes JSON result to payload["result_json"]
 
 require "json"
@@ -82,7 +82,7 @@ module BCPDFQA
         progress_tick.call("options_built")
         progress_tick.call("pipeline_started", {
           "input_pdf" => payload["input_pdf"],
-          "preset" => payload["preset"],
+          "mode" => payload["mode"],
           "page_range" => payload["page_range"]
         })
         heartbeat_thread = Thread.new do
@@ -111,7 +111,7 @@ module BCPDFQA
         result["message"] = "Import completed."
         result["loader"] = loader
         result["input_pdf"] = payload["input_pdf"]
-        result["preset"] = payload["preset"]
+        result["mode"] = payload["mode"]
         result["page_range"] = payload["page_range"]
         result["pipeline_stats"] = stats
         result["model_counts_before"] = before
@@ -196,13 +196,14 @@ module BCPDFQA
     end
 
     def build_opts(payload, importer)
-      presets = importer::ImportDialog::PRESETS
-      preset_name = payload["preset"].to_s.strip
-      preset_name = "Full" if preset_name.empty?
-      preset = presets[preset_name] || presets["Full"] || {}
+      modes = importer::ImportDialog::MODES
+      mode_name = payload["mode"].to_s.strip
+      mode_name = "Auto" if mode_name.empty?
+      mode_name = mode_name[0].upcase + mode_name[1..-1].to_s.downcase
+      mode = modes[mode_name] || modes["Auto"] || {}
 
       raw = {}
-      preset.each { |k, v| raw[k] = v }
+      mode.each { |k, v| raw[k.to_sym] = v }
       raw[:pages] = payload["page_range"].to_s.strip.empty? ? "1" : payload["page_range"].to_s
       raw[:scale] = "1.0" if raw[:scale].to_s.strip.empty?
 

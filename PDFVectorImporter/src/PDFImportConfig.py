@@ -61,7 +61,7 @@ class ImportConfig:
     curve_step_mm: float = 0.2
     make_faces: bool = True
     import_text: bool = True
-    text_mode: str = "labels"               # "labels" | "3d_text" | "glyphs" | "geometry" | "none"
+    text_mode: str = "3d_text"              # "labels" | "3d_text" | "glyphs" | "geometry" | "none"
     strict_text_fidelity: bool = True
     group_by_color: bool = True
     assign_linewidth: bool = True

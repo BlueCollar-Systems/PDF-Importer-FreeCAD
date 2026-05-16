@@ -98,10 +98,10 @@ class ImportPDFDialog(QtWidgets.QDialog):
         # ── Text Mode (orthogonal selector — BCS-ARCH-001) ──
         self.text_combo = QtWidgets.QComboBox()
         self.text_combo.addItems(["Labels", "3D Text", "Glyphs", "Geometry"])
-        self.text_combo.setCurrentText("Labels")
+        self.text_combo.setCurrentText("3D Text")
         self.text_combo.setToolTip(
             "How text is rendered when Import text is enabled:\n"
-            "Labels — FreeCAD Draft Text labels (fast, editable)\n"
+            "Labels — FreeCAD Draft Text labels, editable\n"
             "3D Text — extruded 3D letterforms\n"
             "Glyphs — exact glyph geometry from the PDF font\n"
             "Geometry — fall back to reconstructed line geometry")
@@ -197,6 +197,10 @@ class ImportPDFDialog(QtWidgets.QDialog):
             if mode and mode in self.MODES:
                 self.mode_combo.setCurrentText(mode)
             text_mode = grp.GetString("LastTextMode", "")
+            if text_mode == "Labels" and not grp.GetBool("TextDefaultMigratedV407", False):
+                text_mode = "3D Text"
+                grp.SetString("LastTextMode", text_mode)
+                grp.SetBool("TextDefaultMigratedV407", True)
             if text_mode and text_mode in ("Labels", "3D Text", "Glyphs", "Geometry"):
                 self.text_combo.setCurrentText(text_mode)
             # Import-text toggle is a separate pref (BCS-ARCH-001 orthogonal control).
@@ -335,7 +339,7 @@ class ImportPDFDialog(QtWidgets.QDialog):
             "Glyphs":   "glyphs",
             "Geometry": "geometry",
         }
-        text_mode = text_mode_map.get(text_ui, "labels")
+        text_mode = text_mode_map.get(text_ui, "3d_text")
         if not import_text:
             # Orthogonal toggle takes precedence — text_mode is irrelevant
             # when text is off.

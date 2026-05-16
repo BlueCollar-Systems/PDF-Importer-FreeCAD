@@ -400,7 +400,7 @@ class ImportOptions:
     curve_step_mm: float = 0.5              # Bezier linearization chord
     make_faces: bool = True                 # close filled paths → Part::Face
     import_text: bool = True
-    text_mode: str = "labels"             # "labels" | "geometry" | "none"
+    text_mode: str = "3d_text"            # "labels" | "3d_text" | "glyphs" | "geometry" | "none"
     # When enabled, disables text reconstruction and uses glyph-accurate
     # placement paths only (pdftocairo geometry or exact per-span labels).
     strict_text_fidelity: bool = True

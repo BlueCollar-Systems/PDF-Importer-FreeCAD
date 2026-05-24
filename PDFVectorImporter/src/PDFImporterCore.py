@@ -157,6 +157,10 @@ def _rect_area(obj) -> Optional[float]:
 def _vector_group_stats(drawings: List[dict], page_area: Optional[float] = None) -> Dict[str, float]:
     """Profile coarse vector composition for auto-mode heuristics."""
     total = len(drawings)
+    # Full scans on 10k+ group pages dominated auto-mode time on multi-page shop PDFs.
+    sample_stride = 1
+    if total > 8000:
+        sample_stride = max(1, total // 4000)
     if total <= 0:
         return {
             "fill_only_ratio": 0.0,
@@ -176,7 +180,9 @@ def _vector_group_stats(drawings: List[dict], page_area: Optional[float] = None)
     total_item_count = 0
     max_rect_ratio = 0.0
 
-    for grp in drawings:
+    for idx, grp in enumerate(drawings):
+        if sample_stride > 1 and (idx % sample_stride) != 0:
+            continue
         fill = grp.get("fill")
         stroke = grp.get("color") or grp.get("stroke")
         if fill is not None and stroke is None:
@@ -192,7 +198,8 @@ def _vector_group_stats(drawings: List[dict], page_area: Optional[float] = None)
             if ratio > max_rect_ratio:
                 max_rect_ratio = ratio
 
-    denom = float(total)
+    sampled = float(max(1, (total + sample_stride - 1) // sample_stride))
+    denom = sampled
     return {
         "fill_only_ratio": fill_only / denom,
         "stroke_ratio": stroke_count / denom,
@@ -413,7 +420,7 @@ class ImportOptions:
     hatch_mode: str = "import"              # "import" | "skip" | "group"
     ignore_images: bool = False
     raster_fallback: bool = True             # render page as image if no vectors
-    raster_dpi: int = 200                    # DPI for raster fallback rendering
+    raster_dpi: int = 300                    # DPI for raster fallback rendering (BCS-ARCH-001)
     raster_dpi_user_set: bool = False        # True when user explicitly chose the DPI
     # Import mode: "auto" | "vector" | "raster" | "hybrid"  (BCS-ARCH-001)
     #   auto    — detect scanned/image-heavy and vector-glyph-flood pages
@@ -443,6 +450,9 @@ class ImportOptions:
     #   overlay - same origin
     page_arrangement: str = "spread"
     page_gap_ratio: float = 0.20
+    # Populated when import_mode == "auto" (BCS-ARCH-001 Rule 9).
+    auto_resolved_mode: Optional[str] = None
+    auto_reason: Optional[str] = None
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1913,12 +1923,14 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
     if effective_mode == "auto":
         # Auto-detect: profile the page content to choose best mode
         _progress_update(2, "Analyzing page content...")
+        n_text_blocks = 0
         try:
-            tdict = page.get_text("dict")
+            # blocks is far cheaper than dict on text-heavy shop drawings.
+            blocks = page.get_text("blocks") or []
+            n_text_blocks = sum(1 for b in blocks if len(b) >= 7 and b[6] == 0)
         except Exception as e:
-            _warn(f"get_text(dict) failed during auto-mode: {e}")
-            tdict = {"blocks": []}
-        n_text_blocks = sum(1 for b in tdict.get("blocks", []) if b.get("type") == 0)
+            _warn(f"get_text(blocks) failed during auto-mode: {e}")
+            n_text_blocks = 0
 
         # Build lightweight vector density metrics once so multiple auto rules
         # can reuse the same profile without rescanning the page.
@@ -1996,6 +2008,15 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
 
         else:
             effective_mode = "vector"
+
+        _default_reasons = {
+            "vector": "Standard vector content",
+            "hybrid": "Vectors + embedded raster imagery",
+            "raster": "Raster rendering selected",
+        }
+        auto_reason = _flood_reason or _default_reasons.get(effective_mode, "")
+        opts.auto_resolved_mode = effective_mode
+        opts.auto_reason = auto_reason
 
         if opts.verbose:
             if _flood_reason:
@@ -3105,5 +3126,11 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             view.fitAll()
     except (ImportError, AttributeError, RuntimeError):
         pass
+
+    if opts.import_mode == "auto" and opts.auto_resolved_mode:
+        _msg(
+            f"Auto mode summary: {opts.auto_resolved_mode}"
+            + (f" — {opts.auto_reason}" if opts.auto_reason else "")
+        )
 
     return True

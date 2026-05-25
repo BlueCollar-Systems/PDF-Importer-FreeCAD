@@ -30,6 +30,15 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 
 ## Installation
 
+See **[INSTALL.md](INSTALL.md)** for Windows FreeCAD 1.1 paths, dev junction install, and troubleshooting.
+
+**FreeCAD 1.1 Mod path:** `%APPDATA%\FreeCAD\v1-1\Mod\PDFVectorImporter` (not legacy `FreeCAD\Mod\`).
+
+**Dev one-liner (junction to repo):**
+```powershell
+.\installer\install-dev.ps1
+```
+
 ### From FreeCAD Addon Manager (Recommended)
 1. Open FreeCAD → **Tools** → **Addon Manager**
 2. Search for **PDF Vector Importer**
@@ -48,7 +57,8 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
    git clone https://github.com/BlueCollar-Systems/FC-PDFimporter.git
    ```
 2. Copy the `PDFVectorImporter` folder into your FreeCAD Mod directory:
-   - **Windows:** `%APPDATA%\FreeCAD\Mod\`
+   - **Windows (FreeCAD 1.1):** `%APPDATA%\FreeCAD\v1-1\Mod\`
+   - **Windows (FreeCAD 0.21):** `%APPDATA%\FreeCAD\Mod\`
    - **macOS:** `~/Library/Application Support/FreeCAD/Mod/`
    - **Linux:** `~/.local/share/FreeCAD/Mod/`
 3. Install PyMuPDF:

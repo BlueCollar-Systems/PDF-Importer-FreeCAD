@@ -1764,10 +1764,97 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
 
 
 # ──────────────────────────────────────────────────────────────────────
+# View autofit
+# ──────────────────────────────────────────────────────────────────────
+def _pdf_import_root_objects(fc_doc):
+    """Return top-level objects created by this importer (page groups)."""
+    roots = []
+    for obj in fc_doc.Objects:
+        name = getattr(obj, "Name", "") or ""
+        if not name.startswith("PDF_Page_"):
+            continue
+        try:
+            if obj.isDerivedFrom("App::DocumentObjectGroup"):
+                roots.append(obj)
+        except (AttributeError, RuntimeError):
+            continue
+    return roots
+
+
+def _autofit_import_view(fc_doc) -> None:
+    """Frame the viewport on imported PDF geometry, not unrelated document content."""
+    try:
+        import FreeCADGui as Gui
+    except ImportError:
+        return
+
+    try:
+        fc_doc.recompute()
+    except (RuntimeError, AttributeError):
+        pass
+
+    try:
+        Gui.updateGui()
+    except (AttributeError, RuntimeError):
+        pass
+
+    view = None
+    try:
+        adoc = Gui.ActiveDocument
+        if adoc:
+            view = adoc.ActiveView
+    except (AttributeError, RuntimeError):
+        view = None
+    if view is None:
+        return
+
+    roots = _pdf_import_root_objects(fc_doc)
+    prior_sel = []
+    try:
+        prior_sel = list(Gui.Selection.getSelection())
+    except (AttributeError, RuntimeError):
+        prior_sel = []
+
+    try:
+        if roots:
+            try:
+                Gui.Selection.clearSelection()
+            except (AttributeError, RuntimeError):
+                pass
+            for obj in roots:
+                try:
+                    Gui.Selection.addSelection(obj)
+                except (AttributeError, RuntimeError):
+                    pass
+            try:
+                Gui.SendMsgToActiveView("ViewSelection")
+            except (AttributeError, RuntimeError):
+                pass
+
+        try:
+            view.setCameraType("Orthographic")
+            view.viewTop()
+            view.fitAll()
+        except (AttributeError, RuntimeError):
+            pass
+    finally:
+        try:
+            Gui.Selection.clearSelection()
+            for obj in prior_sel:
+                try:
+                    Gui.Selection.addSelection(obj)
+                except (AttributeError, RuntimeError):
+                    pass
+        except (AttributeError, RuntimeError):
+            pass
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Page importer
 # ──────────────────────────────────────────────────────────────────────
 def import_pdf_page(pdf_path: str, page_num: int = 1,
-                    opts: Optional[ImportOptions] = None):
+                    opts: Optional[ImportOptions] = None,
+                    autofit: bool = True):
     """Import a single PDF page into the active FreeCAD document."""
     if opts is None:
         opts = ImportOptions(ignore_images=not IMAGE_WB)
@@ -1788,16 +1875,8 @@ def import_pdf_page(pdf_path: str, page_num: int = 1,
     finally:
         pdf_doc.close()
 
-    # Autofit viewport after single-page import
-    try:
-        import FreeCADGui
-        view = FreeCADGui.ActiveDocument.ActiveView
-        if view:
-            view.setCameraType("Orthographic")
-            view.viewTop()
-            view.fitAll()
-    except (ImportError, AttributeError, RuntimeError):
-        pass
+    if autofit:
+        _autofit_import_view(fc_doc)
 
     return result
 
@@ -3075,7 +3154,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                 continue
             try:
                 _msg(f"Importing page {p}/{total_pages} ({imported_count+1} of {len(pages)})...")
-                import_pdf_page(pdf_path, page_num=p, opts=opts)
+                import_pdf_page(pdf_path, page_num=p, opts=opts, autofit=False)
                 curr_page_height = page_heights_scaled.get(p, page_height_scaled)
                 # Offset each page group downward so they don't overlap.
                 # FreeCAD may rename the group (e.g., PDF_Page_2 → PDF_Page_2001)
@@ -3115,17 +3194,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         raise
 
     fc_doc.recompute()
-
-    # Auto fit-all with orthographic top-down view
-    try:
-        import FreeCADGui
-        view = FreeCADGui.ActiveDocument.ActiveView
-        if view:
-            view.setCameraType("Orthographic")
-            view.viewTop()
-            view.fitAll()
-    except (ImportError, AttributeError, RuntimeError):
-        pass
+    _autofit_import_view(fc_doc)
 
     if opts.import_mode == "auto" and opts.auto_resolved_mode:
         _msg(

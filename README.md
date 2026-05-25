@@ -114,6 +114,8 @@ Plus a separate **Import text** toggle to skip text entirely.
 
 ## Compatibility
 
+See **[COMPATIBILITY.md](COMPATIBILITY.md)** for the full matrix. Summary:
+
 | FreeCAD Version | Python | PyMuPDF | Status |
 |----------------|--------|---------|--------|
 | 0.21.x | 3.10+ | >=1.24,<2.0 | ⚠️ Expected |

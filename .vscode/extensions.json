@@ -1,0 +1,13 @@
+{
+  "recommendations": [
+    "ms-python.python",
+    "ms-python.vscode-pylance",
+    "charliermarsh.ruff",
+    "GitHub.vscode-pull-request-github",
+    "GitHub.vscode-github-actions",
+    "EditorConfig.EditorConfig",
+    "redhat.vscode-yaml",
+    "tamasfe.even-better-toml"
+  ]
+}
+

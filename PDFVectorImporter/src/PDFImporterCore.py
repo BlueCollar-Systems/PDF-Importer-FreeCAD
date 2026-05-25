@@ -19,15 +19,17 @@ import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-# Ensure bundled PyMuPDF is importable
+# Ensure bundled PyMuPDF is importable (skip namespace-only stubs in lib/)
 _lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
 if _lib_dir not in sys.path:
     sys.path.insert(0, _lib_dir)
 
-try:
-    import pymupdf as fitz  # PyMuPDF >= 1.24 preferred name
-except ImportError:
-    import fitz  # Legacy fallback
+_mod_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _mod_root not in sys.path:
+    sys.path.insert(0, _mod_root)
+from pdfcadcore.fitz_loader import import_fitz as _import_fitz
+
+fitz = _import_fitz(prefer_lib_dir=_lib_dir)
 
 # FreeCAD modules — lazy import for IDE friendliness outside FreeCAD
 try:
@@ -2071,14 +2073,15 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 f"(map/decorative PDF — vectors would be unusable geometry)"
             )
 
-        elif n_drawings > 3000 and n_images > 20:
-            # GIS / map PDF — thousands of contour vectors on top of tiled
-            # raster imagery (USGS topo maps, aerial surveys, etc.).
-            # Importing vectors produces unusable results; render as raster.
+        elif (n_drawings > 3000 and n_images > 20
+              and vg_stats.get("stroke_ratio", 1.0) <= 0.35):
+            # GIS / topo PDF: dense imagery with sparse linework (low stroke ratio).
+            # Garden/CAD maps with many strokes + tiled photos must stay vector/hybrid.
             effective_mode = "raster"
             _flood_reason = (
                 f"GIS/topo map — {n_drawings} vector groups over "
-                f"{n_images} embedded images"
+                f"{n_images} embedded images "
+                f"(stroke_ratio={vg_stats.get('stroke_ratio', 0.0):.0%})"
             )
 
         elif n_images > 0 and n_drawings > 0:

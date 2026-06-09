@@ -34,25 +34,47 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Check package/readme version consistency
+      - name: Check package/readme/pyproject version consistency
         run: |
           PKG_VER=$(grep -oP '(?<=<version>)[^<]+' PDFVectorImporter/package.xml | head -n1)
           ROOT_README_VER=$(grep -oP 'Version-\K[0-9.]+' README.md | head -n1)
           MOD_README_VER=$(grep -oP 'Version-\K[0-9.]+' PDFVectorImporter/README.md | head -n1)
-          if [ -z "$PKG_VER" ] || [ -z "$ROOT_README_VER" ] || [ -z "$MOD_README_VER" ]; then
-            echo "ERROR: Could not read version(s): package=$PKG_VER root=$ROOT_README_VER module=$MOD_README_VER"
+          PYPROJECT_VER=$(grep -oP '(?<=^version = ")[^"]+' pyproject.toml | head -n1)
+          echo "package=$PKG_VER root=$ROOT_README_VER module=$MOD_README_VER pyproject=$PYPROJECT_VER"
+          if [ -z "$PKG_VER" ] || [ -z "$ROOT_README_VER" ] || [ -z "$MOD_README_VER" ] || [ -z "$PYPROJECT_VER" ]; then
+            echo "ERROR: Could not read version(s): package=$PKG_VER root=$ROOT_README_VER module=$MOD_README_VER pyproject=$PYPROJECT_VER"
             exit 1
           fi
-          if [ "$PKG_VER" != "$ROOT_README_VER" ] || [ "$PKG_VER" != "$MOD_README_VER" ]; then
-            echo "ERROR: Version mismatch package=$PKG_VER root=$ROOT_README_VER module=$MOD_README_VER"
+          if [ "$PKG_VER" != "$ROOT_README_VER" ] || [ "$PKG_VER" != "$MOD_README_VER" ] || [ "$PKG_VER" != "$PYPROJECT_VER" ]; then
+            echo "ERROR: Version mismatch package=$PKG_VER root=$ROOT_README_VER module=$MOD_README_VER pyproject=$PYPROJECT_VER"
             exit 1
           fi
+
+  # Source-compat guard for FreeCAD 0.19/0.20 hosts (Python 3.8/3.9).
+  # Syntax-only: the vendored PyMuPDF wheel is cp310-abi3, so the full
+  # dependency suite runs on >=3.10 (D5 ABI floor).
+  legacy-syntax:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.8", "3.9"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Compile all Python modules (legacy floor)
+        run: python -m compileall PDFVectorImporter
 
   syntax-check:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12"]
     steps:
       - name: Checkout
         uses: actions/checkout@v4

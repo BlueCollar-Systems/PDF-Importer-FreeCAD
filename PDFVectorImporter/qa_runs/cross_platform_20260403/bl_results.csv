@@ -1,2 +1,0 @@
-test_id,platform,priority,automation,result,runtime_seconds,notes
-BL-SMOKE-001,BL,P0,AUTO,Pass,0.349,Imported 178 primitives across 1 page(s). | adapter_status=PASS

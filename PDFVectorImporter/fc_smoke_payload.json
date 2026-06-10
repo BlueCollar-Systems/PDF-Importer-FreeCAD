@@ -1,9 +1,0 @@
-{
-  "test_id": "FC-MANUAL-001",
-  "platform": "FC",
-  "input_pdf": "C:/Users/Rowdy Payton/Documents/Playground/tmp/master_bundle_20260317_2052/1071 - Rev 0.pdf",
-  "preset": "Shop Drawing",
-  "page_range": "1",
-  "result_json": "C:/Users/Rowdy Payton/Documents/Playground/tmp/master_bundle_20260317_2052/fc_smoke_result.json",
-  "mod_dir": "C:/Users/Rowdy Payton/Documents/Playground/tmp/master_bundle_20260317_2052/_inspect_fc_v350/PDFVectorImporter"
-}

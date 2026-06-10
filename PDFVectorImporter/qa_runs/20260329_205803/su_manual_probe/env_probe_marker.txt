@@ -1,2 +1,0 @@
-C:\1FC-PDFimporter\PDFVectorImporter\qa_runs\20260329_205803\su_manual_probe\payload.json
-C:\1FC-PDFimporter\PDFVectorImporter\adapters\sketchup_harness.rb

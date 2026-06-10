@@ -44,6 +44,9 @@ dist/
 dev_logs/
 .pytest_cache/
 *.egg-info/
+PDFVectorImporter/qa_runs/
+PDFVectorImporter/fc_smoke_payload.json
+PDFVectorImporter/_archived/
 
 # Local PDF QA/vendor artifacts (keep local, do not track)
 PDFVectorImporter/src/lib/

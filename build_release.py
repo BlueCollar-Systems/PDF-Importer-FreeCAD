@@ -37,6 +37,7 @@ EXCLUDE_DIRS = {
     ".ruff_cache",
     ".github",
     ".git",
+    "_archived",
     "qa_runs",
     "adapters",  # CLI test harnesses — not needed at FreeCAD runtime
 }

@@ -1,2 +1,0 @@
-test_id,platform,priority,automation,result,runtime_seconds,notes
-LC-SMOKE-001,LC,P0,AUTO,Pass,1.091,Exported 265 entities. | adapter_status=PASS

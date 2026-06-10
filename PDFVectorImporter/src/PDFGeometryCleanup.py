@@ -7,4 +7,7 @@ _warnings.warn(
     DeprecationWarning,
     stacklevel=2,
 )
-from pdfcadcore.geometry_cleanup import *  # noqa: F401,F403
+try:
+    from PDFVectorImporter.pdfcadcore.geometry_cleanup import *  # noqa: F401,F403
+except ImportError:
+    from pdfcadcore.geometry_cleanup import *  # noqa: F401,F403

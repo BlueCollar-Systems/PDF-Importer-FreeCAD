@@ -1,5 +1,0 @@
-{
-  "platform": "SU",
-  "status": "FAIL",
-  "message": "Bootstrap error: SyntaxError: C:/1FC-PDFimporter/PDFVectorImporter/adapters/sketchup_harness.rb:110: syntax error, unexpected keyword_rescue, expecting keyword_end\n      rescue LoadError\n            ^\nC:/1FC-PDFimporter/PDFVectorImporter/adapters/sketchup_harness.rb:112: syntax error, unexpected keyword_rescue, expecting keyword_end\n      rescue StandardError\n            ^"
-}

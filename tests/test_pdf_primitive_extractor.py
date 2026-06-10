@@ -5,10 +5,10 @@ import unittest
 from pathlib import Path
 
 
-SRC_DIR = Path(__file__).resolve().parents[1] / "PDFVectorImporter" / "src"
-sys.path.insert(0, str(SRC_DIR))
+MOD_ROOT = Path(__file__).resolve().parents[1] / "PDFVectorImporter"
+sys.path.insert(0, str(MOD_ROOT))
 
-from PDFPrimitiveExtractor import _norm_color  # noqa: E402
+from pdfcadcore.primitive_extractor import _norm_color  # noqa: E402
 
 
 class TestPdfPrimitiveExtractor(unittest.TestCase):

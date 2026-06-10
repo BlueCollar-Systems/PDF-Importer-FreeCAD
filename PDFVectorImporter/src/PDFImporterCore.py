@@ -3114,7 +3114,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
 
     # Reset ID counter once at the start of a multi-page import
     try:
-        from PDFPrimitives import reset_ids
+        from pdfcadcore.primitives import reset_ids
         reset_ids()
     except ImportError:
         pass

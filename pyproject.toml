@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdf-vector-importer-fc"
-version = "4.0.26"
+version = "4.0.27"
 description = "PDF vector importer workbench for FreeCAD — BlueCollar Systems"
 readme = "README.md"
 requires-python = ">=3.10"

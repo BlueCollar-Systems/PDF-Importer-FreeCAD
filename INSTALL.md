@@ -54,6 +54,26 @@ $env:FREECAD_CMD = "D:\FreeCAD 1.1\bin\FreeCADCmd.exe"
 
 Build locally: `python build_windows_installer.py` (requires [Inno Setup 6](https://jrsoftware.org/isinfo.php)).
 
+### Installer error 448 (untrusted mount point)
+
+Windows blocks **elevated** processes from traversing junctions/symlinks created by a normal user (NTSTATUS `0xC00004BE`). This often appears after:
+
+- `.\installer\install-dev.ps1` (creates a Mod junction to the repo), or
+- cleanup of `1PDF-Importer-*` / dev junction folders under `%APPDATA%\FreeCAD\...\Mod\`.
+
+**Fix (try in order):**
+
+1. **Do not** use "Run as administrator" on the Setup.exe - the installer is built for `PrivilegesRequired=lowest`.
+2. Remove any dev junction at your Mod path, then rerun Setup:
+   ```powershell
+   cmd /c rmdir "%APPDATA%\FreeCAD\v1-1\Mod\PDFVectorImporter"
+   cmd /c rmdir "%APPDATA%\FreeCAD\Mod\PDFVectorImporter"
+   ```
+3. **Manual ZIP install:** download `FreeCAD-PDF-Importer_vX.Y.Z.zip`, extract `PDFVectorImporter` into `%APPDATA%\FreeCAD\v1-1\Mod\` (or `FreeCAD\Mod\` for 0.21).
+4. **Developer Mode** (Settings -> Privacy & security -> For developers) can reduce symlink restrictions for dev workflows; release users should prefer a real folder copy under Mod.
+
+Setup builds from this repo resolve/remove Mod junctions before copying files and store uninstall metadata outside the Mod tree.
+
 ## FreeCAD Addon Manager
 
 1. **Tools → Addon Manager**

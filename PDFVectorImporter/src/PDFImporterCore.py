@@ -14,6 +14,7 @@ import math
 import os
 import re
 import sys
+import tempfile
 import time
 import traceback
 from dataclasses import dataclass
@@ -455,6 +456,70 @@ class ImportOptions:
     # Populated when import_mode == "auto" (BCS-ARCH-001 Rule 9).
     auto_resolved_mode: Optional[str] = None
     auto_reason: Optional[str] = None
+    import_report_path: Optional[str] = None
+
+
+def _default_import_report_path(pdf_path: str) -> str:
+    base = os.path.splitext(os.path.basename(pdf_path))[0]
+    return os.path.join(tempfile.gettempdir(), f"{base}_import_report.json")
+
+
+def _pymupdf_version() -> str:
+    return str(getattr(fitz, "__version__", "") or "")
+
+
+def _freecad_version() -> str:
+    try:
+        ver = getattr(FreeCAD, "Version", None)
+        if callable(ver):
+            return str(ver() or "")
+        return str(ver or "")
+    except (AttributeError, RuntimeError, TypeError):
+        return ""
+
+
+def write_import_report(
+    *,
+    pdf_path: str,
+    output_path: str,
+    opts: ImportOptions,
+    pages_imported: int,
+    total_pages: int,
+    primitive_count: int = 0,
+    text_count: int = 0,
+    layer_count: int = 0,
+    elapsed_ms: float = 0.0,
+    fallback_used: bool = False,
+    fallback_reason: Optional[str] = None,
+) -> str:
+    """Emit bcs.import_report/1.1 JSON for one import run."""
+    from pdfcadcore.import_report import build_import_report
+
+    report = build_import_report(
+        host_app="freecad",
+        host_version=_freecad_version(),
+        runtime_lang="python",
+        runtime_version=(
+            f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        ),
+        importer_version="4.0.24",
+        pdf_path=pdf_path,
+        mode=opts.import_mode,
+        pages=pages_imported or total_pages,
+        primitive_count=primitive_count,
+        text_count=text_count,
+        layer_count=layer_count,
+        elapsed_ms=elapsed_ms,
+        fallback_used=fallback_used,
+        fallback_reason=fallback_reason,
+        pdf_engine_version=_pymupdf_version(),
+        extra={
+            "auto_resolved_mode": opts.auto_resolved_mode,
+            "auto_reason": opts.auto_reason,
+        },
+    )
+    report.write_json(output_path)
+    return output_path
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -3111,6 +3176,8 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     if opts is None:
         opts = ImportOptions(ignore_images=not IMAGE_WB)
     fc_doc = _ensure_doc()
+    t_import_start = time.perf_counter()
+    obj_count_before = len(fc_doc.Objects)
 
     # Reset ID counter once at the start of a multi-page import
     try:
@@ -3204,5 +3271,27 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             f"Auto mode summary: {opts.auto_resolved_mode}"
             + (f" — {opts.auto_reason}" if opts.auto_reason else "")
         )
+
+    try:
+        report_path = opts.import_report_path or _default_import_report_path(pdf_path)
+        fallback_used = (
+            opts.import_mode == "raster"
+            or opts.auto_resolved_mode == "raster"
+        )
+        write_import_report(
+            pdf_path=pdf_path,
+            output_path=report_path,
+            opts=opts,
+            pages_imported=imported_count,
+            total_pages=total_pages,
+            primitive_count=max(0, len(fc_doc.Objects) - obj_count_before),
+            elapsed_ms=(time.perf_counter() - t_import_start) * 1000.0,
+            fallback_used=fallback_used,
+            fallback_reason=opts.auto_reason if fallback_used else None,
+        )
+        if opts.verbose:
+            _msg(f"Import report: {report_path}")
+    except (OSError, RuntimeError, TypeError, ValueError, ImportError) as e:
+        _warn(f"Import report write failed: {e}")
 
     return True

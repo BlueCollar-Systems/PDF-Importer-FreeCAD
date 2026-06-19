@@ -1,0 +1,31 @@
+The following dimensions will be provided in the visual representation for each shape.
+All dimensions will be rounded to the nearest 1/16" for fractions and displayed to the 4th decimal place for decimal dimensions except when it would produce redundant zeros (for the visual refernce only, the actual dimensions the shapes are drawn to will be as accurate is is absolutely possible)
+
+
+C-Shape- Depth, Width, Half Web Thickness, Web Thickness, Flange Thickness
+
+HP-Shape- Depth, Width, Half Web Thickness, Web Thickness, Flange Thickness
+
+HSS Rectangular-Shape- Height, Width, Wall Thickness
+
+HSS Round-Shape- Outside Diameter, Inside Diameter, Wall Thickness
+
+HSS Square-Shape- Height, Width, Wall Thickness
+
+L-Shape- Depth, Width, Wall Thickness
+
+M-Shape- Depth, Width, Half Web Thickness, Web Thickness, Flange Thickness
+
+MC-Shapes- Depth, Width, Half Web Thickness, Web Thickness, Flange Thickness
+
+MT-Shapes- Depth, Width, Half Web Thickness, Web Thickness, Flange Thickness
+
+Pipe-Shape- Outside Diameter, Inside Diameter, Wall Thickness
+
+S-Shapes- Depth, Width, Half Web Thickness, Web Thickness, Flange Thickness
+
+ST-Shapes- Depth, Width, Half Web Thickness, Web Thickness, Flange Thickness
+
+W-Shapes- Depth, Width, Half Web Thickness, Web Thickness, Flange Thickness
+
+WT-Shapes- Depth, Width, Half Web Thickness, Web Thickness, Flange Thickness

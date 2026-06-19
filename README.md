@@ -12,6 +12,15 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 
 > BlueCollar Systems -- BUILT. NOT BOUGHT.
 
+## Structural Steel Shape Assets
+
+The former standalone `Structural-Steel-DXF-DWG-Shapes` repository has been
+consolidated here under `resources/steel_shapes/dxf_dwg/` so the FreeCAD
+importer repo is the source home for the DXF/DWG steel shape packs. The
+versioned release ZIP from that old repo is intentionally not stored here;
+GitHub Releases remain the download layer, while this repo keeps the source
+assets, generation scripts, checksums, license, and notes.
+
 ## Key Features
 
 | Category | Capability |
@@ -88,6 +97,23 @@ python build_release.py
 1. Push a tag in `vX.Y.Z` format (example: `v3.5.1`).
 2. GitHub Actions workflow `windows-release` builds both artifacts.
 3. The workflow attaches the ZIP and Setup.exe to that GitHub Release.
+
+## Free Structural Steel Shapes (CC0)
+
+This repository also hosts the public-domain AISC v16.0 DXF/DWG shape packs
+previously distributed from `Structural-Steel-DXF-DWG-Shapes`.
+
+| Location | Contents |
+|----------|----------|
+| [`steel_shapes/dxf/`](steel_shapes/dxf/) | 14 family DXF packs |
+| [`steel_shapes/dwg/`](steel_shapes/dwg/) | 14 family DWG packs |
+| [`steel_shapes/source/`](steel_shapes/source/) | AISC CSV + generation scripts |
+| [`steel_shapes/README.md`](steel_shapes/README.md) | Usage, license, checksum notes |
+| [`steel_shapes/ATTRIBUTION.md`](steel_shapes/ATTRIBUTION.md) | Merge provenance from the former standalone repo |
+
+**Releases:** tag `steel-v1.0.0` (etc.) to publish
+`Structural-Steel-DXF-DWG-Shapes-*.zip` via the `steel-shapes-release` workflow.
+PDF Importer addon releases continue to use `v4.x.x` tags.
 
 ## Usage
 

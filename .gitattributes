@@ -19,3 +19,7 @@
 *.pdf binary
 *.zip binary
 *.whl binary
+*.dxf binary
+*.dwg binary
+*.dxf binary
+*.dwg binary

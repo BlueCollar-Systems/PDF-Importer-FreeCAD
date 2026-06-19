@@ -478,6 +478,18 @@ def _freecad_version() -> str:
         return ""
 
 
+def _importer_version() -> str:
+    pkg_xml = os.path.join(_mod_root, "package.xml")
+    try:
+        with open(pkg_xml, "r", encoding="utf-8") as f:
+            m = re.search(r"<version>(.*?)</version>", f.read())
+        if m:
+            return m.group(1).strip()
+    except OSError:
+        pass
+    return ""
+
+
 def write_import_report(
     *,
     pdf_path: str,
@@ -502,7 +514,7 @@ def write_import_report(
         runtime_version=(
             f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
         ),
-        importer_version="4.0.24",
+        importer_version=_importer_version(),
         pdf_path=pdf_path,
         mode=opts.import_mode,
         pages=pages_imported or total_pages,

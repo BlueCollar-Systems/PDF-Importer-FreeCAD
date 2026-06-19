@@ -15,7 +15,7 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 ## Structural Steel Shape Assets
 
 The former standalone `Structural-Steel-DXF-DWG-Shapes` repository has been
-consolidated here under `resources/steel_shapes/dxf_dwg/` so the FreeCAD
+consolidated here under `steel_shapes/` so the FreeCAD
 importer repo is the source home for the DXF/DWG steel shape packs. The
 versioned release ZIP from that old repo is intentionally not stored here;
 GitHub Releases remain the download layer, while this repo keeps the source

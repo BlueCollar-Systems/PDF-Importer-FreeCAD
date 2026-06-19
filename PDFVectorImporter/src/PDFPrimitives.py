@@ -7,7 +7,4 @@ _warnings.warn(
     DeprecationWarning,
     stacklevel=2,
 )
-try:
-    from PDFVectorImporter.pdfcadcore.primitives import *  # noqa: F401,F403
-except ImportError:
-    from pdfcadcore.primitives import *  # noqa: F401,F403
+from pdfcadcore.primitives import *  # noqa: F401,F403

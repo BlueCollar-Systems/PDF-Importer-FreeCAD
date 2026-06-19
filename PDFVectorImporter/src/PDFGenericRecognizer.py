@@ -7,7 +7,4 @@ _warnings.warn(
     DeprecationWarning,
     stacklevel=2,
 )
-try:
-    from PDFVectorImporter.pdfcadcore.generic_recognizer import *  # noqa: F401,F403
-except ImportError:
-    from pdfcadcore.generic_recognizer import *  # noqa: F401,F403
+from pdfcadcore.generic_recognizer import *  # noqa: F401,F403

@@ -40,7 +40,9 @@ class TestImportReportWriter(unittest.TestCase):
             data = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertEqual(data["schema"], "bcs.import_report/1.1")
             self.assertEqual(data["host"]["app"], "freecad")
-            self.assertEqual(data["importer"]["version"], "4.0.24")
+            package_xml = (MOD_ROOT / "package.xml").read_text(encoding="utf-8")
+            expected_version = package_xml.split("<version>", 1)[1].split("</version>", 1)[0]
+            self.assertEqual(data["importer"]["version"], expected_version)
             self.assertEqual(data["result"]["primitives"], 7)
             self.assertEqual(data["result"]["text_entities"], 2)
             self.assertEqual(data["result"]["layers"], 1)

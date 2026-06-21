@@ -37,13 +37,12 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdi
 
 [Code]
 const
-  INVALID_HANDLE_VALUE = THandle(-1);
+  INVALID_HANDLE_VALUE = -1;
   FILE_FLAG_BACKUP_SEMANTICS = $02000000;
   OPEN_EXISTING = 3;
   FILE_SHARE_READ = 1;
   FILE_SHARE_WRITE = 2;
   FILE_NAME_NORMALIZED = 0;
-  FILE_ATTRIBUTE_REPARSE_POINT = $00000400;
 
 var
   ResolvedInstallDir: string;

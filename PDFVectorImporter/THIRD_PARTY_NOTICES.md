@@ -11,5 +11,5 @@ This package includes third-party components in `src/lib`, including PyMuPDF and
 
 For complete third-party metadata in this package, see:
 
-- `src/lib/pymupdf-1.27.2.dist-info/METADATA`
-- `src/lib/pymupdf-1.27.2.dist-info/COPYING`
+- `src/lib/pymupdf-*.dist-info/METADATA`
+- `src/lib/pymupdf-*.dist-info/COPYING`

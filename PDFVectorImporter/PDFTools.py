@@ -137,6 +137,40 @@ class CheckEnvironmentCommand:
             except ImportError:
                 _warn("  PySide: NOT FOUND")
 
+        # Optional SVG/font helper executables
+        try:
+            from PDFSvgTextRenderer import find_pdftocairo
+        except ImportError:
+            find_pdftocairo = None
+
+        pdftocairo = find_pdftocairo() if find_pdftocairo else None
+        if pdftocairo:
+            _msg(f"  pdftocairo: OK  ({pdftocairo})")
+        else:
+            _warn("  pdftocairo: MISSING — SVG/glyph text and raster helpers reduced")
+            _msg("    Download Poppler: https://github.com/oschwartz10612/poppler-windows/releases/latest")
+            _msg("    Or place pdftocairo.exe in PDFVectorImporter/src/lib/bin/")
+
+        gs_found = False
+        try:
+            import glob
+            import sys as _sys
+            if _sys.platform == "win32":
+                for pat in (
+                    r"C:\Program Files\gs\gs*\bin\gswin64c.exe",
+                    r"C:\Program Files (x86)\gs\gs*\bin\gswin32c.exe",
+                ):
+                    matches = sorted(glob.glob(pat))
+                    if matches:
+                        _msg(f"  Ghostscript: OK  ({matches[-1]})")
+                        gs_found = True
+                        break
+        except (OSError, RuntimeError):
+            pass
+        if not gs_found:
+            _warn("  Ghostscript: MISSING — non-embedded font repair disabled")
+            _msg("    Download: https://ghostscript.com/releases/gsdnld.html")
+
         _msg(f"  sys.path ({len(sys.path)} entries):")
         for p in sys.path:
             _msg(f"    {p}")

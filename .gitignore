@@ -47,6 +47,7 @@ dev_logs/
 PDFVectorImporter/qa_runs/
 PDFVectorImporter/fc_smoke_payload.json
 PDFVectorImporter/_archived/
+PDFVectorImporter/temp/
 
 # Local PDF QA/vendor artifacts (keep local, do not track)
 PDFVectorImporter/src/lib/

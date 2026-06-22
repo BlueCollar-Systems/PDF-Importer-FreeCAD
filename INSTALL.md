@@ -82,11 +82,17 @@ Setup builds from this repo resolve/remove Mod junctions before copying files an
 
 ## PyMuPDF dependency
 
-On first use of the workbench, FreeCAD may prompt to install **PyMuPDF** into:
+Release ZIPs and `FreeCAD-PDF-Importer-Setup_vX.Y.Z.exe` are built with a
+private **PyMuPDF** copy under:
 
 `…\Mod\PDFVectorImporter\src\lib`
 
-You can also install manually:
+That means release users do not need system Python, pip, or any operating
+system Python packages. The **Install / Update PyMuPDF** command remains as a
+source/dev fallback if you install directly from a checkout or intentionally
+build with `--no-vendor-deps`.
+
+Manual fallback install:
 
 ```powershell
 & "C:\Program Files\FreeCAD 1.1\bin\python.exe" -m pip install --target "%APPDATA%\FreeCAD\v1-1\Mod\PDFVectorImporter\src\lib" "PyMuPDF>=1.24,<2.0"

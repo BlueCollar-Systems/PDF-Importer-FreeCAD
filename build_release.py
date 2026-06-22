@@ -20,7 +20,11 @@ Output:
 """
 
 import argparse
+import os
 import re
+import shutil
+import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -40,6 +44,7 @@ EXCLUDE_DIRS = {
     "_archived",
     "qa_runs",
     "adapters",  # CLI test harnesses — not needed at FreeCAD runtime
+    "temp",
 }
 
 EXCLUDE_FILES = {
@@ -63,6 +68,9 @@ EXCLUDE_SUFFIXES = {
     ".swp",
 }
 
+PYMUPDF_SPEC = "PyMuPDF>=1.24,<2.0"
+VENDORED_LIB_DIR = ADDON_DIR / "src" / "lib"
+
 
 def _should_exclude(rel: Path) -> bool:
     for part in rel.parts:
@@ -85,12 +93,132 @@ def _read_version() -> str:
     return "0.0.0"
 
 
-def build(out_dir: Path) -> Path:
+def _candidate_freecad_pythons() -> list[Path]:
+    candidates: list[Path] = []
+    for key in ("FREECAD_PYTHON", "FREECAD_PYTHON_EXE"):
+        value = os.environ.get(key)
+        if value:
+            candidates.append(Path(value))
+    for pattern in (
+        r"C:\Program Files\FreeCAD 1.1\bin\python.exe",
+        r"C:\Program Files\FreeCAD*\bin\python.exe",
+        r"C:\Program Files (x86)\FreeCAD*\bin\python.exe",
+    ):
+        if "*" in pattern:
+            candidates.extend(Path("C:/").glob(pattern.replace("C:\\", "").replace("\\", "/")))
+        else:
+            candidates.append(Path(pattern))
+    candidates.append(Path(sys.executable))
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key not in seen and candidate.exists():
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def _python_version(python_exe: Path) -> tuple[int, int]:
+    code = "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"
+    proc = subprocess.run(
+        [str(python_exe), "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    major, minor = proc.stdout.strip().split(".", 1)
+    return int(major), int(minor)
+
+
+def _lib_has_pymupdf(python_exe: Path, lib_dir: Path) -> bool:
+    if not lib_dir.is_dir():
+        return False
+    code = (
+        "import sys; "
+        f"sys.path.insert(0, r'{lib_dir}'); "
+        "import pymupdf as fitz; "
+        "print(getattr(fitz, '__version__', '') or getattr(fitz, 'VersionBind', ''))"
+    )
+    proc = subprocess.run(
+        [str(python_exe), "-c", code],
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode == 0 and bool(proc.stdout.strip())
+
+
+def _prune_vendored_pymupdf() -> None:
+    """Remove PyMuPDF development files that are not needed at runtime."""
+    for rel in (
+        Path("pymupdf") / "mupdf-devel",
+    ):
+        path = VENDORED_LIB_DIR / rel
+        if path.exists():
+            shutil.rmtree(path)
+
+
+def ensure_runtime_dependencies(*, vendor: bool = True) -> Path:
+    """Ensure the release tree has a FreeCAD-compatible private PyMuPDF."""
+    candidates = _candidate_freecad_pythons()
+    if not candidates:
+        raise RuntimeError("No Python executable found for PyMuPDF verification.")
+
+    preferred = candidates[0]
+    for python_exe in candidates:
+        if _lib_has_pymupdf(python_exe, VENDORED_LIB_DIR):
+            _prune_vendored_pymupdf()
+            print(f"Vendored PyMuPDF OK for {python_exe}: {VENDORED_LIB_DIR}")
+            return python_exe
+
+    if not vendor:
+        raise RuntimeError(
+            "PyMuPDF is not bundled in PDFVectorImporter/src/lib. "
+            "Run build_release.py without --no-vendor-deps or populate src/lib first."
+        )
+
+    py_version = _python_version(preferred)
+    if py_version < (3, 10):
+        raise RuntimeError(
+            f"{preferred} is Python {py_version[0]}.{py_version[1]}; "
+            "PyMuPDF wheels require Python 3.10+."
+        )
+
+    if VENDORED_LIB_DIR.exists():
+        shutil.rmtree(VENDORED_LIB_DIR)
+    VENDORED_LIB_DIR.mkdir(parents=True, exist_ok=True)
+
+    print(f"Vendoring {PYMUPDF_SPEC} into {VENDORED_LIB_DIR}")
+    print(f"Using Python: {preferred}")
+    subprocess.run(
+        [
+            str(preferred),
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--only-binary",
+            ":all:",
+            "--target",
+            str(VENDORED_LIB_DIR),
+            PYMUPDF_SPEC,
+        ],
+        check=True,
+    )
+    _prune_vendored_pymupdf()
+
+    if not _lib_has_pymupdf(preferred, VENDORED_LIB_DIR):
+        raise RuntimeError(f"PyMuPDF install completed but import failed from {VENDORED_LIB_DIR}")
+    return preferred
+
+
+def build(out_dir: Path, *, vendor_deps: bool = True) -> Path:
     version = _read_version()
     zip_name = f"FreeCAD-PDF-Importer_v{version}.zip"
     zip_path = out_dir / zip_name
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    ensure_runtime_dependencies(vendor=vendor_deps)
 
     file_count = 0
     skipped = 0
@@ -119,10 +247,15 @@ def main() -> None:
         "--out", default=str(REPO_ROOT),
         help="Output directory (default: repo root)"
     )
+    parser.add_argument(
+        "--no-vendor-deps",
+        action="store_true",
+        help="Fail if runtime dependencies are not already present instead of installing them.",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out).resolve()
-    zip_path = build(out_dir)
+    zip_path = build(out_dir, vendor_deps=not args.no_vendor_deps)
     print(f"\nRelease ready: {zip_path}")
 
 

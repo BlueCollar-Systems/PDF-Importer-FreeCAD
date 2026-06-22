@@ -70,10 +70,7 @@ See **[INSTALL.md](INSTALL.md)** for Windows FreeCAD 1.1 paths, dev junction ins
    - **Windows (FreeCAD 0.21):** `%APPDATA%\FreeCAD\Mod\`
    - **macOS:** `~/Library/Application Support/FreeCAD/Mod/`
    - **Linux:** `~/.local/share/FreeCAD/Mod/`
-3. Install PyMuPDF:
-   ```bash
-   pip install "PyMuPDF>=1.24,<2.0"
-   ```
+3. For release ZIP/Setup installs, PyMuPDF is already bundled under `PDFVectorImporter/src/lib`. For source checkouts, run `python build_release.py` to stage the private runtime, or use **PDF Vector Importer > Install / Update PyMuPDF** after loading the workbench.
 4. Restart FreeCAD
 
 ## Building Release Artifacts
@@ -169,7 +166,7 @@ Evidence levels:
 
 - **FreeCAD** 0.21 or later
 - **Python** 3.10+ (adapters use PEP 604 union types)
-- **PyMuPDF** (automatically installed via Addon Manager)
+- **PyMuPDF** `>=1.24,<2.0` (bundled in release ZIP/Setup installs under `PDFVectorImporter/src/lib`; source checkouts can stage it with `python build_release.py` or the workbench installer)
 
 ## Known Limitations
 

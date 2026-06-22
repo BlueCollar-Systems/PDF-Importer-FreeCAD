@@ -271,7 +271,7 @@ begin
   begin
     MsgBox(
       'PDF Vector Importer was installed to:' + #13#10 + ExpandConstant('{app}') + #13#10#13#10 +
-      'Restart FreeCAD. If PyMuPDF is missing, install it from FreeCAD Addon Manager.',
+      'Restart FreeCAD. This installer includes the private PyMuPDF runtime under src\lib.',
       mbInformation, MB_OK
     );
   end;

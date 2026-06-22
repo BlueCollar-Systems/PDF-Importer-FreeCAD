@@ -47,7 +47,7 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 
 2. Restart FreeCAD.
 3. Switch to the **PDF Vector Importer** workbench from the workbench selector.
-4. PyMuPDF (`>=1.24,<2.0`) installs automatically on first use (requires pip / internet).
+4. Release ZIP/Setup installs include the private PyMuPDF runtime under `PDFVectorImporter/src/lib`; source checkouts can stage it with `python build_release.py` or **PDF Vector Importer > Install / Update PyMuPDF**.
 
 ---
 
@@ -56,7 +56,7 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 | Dependency | Required | Notes |
 |---|---|---|
 | **FreeCAD** | 0.21+ | Tested through 1.0 |
-| **PyMuPDF** | Yes | Auto-installed on first run (`>=1.24,<2.0`) |
+| **PyMuPDF** | Yes | Bundled in release ZIP/Setup installs (`>=1.24,<2.0`); source checkouts can stage it locally |
 | **pdftocairo** | Optional | Required only for text-as-geometry import |
 
 ---

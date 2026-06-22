@@ -43,6 +43,7 @@ dist/
 # Dev artifacts
 dev_logs/
 .pytest_cache/
+.pytest_tmp/
 *.egg-info/
 PDFVectorImporter/qa_runs/
 PDFVectorImporter/fc_smoke_payload.json

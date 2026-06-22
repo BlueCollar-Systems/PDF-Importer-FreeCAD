@@ -29,6 +29,7 @@ exclude = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--basetemp=.pytest_tmp/run"
 norecursedirs = [
   "dev_logs",
   "installer",

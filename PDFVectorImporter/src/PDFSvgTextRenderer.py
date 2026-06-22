@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
-# PDFSvgTextRenderer.py — Pixel-perfect text via pdftocairo SVG glyphs
+# PDFSvgTextRenderer.py — Pixel-perfect text via SVG glyph paths
 # BlueCollar Systems — BUILT. NOT BOUGHT.
 #
-# Renders text as vector glyph outlines using pdftocairo.
+# Renders text as vector glyph outlines using pdftocairo, or bundled PyMuPDF
+# when Poppler is absent.
 # Each unique glyph is built once as a Part.Shape, then translated
 # and compounded into a single Part::Feature for all text on the page.
 #
-# Falls back gracefully if pdftocairo is not available.
+# Falls back gracefully to caller-provided label text if no SVG renderer is
+# available.
 
 from __future__ import annotations
 
@@ -103,80 +105,31 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
     Returns {"shapes": int, "glyphs": int} or None if unavailable.
     """
     exe = find_pdftocairo()
-    if exe is None:
-        if FreeCAD:
-            FreeCAD.Console.PrintMessage(
-                "PDFSvgTextRenderer: pdftocairo not found — "
-                "text-as-geometry skipped. Place pdftocairo(.exe) in "
-                "src/lib/bin/ or install Poppler to enable this feature.\n"
-            )
-        return None
+    renderer_name = "pdftocairo" if exe else "pymupdf"
 
     doc = fc_doc or FreeCAD.ActiveDocument
     if doc is None:
         return None
 
-    # Generate SVG — always clean up temp file regardless of outcome
-    fd, svg_path = tempfile.mkstemp(suffix=".svg", prefix=f"bc_fc_svg_{page_num}_")
-    os.close(fd)  # close fd so subprocess can write to the path
     svg = None
-
-    try:
-        kw = {}
-        if sys.platform == "win32":
-            kw["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
-
-        cmd_variants = [
-            # Preferred: crop to page crop box (best fidelity when supported).
-            [exe, "-svg", "-cropbox", "-f", str(page_num), "-l", str(page_num),
-             "--", pdf_path, svg_path],
-            # Compatibility fallback: some pdftocairo builds reject -cropbox with -svg.
-            [exe, "-svg", "-f", str(page_num), "-l", str(page_num),
-             "--", pdf_path, svg_path],
-        ]
-        last_err = None
-        for cmd in cmd_variants:
-            try:
-                if os.path.isfile(svg_path):
-                    os.remove(svg_path)
-                subprocess.run(cmd, check=True, timeout=90, capture_output=True, **kw)
-                if os.path.isfile(svg_path):
-                    with open(svg_path, "r", encoding="utf-8") as f:
-                        svg = f.read()
-                    if svg:
-                        break
-            except subprocess.TimeoutExpired:
-                # Timeout is unlikely to improve by retrying variants.
-                raise
-            except (subprocess.SubprocessError, OSError, ValueError, UnicodeError) as e:
-                last_err = e
-                continue
-
-        if not svg:
-            if last_err:
-                raise last_err
-            return None
-
-    except subprocess.TimeoutExpired:
+    if exe:
+        svg = _render_svg_with_pdftocairo(exe, pdf_path, page_num)
+    else:
         if FreeCAD:
-            FreeCAD.Console.PrintWarning(
-                f"PDFSvgTextRenderer: pdftocairo timed out on page {page_num} — "
-                "text-as-geometry skipped.\n"
+            FreeCAD.Console.PrintMessage(
+                "PDFSvgTextRenderer: pdftocairo not found — using bundled "
+                "PyMuPDF SVG text fallback.\n"
             )
-        return None
-    except (subprocess.SubprocessError, OSError, ValueError, UnicodeError) as e:
-        if FreeCAD:
-            FreeCAD.Console.PrintWarning(
-                f"PDFSvgTextRenderer: pdftocairo failed on page {page_num}: {e}\n"
-            )
-        return None
-    finally:
-        try:
-            os.remove(svg_path)
-        except OSError:
-            pass
+        svg = _render_svg_with_pymupdf(pdf_path, page_num)
 
     if not svg:
+        return None
+    if _svg_too_large(svg):
+        if FreeCAD:
+            FreeCAD.Console.PrintWarning(
+                f"PDFSvgTextRenderer: page {page_num} SVG text payload is too large — "
+                "falling back to editable labels.\n"
+            )
         return None
 
     # Parse SVG dimensions / viewBox
@@ -192,17 +145,13 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
     y_unit_to_mm = (page_h_eff * scale) / max(vb_h, 1e-12)
 
     # Parse glyph definitions
-    glyph_defs = {}
-    for gid, path_d in re.findall(
-            r'<g id="(glyph-\d+-\d+)">\s*<path d="([^"]*)"', svg, re.DOTALL):
-        if path_d.strip():
-            glyph_defs[gid] = path_d
+    glyph_defs = _parse_glyph_defs(svg)
 
     # Parse use placements
     placements = _parse_use_placements(svg)
 
     if not placements:
-        return {"shapes": 0, "glyphs": 0}
+        return {"shapes": 0, "glyphs": 0, "renderer": renderer_name}
 
     # Build Part.Shape for each unique glyph
     glyph_shapes: Dict[str, Part.Shape] = {}
@@ -271,9 +220,157 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
             pass
         if parent_group:
             parent_group.addObject(text_obj)
-        return {"shapes": len(glyph_shapes), "glyphs": glyph_count}
+        return {"shapes": len(glyph_shapes), "glyphs": glyph_count, "renderer": renderer_name}
     except (RuntimeError, ValueError, TypeError):
         return None
+
+
+def _render_svg_with_pdftocairo(exe: str, pdf_path: str, page_num: int) -> Optional[str]:
+    # Always clean up temp file regardless of outcome.
+    fd, svg_path = tempfile.mkstemp(suffix=".svg", prefix=f"bc_fc_svg_{page_num}_")
+    os.close(fd)  # close fd so subprocess can write to the path
+
+    try:
+        kw = {}
+        if sys.platform == "win32":
+            kw["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+
+        cmd_variants = [
+            # Preferred: crop to page crop box (best fidelity when supported).
+            [exe, "-svg", "-cropbox", "-f", str(page_num), "-l", str(page_num),
+             "--", pdf_path, svg_path],
+            # Compatibility fallback: some pdftocairo builds reject -cropbox with -svg.
+            [exe, "-svg", "-f", str(page_num), "-l", str(page_num),
+             "--", pdf_path, svg_path],
+        ]
+        last_err = None
+        for cmd in cmd_variants:
+            try:
+                if os.path.isfile(svg_path):
+                    os.remove(svg_path)
+                subprocess.run(cmd, check=True, timeout=90, capture_output=True, **kw)
+                if os.path.isfile(svg_path):
+                    with open(svg_path, "r", encoding="utf-8") as f:
+                        svg = f.read()
+                    if svg:
+                        return svg
+            except subprocess.TimeoutExpired:
+                # Timeout is unlikely to improve by retrying variants.
+                raise
+            except (subprocess.SubprocessError, OSError, ValueError, UnicodeError) as e:
+                last_err = e
+                continue
+
+        if last_err:
+            raise last_err
+        return None
+
+    except subprocess.TimeoutExpired:
+        if FreeCAD:
+            FreeCAD.Console.PrintWarning(
+                f"PDFSvgTextRenderer: pdftocairo timed out on page {page_num} — "
+                "falling back to editable labels.\n"
+            )
+        return None
+    except (subprocess.SubprocessError, OSError, ValueError, UnicodeError) as e:
+        if FreeCAD:
+            FreeCAD.Console.PrintWarning(
+                f"PDFSvgTextRenderer: pdftocairo failed on page {page_num}: {e}\n"
+            )
+        return None
+    finally:
+        try:
+            os.remove(svg_path)
+        except OSError:
+            pass
+
+
+def _load_fitz():
+    try:
+        import fitz  # type: ignore
+        return fitz
+    except Exception:
+        pass
+
+    lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
+    if lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+    try:
+        import fitz  # type: ignore
+        return fitz
+    except Exception as e:
+        if FreeCAD:
+            FreeCAD.Console.PrintWarning(
+                f"PDFSvgTextRenderer: PyMuPDF fallback unavailable: {e}\n"
+            )
+        return None
+
+
+def _render_svg_with_pymupdf(pdf_path: str, page_num: int) -> Optional[str]:
+    fitz = _load_fitz()
+    if fitz is None:
+        return None
+
+    pdf_doc = None
+    try:
+        pdf_doc = fitz.open(pdf_path)
+        if page_num < 1 or page_num > len(pdf_doc):
+            return None
+        page = pdf_doc.load_page(page_num - 1)
+        return page.get_svg_image(text_as_path=1)
+    except Exception as e:
+        if FreeCAD:
+            FreeCAD.Console.PrintWarning(
+                f"PDFSvgTextRenderer: PyMuPDF SVG fallback failed on page {page_num}: {e}\n"
+            )
+        return None
+    finally:
+        try:
+            if pdf_doc is not None:
+                pdf_doc.close()
+        except Exception:
+            pass
+
+
+def _max_svg_text_bytes() -> int:
+    raw = os.environ.get("BC_FC_SVG_TEXT_MAX_BYTES", "").strip()
+    try:
+        value = int(raw) if raw else 50_000_000
+        return value if value > 0 else 50_000_000
+    except (TypeError, ValueError):
+        return 50_000_000
+
+
+def _svg_too_large(svg: str) -> bool:
+    try:
+        return len(svg.encode("utf-8", "ignore")) > _max_svg_text_bytes()
+    except Exception:
+        return False
+
+
+def _glyph_reference_id(gid: str) -> bool:
+    return bool(gid) and (
+        gid.startswith("glyph-") or gid.startswith("font_") or gid.startswith("font-")
+    )
+
+
+def _parse_glyph_defs(svg: str) -> Dict[str, str]:
+    glyph_defs: Dict[str, str] = {}
+    for gid, path_d in re.findall(
+            r'<g id="([^"]+)">\s*<path d="([^"]*)"', svg, re.DOTALL):
+        if _glyph_reference_id(gid) and path_d.strip():
+            glyph_defs[gid] = path_d
+
+    for tag in re.findall(r'<path\b[^>]*>', svg, re.IGNORECASE | re.DOTALL):
+        id_m = re.search(r'\bid="([^"]+)"', tag, re.IGNORECASE)
+        d_m = re.search(r'\bd="([^"]*)"', tag, re.IGNORECASE | re.DOTALL)
+        if not id_m or not d_m:
+            continue
+        gid = id_m.group(1)
+        path_d = d_m.group(1)
+        if _glyph_reference_id(gid) and path_d.strip():
+            glyph_defs[gid] = path_d
+    return glyph_defs
 
 
 def _parse_svg_dim(svg: str, attr: str, fallback: float) -> float:
@@ -311,9 +408,11 @@ def _parse_use_placements(svg: str):
         if not href_m:
             continue
         href = href_m.group(1).strip()
-        if not href.startswith("#glyph-"):
+        if not href.startswith("#"):
             continue
         gid = href[1:]
+        if not _glyph_reference_id(gid):
+            continue
         x = _attr_float(tag, "x", 0.0)
         y = _attr_float(tag, "y", 0.0)
         matrix = None

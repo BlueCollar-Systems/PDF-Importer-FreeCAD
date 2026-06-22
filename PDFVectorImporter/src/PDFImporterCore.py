@@ -2662,13 +2662,14 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             fc_doc.recompute()
             return top_group
 
-        # Try pdftocairo vector text (Geometry mode)
+        # Try pdftocairo vector text (Glyphs / Geometry modes)
         svg_text_done = False
-        if opts.text_mode == "geometry":
+        if opts.text_mode in ("glyphs", "geometry"):
             try:
                 from PDFVectorImporter.src.PDFSvgTextRenderer import render_text
                 text_parent = top_group or fc_doc
-                _progress_update(87, "Rendering text glyphs via pdftocairo...")
+                label = "text geometry" if opts.text_mode == "geometry" else "text glyphs"
+                _progress_update(87, f"Rendering {label} via pdftocairo...")
                 result = render_text(
                     pdf_path, page_num, page_h, scale, page.rect.width,
                     fc_doc=fc_doc, parent_group=text_parent, flip_y=opts.flip_y)
@@ -2678,7 +2679,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     n_glyphs = result['glyphs']
                     _progress_update(
                         89,
-                        f"Rendering text glyphs ({n_glyphs} items)...")
+                        f"Rendering {label} ({n_glyphs} items)...")
                     if opts.verbose:
                         _msg(f"  Text: {result['glyphs']} glyphs from "
                              f"{result['shapes']} unique shapes (pdftocairo)")

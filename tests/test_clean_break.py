@@ -17,6 +17,7 @@ WORKBENCH_DIR = REPO_ROOT / "PDFVectorImporter"
 SRC_DIR = WORKBENCH_DIR / "src"
 ADAPTERS_DIR = WORKBENCH_DIR / "adapters"
 EMBEDDED_CORE_CONFIG = WORKBENCH_DIR / "pdfcadcore" / "import_config.py"
+IMPORTER_CORE = SRC_DIR / "PDFImporterCore.py"
 
 for p in (str(SRC_DIR), str(WORKBENCH_DIR)):
     if p not in sys.path:
@@ -177,6 +178,11 @@ class TestTextDefaults(unittest.TestCase):
         source = EMBEDDED_CORE_CONFIG.read_text(encoding="utf-8")
         self.assertIn('text_mode: str = "3d_text"', source)
         self.assertNotIn('text_mode: str = "labels"', source)
+
+    def test_glyphs_mode_uses_vector_glyph_renderer(self):
+        source = IMPORTER_CORE.read_text(encoding="utf-8")
+        self.assertIn('if opts.text_mode in ("glyphs", "geometry"):', source)
+        self.assertIn('label = "text geometry" if opts.text_mode == "geometry" else "text glyphs"', source)
 
 
 class TestBlenderAdapterCleanBreak(unittest.TestCase):

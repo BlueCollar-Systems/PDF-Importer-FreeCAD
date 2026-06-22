@@ -456,12 +456,34 @@ class ImportOptions:
     # Populated when import_mode == "auto" (BCS-ARCH-001 Rule 9).
     auto_resolved_mode: Optional[str] = None
     auto_reason: Optional[str] = None
+    raster_page_count: int = 0
     import_report_path: Optional[str] = None
 
 
 def _default_import_report_path(pdf_path: str) -> str:
     base = os.path.splitext(os.path.basename(pdf_path))[0]
     return os.path.join(tempfile.gettempdir(), f"{base}_import_report.json")
+
+
+def _report_fallback_state(opts: ImportOptions):
+    fallback_used = (
+        opts.import_mode == "raster"
+        or opts.raster_page_count > 0
+        or opts.auto_resolved_mode == "raster"
+    )
+    if opts.import_mode == "raster":
+        fallback_reason = "forced_raster_mode"
+    elif opts.raster_page_count > 0:
+        pages = opts.raster_page_count
+        fallback_reason = (
+            opts.auto_reason
+            or f"raster_fallback_{pages}_page{'s' if pages != 1 else ''}"
+        )
+    elif opts.auto_resolved_mode == "raster":
+        fallback_reason = opts.auto_reason
+    else:
+        fallback_reason = None
+    return fallback_used, fallback_reason
 
 
 def _pymupdf_version() -> str:
@@ -2299,6 +2321,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
 
     # ── Raster-only mode ──
     if effective_mode == "raster":
+        opts.raster_page_count += 1
         _msg(f"Page {page_num}: rendering at {opts.raster_dpi} DPI (raster mode)")
         _progress_update(5, f"Rendering raster image at {opts.raster_dpi} DPI...")
         _import_page_as_raster(
@@ -3410,10 +3433,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
 
     try:
         report_path = opts.import_report_path or _default_import_report_path(pdf_path)
-        fallback_used = (
-            opts.import_mode == "raster"
-            or opts.auto_resolved_mode == "raster"
-        )
+        fallback_used, fallback_reason = _report_fallback_state(opts)
         write_import_report(
             pdf_path=pdf_path,
             output_path=report_path,
@@ -3423,7 +3443,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             primitive_count=max(0, len(fc_doc.Objects) - obj_count_before),
             elapsed_ms=(time.perf_counter() - t_import_start) * 1000.0,
             fallback_used=fallback_used,
-            fallback_reason=opts.auto_reason if fallback_used else None,
+            fallback_reason=fallback_reason,
         )
         if opts.verbose:
             _msg(f"Import report: {report_path}")

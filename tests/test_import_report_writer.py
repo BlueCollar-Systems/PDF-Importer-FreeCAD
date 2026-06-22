@@ -13,10 +13,37 @@ MOD_ROOT = REPO_ROOT / "PDFVectorImporter"
 for path in (SRC_DIR, MOD_ROOT):
     sys.path.insert(0, str(path))
 
-from PDFImporterCore import ImportOptions, write_import_report  # noqa: E402
+from PDFImporterCore import ImportOptions, _report_fallback_state, write_import_report  # noqa: E402
 
 
 class TestImportReportWriter(unittest.TestCase):
+    def test_report_fallback_state_forced_raster(self) -> None:
+        opts = ImportOptions(import_mode="raster")
+
+        self.assertEqual(
+            _report_fallback_state(opts),
+            (True, "forced_raster_mode"),
+        )
+
+    def test_report_fallback_state_counts_raster_pages(self) -> None:
+        opts = ImportOptions(import_mode="auto")
+        opts.raster_page_count = 2
+
+        self.assertEqual(
+            _report_fallback_state(opts),
+            (True, "raster_fallback_2_pages"),
+        )
+
+    def test_report_fallback_state_preserves_auto_reason(self) -> None:
+        opts = ImportOptions(import_mode="auto")
+        opts.auto_resolved_mode = "raster"
+        opts.auto_reason = "text-heavy page"
+
+        self.assertEqual(
+            _report_fallback_state(opts),
+            (True, "text-heavy page"),
+        )
+
     def test_write_import_report_uses_shared_schema(self) -> None:
         with tempfile.TemporaryDirectory(prefix="fc_import_report_") as tmp:
             report_path = Path(tmp) / "import_report.json"

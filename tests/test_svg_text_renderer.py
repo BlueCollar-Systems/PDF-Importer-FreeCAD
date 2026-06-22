@@ -74,3 +74,55 @@ def test_load_fitz_uses_validated_loader(monkeypatch):
     assert renderer._load_fitz() == "fitz-module"
     assert calls
     assert str(calls[0]).endswith(str(Path("PDFVectorImporter") / "src" / "lib"))
+
+
+class _FakeVector:
+    def __init__(self, x=0.0, y=0.0, z=0.0):
+        self.x = float(x)
+        self.y = float(y)
+        self.z = float(z)
+
+    def distanceToPoint(self, other):
+        dx = self.x - other.x
+        dy = self.y - other.y
+        dz = self.z - other.z
+        return (dx * dx + dy * dy + dz * dz) ** 0.5
+
+
+class _FakeLineSegment:
+    def __init__(self, p1, p2):
+        self.p1 = p1
+        self.p2 = p2
+
+    def toShape(self):
+        return (self.p1, self.p2)
+
+
+class _FakePart:
+    LineSegment = _FakeLineSegment
+
+
+def _install_fake_part(monkeypatch):
+    monkeypatch.setattr(renderer, "Vector", _FakeVector)
+    monkeypatch.setattr(renderer, "Part", _FakePart)
+
+
+def test_svg_path_parser_handles_implicit_moveto_lines(monkeypatch):
+    _install_fake_part(monkeypatch)
+
+    edges = renderer._svg_path_to_edges("M0 0 10 0 10 10", 1.0)
+
+    assert len(edges) == 2
+    assert edges[0][0].x == 0.0
+    assert edges[0][1].x == 10.0
+    assert edges[1][1].y == -10.0
+
+
+def test_svg_path_parser_handles_quadratic_and_arc_commands(monkeypatch):
+    _install_fake_part(monkeypatch)
+
+    quad_edges = renderer._svg_path_to_edges("M0 0 Q5 10 10 0 T20 0", 1.0)
+    arc_edges = renderer._svg_path_to_edges("M0 0 A10 10 0 0 1 10 10", 1.0)
+
+    assert len(quad_edges) > 4
+    assert len(arc_edges) > 1

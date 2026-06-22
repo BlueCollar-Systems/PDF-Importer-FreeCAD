@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import os
+import math
 import re
 import shutil
 import subprocess
@@ -470,7 +471,7 @@ def _svg_path_to_edges(d: str, scale_x: float, scale_y: Optional[float] = None) 
     Glyph coordinates are in PDF points, Y-down.
     We flip Y and scale to mm for FreeCAD.
     """
-    tokens = re.findall(r'[MLHVCSZmlhvcsz]|[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', d)
+    tokens = re.findall(r'[MLHVCSZQTAmlhvcszqta]|[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', d)
     edges = []
     subpath_pts = []
     start_pt = None
@@ -478,6 +479,7 @@ def _svg_path_to_edges(d: str, scale_x: float, scale_y: Optional[float] = None) 
     cmd = None
     nums: List[float] = []
     prev_cubic_cp2: Optional[List[float]] = None  # second control point of previous cubic (in abs coords)
+    prev_quad_cp: Optional[List[float]] = None    # control point of previous quadratic (in abs coords)
 
     if scale_y is None:
         scale_y = scale_x
@@ -497,24 +499,114 @@ def _svg_path_to_edges(d: str, scale_x: float, scale_y: Optional[float] = None) 
                         pass
         subpath_pts = []
 
+    def append_cubic(p0, p1, p2, p3):
+        chord = p0.distanceToPoint(p3)
+        n = 6 if chord < 0.5 else (8 if chord < 2.0 else 12)
+        for i in range(1, n + 1):
+            t = i / n
+            mt = 1.0 - t
+            bx = mt**3*p0.x + 3*mt**2*t*p1.x + 3*mt*t**2*p2.x + t**3*p3.x
+            by = mt**3*p0.y + 3*mt**2*t*p1.y + 3*mt*t**2*p2.y + t**3*p3.y
+            subpath_pts.append(Vector(bx, by, 0.0))
+
+    def append_quadratic(p0, p1, p2):
+        chord = p0.distanceToPoint(p2)
+        n = 5 if chord < 0.5 else (8 if chord < 2.0 else 10)
+        for i in range(1, n + 1):
+            t = i / n
+            mt = 1.0 - t
+            bx = mt**2*p0.x + 2*mt*t*p1.x + t**2*p2.x
+            by = mt**2*p0.y + 2*mt*t*p1.y + t**2*p2.y
+            subpath_pts.append(Vector(bx, by, 0.0))
+
+    def svg_arc_points(x0, y0, rx, ry, angle_deg, large_arc, sweep, x, y):
+        rx = abs(float(rx))
+        ry = abs(float(ry))
+        if rx <= 1e-12 or ry <= 1e-12:
+            return [(x, y)]
+        if abs(x0 - x) <= 1e-12 and abs(y0 - y) <= 1e-12:
+            return []
+
+        phi = math.radians(float(angle_deg))
+        cos_phi = math.cos(phi)
+        sin_phi = math.sin(phi)
+        dx = (x0 - x) / 2.0
+        dy = (y0 - y) / 2.0
+        x1p = cos_phi * dx + sin_phi * dy
+        y1p = -sin_phi * dx + cos_phi * dy
+
+        lam = (x1p * x1p) / (rx * rx) + (y1p * y1p) / (ry * ry)
+        if lam > 1.0:
+            scale = math.sqrt(lam)
+            rx *= scale
+            ry *= scale
+
+        rx2 = rx * rx
+        ry2 = ry * ry
+        x1p2 = x1p * x1p
+        y1p2 = y1p * y1p
+        denom = rx2 * y1p2 + ry2 * x1p2
+        if denom <= 1e-12:
+            return [(x, y)]
+        num = max(0.0, rx2 * ry2 - rx2 * y1p2 - ry2 * x1p2)
+        sign = -1.0 if bool(int(large_arc)) == bool(int(sweep)) else 1.0
+        coef = sign * math.sqrt(num / denom)
+        cxp = coef * (rx * y1p / ry)
+        cyp = coef * (-ry * x1p / rx)
+        cx_abs = cos_phi * cxp - sin_phi * cyp + (x0 + x) / 2.0
+        cy_abs = sin_phi * cxp + cos_phi * cyp + (y0 + y) / 2.0
+
+        def angle_between(ux, uy, vx, vy):
+            dot = ux * vx + uy * vy
+            det = ux * vy - uy * vx
+            return math.atan2(det, dot)
+
+        ux = (x1p - cxp) / rx
+        uy = (y1p - cyp) / ry
+        vx = (-x1p - cxp) / rx
+        vy = (-y1p - cyp) / ry
+        theta1 = angle_between(1.0, 0.0, ux, uy)
+        delta = angle_between(ux, uy, vx, vy)
+        if not bool(int(sweep)) and delta > 0:
+            delta -= 2.0 * math.pi
+        elif bool(int(sweep)) and delta < 0:
+            delta += 2.0 * math.pi
+
+        n = max(4, min(32, int(math.ceil(abs(delta) / (math.pi / 8.0)))))
+        pts = []
+        for i in range(1, n + 1):
+            theta = theta1 + delta * (i / n)
+            xp = rx * math.cos(theta)
+            yp = ry * math.sin(theta)
+            gx = cos_phi * xp - sin_phi * yp + cx_abs
+            gy = sin_phi * xp + cos_phi * yp + cy_abs
+            pts.append((gx, gy))
+        return pts
+
     def run():
-        nonlocal cx, cy, start_pt, subpath_pts, is_relative, prev_cubic_cp2
+        nonlocal cx, cy, start_pt, subpath_pts, is_relative
+        nonlocal prev_cubic_cp2, prev_quad_cp
 
         if cmd == "M":
             prev_cubic_cp2 = None
+            prev_quad_cp = None
+            first_pair = True
             while len(nums) >= 2:
-                flush_subpath()
                 nx, ny = nums.pop(0), nums.pop(0)
                 if is_relative:
                     cx, cy = cx + nx, cy + ny
                 else:
                     cx, cy = nx, ny
-                start_pt = mk(cx, cy)
-                subpath_pts = [start_pt]
-                # After first M pair, implicit coords are treated as L
-                is_relative = is_relative  # keep relative state for implicit L
+                if first_pair:
+                    flush_subpath()
+                    start_pt = mk(cx, cy)
+                    subpath_pts = [start_pt]
+                    first_pair = False
+                else:
+                    subpath_pts.append(mk(cx, cy))
         elif cmd == "L":
             prev_cubic_cp2 = None
+            prev_quad_cp = None
             while len(nums) >= 2:
                 nx, ny = nums.pop(0), nums.pop(0)
                 if is_relative:
@@ -524,6 +616,7 @@ def _svg_path_to_edges(d: str, scale_x: float, scale_y: Optional[float] = None) 
                 subpath_pts.append(mk(cx, cy))
         elif cmd == "H":
             prev_cubic_cp2 = None
+            prev_quad_cp = None
             while nums:
                 nx = nums.pop(0)
                 if is_relative:
@@ -533,6 +626,7 @@ def _svg_path_to_edges(d: str, scale_x: float, scale_y: Optional[float] = None) 
                 subpath_pts.append(mk(cx, cy))
         elif cmd == "V":
             prev_cubic_cp2 = None
+            prev_quad_cp = None
             while nums:
                 ny = nums.pop(0)
                 if is_relative:
@@ -541,6 +635,7 @@ def _svg_path_to_edges(d: str, scale_x: float, scale_y: Optional[float] = None) 
                     cy = ny
                 subpath_pts.append(mk(cx, cy))
         elif cmd == "C":
+            prev_quad_cp = None
             while len(nums) >= 6:
                 rx1, ry1, rx2, ry2, rx, ry = [nums.pop(0) for _ in range(6)]
                 if is_relative:
@@ -555,18 +650,11 @@ def _svg_path_to_edges(d: str, scale_x: float, scale_y: Optional[float] = None) 
                 p1 = mk(x1, y1)
                 p2 = mk(x2, y2)
                 p3 = mk(x, y)
-                chord = p0.distanceToPoint(p3)
-                n = 6 if chord < 0.5 else (8 if chord < 2.0 else 12)
-                for i in range(1, n + 1):
-                    t = i / n
-                    mt = 1.0 - t
-                    bx = mt**3*p0.x + 3*mt**2*t*p1.x + 3*mt*t**2*p2.x + t**3*p3.x
-                    by = mt**3*p0.y + 3*mt**2*t*p1.y + 3*mt*t**2*p2.y + t**3*p3.y
-                    pt = Vector(bx, by, 0.0)
-                    subpath_pts.append(pt)
+                append_cubic(p0, p1, p2, p3)
                 prev_cubic_cp2 = [x2, y2]
                 cx, cy = x, y
         elif cmd == "S":
+            prev_quad_cp = None
             while len(nums) >= 4:
                 rx2, ry2, rx, ry = nums.pop(0), nums.pop(0), nums.pop(0), nums.pop(0)
                 if is_relative:
@@ -585,19 +673,56 @@ def _svg_path_to_edges(d: str, scale_x: float, scale_y: Optional[float] = None) 
                 p1 = mk(x1, y1)
                 p2 = mk(x2, y2)
                 p3 = mk(x, y)
-                chord = p0.distanceToPoint(p3)
-                n = 6 if chord < 0.5 else (8 if chord < 2.0 else 12)
-                for i in range(1, n + 1):
-                    t = i / n
-                    mt = 1.0 - t
-                    bx = mt**3*p0.x + 3*mt**2*t*p1.x + 3*mt*t**2*p2.x + t**3*p3.x
-                    by = mt**3*p0.y + 3*mt**2*t*p1.y + 3*mt*t**2*p2.y + t**3*p3.y
-                    pt = Vector(bx, by, 0.0)
-                    subpath_pts.append(pt)
+                append_cubic(p0, p1, p2, p3)
                 prev_cubic_cp2 = [x2, y2]
+                cx, cy = x, y
+        elif cmd == "Q":
+            prev_cubic_cp2 = None
+            while len(nums) >= 4:
+                rx1, ry1, rx, ry = nums.pop(0), nums.pop(0), nums.pop(0), nums.pop(0)
+                if is_relative:
+                    x1, y1 = cx + rx1, cy + ry1
+                    x, y = cx + rx, cy + ry
+                else:
+                    x1, y1 = rx1, ry1
+                    x, y = rx, ry
+                p0 = subpath_pts[-1] if subpath_pts else mk(cx, cy)
+                append_quadratic(p0, mk(x1, y1), mk(x, y))
+                prev_quad_cp = [x1, y1]
+                cx, cy = x, y
+        elif cmd == "T":
+            prev_cubic_cp2 = None
+            while len(nums) >= 2:
+                rx, ry = nums.pop(0), nums.pop(0)
+                if is_relative:
+                    x, y = cx + rx, cy + ry
+                else:
+                    x, y = rx, ry
+                if prev_quad_cp is not None:
+                    x1 = 2 * cx - prev_quad_cp[0]
+                    y1 = 2 * cy - prev_quad_cp[1]
+                else:
+                    x1, y1 = cx, cy
+                p0 = subpath_pts[-1] if subpath_pts else mk(cx, cy)
+                append_quadratic(p0, mk(x1, y1), mk(x, y))
+                prev_quad_cp = [x1, y1]
+                cx, cy = x, y
+        elif cmd == "A":
+            prev_cubic_cp2 = None
+            prev_quad_cp = None
+            while len(nums) >= 7:
+                rx, ry, xrot, large, sweep, ex, ey = [nums.pop(0) for _ in range(7)]
+                x0, y0 = cx, cy
+                if is_relative:
+                    x, y = cx + ex, cy + ey
+                else:
+                    x, y = ex, ey
+                for ax, ay in svg_arc_points(x0, y0, rx, ry, xrot, large, sweep, x, y):
+                    subpath_pts.append(mk(ax, ay))
                 cx, cy = x, y
         elif cmd == "Z":
             prev_cubic_cp2 = None
+            prev_quad_cp = None
             if subpath_pts and start_pt:
                 if subpath_pts[-1].distanceToPoint(start_pt) > 1e-4:
                     subpath_pts.append(start_pt)

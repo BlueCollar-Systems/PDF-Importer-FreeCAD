@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 # Ensure bundled PyMuPDF is importable (skip namespace-only stubs in lib/)
@@ -457,6 +457,7 @@ class ImportOptions:
     auto_resolved_mode: Optional[str] = None
     auto_reason: Optional[str] = None
     raster_page_count: int = 0
+    raster_fallback_reasons: List[str] = field(default_factory=list)
     import_report_path: Optional[str] = None
 
 
@@ -475,15 +476,32 @@ def _report_fallback_state(opts: ImportOptions):
         fallback_reason = "forced_raster_mode"
     elif opts.raster_page_count > 0:
         pages = opts.raster_page_count
-        fallback_reason = (
-            opts.auto_reason
-            or f"raster_fallback_{pages}_page{'s' if pages != 1 else ''}"
-        )
+        reasons = []
+        for reason in getattr(opts, "raster_fallback_reasons", []) or []:
+            reason = str(reason).strip()
+            if reason and reason not in reasons:
+                reasons.append(reason)
+        if len(reasons) == 1:
+            fallback_reason = reasons[0]
+        elif len(reasons) > 1:
+            label = f"raster_fallback_{pages}_page{'s' if pages != 1 else ''}"
+            fallback_reason = f"{label}: {'; '.join(reasons[:4])}"
+            if len(reasons) > 4:
+                fallback_reason += f"; +{len(reasons) - 4} more"
+        else:
+            fallback_reason = f"raster_fallback_{pages}_page{'s' if pages != 1 else ''}"
     elif opts.auto_resolved_mode == "raster":
         fallback_reason = opts.auto_reason
     else:
         fallback_reason = None
     return fallback_used, fallback_reason
+
+
+def _record_raster_page(opts: ImportOptions, reason: Optional[str] = None) -> None:
+    opts.raster_page_count += 1
+    reason = str(reason or "").strip()
+    if reason:
+        opts.raster_fallback_reasons.append(reason)
 
 
 def _pymupdf_version() -> str:
@@ -527,6 +545,7 @@ def write_import_report(
     fallback_reason: Optional[str] = None,
 ) -> str:
     """Emit bcs.import_report/1.1 JSON for one import run."""
+    from pdfcadcore.fitz_loader import sample_process_mb
     from pdfcadcore.import_report import build_import_report
 
     report = build_import_report(
@@ -549,9 +568,12 @@ def write_import_report(
         pdf_engine_version=_pymupdf_version(),
         import_text=bool(opts.import_text),
         text_mode=str(opts.text_mode or "3d_text"),
+        peak_mb=sample_process_mb(),
         extra={
             "auto_resolved_mode": opts.auto_resolved_mode,
             "auto_reason": opts.auto_reason,
+            "raster_page_count": opts.raster_page_count,
+            "raster_fallback_reasons": list(opts.raster_fallback_reasons),
         },
     )
     report.write_json(output_path)
@@ -1939,9 +1961,34 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
         elif area_cm2 > 700:
             dpi = 300
 
-    zoom = dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat)
+    dpi, pixel_budget, was_capped = _cap_raster_dpi(page, dpi)
+    if was_capped:
+        _warn(
+            f"Page {page_num}: raster DPI capped to {dpi} "
+            f"({pixel_budget:,} pixel budget)"
+        )
+
+    pix = None
+    last_error = None
+    retry_dpis = []
+    for candidate in (dpi, max(96, dpi // 2), 96):
+        if candidate not in retry_dpis:
+            retry_dpis.append(candidate)
+    for candidate in retry_dpis:
+        try:
+            zoom = candidate / 72.0
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat)
+            dpi = candidate
+            break
+        except (RuntimeError, MemoryError, ValueError, OverflowError) as e:
+            last_error = e
+            _warn(
+                f"Page {page_num}: raster render failed at {candidate} DPI: {e}"
+            )
+    if pix is None:
+        _warn(f"Raster render failed after retries: {last_error}")
+        return
 
     # Save to temp file
     tmpdir = os.path.join(FreeCAD.getUserAppDataDir(),
@@ -1967,6 +2014,27 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
     except (RuntimeError, OSError, ValueError, TypeError) as e:
         _warn(f"Raster placement failed: {e}\n"
               f"Image saved to: {img_path}")
+
+
+def _raster_pixel_budget() -> int:
+    raw = os.environ.get("BC_FC_RASTER_PIXEL_BUDGET", "").strip()
+    try:
+        value = int(raw) if raw else 120_000_000
+    except (TypeError, ValueError):
+        value = 120_000_000
+    return max(10_000_000, min(240_000_000, value))
+
+
+def _cap_raster_dpi(page, requested_dpi: int):
+    budget = _raster_pixel_budget()
+    dpi = max(72, int(requested_dpi or 200))
+    page_area_pt2 = max(1.0, float(page.rect.width) * float(page.rect.height))
+    pixels = page_area_pt2 * ((dpi / 72.0) ** 2)
+    if pixels <= budget:
+        return dpi, budget, False
+    capped = int(math.floor(math.sqrt(budget / page_area_pt2) * 72.0))
+    capped = max(72, min(dpi, capped))
+    return capped, budget, capped != dpi
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -2067,15 +2135,12 @@ def import_pdf_page(pdf_path: str, page_num: int = 1,
     fc_doc = _ensure_doc()  # Store reference — don't rely on ActiveDocument later
 
     # Validate PDF before opening
-    try:
-        with open(pdf_path, 'rb') as f:
-            header = f.read(5)
-        if header != b'%PDF-':
-            raise ValueError(f"Not a valid PDF file: {pdf_path}")
-    except OSError as e:
-        raise ValueError(f"Cannot read PDF file: {e}") from e
+    from pdfcadcore.fitz_loader import PdfOpenError, safe_open
 
-    pdf_doc = fitz.open(pdf_path)
+    try:
+        pdf_doc = safe_open(pdf_path)
+    except PdfOpenError:
+        raise
     try:
         result = _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc)
     finally:
@@ -2319,9 +2384,11 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         fc_doc.recompute()
         return top_group
 
+    placed_full_page_raster_background = False
+
     # ── Raster-only mode ──
     if effective_mode == "raster":
-        opts.raster_page_count += 1
+        _record_raster_page(opts, opts.auto_reason or "raster mode")
         _msg(f"Page {page_num}: rendering at {opts.raster_dpi} DPI (raster mode)")
         _progress_update(5, f"Rendering raster image at {opts.raster_dpi} DPI...")
         _import_page_as_raster(
@@ -2341,6 +2408,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         _import_page_as_raster(
             pdf_doc, page, page_num, page_h, opts, scale,
             top_group or fc_doc, fc_doc)
+        placed_full_page_raster_background = True
         _msg(f"Page {page_num}: overlaying vector geometry…")
         # Fall through to vector import below
 
@@ -2352,6 +2420,10 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             _msg(f"Page {page_num}: appears to be scanned/raster — "
                  f"rendering at {opts.raster_dpi} DPI")
             _progress_update(5, f"Rendering raster image at {opts.raster_dpi} DPI...")
+            _record_raster_page(
+                opts,
+                "legacy_vector_raster_fallback: scanned/raster page"
+            )
             _import_page_as_raster(
                 pdf_doc, page, page_num, page_h, opts, scale,
                 top_group or fc_doc, fc_doc)
@@ -3214,7 +3286,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             _warn(f"Hatch group creation failed: {e}")
 
     # ── Embedded images ──
-    if not opts.ignore_images:
+    if not opts.ignore_images and not placed_full_page_raster_background:
         try:
             img_group = _make_group(top_group or fc_doc, "Images", fc_doc)
             imglist = page.get_images(full=True)
@@ -3353,7 +3425,9 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     page_height_scaled = 792 * _unit_scale  # default: US Letter height in points
     page_heights_scaled: Dict[int, float] = {}
     try:
-        with fitz.open(pdf_path) as pdoc:
+        from pdfcadcore.fitz_loader import PdfOpenError, safe_open
+
+        with safe_open(pdf_path) as pdoc:
             total_pages = len(pdoc)
             # Default to all pages when no explicit page list is provided
             pages = opts.pages or list(range(1, total_pages + 1))
@@ -3365,6 +3439,9 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                         page_heights_scaled[p] = pdoc.load_page(p - 1).rect.height * _unit_scale
                     except (ValueError, RuntimeError):
                         pass
+    except PdfOpenError as e:
+        _err(str(e))
+        return
     except (RuntimeError, OSError) as e:
         _err(f"Cannot open PDF: {e}")
         return

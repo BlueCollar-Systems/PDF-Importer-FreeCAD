@@ -34,6 +34,34 @@ class TestImportReportWriter(unittest.TestCase):
             (True, "raster_fallback_2_pages"),
         )
 
+    def test_report_fallback_state_uses_recorded_raster_reason(self) -> None:
+        opts = ImportOptions(import_mode="auto")
+        opts.raster_page_count = 1
+        opts.raster_fallback_reasons.append("scanned/raster page")
+        opts.auto_reason = "Standard vector content"
+
+        self.assertEqual(
+            _report_fallback_state(opts),
+            (True, "scanned/raster page"),
+        )
+
+    def test_report_fallback_state_summarizes_mixed_raster_reasons(self) -> None:
+        opts = ImportOptions(import_mode="auto")
+        opts.raster_page_count = 2
+        opts.raster_fallback_reasons.extend([
+            "scanned/raster page",
+            "GIS/topo map",
+        ])
+        opts.auto_reason = "Standard vector content"
+
+        used, reason = _report_fallback_state(opts)
+
+        self.assertTrue(used)
+        self.assertIn("raster_fallback_2_pages", reason)
+        self.assertIn("scanned/raster page", reason)
+        self.assertIn("GIS/topo map", reason)
+        self.assertNotEqual(reason, "Standard vector content")
+
     def test_report_fallback_state_preserves_auto_reason(self) -> None:
         opts = ImportOptions(import_mode="auto")
         opts.auto_resolved_mode = "raster"

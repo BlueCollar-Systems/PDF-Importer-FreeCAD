@@ -128,15 +128,15 @@ def _import_with_dialog(filename):
 
     # Pre-populate page count
     try:
-        try:
-            import pymupdf as fitz  # PyMuPDF >= 1.24 preferred name
-        except ImportError:
-            import fitz  # Legacy fallback
-        with fitz.open(filename) as doc:
+        from pdfcadcore.fitz_loader import PdfOpenError, safe_open
+
+        with safe_open(filename) as doc:
             page_count = doc.page_count
         dlg._page_count = page_count
         dlg.page_edit.setPlaceholderText(
             f"1-{page_count}  (PDF has {page_count} pages)")
+    except PdfOpenError as exc:
+        FreeCAD.Console.PrintWarning(f"{exc}\n")
     except (ImportError, OSError, RuntimeError, ValueError):
         pass
 
@@ -162,6 +162,16 @@ def _import_with_dialog(filename):
         except (ImportError, AttributeError, RuntimeError):
             pass
     except (RuntimeError, ValueError, TypeError, OSError, AttributeError, ImportError) as e:
+        from pdfcadcore.fitz_loader import PdfOpenError
+
+        if isinstance(e, PdfOpenError):
+            FreeCAD.Console.PrintError(f"Import failed: {e}\n")
+            try:
+                from PySide6 import QtWidgets
+            except ImportError:
+                from PySide2 import QtWidgets
+            QtWidgets.QMessageBox.warning(None, "PDF Import", str(e))
+            return
         import traceback
         FreeCAD.Console.PrintError(f"Import failed: {e}\n{traceback.format_exc()}")
         try:

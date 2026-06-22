@@ -25,7 +25,7 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 | **Dash Patterns** | Hidden, center, and phantom line types mapped from PDF dash arrays |
 | **Scale by Reference** | Pick two points on a known dimension, type the real-world value |
 | **Quick Scale** | Architectural presets from 1:1 through 1:200 |
-| **Text Import** | Labels or exploded geometry via pdftocairo |
+| **Text Import** | Labels, 3D Text, and vector glyph/geometry via pdftocairo or bundled PyMuPDF fallback |
 | **Raster Fallback** | Scanned pages imported as positioned images when no vectors are found |
 | **Image Extraction** | Embedded images extracted and placed in the model |
 | **Hatch Detection** | Three modes: Import, Group, or Skip detected hatch regions |
@@ -57,7 +57,7 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 |---|---|---|
 | **FreeCAD** | 0.21+ | Tested through 1.0 |
 | **PyMuPDF** | Yes | Bundled in release ZIP/Setup installs (`>=1.24,<2.0`); source checkouts can stage it locally |
-| **pdftocairo** | Optional | Required only for text-as-geometry import |
+| **pdftocairo** | Optional | Preferred SVG renderer for text-as-geometry; bundled PyMuPDF is used when Poppler is absent |
 
 ---
 

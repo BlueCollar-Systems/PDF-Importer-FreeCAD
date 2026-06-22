@@ -2767,14 +2767,15 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             fc_doc.recompute()
             return top_group
 
-        # Try pdftocairo vector text (Glyphs / Geometry modes)
+        # Try SVG vector text (Glyphs / Geometry modes). Poppler/pdftocairo is
+        # preferred; bundled PyMuPDF is used when Poppler is absent.
         svg_text_done = False
         if opts.text_mode in ("glyphs", "geometry"):
             try:
                 from PDFVectorImporter.src.PDFSvgTextRenderer import render_text
                 text_parent = top_group or fc_doc
                 label = "text geometry" if opts.text_mode == "geometry" else "text glyphs"
-                _progress_update(87, f"Rendering {label} via pdftocairo...")
+                _progress_update(87, f"Rendering {label} via SVG renderer...")
                 result = render_text(
                     pdf_path, page_num, page_h, scale, page.rect.width,
                     fc_doc=fc_doc, parent_group=text_parent, flip_y=opts.flip_y)
@@ -2787,7 +2788,8 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                         f"Rendering {label} ({n_glyphs} items)...")
                     if opts.verbose:
                         _msg(f"  Text: {result['glyphs']} glyphs from "
-                             f"{result['shapes']} unique shapes (pdftocairo)")
+                             f"{result['shapes']} unique shapes "
+                             f"({result.get('renderer', 'svg')})")
             except (RuntimeError, ValueError, TypeError, OSError, ImportError, AttributeError) as e:
                 _warn(f"SVG text renderer failed, falling back to Draft text: {e}")
 

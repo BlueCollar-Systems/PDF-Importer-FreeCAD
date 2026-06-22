@@ -147,9 +147,9 @@ class CheckEnvironmentCommand:
         if pdftocairo:
             _msg(f"  pdftocairo: OK  ({pdftocairo})")
         else:
-            _warn("  pdftocairo: MISSING — SVG/glyph text and raster helpers reduced")
+            _warn("  pdftocairo: MISSING — SVG/glyph text uses bundled PyMuPDF fallback")
             _msg("    Download Poppler: https://github.com/oschwartz10612/poppler-windows/releases/latest")
-            _msg("    Or place pdftocairo.exe in PDFVectorImporter/src/lib/bin/")
+            _msg("    Or place pdftocairo.exe in PDFVectorImporter/src/lib/bin/ for Poppler-first SVG rendering")
 
         gs_found = False
         try:

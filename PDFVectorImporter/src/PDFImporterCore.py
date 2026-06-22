@@ -1646,7 +1646,14 @@ def _render_text_spans_3d(
                     pos = _apply_text_local_y_offset(pos, angle_deg, offset_fc)
 
                 try:
-                    ss = Draft.makeShapeString(txt, font_path)
+                    make_shapestring = getattr(
+                        Draft,
+                        "make_shapestring",
+                        getattr(Draft, "makeShapeString", None),
+                    )
+                    if make_shapestring is None:
+                        raise AttributeError("Draft ShapeString API unavailable")
+                    ss = make_shapestring(txt, font_path)
                 except (RuntimeError, ValueError, TypeError, AttributeError):
                     continue
                 try:

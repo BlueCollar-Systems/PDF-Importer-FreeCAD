@@ -287,17 +287,20 @@ def _render_svg_with_pdftocairo(exe: str, pdf_path: str, page_num: int) -> Optio
 
 def _load_fitz():
     try:
-        import fitz  # type: ignore
-        return fitz
+        from pdfcadcore.fitz_loader import import_fitz
     except Exception:
-        pass
+        try:
+            from PDFVectorImporter.pdfcadcore.fitz_loader import import_fitz
+        except Exception as e:
+            if FreeCAD:
+                FreeCAD.Console.PrintWarning(
+                    f"PDFSvgTextRenderer: PyMuPDF fallback loader unavailable: {e}\n"
+                )
+            return None
 
-    lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
-    if lib_dir not in sys.path:
-        sys.path.insert(0, lib_dir)
     try:
-        import fitz  # type: ignore
-        return fitz
+        lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
+        return import_fitz(prefer_lib_dir=lib_dir)
     except Exception as e:
         if FreeCAD:
             FreeCAD.Console.PrintWarning(

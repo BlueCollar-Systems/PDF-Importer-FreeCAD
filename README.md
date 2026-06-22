@@ -144,6 +144,7 @@ types, not in quality tier.
 | **Geometry** | Text converted to non-editable geometry |
 
 Plus a separate **Import text** toggle to skip text entirely.
+Glyphs and Geometry prefer Poppler/pdftocairo SVG output when available, then fall back to bundled PyMuPDF SVG paths before degrading to Labels.
 
 ## Compatibility
 
@@ -166,7 +167,7 @@ Evidence levels:
 
 - **FreeCAD** 0.21 or later
 - **Python** 3.10+ (adapters use PEP 604 union types)
-- **PyMuPDF** `>=1.24,<2.0` (bundled in release ZIP/Setup installs under `PDFVectorImporter/src/lib`; source checkouts can stage it with `python build_release.py` or the workbench installer)
+- **PyMuPDF** `>=1.24,<2.0` (bundled in release ZIP/Setup installs under `PDFVectorImporter/src/lib`; source checkouts can stage it with `python build_release.py` or the workbench installer). When Poppler/pdftocairo is absent, bundled PyMuPDF also backs Glyphs/Geometry text rendering.
 
 ## Known Limitations
 

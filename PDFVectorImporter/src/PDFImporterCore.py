@@ -525,6 +525,8 @@ def write_import_report(
         fallback_used=fallback_used,
         fallback_reason=fallback_reason,
         pdf_engine_version=_pymupdf_version(),
+        import_text=bool(opts.import_text),
+        text_mode=str(opts.text_mode or "3d_text"),
         extra={
             "auto_resolved_mode": opts.auto_resolved_mode,
             "auto_reason": opts.auto_reason,
@@ -1560,6 +1562,102 @@ def _render_text_spans_exact_labels(
 
                 try:
                     text_group.addObject(t)
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    pass
+                count += 1
+    return count
+
+
+def _resolve_shapestring_font_path(font_name: str) -> Optional[str]:
+    """Resolve a TTF path for Draft ShapeString extruded text."""
+    windir = os.environ.get("WINDIR", r"C:\Windows")
+    lower = (font_name or "").lower()
+    candidates: List[str] = []
+    if "courier" in lower or "mono" in lower:
+        candidates.append(os.path.join(windir, "Fonts", "cour.ttf"))
+    elif "times" in lower or "serif" in lower:
+        candidates.append(os.path.join(windir, "Fonts", "times.ttf"))
+    candidates.extend([
+        os.path.join(windir, "Fonts", "arial.ttf"),
+        os.path.join(windir, "Fonts", "calibri.ttf"),
+        os.path.join(windir, "Fonts", "segoeui.ttf"),
+    ])
+    override = os.environ.get("BC_PDF_SHAPESTRING_FONT", "").strip()
+    if override:
+        candidates.insert(0, override)
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def _render_text_spans_3d(
+    tdict: dict,
+    text_group,
+    page_h: float,
+    opts: ImportOptions,
+    scale: float,
+) -> int:
+    """Render extruded ShapeString text for the 3D Text mode."""
+    if Draft is None or text_group is None:
+        return 0
+
+    count = 0
+    font_path = _resolve_shapestring_font_path("")
+    if not font_path:
+        _warn("3D Text mode: no TTF font found for ShapeString — falling back to labels")
+        return 0
+
+    rotated_threshold = _rotated_text_threshold_deg()
+    for block in tdict.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            spans = line.get("spans", []) or []
+            if not spans:
+                continue
+            angle_deg = _line_angle_deg(line)
+            norm_angle = _normalize_text_angle_deg(angle_deg)
+            rot = Rotation(Vector(0, 0, 1), angle_deg)
+
+            for span in spans:
+                text = span.get("text", "")
+                if not text or text.isspace():
+                    continue
+                origin = _span_origin_pdf(span)
+                if not origin:
+                    continue
+                try:
+                    size_pt = float(span.get("size", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    size_pt = 0.0
+                font_size_fc = max(0.1, (size_pt if size_pt > 0.0 else 3.0) * scale)
+                txt = str(text).strip()
+                if not txt:
+                    continue
+
+                pos = _to_fc(origin, page_h, opts, scale)
+                if abs(norm_angle) >= rotated_threshold:
+                    try:
+                        desc = float(span.get("descender", -0.2) or -0.2)
+                    except (TypeError, ValueError):
+                        desc = -0.2
+                    offset_fc = _effective_descender(txt, desc) * font_size_fc * 0.35
+                    pos = _apply_text_local_y_offset(pos, angle_deg, offset_fc)
+
+                try:
+                    ss = Draft.makeShapeString(txt, font_path)
+                except (RuntimeError, ValueError, TypeError, AttributeError):
+                    continue
+                try:
+                    ss.Placement = Placement(pos, rot)
+                    ss.ViewObject.FontSize = font_size_fc
+                    extrude = max(font_size_fc * 0.12, 0.05)
+                    ss.ViewObject.Extrusion = extrude
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    pass
+                try:
+                    text_group.addObject(ss)
                 except (AttributeError, RuntimeError, TypeError, ValueError):
                     pass
                 count += 1
@@ -2691,6 +2789,22 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
           try:
             tdict = _preprocess_text_blocks(page.get_text("dict"))
             text_group = _make_group(top_group or fc_doc, "Text", fc_doc)
+
+            # 3D Text uses extruded ShapeStrings; labels use editable Draft text.
+            if opts.text_mode == "3d_text":
+                span_count = _render_text_spans_3d(
+                    tdict, text_group, page_h, opts, scale
+                )
+                if span_count > 0:
+                    obj_count += span_count
+                    _progress_update(
+                        89,
+                        f"Rendering 3D text ({span_count} spans)...")
+                    if opts.verbose:
+                        _msg(f"  Text: {span_count} extruded ShapeString spans")
+                    tdict = {"blocks": []}
+                elif opts.verbose:
+                    _warn("3D Text mode produced 0 spans — falling back to labels")
 
             # High-fidelity Labels path: render each PDF span at its exact origin.
             # This preserves stacked fractions and micro-positioning much closer

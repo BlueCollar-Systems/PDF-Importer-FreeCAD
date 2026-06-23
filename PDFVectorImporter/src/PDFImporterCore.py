@@ -459,6 +459,9 @@ class ImportOptions:
     raster_page_count: int = 0
     raster_fallback_reasons: List[str] = field(default_factory=list)
     import_report_path: Optional[str] = None
+    # ShapeString telemetry when 3d_text degrades to labels (Round-2 action #12).
+    shapestring_skips: Dict[str, int] = field(default_factory=dict)
+    phase_timings_ms: Dict[str, float] = field(default_factory=dict)
 
 
 def _default_import_report_path(pdf_path: str) -> str:
@@ -548,6 +551,21 @@ def write_import_report(
     from pdfcadcore.fitz_loader import sample_process_mb
     from pdfcadcore.import_report import build_import_report
 
+    phases = dict(getattr(opts, "phase_timings_ms", {}) or {})
+    if elapsed_ms > 0 and "total_ms" not in phases:
+        phases["total_ms"] = float(elapsed_ms)
+
+    skips = dict(getattr(opts, "shapestring_skips", {}) or {})
+    extra = {
+        "auto_resolved_mode": opts.auto_resolved_mode,
+        "auto_reason": opts.auto_reason,
+        "raster_page_count": opts.raster_page_count,
+        "raster_fallback_reasons": list(opts.raster_fallback_reasons),
+    }
+    if skips:
+        extra["shapestring_skips"] = skips
+        extra["shapestring_skip_total"] = sum(int(v) for v in skips.values())
+
     report = build_import_report(
         host_app="freecad",
         host_version=_freecad_version(),
@@ -569,12 +587,8 @@ def write_import_report(
         import_text=bool(opts.import_text),
         text_mode=str(opts.text_mode or "3d_text"),
         peak_mb=sample_process_mb(),
-        extra={
-            "auto_resolved_mode": opts.auto_resolved_mode,
-            "auto_reason": opts.auto_reason,
-            "raster_page_count": opts.raster_page_count,
-            "raster_fallback_reasons": list(opts.raster_fallback_reasons),
-        },
+        performance_phases=phases or None,
+        extra=extra,
     )
     report.write_json(output_path)
     return output_path
@@ -1635,6 +1649,13 @@ def _resolve_shapestring_font_path(font_name: str) -> Optional[str]:
     return None
 
 
+def _record_shapestring_skip(opts: ImportOptions, reason: str) -> None:
+    skips = getattr(opts, "shapestring_skips", None)
+    if skips is None:
+        return
+    skips[reason] = int(skips.get(reason, 0)) + 1
+
+
 def _render_text_spans_3d(
     tdict: dict,
     text_group,
@@ -1650,6 +1671,7 @@ def _render_text_spans_3d(
     font_path = _resolve_shapestring_font_path("")
     if not font_path:
         _warn("3D Text mode: no TTF font found for ShapeString — falling back to labels")
+        _record_shapestring_skip(opts, "no_ttf_font")
         return 0
 
     rotated_threshold = _rotated_text_threshold_deg()
@@ -1699,6 +1721,7 @@ def _render_text_spans_3d(
                         raise AttributeError("Draft ShapeString API unavailable")
                     ss = make_shapestring(txt, font_path)
                 except (RuntimeError, ValueError, TypeError, AttributeError):
+                    _record_shapestring_skip(opts, "shapestring_failed")
                     continue
                 try:
                     ss.Placement = Placement(pos, rot)
@@ -2907,8 +2930,10 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     if opts.verbose:
                         _msg(f"  Text: {span_count} extruded ShapeString spans")
                     tdict = {"blocks": []}
-                elif opts.verbose:
-                    _warn("3D Text mode produced 0 spans — falling back to labels")
+                else:
+                    _record_shapestring_skip(opts, "fallback_to_labels")
+                    if opts.verbose:
+                        _warn("3D Text mode produced 0 spans — falling back to labels")
 
             # High-fidelity Labels path: render each PDF span at its exact origin.
             # This preserves stacked fractions and micro-positioning much closer
@@ -3408,6 +3433,8 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         opts = ImportOptions(ignore_images=not IMAGE_WB)
     fc_doc = _ensure_doc()
     t_import_start = time.perf_counter()
+    opts.phase_timings_ms.clear()
+    opts.shapestring_skips.clear()
     obj_count_before = len(fc_doc.Objects)
 
     # Reset ID counter once at the start of a multi-page import
@@ -3424,6 +3451,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     _unit_scale = (MM_PER_PT if opts.scale_to_mm else 1.0) * opts.user_scale
     page_height_scaled = 792 * _unit_scale  # default: US Letter height in points
     page_heights_scaled: Dict[int, float] = {}
+    t_phase = time.perf_counter()
     try:
         from pdfcadcore.fitz_loader import PdfOpenError, safe_open
 
@@ -3439,6 +3467,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                         page_heights_scaled[p] = pdoc.load_page(p - 1).rect.height * _unit_scale
                     except (ValueError, RuntimeError):
                         pass
+        opts.phase_timings_ms["open_pdf_ms"] = (time.perf_counter() - t_phase) * 1000.0
     except PdfOpenError as e:
         _err(str(e))
         return
@@ -3448,6 +3477,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
 
     # Wrap entire import in a FreeCAD transaction so Ctrl+Z undoes it in one step
     fc_doc.openTransaction("Import PDF")
+    t_phase = time.perf_counter()
     try:
         imported_count = 0
         running_stack_offset = 0.0
@@ -3495,12 +3525,15 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as e:
                 _err(f"Failed to import page {p}: {e}\n{traceback.format_exc()}")
         fc_doc.commitTransaction()
+        opts.phase_timings_ms["pages_import_ms"] = (time.perf_counter() - t_phase) * 1000.0
     except Exception:
         fc_doc.abortTransaction()
         raise
 
+    t_phase = time.perf_counter()
     fc_doc.recompute()
     _autofit_import_view(fc_doc)
+    opts.phase_timings_ms["postprocess_ms"] = (time.perf_counter() - t_phase) * 1000.0
 
     if opts.import_mode == "auto" and opts.auto_resolved_mode:
         _msg(
@@ -3511,6 +3544,8 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     try:
         report_path = opts.import_report_path or _default_import_report_path(pdf_path)
         fallback_used, fallback_reason = _report_fallback_state(opts)
+        elapsed_ms = (time.perf_counter() - t_import_start) * 1000.0
+        opts.phase_timings_ms["total_ms"] = elapsed_ms
         write_import_report(
             pdf_path=pdf_path,
             output_path=report_path,
@@ -3518,7 +3553,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             pages_imported=imported_count,
             total_pages=total_pages,
             primitive_count=max(0, len(fc_doc.Objects) - obj_count_before),
-            elapsed_ms=(time.perf_counter() - t_import_start) * 1000.0,
+            elapsed_ms=elapsed_ms,
             fallback_used=fallback_used,
             fallback_reason=fallback_reason,
         )

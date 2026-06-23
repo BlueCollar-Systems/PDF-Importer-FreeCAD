@@ -110,6 +110,19 @@ Expected: `exists: True` and a path ending in `v1-1\Mod\PDFVectorImporter` on Fr
 
 In the GUI: workbench list should include **PDF Vector Importer**; toolbar **PDF Import**.
 
+## Import report / scale trust
+
+Each import can emit `import_report.json` (`bcs.import_report/1.1`) with `extra.resolved_scale`.
+
+- Use `factor` for scaling **only when** `confidence >= 0.70` **and** `fallback_reason` is not `no_scale_detected`.
+- Otherwise treat scale as unknown and set scale manually in FreeCAD.
+
+## Bad-PDF open gate
+
+FreeCAD refuses encrypted, non-PDF, and truncated files at open time (**fail closed**).
+SketchUp shows the same messages but may **fail open** if the gate check itself errors.
+Message parity is intentional; detection parity is not complete across hosts.
+
 ## Uninstall
 
 - **Junction (dev):** `Remove-Item "$env:APPDATA\FreeCAD\v1-1\Mod\PDFVectorImporter"` (removes link only, not the repo).

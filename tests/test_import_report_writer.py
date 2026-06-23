@@ -78,6 +78,9 @@ class TestImportReportWriter(unittest.TestCase):
             opts = ImportOptions(import_mode="auto")
             opts.auto_resolved_mode = "vector"
             opts.auto_reason = "test vector page"
+            opts.phase_timings_ms["open_pdf_ms"] = 1.25
+            opts.phase_timings_ms["pages_import_ms"] = 8.75
+            opts.shapestring_skips["shapestring_failed"] = 2
 
             result = write_import_report(
                 pdf_path=str(Path(tmp) / "sample.pdf"),
@@ -101,7 +104,12 @@ class TestImportReportWriter(unittest.TestCase):
             self.assertEqual(data["result"]["primitives"], 7)
             self.assertEqual(data["result"]["text_entities"], 2)
             self.assertEqual(data["result"]["layers"], 1)
+            self.assertEqual(data["performance"]["phases"]["open_pdf_ms"], 1.25)
+            self.assertEqual(data["performance"]["phases"]["pages_import_ms"], 8.75)
+            self.assertEqual(data["performance"]["phases"]["total_ms"], 12.5)
             self.assertEqual(data["extra"]["auto_resolved_mode"], "vector")
+            self.assertEqual(data["extra"]["shapestring_skips"]["shapestring_failed"], 2)
+            self.assertEqual(data["extra"]["shapestring_skip_total"], 2)
 
 
 if __name__ == "__main__":

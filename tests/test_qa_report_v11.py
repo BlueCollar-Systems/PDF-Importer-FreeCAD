@@ -25,6 +25,7 @@ class TestQAReportV11(unittest.TestCase):
             importer_version="4.0.13",
             dxf_version="R2010",
             memory_peak_mb=512.5,
+            phase_timings={"parse": 0.4, "text": 0.6},
             fallback_reason="page_stream",
             preset="auto",
             status="ok",
@@ -36,6 +37,8 @@ class TestQAReportV11(unittest.TestCase):
         self.assertEqual(loaded.schema_version, "1.1")
         self.assertEqual(loaded.host_version, "1.0.2")
         self.assertEqual(loaded.memory_peak_mb, 512.5)
+        self.assertEqual(loaded.phase_timings["parse"], 0.4)
+        self.assertEqual(loaded.phase_timings["text"], 0.6)
         self.assertEqual(loaded.fallback_reason, "page_stream")
 
     def test_reads_legacy_v10_payload(self):
@@ -50,6 +53,7 @@ class TestQAReportV11(unittest.TestCase):
         self.assertEqual(report.schema_version, "1.0")
         self.assertEqual(report.host_version, "")
         self.assertEqual(report.memory_peak_mb, 0.0)
+        self.assertEqual(report.phase_timings, {})
 
 
 if __name__ == "__main__":

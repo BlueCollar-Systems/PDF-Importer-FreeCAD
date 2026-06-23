@@ -34,11 +34,19 @@ def test_build_import_report_geometry_mode():
         mode="vector",
         import_text=True,
         text_mode="geometry",
+        performance_phases={"geometry_ms": 10.5},
+        helper_timings_ms={"svg_renderer_ms": 2.0},
+        text_source_spans=4,
+        text_glyph_estimate=18,
         extra={"curves": 12},
     )
     data = report.to_dict()
     assert data["extra"]["text_mode"] == "geometry"
     assert data["extra"]["curves"] == 12
+    assert data["extra"]["text_source_spans"] == 4
+    assert data["extra"]["text_glyph_estimate"] == 18
+    assert data["performance"]["phases"]["geometry_ms"] == 10.5
+    assert data["performance"]["helpers_ms"]["svg_renderer_ms"] == 2.0
 
 
 @pytest.mark.parametrize(

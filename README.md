@@ -182,6 +182,17 @@ Evidence levels:
 | OCG layer assignment | Extractor-level OCG mapping is validated on corpus `layered_ocg.pdf`; FreeCAD host-run grouping verification is still required in target runtime |
 | Legacy hosts | FreeCAD versions older than 0.21 are not part of current validation coverage |
 
+## Import report / scale trust
+
+Imports write `<output>_import_report.json` with `extra.resolved_scale` when detected.
+
+- Use `factor` for scaling **only when** `confidence >= 0.70` **and** `fallback_reason` is not `no_scale_detected`.
+- Otherwise treat scale as unknown.
+
+## Bad-PDF open gate
+
+FreeCAD refuses bad PDFs at open time (**fail closed**). SketchUp uses the same user-facing messages but may proceed on rare gate-internal errors (**fail open**). Compare `fallback.reason` per host rather than assuming identical refusal behavior.
+
 ## License
 
 MIT License — see [LICENSE](LICENSE) for details.

@@ -18,7 +18,7 @@ import tempfile
 import time
 import traceback
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 # Ensure bundled PyMuPDF is importable (skip namespace-only stubs in lib/)
 _lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
@@ -461,6 +461,9 @@ class ImportOptions:
     import_report_path: Optional[str] = None
     # ShapeString telemetry when 3d_text degrades to labels (Round-2 action #12).
     shapestring_skips: Dict[str, int] = field(default_factory=dict)
+    # Scale detection telemetry for import_report cross-check (Round 5).
+    resolved_scale: Optional[Dict[str, Any]] = None
+    scale_hints: Dict[str, Any] = field(default_factory=dict)
     phase_timings_ms: Dict[str, float] = field(default_factory=dict)
 
 
@@ -565,6 +568,12 @@ def write_import_report(
     if skips:
         extra["shapestring_skips"] = skips
         extra["shapestring_skip_total"] = sum(int(v) for v in skips.values())
+    resolved_scale = getattr(opts, "resolved_scale", None)
+    scale_hints = getattr(opts, "scale_hints", None)
+    if resolved_scale:
+        extra["resolved_scale"] = resolved_scale
+    if scale_hints:
+        extra["scale_hints"] = scale_hints
 
     report = build_import_report(
         host_app="freecad",

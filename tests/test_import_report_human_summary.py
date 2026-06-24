@@ -57,6 +57,29 @@ class TestImportReportHumanSummary(unittest.TestCase):
         self.assertIn("fallback", summary.lower())
         self.assertIn("No editable geometry", summary)
 
+    def test_scale_crosscheck_low_confidence(self) -> None:
+        report = build_import_report(
+            host_app="freecad",
+            pdf_path="drawing.pdf",
+            mode="auto",
+            pages=1,
+            primitive_count=40,
+            extra={
+                "resolved_scale": {
+                    "factor": 48.0,
+                    "notation": '1/4" = 1\'-0"',
+                    "source": "titleblock",
+                    "confidence": 0.55,
+                },
+                "scale_hints": {"title_block_detected": True, "dimension_count": 4},
+            },
+        )
+        crosscheck = report.extra.get("scale_crosscheck")
+        self.assertIsInstance(crosscheck, dict)
+        self.assertIn("low_confidence", crosscheck.get("reasons", []))
+        summary = report.extra.get("human_summary", "")
+        self.assertIn("Scale note:", summary)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

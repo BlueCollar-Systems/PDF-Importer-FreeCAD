@@ -7,6 +7,15 @@
 
 FreeCAD **1.1** stores user data under a **versioned profile**, not the legacy `FreeCAD\Mod\` folder:
 
+## Before you import (text modes & scale)
+
+Professional import — maximum fidelity; Auto picks vector, raster, or hybrid per page.
+
+- **Labels** = editable text (ShapeString / labels path).
+- **Outlines / Glyphs / Geometry** = exact vector fidelity (not editable text).
+- **3D text** = ShapeString extrusion where supported.
+- Scale is detected from title blocks when possible. If `import_report.json` shows a **scale note** in `human_summary` or `extra.scale_crosscheck`, verify one known dimension before takeoff.
+
 | FreeCAD | Mod folder (Windows) |
 |---------|----------------------|
 | **1.1.x** | `%APPDATA%\FreeCAD\v1-1\Mod\PDFVectorImporter` |

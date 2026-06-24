@@ -47,6 +47,10 @@ def test_build_import_report_geometry_mode():
     assert data["extra"]["text_glyph_estimate"] == 18
     assert data["performance"]["phases"]["geometry_ms"] == 10.5
     assert data["performance"]["helpers_ms"]["svg_renderer_ms"] == 2.0
+    diagnostics = data["extra"]["diagnostics"]
+    assert diagnostics["quality_level"] == "empty"
+    assert "text_mode_geometry" in diagnostics["signals"]
+    assert diagnostics["recommended_actions"]
 
 
 @pytest.mark.parametrize(
@@ -61,3 +65,28 @@ def test_all_text_modes_round_trip(text_mode: str):
         import_text=text_mode != "geometry",
     )
     assert report.to_dict()["extra"]["text_mode"] == text_mode
+
+
+def test_import_report_diagnostics_for_fallback_and_dense_text():
+    report = build_import_report(
+        host_app="freecad",
+        pdf_path="scan.pdf",
+        mode="auto",
+        primitive_count=0,
+        text_count=0,
+        layer_count=0,
+        warnings=2,
+        fallback_used=True,
+        fallback_reason="raster_fallback_1_pages",
+        import_text=True,
+        text_mode="glyphs",
+        text_source_spans=14,
+        text_glyph_estimate=1200,
+    )
+    diagnostics = report.to_dict()["extra"]["diagnostics"]
+    assert diagnostics["quality_level"] == "empty"
+    assert "fallback_used" in diagnostics["signals"]
+    assert "warnings_present" in diagnostics["signals"]
+    assert "source_text_seen_but_no_text_entities_created" in diagnostics["signals"]
+    assert "dense_text_glyph_workload" in diagnostics["signals"]
+    assert any("Vector or Hybrid" in action for action in diagnostics["recommended_actions"])

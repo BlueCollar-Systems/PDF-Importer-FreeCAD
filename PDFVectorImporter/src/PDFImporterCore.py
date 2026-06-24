@@ -1725,9 +1725,27 @@ def _render_text_spans_3d(
                     continue
                 try:
                     ss.Placement = Placement(pos, rot)
-                    ss.ViewObject.FontSize = font_size_fc
+                    # ShapeString is geometry, not Draft label text.  Its
+                    # visible size is controlled by data properties; setting
+                    # ViewObject.FontSize only affects Draft text and can leave
+                    # stale/default ShapeString sizes that dwarf the drawing.
+                    try:
+                        ss.Size = font_size_fc
+                    except (AttributeError, RuntimeError, TypeError, ValueError):
+                        pass
+                    try:
+                        ss.ScaleToSize = True
+                    except (AttributeError, RuntimeError, TypeError, ValueError):
+                        pass
+                    try:
+                        ss.MakeFace = True
+                    except (AttributeError, RuntimeError, TypeError, ValueError):
+                        pass
                     extrude = max(font_size_fc * 0.12, 0.05)
-                    ss.ViewObject.Extrusion = extrude
+                    try:
+                        ss.Extrusion = extrude
+                    except (AttributeError, RuntimeError, TypeError, ValueError):
+                        pass
                 except (AttributeError, RuntimeError, TypeError, ValueError):
                     pass
                 try:

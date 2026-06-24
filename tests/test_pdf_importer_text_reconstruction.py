@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 SRC_DIR = Path(__file__).resolve().parents[1] / "PDFVectorImporter" / "src"
+CORE_PATH = SRC_DIR / "PDFImporterCore.py"
 sys.path.insert(0, str(SRC_DIR))
 
 from PDFImporterCore import (  # noqa: E402
@@ -33,6 +34,13 @@ class TestPdfImporterTextReconstruction(unittest.TestCase):
             {"text": "3", "size": 12.0, "flags": 0},
         ]
         self.assertEqual(_reconstruct_line_text(spans), "1 9/16 3")
+
+    def test_shapestring_3d_text_uses_geometry_size_property(self) -> None:
+        source = CORE_PATH.read_text(encoding="utf-8")
+        self.assertIn("ss.Size = font_size_fc", source)
+        self.assertIn("ss.ScaleToSize = True", source)
+        self.assertIn("ss.MakeFace = True", source)
+        self.assertNotIn("ss.ViewObject.FontSize = font_size_fc", source)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

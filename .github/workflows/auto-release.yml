@@ -54,6 +54,11 @@ jobs:
         run: |
           python pdfcadcore_sync_check.py --skip-cross-repo
           python -m compileall PDFVectorImporter
+          # Vendor the bundled PyMuPDF into src/lib BEFORE the gate: tests such as
+          # test_diagnostics_reports_bundled_pymupdf require the bundled runtime,
+          # and src/lib is gitignored/empty on a fresh checkout (vendoring otherwise
+          # only happens later in build_release.py). Idempotent — build reuses it.
+          python -c "import build_release; build_release.ensure_runtime_dependencies()"
           python -m pytest tests/ -q --basetemp "$RUNNER_TEMP/pytest-freecad"
 
       - name: Read and bump version
@@ -169,14 +174,17 @@ jobs:
           ZIP="FreeCAD-PDF-Importer_v${{ steps.version.outputs.version }}.zip"
 
           git fetch --tags --force
-          if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
-            echo "Tag ${VERSION} already exists — skipping."
+          if gh release view "${VERSION}" >/dev/null 2>&1; then
+            echo "Release ${VERSION} already exists — skipping."
             exit 0
           fi
-          git tag "${VERSION}"
-          git push origin "${VERSION}"
-
+          # Create the tag via the gh/releases API (GITHUB_TOKEN), NOT `git push
+          # origin <tag>`: the checkout PAT lacks `workflow` scope, so pushing a
+          # tag whose commit touches .github/workflows/ is rejected. gh creates
+          # the tag at the target commit through the API, which is not subject to
+          # that restriction.
           gh release create "${VERSION}" \
+            --target "$(git rev-parse HEAD)" \
             --title "${VERSION} — PDF Vector Importer for FreeCAD" \
             --notes "Automated release from latest \`main\` commit.
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 
@@ -28,8 +29,16 @@ def test_preflight_prints_freecad_guidance(capsys) -> None:
     assert "verify one known dimension" in out
 
 
-def test_diagnostics_reports_bundled_pymupdf(capsys) -> None:
+def test_diagnostics_reports_bundled_pymupdf(capsys, monkeypatch, tmp_path) -> None:
     module = _load_preflight_module()
+    vendored_lib = tmp_path / "lib"
+    pymupdf_pkg = vendored_lib / "pymupdf"
+    pymupdf_pkg.mkdir(parents=True)
+    (pymupdf_pkg / "__init__.py").write_text("__version__ = 'test-vendored'\n", encoding="utf-8")
+
+    monkeypatch.setattr(module, "VENDORED_LIB", vendored_lib)
+    monkeypatch.delitem(sys.modules, "pymupdf", raising=False)
+    monkeypatch.delitem(sys.modules, "fitz", raising=False)
 
     result = module.main(["--diagnostics"])
 

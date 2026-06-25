@@ -2,7 +2,7 @@
 <package format="1" xmlns="https://wiki.freecad.org/Package_Metadata">
   <name>PDFVectorImporter</name>
   <description>Import PDF vector drawings as editable FreeCAD geometry with arc reconstruction, text, scaling, and steel feature detection.</description>
-  <version>4.0.51</version>
+  <version>4.0.52</version>
   <date>2026-06-25</date>
   <maintainer email="support@bluecollar-systems.com">BlueCollar Systems</maintainer>
   <!-- AI Contributors: Claude & Claude Code (Anthropic), ChatGPT & Codex (OpenAI),

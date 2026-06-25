@@ -510,6 +510,27 @@ def _record_raster_page(opts: ImportOptions, reason: Optional[str] = None) -> No
         opts.raster_fallback_reasons.append(reason)
 
 
+def _merge_page_scale_into_opts(opts: ImportOptions, resolved) -> None:
+    """Merge one page's scale detection into multi-page import_report fields."""
+    if resolved is None or float(getattr(resolved, "confidence", 0) or 0) <= 0:
+        return
+    current = getattr(opts, "resolved_scale", None) or {}
+    if not current or float(resolved.confidence) > float(current.get("confidence", 0)):
+        opts.resolved_scale = {
+            "factor": resolved.factor,
+            "notation": resolved.notation,
+            "source": resolved.source,
+            "confidence": resolved.confidence,
+            "fallback_reason": resolved.fallback_reason,
+        }
+    hints = dict(getattr(opts, "scale_hints", {}) or {})
+    alts = {float(v) for v in hints.get("alternate_scale_factors") or []}
+    if resolved.factor:
+        alts.add(float(resolved.factor))
+    hints["alternate_scale_factors"] = sorted(alts)
+    opts.scale_hints = hints
+
+
 def _pymupdf_version() -> str:
     return str(getattr(fitz, "__version__", "") or "")
 
@@ -2354,10 +2375,16 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
 
         _flood_reason = ""  # human-readable explanation for the log
 
-        if n_drawings < 5 and n_text_blocks < 3:
+        if n_drawings < 5 and n_text_blocks == 0:
             # Scanned / pure raster page — no usable vector content
             effective_mode = "raster"
             _flood_reason = "scanned/raster page (no usable vector content)"
+
+        elif n_drawings < 5 and n_text_blocks > 0:
+            # Text-only or text-dominant page. Preserve editable text; if a
+            # raster image is present, keep it as a background.
+            effective_mode = "hybrid" if n_images > 0 else "vector"
+            _flood_reason = "text-only page — preserving editable text"
 
         elif glyph_flood:
             # Vectorized text/map-art flood: huge counts of tiny filled groups.
@@ -2466,7 +2493,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
     if effective_mode == "vector" and opts.raster_fallback and n_drawings < 5:
         tdict = page.get_text("dict")
         n_text = sum(1 for b in tdict.get("blocks", []) if b.get("type") == 0)
-        if n_text < 3:
+        if n_text == 0:
             _msg(f"Page {page_num}: appears to be scanned/raster — "
                  f"rendering at {opts.raster_dpi} DPI")
             _progress_update(5, f"Rendering raster image at {opts.raster_dpi} DPI...")
@@ -3567,6 +3594,25 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             f"Auto mode summary: {opts.auto_resolved_mode}"
             + (f" — {opts.auto_reason}" if opts.auto_reason else "")
         )
+
+    # Round 5: merge per-page title-block scale into import_report (LC parity).
+    try:
+        from pdfcadcore.fitz_loader import safe_open as _scale_safe_open
+        from pdfcadcore.resolved_scale import probe_page_scale
+
+        with _scale_safe_open(pdf_path) as scale_doc:
+            for p in pages:
+                if p < 1 or p > total_pages:
+                    continue
+                _merge_page_scale_into_opts(
+                    opts,
+                    probe_page_scale(scale_doc.load_page(p - 1), p),
+                )
+    except ImportError:
+        pass
+    except (RuntimeError, OSError, ValueError, TypeError) as e:
+        if opts.verbose:
+            _warn(f"Scale detection pass skipped: {e}")
 
     try:
         report_path = opts.import_report_path or _default_import_report_path(pdf_path)

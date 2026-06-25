@@ -57,7 +57,7 @@ jobs:
           # Vendor the bundled PyMuPDF into src/lib BEFORE the gate: tests such as
           # test_diagnostics_reports_bundled_pymupdf require the bundled runtime,
           # and src/lib is gitignored/empty on a fresh checkout (vendoring otherwise
-          # only happens later in build_release.py). Idempotent — build reuses it.
+          # only happens later in build_release.py). Idempotent - build reuses it.
           python -c "import build_release; build_release.ensure_runtime_dependencies()"
           python -m pytest tests/ -q --basetemp "$RUNNER_TEMP/pytest-freecad"
 

@@ -39,9 +39,17 @@ No system Python, pip, or OS packages required for release users.
 
 ## Legacy hardware notes
 
-- Large multi-page PDFs: import page ranges on **&lt; 8 GB RAM** machines.
+- Large multi-page PDFs: import page ranges on **&lt; 8 GB RAM** machines; see `import_report.extra.performance_hint`.
 - **Glyphs/Geometry** text modes increase sketch complexity — prefer **Labels** on weak PCs.
 - Windows SmartScreen may warn — installer is unsigned but functional.
+
+## Offline install
+
+Release **Inno Setup EXE** from GitHub works without internet after download. Dev/source installs may run `preflight_check.py --install` once if wheels are not vendored.
+
+## Enterprise / roaming
+
+Workbench installs under `%APPDATA%\FreeCAD\…\Mod\`. Roaming profiles may break junction-based dev installs — use the release EXE for golden images.
 
 ## Preflight command
 

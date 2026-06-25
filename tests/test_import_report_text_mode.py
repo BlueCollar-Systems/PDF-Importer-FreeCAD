@@ -10,7 +10,11 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "PDFVectorImporter"))
 
-from pdfcadcore.import_report import build_import_report
+from pdfcadcore.import_report import (
+    build_font_embedding_hints,
+    build_import_report,
+    build_pdf_interactive_note,
+)
 
 
 def test_build_import_report_includes_text_mode_in_extra():
@@ -90,3 +94,57 @@ def test_import_report_diagnostics_for_fallback_and_dense_text():
     assert "source_text_seen_but_no_text_entities_created" in diagnostics["signals"]
     assert "dense_text_glyph_workload" in diagnostics["signals"]
     assert any("Vector or Hybrid" in action for action in diagnostics["recommended_actions"])
+
+
+def test_font_embedding_hints_uses_extension_not_referencer():
+    class Page:
+        def get_fonts(self, full=True):
+            assert full is True
+            return [
+                (8, "otf", "Type0", "AAAAAA+EmbeddedFont", "F0", "Identity-H", 0),
+                (9, "n/a", "Type1", "Helvetica-Bold", "F1", "", 0),
+            ]
+
+    class Doc:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, index):
+            assert index == 0
+            return Page()
+
+    hints = build_font_embedding_hints(Doc())
+    assert hints["non_embedded_fonts"] == ["Helvetica-Bold"]
+    assert "Labels mode may substitute" in hints["font_substitution_note"]
+
+
+def test_pdf_interactive_note_ignores_null_catalog_keys():
+    class Doc:
+        def pdf_catalog(self):
+            return 1
+
+        def xref_get_key(self, xref, key):
+            return ("null", "null")
+
+        def xref_length(self):
+            return 2
+
+    assert build_pdf_interactive_note(Doc()) == {}
+
+
+def test_pdf_interactive_note_detects_javascript_action():
+    class Doc:
+        def pdf_catalog(self):
+            return 1
+
+        def xref_get_key(self, xref, key):
+            if xref == 2 and key == "S":
+                return ("name", "/JavaScript")
+            return ("null", "null")
+
+        def xref_length(self):
+            return 3
+
+    note = build_pdf_interactive_note(Doc())
+    assert note["pdf_interactive_flags"] == ["JavaScript"]
+    assert "scripts are not executed" in note["pdf_interactive_note"]

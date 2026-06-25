@@ -16,6 +16,12 @@ Professional import — maximum fidelity; Auto picks vector, raster, or hybrid p
 - **3D text** = ShapeString extrusion where supported.
 - Scale is detected from title blocks when possible. If `import_report.json` shows a **scale note** in `human_summary` or `extra.scale_crosscheck`, verify one known dimension before takeoff.
 
+**Offline install:** The Windows installer EXE from GitHub Releases works without internet after download — PyMuPDF runtime is bundled. Source/dev installs may run `preflight_check.py --install` once (requires network if `lib/` is empty).
+
+## Upgrading / skipping versions
+
+Run the latest `FreeCAD-PDF-Importer-Setup.exe` from Releases — it replaces the workbench under your FreeCAD user Mod folder. Skipping versions is fine; restart FreeCAD and run `preflight_check.py` once after a major jump.
+
 | FreeCAD | Mod folder (Windows) |
 |---------|----------------------|
 | **1.1.x** | `%APPDATA%\FreeCAD\v1-1\Mod\PDFVectorImporter` |

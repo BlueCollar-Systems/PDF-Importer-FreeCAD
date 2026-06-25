@@ -109,6 +109,17 @@ Manual fallback install:
 
 (Adjust `python.exe` and `lib` path for your FreeCAD version.)
 
+## Preflight (before first import)
+
+From the repo root (or after copying `preflight_check.py` beside your install):
+
+```powershell
+python preflight_check.py
+python preflight_check.py --diagnostics
+```
+
+Prints shared text-mode and scale-trust guidance from `pdfcadcore/preflight_copy.py`. See [COMPATIBILITY.md](COMPATIBILITY.md) for host version matrix.
+
 ## Verify installation
 
 ```powershell

@@ -1557,6 +1557,70 @@ def _span_origin_pdf(span: dict) -> Optional[Tuple[float, float]]:
     return None
 
 
+def _span_bbox_pdf(span: dict) -> Optional[Tuple[float, float, float, float]]:
+    """Return a normalized PDF-space bbox for one span, if available."""
+    bbox = span.get("bbox")
+    if bbox and len(bbox) >= 4:
+        try:
+            x0, y0, x1, y1 = [float(v) for v in bbox[:4]]
+        except (TypeError, ValueError):
+            return None
+        vals = (x0, y0, x1, y1)
+        if not all(math.isfinite(v) for v in vals):
+            return None
+        return min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
+    return None
+
+
+def _fit_font_size_to_span_bbox(
+    text: str,
+    font_size_fc: float,
+    span: dict,
+    scale: float,
+    angle_deg: float = 0.0,
+) -> float:
+    """Clamp host text size to the source PDF span bbox without growing it.
+
+    Draft Text and ShapeString use host fonts, so the same font-size value can
+    render wider than the source PDF span.  When that happens, shrink uniformly
+    to keep labels and 3D text inside the measured source bbox while preserving
+    the original PDF baseline/rotation and avoiding non-uniform distortion.
+    """
+    try:
+        fitted = float(font_size_fc)
+    except (TypeError, ValueError):
+        return font_size_fc
+    if fitted <= 0.0:
+        return fitted
+
+    bbox = _span_bbox_pdf(span)
+    if not bbox:
+        return max(0.1, fitted)
+
+    x0, y0, x1, y1 = bbox
+    bbox_w_pdf = max(0.0, x1 - x0)
+    bbox_h_pdf = max(0.0, y1 - y0)
+    if bbox_w_pdf <= 1e-6 or bbox_h_pdf <= 1e-6:
+        return max(0.1, fitted)
+
+    s = max(float(scale), 1e-12)
+    norm_angle = abs(_normalize_text_angle_deg(angle_deg))
+    along_pdf = bbox_h_pdf if norm_angle >= 45.0 else bbox_w_pdf
+    normal_pdf = bbox_w_pdf if norm_angle >= 45.0 else bbox_h_pdf
+
+    estimated_width_pdf = _estimate_text_width_mm(text, fitted) / s
+    if estimated_width_pdf > along_pdf * 1.08 and estimated_width_pdf > 1e-9:
+        width_ratio = (along_pdf * 0.98) / estimated_width_pdf
+        if math.isfinite(width_ratio) and width_ratio > 0.0:
+            fitted *= max(0.25, min(1.0, width_ratio))
+
+    height_cap_fc = normal_pdf * s * 1.12
+    if height_cap_fc >= 0.1 and fitted > height_cap_fc * 1.08:
+        fitted = height_cap_fc
+
+    return max(0.1, fitted)
+
+
 def _render_text_spans_exact_labels(
     tdict: dict,
     text_group,
@@ -1604,6 +1668,7 @@ def _render_text_spans_exact_labels(
                 txt = str(text).strip()
                 if not txt:
                     continue
+                font_size_fc = _fit_font_size_to_span_bbox(txt, font_size_fc, span, scale, angle_deg)
 
                 dedupe_key = (
                     txt,
@@ -1625,15 +1690,16 @@ def _render_text_spans_exact_labels(
 
                 pos = _to_fc(origin, page_h, opts, scale)
                 font_name = _normalize_pdf_font_name(span.get("font", ""))
-                # Draft text anchoring differs slightly from PDF span origins for
-                # rotated labels; apply a conservative local-Y nudge only for
-                # clearly non-horizontal text to improve vertical/diagonal fit.
-                if abs(norm_angle) >= rotated_threshold:
-                    try:
-                        desc = float(span.get("descender", -0.2) or -0.2)
-                    except (TypeError, ValueError):
-                        desc = -0.2
-                    offset_fc = _effective_descender(txt, desc) * font_size_fc * 0.35
+                # Draft text is placed from a host text-box anchor while PDF
+                # spans report a baseline origin. Apply the same local-axis
+                # correction for horizontal and rotated exact labels so leader
+                # callouts do not drift when switching modes.
+                try:
+                    desc = float(span.get("descender", -0.2) or -0.2)
+                except (TypeError, ValueError):
+                    desc = -0.2
+                offset_fc = _effective_descender(txt, desc) * font_size_fc * 0.35
+                if abs(offset_fc) > 1e-12:
                     pos = _apply_text_local_y_offset(pos, angle_deg, offset_fc)
                 try:
                     t = Draft.make_text([text], placement=Placement(pos, rot))
@@ -1731,6 +1797,7 @@ def _render_text_spans_3d(
                 txt = str(text).strip()
                 if not txt:
                     continue
+                font_size_fc = _fit_font_size_to_span_bbox(txt, font_size_fc, span, scale, angle_deg)
 
                 pos = _to_fc(origin, page_h, opts, scale)
                 if abs(norm_angle) >= rotated_threshold:
@@ -2070,18 +2137,20 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
     # Register cleanup: remove temp image when document is closed or on next import
     _register_temp_cleanup(img_path)
 
-    # Calculate real-world size in mm from PDF page dimensions
-    w_mm = page.rect.width * MM_PER_PT
-    h_mm = page.rect.height * MM_PER_PT
+    # Match the vector/text transform exactly: PDF page units multiplied by the
+    # effective import scale (MM_PER_PT when scale_to_mm is enabled, plus any
+    # user scale). Hybrid imports must not place the raster at an unscaled size.
+    w_units = page.rect.width * scale
+    h_units = page.rect.height * scale
 
     try:
         ip = fc_doc.addObject("Image::ImagePlane", f"Page_{page_num}_raster")
         ip.ImageFile = img_path
-        ip.XSize = w_mm
-        ip.YSize = h_mm
+        ip.XSize = w_units
+        ip.YSize = h_units
         ip.Placement = Placement(_v(0, 0, -0.1), Rotation())  # slightly behind vectors
         parent.addObject(ip)
-        _msg(f"Placed page {page_num} as {dpi} DPI raster ({w_mm:.0f} x {h_mm:.0f} mm)")
+        _msg(f"Placed page {page_num} as {dpi} DPI raster ({w_units:.0f} x {h_units:.0f} model units)")
     except (RuntimeError, OSError, ValueError, TypeError) as e:
         _warn(f"Raster placement failed: {e}\n"
               f"Image saved to: {img_path}")

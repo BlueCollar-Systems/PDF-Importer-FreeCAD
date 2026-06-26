@@ -150,7 +150,7 @@ jobs:
       - name: Commit and push version bump
         env:
           VERSION: ${{ steps.version.outputs.version }}
-          GH_TOKEN: ${{ secrets.RELEASE_BUMP_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
           git config user.name "github-actions[bot]"
@@ -177,7 +177,7 @@ jobs:
 
       - name: Create tag and release
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_BUMP_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
           VERSION="v${{ steps.version.outputs.version }}"

@@ -66,108 +66,42 @@ jobs:
           python -c "import build_release; build_release.ensure_runtime_dependencies()"
           python -m pytest tests/ -q --basetemp "$RUNNER_TEMP/pytest-freecad"
 
-      - name: Read and bump version
+      - name: Read committed version
         id: version
         run: |
           python - <<'PY'
-          import datetime
           import os
           import pathlib
           import re
-          import subprocess
 
           package_xml = pathlib.Path("PDFVectorImporter/package.xml")
-          readme = pathlib.Path("README.md")
           package_text = package_xml.read_text(encoding="utf-8")
 
-          match = re.search(r"<version>(\d+)\.(\d+)\.(\d+)</version>", package_text)
+          match = re.search(r"<version>(\d+\.\d+\.\d+)</version>", package_text)
           if not match:
               raise SystemExit("Could not find <version> in PDFVectorImporter/package.xml")
+          version = match.group(1)
 
-          major, minor, patch = map(int, match.groups())
-          tags = set(
-              t.strip()
-              for t in subprocess.check_output(
-                  ["git", "tag", "--list"],
-                  text=True,
-              ).splitlines()
-              if t.strip()
-          )
-          next_patch = patch + 1
-          while f"v{major}.{minor}.{next_patch}" in tags:
-              next_patch += 1
-          new_version = f"{major}.{minor}.{next_patch}"
-          today = datetime.date.today().isoformat()
-
-          package_text = re.sub(
-              r"(<version>)(\d+\.\d+\.\d+)(</version>)",
-              rf"\g<1>{new_version}\3",
-              package_text,
-              count=1,
-          )
-          package_text = re.sub(
-              r"(<date>)(\d{4}-\d{2}-\d{2})(</date>)",
-              rf"\g<1>{today}\3",
-              package_text,
-              count=1,
-          )
-          package_xml.write_text(package_text, encoding="utf-8")
-
-          pyproject = pathlib.Path("pyproject.toml")
-          if pyproject.exists():
-              pyproject_text = pyproject.read_text(encoding="utf-8")
-              pyproject_text = re.sub(
-                  r'(^version\s*=\s*")(\d+\.\d+\.\d+)(")',
-                  rf"\g<1>{new_version}\3",
-                  pyproject_text,
-                  count=1,
-                  flags=re.MULTILINE,
-              )
-              pyproject.write_text(pyproject_text, encoding="utf-8")
+          pyproject_text = pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
+          pyproject_match = re.search(r'^version\s*=\s*"(\d+\.\d+\.\d+)"', pyproject_text, re.MULTILINE)
+          if not pyproject_match or pyproject_match.group(1) != version:
+              got = pyproject_match.group(1) if pyproject_match else "missing"
+              raise SystemExit(f"Version mismatch: package={version} pyproject={got}")
 
           for readme in [pathlib.Path("README.md"), pathlib.Path("PDFVectorImporter/README.md")]:
-              if not readme.exists():
-                  continue
               readme_text = readme.read_text(encoding="utf-8")
-              readme_text = re.sub(
-                  r"(!\[Version:\s*)(\d+\.\d+\.\d+)(\])",
-                  rf"\g<1>{new_version}\3",
-                  readme_text,
-                  count=1,
-              )
-              readme_text = re.sub(
-                  r"(Version-)(\d+\.\d+\.\d+)(-(green|blue)\.svg)",
-                  rf"\g<1>{new_version}\3",
-                  readme_text,
-                  count=1,
-              )
-              readme.write_text(readme_text, encoding="utf-8")
+              badge_match = re.search(r"Version-(\d+\.\d+\.\d+)-(?:green|blue)\.svg", readme_text)
+              if not badge_match or badge_match.group(1) != version:
+                  got = badge_match.group(1) if badge_match else "missing"
+                  raise SystemExit(f"Version mismatch: package={version} {readme}={got}")
 
           out = pathlib.Path(os.environ["GITHUB_OUTPUT"])
-          out.write_text(f"version={new_version}\n", encoding="utf-8")
+          out.write_text(f"version={version}\n", encoding="utf-8")
           PY
 
-      - name: Commit and push version bump
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set release target
         run: |
-          set -e
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git add PDFVectorImporter/package.xml pyproject.toml README.md PDFVectorImporter/README.md
-          if git diff --cached --quiet; then
-            echo "No version bump changes to commit."
-            echo "RELEASE_TARGET=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-          else
-            git commit -m "chore: bump version to ${VERSION}"
-            if ! git push origin "HEAD:${GITHUB_REF_NAME}"; then
-              echo "::error::Could not push version bump to '${GITHUB_REF_NAME}'. Refusing to publish a release whose tag does not match committed version files."
-              exit 1
-            fi
-            echo "RELEASE_TARGET=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-          fi
+          echo "RELEASE_TARGET=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Build release zip
         run: python build_release.py

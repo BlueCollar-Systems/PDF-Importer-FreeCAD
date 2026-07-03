@@ -151,13 +151,34 @@ def _quad_to_points(
     return out
 
 
+def _page_rotation(page) -> int:
+    """Return the PDF /Rotate entry (0, 90, 180, 270) normalised to [0,360)."""
+    try:
+        rot = int(getattr(page, "rotation", 0) or 0)
+    except (TypeError, ValueError):
+        rot = 0
+    return rot % 360
+
+
 def _page_mediabox_height(page) -> float:
-    """Media-box height for Y-flip (PDF user space, not crop-relative)."""
+    """Media-box height for Y-flip accounting for PDF /Rotate.
+
+    PDF user-space coordinates are defined in the *unrotated* mediabox, but
+    PyMuPDF applies /Rotate when building ``page.rect``.  For 90°/270° pages
+    the viewer swaps width↔height, so we must use the rotated dimension as the
+    Y-flip baseline to match what ``get_drawings`` / ``get_text`` actually
+    returns (which is already in the *rotated* display space).
+    """
+    rot = _page_rotation(page)
     try:
         mbox = page.mediabox
-        return float(mbox.height)
+        w, h = float(mbox.width), float(mbox.height)
     except AttributeError:
-        return float(page.rect.height)
+        w, h = float(page.rect.width), float(page.rect.height)
+    if rot in (90, 270):
+        # Rotated page: display height == mediabox width
+        return w
+    return h
 
 
 def _collect_page_layers(primitives: List[Primitive]) -> List[str]:
@@ -180,15 +201,28 @@ def extract_page(
     detect_arcs: bool = True,
     arc_fit_tol_mm: float = 0.05,
     min_arc_angle_deg: float = 5.0,
+    arc_min_pts: int = 5,
 ) -> PageData:
     """Extract normalized primitives from a PyMuPDF page."""
+    # Determine the effective display dimensions respecting PDF /Rotate.
+    # PyMuPDF applies /Rotate so page.rect already reflects the display
+    # orientation; use that for page_w/h_mm and for the Y-flip baseline.
+    rot = _page_rotation(page)
     try:
         mbox = page.mediabox
-        page_w_pts = float(mbox.width)
-        page_h_pts = float(mbox.height)
+        mb_w = float(mbox.width)
+        mb_h = float(mbox.height)
     except AttributeError:
-        page_w_pts = float(page.rect.width)
-        page_h_pts = float(page.rect.height)
+        mb_w = float(page.rect.width)
+        mb_h = float(page.rect.height)
+
+    if rot in (90, 270):
+        # Display width/height are swapped relative to the raw mediabox
+        page_w_pts, page_h_pts = mb_h, mb_w
+    else:
+        page_w_pts, page_h_pts = mb_w, mb_h
+
+    # page_h is the Y-flip baseline in PDF user-space points
     page_h = page_h_pts
     page_w_mm = page_w_pts * MM_PER_PT * scale
     page_h_mm = page_h_pts * MM_PER_PT * scale
@@ -326,11 +360,24 @@ def extract_page(
             ))
 
     if detect_arcs:
+        # Performance gate: only pass polylines that have enough points to
+        # form a plausible arc and meet the minimum angle span.  This avoids
+        # running the full Kasa circle-fit on thousands of short lines in
+        # dense drawings, cutting per-page time significantly on large PDFs.
+        arc_candidates = [
+            p for p in primitives
+            if p.type in ("polyline", "closed_loop") and len(p.points or []) >= arc_min_pts
+        ]
+        non_candidates = [
+            p for p in primitives
+            if p not in arc_candidates
+        ]
         promote_circular_primitives(
-            primitives,
+            arc_candidates,
             arc_fit_tol_mm=arc_fit_tol_mm,
             min_arc_angle_deg=min_arc_angle_deg,
         )
+        primitives = non_candidates + arc_candidates
 
     text_items = _extract_text(page, page_h_pts, page_num, flip_y, scale)
     layers = _collect_page_layers(primitives)

@@ -103,7 +103,7 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 flip_y: bool = True) -> Optional[dict]:
     """Render text from a PDF page as vector glyph geometry.
 
-    Returns {"shapes": int, "glyphs": int} or None if unavailable.
+    Returns {"shapes": int, "glyphs": int, "entity_type": str} or None if unavailable.
     """
     exe = find_pdftocairo()
     renderer_name = "pdftocairo" if exe else "pymupdf"
@@ -152,7 +152,7 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
     placements = _parse_use_placements(svg)
 
     if not placements:
-        return {"shapes": 0, "glyphs": 0, "renderer": renderer_name}
+        return {"shapes": 0, "glyphs": 0, "entity_type": "glyphs", "renderer": renderer_name}
 
     # Build Part.Shape for each unique glyph
     glyph_shapes: Dict[str, Part.Shape] = {}
@@ -207,7 +207,7 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
             pass
 
     if not all_shapes:
-        return {"shapes": 0, "glyphs": 0}
+        return {"shapes": 0, "glyphs": 0, "entity_type": "glyphs"}
 
     # Combine all text into one compound object
     try:
@@ -221,7 +221,7 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
             pass
         if parent_group:
             parent_group.addObject(text_obj)
-        return {"shapes": len(glyph_shapes), "glyphs": glyph_count, "renderer": renderer_name}
+        return {"shapes": len(glyph_shapes), "glyphs": glyph_count, "entity_type": "glyphs", "renderer": renderer_name}
     except (RuntimeError, ValueError, TypeError):
         return None
 

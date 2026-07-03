@@ -573,7 +573,7 @@ def write_import_report(
 ) -> str:
     """Emit bcs.import_report/1.1 JSON for one import run."""
     from pdfcadcore.fitz_loader import sample_process_mb
-    from pdfcadcore.import_report import build_import_report
+    from pdfcadcore.import_report import build_actual_text_entity_types, build_import_report
 
     phases = dict(getattr(opts, "phase_timings_ms", {}) or {})
     if elapsed_ms > 0 and "total_ms" not in phases:
@@ -586,6 +586,19 @@ def write_import_report(
         "raster_page_count": opts.raster_page_count,
         "raster_fallback_reasons": list(opts.raster_fallback_reasons),
     }
+    
+    # Add text entity info to extra if available
+    if hasattr(opts, '_report_extra') and opts._report_extra:
+        extra.update(opts._report_extra)
+    entity_info = extra.get("actual_text_entity_types")
+    if isinstance(entity_info, dict):
+        extra["actual_text_entity_types"] = build_actual_text_entity_types(
+            host_app="freecad",
+            text_mode=str(entity_info.get("entity_type") or opts.text_mode or "3d_text"),
+            count=int(entity_info.get("count") or 0),
+            font_rendered=bool(entity_info.get("font_rendered")),
+            examples=list(entity_info.get("examples") or []),
+        )
     if skips:
         extra["shapestring_skips"] = skips
         extra["shapestring_skip_total"] = sum(int(v) for v in skips.values())
@@ -3011,6 +3024,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         # Try SVG vector text (Glyphs / Geometry modes). Poppler/pdftocairo is
         # preferred; bundled PyMuPDF is used when Poppler is absent.
         svg_text_done = False
+        text_entity_info = None
         if opts.text_mode in ("glyphs", "geometry"):
             try:
                 from PDFVectorImporter.src.PDFSvgTextRenderer import render_text
@@ -3024,6 +3038,13 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     svg_text_done = True
                     obj_count += 1
                     n_glyphs = result['glyphs']
+                    entity_type = result.get('entity_type', 'glyphs')
+                    text_entity_info = {
+                        'entity_type': entity_type,
+                        'count': n_glyphs,
+                        'font_rendered': False,
+                        'examples': []
+                    }
                     _progress_update(
                         89,
                         f"Rendering {label} ({n_glyphs} items)...")
@@ -3047,6 +3068,12 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 )
                 if span_count > 0:
                     obj_count += span_count
+                    text_entity_info = {
+                        'entity_type': '3d_text',
+                        'count': span_count,
+                        'font_rendered': True,
+                        'examples': []
+                    }
                     _progress_update(
                         89,
                         f"Rendering 3D text ({span_count} spans)...")
@@ -3072,6 +3099,15 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 )
                 if exact_span_count > 0:
                     obj_count += exact_span_count
+                    if text_entity_info is None:
+                        text_entity_info = {
+                            'entity_type': 'labels',
+                            'count': exact_span_count,
+                            'font_rendered': True,
+                            'examples': []
+                        }
+                    else:
+                        text_entity_info['count'] += exact_span_count
                     _progress_update(
                         89,
                         f"Rendering text labels ({exact_span_count} spans)...")
@@ -3356,6 +3392,17 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                             pass
                         text_group.addObject(t)
                         obj_count += 1
+                        if text_entity_info is None:
+                            text_entity_info = {
+                                'entity_type': 'labels',
+                                'count': 1,
+                                'font_rendered': True,
+                                'examples': [item["content"][:20]]
+                            }
+                        else:
+                            text_entity_info['count'] += 1
+                            if len(text_entity_info['examples']) < 3:
+                                text_entity_info['examples'].append(item["content"][:20])
                     except (RuntimeError, ValueError, TypeError, AttributeError):
                         pass
           except (RuntimeError, ValueError, TypeError, AttributeError) as e:
@@ -3515,7 +3562,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
     fc_doc.recompute()
     elapsed_total = time.time() - _import_start
     _msg(f"Page {page_num}: {obj_count} objects created in {elapsed_total:.1f}s")
-    return top_group
+    return top_group, text_entity_info
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -3607,13 +3654,24 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         page_arrangement = _normalize_page_arrangement(getattr(opts, "page_arrangement", "spread"))
         page_gap_ratio = _normalize_page_gap_ratio(getattr(opts, "page_gap_ratio", 0.20))
         first_page = True
+        all_text_entity_info = None
         for p in pages:
             if p < 1 or p > total_pages:
                 _warn(f"Skipping out-of-range page {p} (PDF has {total_pages} pages)")
                 continue
             try:
                 _msg(f"Importing page {p}/{total_pages} ({imported_count+1} of {len(pages)})...")
-                import_pdf_page(pdf_path, page_num=p, opts=opts, autofit=False)
+                _, page_text_info = import_pdf_page(pdf_path, page_num=p, opts=opts, autofit=False)
+                if page_text_info:
+                    if all_text_entity_info is None:
+                        all_text_entity_info = page_text_info.copy()
+                    else:
+                        all_text_entity_info["count"] += page_text_info.get("count", 0)
+                        examples = page_text_info.get("examples", [])
+                        if examples and len(all_text_entity_info["examples"]) < 3:
+                            all_text_entity_info["examples"].extend(
+                                examples[:3 - len(all_text_entity_info["examples"])]
+                            )
                 curr_page_height = page_heights_scaled.get(p, page_height_scaled)
                 # Offset each page group downward so they don't overlap.
                 # FreeCAD may rename the group (e.g., PDF_Page_2 → PDF_Page_2001)
@@ -3688,6 +3746,13 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         fallback_used, fallback_reason = _report_fallback_state(opts)
         elapsed_ms = (time.perf_counter() - t_import_start) * 1000.0
         opts.phase_timings_ms["total_ms"] = elapsed_ms
+
+        # Add text entity info to extra
+        if not hasattr(opts, '_report_extra'):
+            opts._report_extra = {}
+        if all_text_entity_info:
+            opts._report_extra['actual_text_entity_types'] = all_text_entity_info
+        
         write_import_report(
             pdf_path=pdf_path,
             output_path=report_path,

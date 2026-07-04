@@ -10,6 +10,8 @@ Converts PDF drawings into editable FreeCAD geometry with text and image support
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 import re
@@ -579,6 +581,29 @@ def _importer_version() -> str:
     return ""
 
 
+def _model3d_report_payload(opts: ImportOptions) -> Dict[str, Any]:
+    mode = _normalize_model3d_mode(getattr(opts, "model3d_mode", "off"))
+    intent = getattr(opts, "_model3d_intent", None)
+    solids = int(getattr(opts, "_model3d_solids", 0) or 0)
+    payload: Dict[str, Any] = {
+        "supported": True,
+        "enabled": mode != "off",
+        "mode": mode,
+        "depth_mm": round(_model3d_depth_units(opts), 4),
+        "solids_created": solids,
+    }
+    if mode == "off":
+        payload["skipped_reason"] = "option_off"
+    elif mode == "auto" and not bool(getattr(opts, "_model3d_intent_feasible", False)):
+        reason = None
+        if isinstance(intent, dict):
+            reason = intent.get("skipped_reason")
+        payload["skipped_reason"] = reason or "no_3d_intent_evidence"
+    elif solids == 0:
+        payload["skipped_reason"] = "no_extrudable_closed_regions"
+    return payload
+
+
 def write_import_report(
     *,
     pdf_path: str,
@@ -607,6 +632,8 @@ def write_import_report(
         "auto_reason": opts.auto_reason,
         "raster_page_count": opts.raster_page_count,
         "raster_fallback_reasons": list(opts.raster_fallback_reasons),
+        "model_3d_intent": getattr(opts, "_model3d_intent", None),
+        "model_3d": _model3d_report_payload(opts),
     }
     
     # Add text entity info to extra if available
@@ -684,23 +711,53 @@ def write_import_report(
             "object_count": len(provenance_objects),
         }
 
-    from pdfcadcore.parts_bootstrap import write_parts_bootstrap_sidecar
+    from pdfcadcore.parts_bootstrap import extract_bootstrap_rows, write_parts_bootstrap_sidecar
 
     bootstrap_path = str(Path(output_path).with_name("parts_bootstrap.json"))
+    build_stamp = str((report.report_meta or {}).get("build_stamp") or "")
+    bootstrap_text_items = list(getattr(opts, "_bootstrap_text_items", []) or [])
+    if not bootstrap_text_items:
+        for page_text in list(getattr(opts, "_model3d_text_evidence", []) or []):
+            for line in str(page_text).splitlines():
+                line = line.strip()
+                if line:
+                    bootstrap_text_items.append({"text": line, "page": 1})
+    bootstrap_rows = extract_bootstrap_rows(bootstrap_text_items)
+    import_build_stamp = {
+        "host": "freecad",
+        "semver": _importer_version(),
+    }
+    if build_stamp:
+        import_build_stamp["build_stamp"] = build_stamp
     write_parts_bootstrap_sidecar(
         bootstrap_path,
         pdf_path,
         page_count=int(total_pages or pages_imported or 0) or None,
+        rows=bootstrap_rows,
+        import_build_stamp=import_build_stamp,
     )
     extra_ref = report.extra
     extra_ref["parts_bootstrap"] = {
         "schema": "bcs.parts_bootstrap/1.0",
         "sidecar_path": Path(bootstrap_path).name,
-        "row_count": 0,
-        "note": "stub emitter — BOM extraction deferred",
+        "row_count": len(bootstrap_rows),
+        "note": "BOM row extraction from drawing text" if bootstrap_rows else "no BOM rows detected",
     }
 
     report.write_json(output_path)
+    try:
+        import_build_stamp["report_sha256"] = hashlib.sha256(
+            Path(output_path).read_bytes()
+        ).hexdigest()
+        write_parts_bootstrap_sidecar(
+            bootstrap_path,
+            pdf_path,
+            page_count=int(total_pages or pages_imported or 0) or None,
+            rows=bootstrap_rows,
+            import_build_stamp=import_build_stamp,
+        )
+    except OSError:
+        pass
     return output_path
 
 
@@ -3941,6 +3998,8 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     t_import_start = time.perf_counter()
     opts.phase_timings_ms.clear()
     opts.shapestring_skips.clear()
+    opts._model3d_solids = 0
+    opts._bootstrap_text_items = []
     obj_count_before = len(fc_doc.Objects)
 
     # Reset ID counter once at the start of a multi-page import
@@ -3974,7 +4033,14 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                         _page_for_meta = pdoc.load_page(p - 1)
                         page_heights_scaled[p] = _page_for_meta.rect.height * _unit_scale
                         try:
-                            model3d_text_evidence.append(_page_for_meta.get_text("text") or "")
+                            page_text = _page_for_meta.get_text("text") or ""
+                            model3d_text_evidence.append(page_text)
+                            for line in page_text.splitlines():
+                                line = line.strip()
+                                if line:
+                                    opts._bootstrap_text_items.append(
+                                        {"text": line, "page": p}
+                                    )
                         except (RuntimeError, ValueError, AttributeError):
                             pass
                     except (ValueError, RuntimeError):
@@ -3986,6 +4052,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             intent = analyze_model3d_intent(model3d_text_evidence, host_supports_3d=True)
             opts._model3d_intent = intent.to_dict()
             opts._model3d_intent_feasible = bool(intent.feasible)
+            opts._model3d_text_evidence = list(model3d_text_evidence)
         except (ImportError, RuntimeError, TypeError, ValueError, AttributeError):
             opts._model3d_intent = {
                 "feasible": False,
@@ -4128,6 +4195,28 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             opts._report_extra = {}
         if all_text_entity_info:
             opts._report_extra['actual_text_entity_types'] = all_text_entity_info
+
+        if bool(getattr(opts, "model3d_semantic", False)):
+            intent = getattr(opts, "_model3d_intent", None) or {}
+            members = intent.get("members") if isinstance(intent, dict) else []
+            if members:
+                try:
+                    from pdfcadcore.semantic_members import create_semantic_members
+
+                    semantic_report = create_semantic_members(
+                        list(members),
+                        doc=fc_doc,
+                    )
+                    if not hasattr(opts, "_report_extra"):
+                        opts._report_extra = {}
+                    model3d_extra = dict(
+                        getattr(opts, "_report_extra", {}).get("model_3d") or {}
+                    )
+                    model3d_extra["semantic_members"] = semantic_report
+                    opts._report_extra["model_3d"] = model3d_extra
+                except (ImportError, RuntimeError, TypeError, ValueError) as e:
+                    if opts.verbose:
+                        _warn(f"Semantic member generation skipped: {e}")
         
         write_import_report(
             pdf_path=pdf_path,

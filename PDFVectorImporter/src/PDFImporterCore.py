@@ -878,16 +878,18 @@ def _apply_style(obj, stroke_rgb, width, dashes, opts: ImportOptions):
             vo.LineColor = stroke_rgb
         if opts.assign_linewidth and width is not None:
             try:
-                # PDF line widths in points are tiny; scale and enforce a visible minimum
-                lw = float(width) * (0.7 if opts.scale_to_mm else 1.0)
-                # Minimum 2.0 so lines are always visible regardless of background
-                vo.LineWidth = max(2.0, lw)
+                # width from get_drawings() is in PDF points (1 pt = 1/72 in).
+                # FreeCAD LineWidth is in screen pixels at ~96 dpi.
+                # 1 pt ≈ 1.333 px at 96 dpi.  Preserve relative variation;
+                # use a 1 px floor so hairlines stay visible without inflating
+                # heavier lines that carry structural meaning.
+                lw_px = float(width) * (96.0 / 72.0)
+                vo.LineWidth = max(1.0, round(lw_px, 1))
             except (TypeError, ValueError, AttributeError):
-                vo.LineWidth = 2.0
+                vo.LineWidth = 1.0
         else:
-            # Even with no width info, make lines visible
             try:
-                vo.LineWidth = 2.0
+                vo.LineWidth = 1.0
             except (AttributeError, RuntimeError):
                 pass
         if opts.map_dashes and dashes and len(dashes) >= 2:
@@ -2315,7 +2317,15 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         raise ValueError(f"Page {page_num} out of range 1..{len(pdf_doc)}")
 
     page = pdf_doc.load_page(page_num - 1)
-    page_h = page.rect.height
+    # Use rotation-corrected height for Y-flip — for 90°/270° pages the
+    # display height equals the raw mediabox *width*, not height.
+    _fc_rot = int(getattr(page, "rotation", 0) or 0) % 360
+    try:
+        _fc_mb = page.mediabox
+        _fc_mb_w, _fc_mb_h = float(_fc_mb.width), float(_fc_mb.height)
+    except AttributeError:
+        _fc_mb_w, _fc_mb_h = float(page.rect.width), float(page.rect.height)
+    page_h = _fc_mb_w if _fc_rot in (90, 270) else _fc_mb_h
     scale = (MM_PER_PT if opts.scale_to_mm else 1.0) * opts.user_scale
 
     # Top-level group

@@ -102,6 +102,13 @@ jobs:
       - name: Run pdfcadcore unit tests
         run: python -m pytest tests/ -v
 
+      - name: Validate corpus contract schemas
+        env:
+          BCS_CORPUS_ROOT: ${{ github.workspace }}/pdf-test-corpus
+        run: |
+          git clone --depth 1 https://github.com/BlueCollar-Systems/pdf-test-corpus.git pdf-test-corpus
+          python pdf-test-corpus/tools/validate_contract_schemas.py
+
       - name: BCS-ARCH-001 mode smoke test
         run: |
           python -c "

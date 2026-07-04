@@ -156,7 +156,12 @@ def _extract_sequence_rows(items: List[tuple[str, Optional[int]]]) -> List[Dict[
         if cursor < len(items) and not _MARK_LINE_RE.match(items[cursor][0]) and not _is_header_line(items[cursor][0]):
             remarks = items[cursor][0]
             cursor += 1
-        if cursor < len(items) and not _MARK_LINE_RE.match(items[cursor][0]) and not _is_header_line(items[cursor][0]):
+        current_starts_next_row = (
+            cursor + 1 < len(items)
+            and _MARK_LINE_RE.match(items[cursor][0])
+            and _QTY_LINE_RE.match(items[cursor + 1][0])
+        )
+        if cursor < len(items) and not current_starts_next_row and not _is_header_line(items[cursor][0]):
             grade = items[cursor][0]
             cursor += 1
 

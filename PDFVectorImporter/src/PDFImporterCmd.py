@@ -155,6 +155,28 @@ class ImportPDFDialog(QtWidgets.QDialog):
             "How multi-page imports are laid out in model space.\n"
             "Spread (20% gap) keeps pages readable by default.")
 
+        # ── Optional 3D model generation ──
+        self.model3d_combo = QtWidgets.QComboBox()
+        self.model3d_combo.addItems([
+            "Off",
+            "Auto (if drawing has 3D evidence)",
+            "Extrude closed shapes",
+        ])
+        self.model3d_combo.setCurrentText("Off")
+        self.model3d_combo.setToolTip(
+            "Optional 3D model generation for capable hosts.\n"
+            "Auto only extrudes when text evidence (plate thickness or member designations) "
+            "makes a 3D result honest.\n"
+            "Extrude closed shapes is explicit and still skips page-background fills.")
+
+        self.model3d_depth_spin = QtWidgets.QDoubleSpinBox()
+        self.model3d_depth_spin.setRange(0.01, 100000.0)
+        self.model3d_depth_spin.setDecimals(3)
+        self.model3d_depth_spin.setSingleStep(1.0)
+        self.model3d_depth_spin.setValue(3.175)
+        self.model3d_depth_spin.setSuffix(" mm")
+        self.model3d_depth_spin.setToolTip("Extrusion depth for generated solids.")
+
         # ── Restore last-used settings ──
         self._restore_settings()
 
@@ -168,6 +190,8 @@ class ImportPDFDialog(QtWidgets.QDialog):
         form.addRow("Text Mode:", self.text_combo)
         form.addRow("Grouping:", self.grouping_combo)
         form.addRow("Page Layout:", self.page_arrangement_combo)
+        form.addRow("3D Model:", self.model3d_combo)
+        form.addRow("3D Depth:", self.model3d_depth_spin)
         form.addRow(self.advanced_group)
 
         btns = QtWidgets.QDialogButtonBox(
@@ -235,6 +259,12 @@ class ImportPDFDialog(QtWidgets.QDialog):
             page_arrangement = grp.GetString("LastPageArrangement", "")
             if page_arrangement:
                 self.page_arrangement_combo.setCurrentText(page_arrangement)
+            model3d_mode = grp.GetString("LastModel3DMode", "")
+            if model3d_mode:
+                self.model3d_combo.setCurrentText(model3d_mode)
+            depth = grp.GetFloat("LastModel3DDepthMm", 0.0)
+            if depth > 0:
+                self.model3d_depth_spin.setValue(depth)
         except (AttributeError, RuntimeError, ValueError):
             pass  # First run or corrupted prefs — use defaults
 
@@ -248,6 +278,8 @@ class ImportPDFDialog(QtWidgets.QDialog):
             grp.SetFloat("LastScale", self.scale_spin.value())
             grp.SetString("LastGroupingMode", self.grouping_combo.currentText())
             grp.SetString("LastPageArrangement", self.page_arrangement_combo.currentText())
+            grp.SetString("LastModel3DMode", self.model3d_combo.currentText())
+            grp.SetFloat("LastModel3DDepthMm", self.model3d_depth_spin.value())
         except (AttributeError, RuntimeError, ValueError):
             pass
 
@@ -262,6 +294,11 @@ class ImportPDFDialog(QtWidgets.QDialog):
         "compact": "Compact gap",
         "touch": "Touching pages",
         "overlay": "Overlay pages",
+    }
+    _MODEL3D_MAP = {
+        "off": "Off",
+        "auto": "Auto (if drawing has 3D evidence)",
+        "extrude": "Extrude closed shapes",
     }
 
     # UI label -> canonical BCS-ARCH-001 mode value.
@@ -408,6 +445,9 @@ class ImportPDFDialog(QtWidgets.QDialog):
         opts.cleanup_level = "balanced"
         opts.lineweight_mode = "preserve"
         opts.grouping_mode = _grp_rev.get(self.grouping_combo.currentText(), "per_page")
+        _m3d_rev = {v: k for k, v in self._MODEL3D_MAP.items()}
+        opts.model3d_mode = _m3d_rev.get(self.model3d_combo.currentText(), "off")
+        opts.model3d_depth_mm = float(self.model3d_depth_spin.value())
 
         return opts
 

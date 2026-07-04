@@ -80,6 +80,56 @@ class TestImportReportHumanSummary(unittest.TestCase):
         summary = report.extra.get("human_summary", "")
         self.assertIn("Scale note:", summary)
 
+    def test_import_contract_ready_aggregate(self) -> None:
+        report = build_import_report(
+            host_app="freecad",
+            importer_version="4.0.60",
+            pdf_path="drawing.pdf",
+            mode="auto",
+            pages=1,
+            primitive_count=40,
+            text_count=2,
+            text_mode="labels",
+            extra={
+                "actual_text_entity_types": {
+                    "entity_type": "labels",
+                    "count": 2,
+                    "native_label": 2,
+                },
+                "resolved_scale": {
+                    "factor": 48.0,
+                    "notation": '1/4" = 1\'-0"',
+                    "source": "titleblock",
+                    "confidence": 0.55,
+                },
+            },
+        )
+
+        ready = report.extra.get("import_contract_ready")
+        self.assertIsInstance(ready, dict)
+        self.assertTrue(ready["ready"])
+        self.assertTrue(ready["checks"]["build_stamp"])
+        self.assertTrue(ready["checks"]["scale_crosscheck"])
+        self.assertTrue(ready["checks"]["actual_text_entity_types"])
+        self.assertTrue(ready["checks"]["no_open_failure"])
+
+    def test_import_contract_ready_fails_when_text_entities_unverified(self) -> None:
+        report = build_import_report(
+            host_app="freecad",
+            importer_version="4.0.60",
+            pdf_path="drawing.pdf",
+            mode="auto",
+            pages=1,
+            primitive_count=40,
+            text_count=2,
+        )
+
+        ready = report.extra.get("import_contract_ready")
+        self.assertIsInstance(ready, dict)
+        self.assertFalse(ready["ready"])
+        self.assertTrue(ready["checks"]["scale_crosscheck"])
+        self.assertFalse(ready["checks"]["actual_text_entity_types"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -12,7 +13,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "PDFVectorImporter" / "src"
 MOD_ROOT = REPO_ROOT / "PDFVectorImporter"
-CORPUS_ROOT = Path(r"C:\1pdf-test-corpus")
+_CORPUS_ENV = os.environ.get("BCS_CORPUS_ROOT") or os.environ.get("PDF_TEST_CORPUS")
+CORPUS_ROOT = Path(_CORPUS_ENV) if _CORPUS_ENV else Path(r"C:\1pdf-test-corpus")
 for path in (SRC_DIR, MOD_ROOT):
     sys.path.insert(0, str(path))
 
@@ -26,6 +28,8 @@ except ImportError:  # pragma: no cover - legacy PyMuPDF name
 
 def _load_text_entity_schema() -> dict:
     path = CORPUS_ROOT / "schemas" / "text_entity_verification.schema.json"
+    if not path.is_file():
+        raise unittest.SkipTest(f"text entity schema unavailable: {path}")
     return json.loads(path.read_text(encoding="utf-8"))
 
 

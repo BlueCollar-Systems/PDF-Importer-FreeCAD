@@ -364,14 +364,20 @@ def extract_page(
         # form a plausible arc and meet the minimum angle span.  This avoids
         # running the full Kasa circle-fit on thousands of short lines in
         # dense drawings, cutting per-page time significantly on large PDFs.
-        arc_candidates = [
-            p for p in primitives
-            if p.type in ("polyline", "closed_loop") and len(p.points or []) >= arc_min_pts
-        ]
-        non_candidates = [
-            p for p in primitives
-            if p not in arc_candidates
-        ]
+        #
+        # Partition in a single pass. Every Primitive has a unique ``id`` so
+        # no two are value-equal; splitting by the candidate predicate yields
+        # exactly the same two lists (and order) as the previous
+        # ``p not in arc_candidates`` membership test, but in O(n) instead of
+        # O(n^2) dataclass __eq__ comparisons (the dominant cost on
+        # primitive-dense pages).
+        arc_candidates = []
+        non_candidates = []
+        for p in primitives:
+            if p.type in ("polyline", "closed_loop") and len(p.points or []) >= arc_min_pts:
+                arc_candidates.append(p)
+            else:
+                non_candidates.append(p)
         promote_circular_primitives(
             arc_candidates,
             arc_fit_tol_mm=arc_fit_tol_mm,
@@ -834,23 +840,38 @@ def _merged_bbox(*boxes, scale_width=1.0):
     return (x0, y0, x1, y1)
 
 
+# Precompiled classifier patterns.  ``_classify_generic`` runs once per text
+# span (thousands of times on text-heavy sheets); precompiling avoids a regex
+# cache lookup on every call.  Patterns and flags are unchanged, so matches are
+# identical to the previous inline ``re.search`` calls.
+_GEN_DIM_FEET = re.compile(r"\d+['']\s*[-\u2013]?\s*\d")
+_GEN_DIM_FRAC = re.compile(r"\d+\s*/\s*\d+")
+_GEN_DIM_UNIT = re.compile(r'\d+\.?\d*\s*(?:"|mm|cm|in|ft)', re.I)
+_GEN_SCALE_KW = re.compile(r"SCALE[:\s]*\d")
+_GEN_SCALE_RATIO = re.compile(r"\d+\s*:\s*\d+")
+_GEN_TITLEBLOCK = re.compile(r"\b(DRAWN|CHECKED|DATE|SCALE|REV|SHEET|PROJECT|DWG|TITLE)\b")
+_GEN_CALLOUT = re.compile(r"\u00D8|\bDIA\b|\bRAD\b|\bR\d", re.I)
+_GEN_DETAIL = re.compile(r"\b(DETAIL|SECTION|SEC|VIEW|ELEVATION)\s+[A-Z]")
+_GEN_LABEL = re.compile(r"[A-Z]{2,}")
+
+
 def _classify_generic(text: str) -> list:
     tags = []
     t = text.strip()
     tu = t.upper()
-    if re.search(r"\d+['']\s*[-\u2013]?\s*\d", t) or re.search(r"\d+\s*/\s*\d+", t):
+    if _GEN_DIM_FEET.search(t) or _GEN_DIM_FRAC.search(t):
         tags.append("dimension_like")
-    if re.search(r'\d+\.?\d*\s*(?:"|mm|cm|in|ft)', t, re.I):
+    if _GEN_DIM_UNIT.search(t):
         tags.append("dimension_like")
-    if re.search(r"SCALE[:\s]*\d", tu) or re.search(r"\d+\s*:\s*\d+", t):
+    if _GEN_SCALE_KW.search(tu) or _GEN_SCALE_RATIO.search(t):
         tags.append("scale_like")
-    if re.search(r"\b(DRAWN|CHECKED|DATE|SCALE|REV|SHEET|PROJECT|DWG|TITLE)\b", tu):
+    if _GEN_TITLEBLOCK.search(tu):
         tags.append("titleblock_like")
-    if re.search(r"\u00D8|\bDIA\b|\bRAD\b|\bR\d", t, re.I):
+    if _GEN_CALLOUT.search(t):
         tags.append("callout_like")
-    if re.search(r"\b(DETAIL|SECTION|SEC|VIEW|ELEVATION)\s+[A-Z]", tu):
+    if _GEN_DETAIL.search(tu):
         tags.append("detail_reference")
-    if len(t) > 1 and len(t) < 60 and re.search(r"[A-Z]{2,}", tu):
+    if len(t) > 1 and len(t) < 60 and _GEN_LABEL.search(tu):
         tags.append("label_like")
     return tags
 

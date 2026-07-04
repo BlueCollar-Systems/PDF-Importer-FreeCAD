@@ -60,6 +60,61 @@ class TestPdfPrimitiveExtractor(unittest.TestCase):
         self.assertIn("1/4", texts)
         self.assertNotIn("2/4", texts)
 
+    def test_fraction_overlay_artifacts_are_deduped(self) -> None:
+        items = [
+            NormalizedText(
+                id=1, text="316", normalized="316",
+                insertion=(531.42, 316.45), bbox=(531.42, 316.45, 537.57, 321.40),
+                font_size=3.55, page_number=1,
+            ),
+            NormalizedText(
+                id=2, text="/", normalized="/",
+                insertion=(533.03, 316.80), bbox=(533.03, 316.80, 534.20, 321.03),
+                font_size=4.23, page_number=1,
+            ),
+            NormalizedText(
+                id=3, text="3/16", normalized="3/16",
+                insertion=(532.65, 311.83), bbox=(532.65, 311.83, 536.34, 316.78),
+                font_size=2.33, page_number=1,
+            ),
+        ]
+
+        merged = _merge_stacked_fractions(items)
+        texts = [item.text for item in merged]
+
+        self.assertEqual(texts.count("3/16"), 1)
+        self.assertNotIn("316", texts)
+        self.assertNotIn("/", texts)
+
+    def test_ambiguous_same_fraction_overlay_group_merges_once(self) -> None:
+        items = [
+            NormalizedText(
+                id=1, text="316", normalized="316",
+                insertion=(531.42, 318.64), bbox=(531.42, 316.45, 537.57, 321.40),
+                font_size=3.55, page_number=1,
+            ),
+            NormalizedText(
+                id=2, text="/", normalized="/",
+                insertion=(533.03, 317.75), bbox=(533.03, 316.80, 534.20, 321.03),
+                font_size=4.23, page_number=1,
+            ),
+            NormalizedText(
+                id=3, text="316", normalized="316",
+                insertion=(531.42, 314.02), bbox=(531.42, 311.83, 537.57, 316.78),
+                font_size=3.55, page_number=1,
+            ),
+            NormalizedText(
+                id=4, text="/", normalized="/",
+                insertion=(533.03, 313.10), bbox=(533.03, 312.15, 534.20, 316.37),
+                font_size=4.23, page_number=1,
+            ),
+        ]
+
+        merged = _merge_stacked_fractions(items)
+        texts = [item.text for item in merged]
+
+        self.assertEqual(texts, ["3/16"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -11,7 +11,6 @@ Converts PDF drawings into editable FreeCAD geometry with text and image support
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import os
 import re

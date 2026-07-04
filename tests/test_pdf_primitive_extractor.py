@@ -23,6 +23,12 @@ class TestPdfPrimitiveExtractor(unittest.TestCase):
         rgb = _norm_color(0.5)
         self.assertEqual(rgb, (0.5, 0.5, 0.5))
 
+    def test_packed_integer_color_decodes_to_rgb(self) -> None:
+        rgb = _norm_color(0x66AA33)
+        self.assertAlmostEqual(rgb[0], 0x66 / 255.0, places=4)
+        self.assertAlmostEqual(rgb[1], 0xAA / 255.0, places=4)
+        self.assertAlmostEqual(rgb[2], 0x33 / 255.0, places=4)
+
     def test_stacked_fraction_merge_ignores_full_size_whole_number(self) -> None:
         items = [
             NormalizedText(

@@ -71,12 +71,12 @@ class TestActualTextEntityTypes(unittest.TestCase):
             node for node in ast.walk(import_pdf_node)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id == "import_pdf_page"
+            and node.func.id == "_import_pdf_page_inner"
         ]
         self.assertEqual(
             len(calls),
             1,
-            "import_pdf must not call import_pdf_page again during report writing",
+            "import_pdf must call _import_pdf_page_inner exactly once and never reopen pages via import_pdf_page",
         )
 
     def test_freecad_report_emits_schema_compatible_text_entity_payload(self) -> None:

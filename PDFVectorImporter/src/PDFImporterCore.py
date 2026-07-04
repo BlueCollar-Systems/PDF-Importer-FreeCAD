@@ -370,7 +370,16 @@ def _norm_color(col) -> Tuple[float, float, float]:
     if col is None:
         return (0.0, 0.0, 0.0)
     try:
-        if isinstance(col, (int, float)):
+        if isinstance(col, int) and not isinstance(col, bool):
+            if col < 0:
+                return (0.0, 0.0, 0.0)
+            packed = int(col) & 0xFFFFFF
+            return (
+                ((packed >> 16) & 0xFF) / 255.0,
+                ((packed >> 8) & 0xFF) / 255.0,
+                (packed & 0xFF) / 255.0,
+            )
+        if isinstance(col, float):
             g = _clamp01(col)
             return (g, g, g)
         vals = []
@@ -394,6 +403,13 @@ def _norm_color(col) -> Tuple[float, float, float]:
         return (vals[0], vals[1], vals[2])
     except (TypeError, ValueError, AttributeError):
         return (0.0, 0.0, 0.0)
+
+
+def _optional_color(col) -> Optional[Tuple[float, float, float]]:
+    """Return normalized RGB only when the source PDF actually supplied a color."""
+    if col is None:
+        return None
+    return _norm_color(col)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -870,12 +886,25 @@ def _make_shape_obj(edges: List, closed: bool, make_face: bool, fc_doc=None):
         return None
 
 
-def _apply_style(obj, stroke_rgb, width, dashes, opts: ImportOptions):
-    """Set line color, width, and dash style on a Part::Feature ViewObject."""
+def _apply_style(obj, stroke_rgb, fill_rgb, width, dashes, opts: ImportOptions):
+    """Set source stroke/fill color, line width, and dash style on a ViewObject."""
     try:
         vo = obj.ViewObject
-        if stroke_rgb is not None:
-            vo.LineColor = stroke_rgb
+        visible_rgb = stroke_rgb or fill_rgb
+        if visible_rgb is not None:
+            try:
+                vo.LineColor = visible_rgb
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                pass
+            try:
+                vo.PointColor = visible_rgb
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                pass
+        if fill_rgb is not None:
+            try:
+                vo.ShapeColor = fill_rgb
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                pass
         if opts.assign_linewidth and width is not None:
             try:
                 # width from get_drawings() is in PDF points (1 pt = 1/72 in).
@@ -1636,6 +1665,97 @@ def _fit_font_size_to_span_bbox(
     return max(0.1, fitted)
 
 
+def _build_text_layout_context(tdict: dict) -> dict:
+    """Collect lightweight page context for table-specific text placement."""
+    quan_headers = []
+    for block in tdict.get("blocks", []) or []:
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []) or []:
+            for span in line.get("spans", []) or []:
+                text = str(span.get("text", "") or "").strip().upper()
+                if text not in {"QUAN", "QTY", "QTY."}:
+                    continue
+                bbox = _span_bbox_pdf(span)
+                if not bbox:
+                    continue
+                x0, y0, x1, y1 = bbox
+                quan_headers.append({
+                    "cx": (x0 + x1) * 0.5,
+                    "cy": (y0 + y1) * 0.5,
+                    "width": max(1.0, x1 - x0),
+                })
+    return {"quan_headers": quan_headers}
+
+
+def _is_simple_quantity_text(text: str) -> bool:
+    return bool(re.fullmatch(r"\d{1,3}", str(text or "").strip()))
+
+
+def _is_bom_quantity_span(span: dict, text: str, context: dict) -> bool:
+    """Return True for simple BOM quantity cells that should stay horizontal."""
+    if not _is_simple_quantity_text(text):
+        return False
+    bbox = _span_bbox_pdf(span)
+    if not bbox:
+        return False
+    headers = list((context or {}).get("quan_headers") or [])
+    if not headers:
+        return False
+    x0, y0, x1, y1 = bbox
+    cx = (x0 + x1) * 0.5
+    cy = (y0 + y1) * 0.5
+    for header in headers:
+        if cy < float(header["cy"]) - 4.0:
+            continue
+        tol_x = max(10.0, float(header["width"]) * 1.75)
+        if abs(cx - float(header["cx"])) <= tol_x:
+            return True
+    return False
+
+
+def _horizontal_quantity_origin_pdf(
+    span: dict,
+    text: str,
+    font_size_fc: float,
+    scale: float,
+) -> Optional[Tuple[float, float]]:
+    """Place a rotated BOM quantity back as centered horizontal text."""
+    bbox = _span_bbox_pdf(span)
+    if not bbox:
+        return None
+    x0, y0, x1, y1 = bbox
+    center_x = (x0 + x1) * 0.5
+    width_pdf = _estimate_text_width_mm(text, font_size_fc) / max(scale, 1e-12)
+    try:
+        size_pt = max(0.0, float(span.get("size", 0.0) or 0.0))
+        desc = abs(float(span.get("descender", -0.2) or -0.2))
+    except (TypeError, ValueError):
+        size_pt = 0.0
+        desc = 0.2
+    baseline_y = y1 - desc * size_pt
+    return center_x - (width_pdf * 0.5), baseline_y
+
+
+def _span_source_color(span: dict) -> Optional[Tuple[float, float, float]]:
+    return _optional_color(span.get("color"))
+
+
+def _apply_text_color(obj, rgb: Optional[Tuple[float, float, float]]) -> None:
+    """Apply a source text color to Draft text or ShapeString view providers."""
+    if rgb is None:
+        return
+    try:
+        vo = obj.ViewObject
+    except (AttributeError, RuntimeError):
+        return
+    for prop in ("TextColor", "ShapeColor", "LineColor", "PointColor"):
+        try:
+            setattr(vo, prop, rgb)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+
+
 def _render_text_spans_exact_labels(
     tdict: dict,
     text_group,
@@ -1643,6 +1763,7 @@ def _render_text_spans_exact_labels(
     opts: ImportOptions,
     scale: float,
     only_rotated: bool = False,
+    layout_context: Optional[dict] = None,
 ) -> int:
     """Render one Draft text object per PDF span for highest label fidelity."""
     if Draft is None or text_group is None:
@@ -1665,14 +1786,10 @@ def _render_text_spans_exact_labels(
             norm_angle = _normalize_text_angle_deg(angle_deg)
             if only_rotated and abs(norm_angle) < rotated_threshold:
                 continue
-            rot = Rotation(Vector(0, 0, 1), angle_deg)
 
             for span in spans:
                 text = span.get("text", "")
                 if not text or text.isspace():
-                    continue
-                origin = _span_origin_pdf(span)
-                if not origin:
                     continue
 
                 try:
@@ -1683,11 +1800,19 @@ def _render_text_spans_exact_labels(
                 txt = str(text).strip()
                 if not txt:
                     continue
-                font_size_fc = _fit_font_size_to_span_bbox(txt, font_size_fc, span, scale, angle_deg)
+                is_bom_quantity = _is_bom_quantity_span(span, txt, layout_context or {})
+                span_angle_deg = 0.0 if is_bom_quantity else angle_deg
+                font_size_fc = _fit_font_size_to_span_bbox(txt, font_size_fc, span, scale, span_angle_deg)
+                if is_bom_quantity:
+                    origin = _horizontal_quantity_origin_pdf(span, txt, font_size_fc, scale)
+                else:
+                    origin = _span_origin_pdf(span)
+                if not origin:
+                    continue
 
                 dedupe_key = (
                     txt,
-                    round(float(norm_angle), 1),
+                    round(float(_normalize_text_angle_deg(span_angle_deg)), 1),
                     round(float(font_size_fc), 2),
                 )
                 bucket = seen.setdefault(dedupe_key, [])
@@ -1709,13 +1834,15 @@ def _render_text_spans_exact_labels(
                 # spans report a baseline origin. Apply the same local-axis
                 # correction for horizontal and rotated exact labels so leader
                 # callouts do not drift when switching modes.
-                try:
-                    desc = float(span.get("descender", -0.2) or -0.2)
-                except (TypeError, ValueError):
-                    desc = -0.2
-                offset_fc = _effective_descender(txt, desc) * font_size_fc * 0.35
-                if abs(offset_fc) > 1e-12:
-                    pos = _apply_text_local_y_offset(pos, angle_deg, offset_fc)
+                if not is_bom_quantity:
+                    try:
+                        desc = float(span.get("descender", -0.2) or -0.2)
+                    except (TypeError, ValueError):
+                        desc = -0.2
+                    offset_fc = _effective_descender(txt, desc) * font_size_fc * 0.35
+                    if abs(offset_fc) > 1e-12:
+                        pos = _apply_text_local_y_offset(pos, span_angle_deg, offset_fc)
+                rot = Rotation(Vector(0, 0, 1), span_angle_deg)
                 try:
                     t = Draft.make_text([text], placement=Placement(pos, rot))
                 except (RuntimeError, ValueError, TypeError, AttributeError):
@@ -1728,6 +1855,7 @@ def _render_text_spans_exact_labels(
                     t.ViewObject.Justification = "Left"
                 except (AttributeError, RuntimeError, TypeError, ValueError):
                     pass
+                _apply_text_color(t, _span_source_color(span))
 
                 try:
                     text_group.addObject(t)
@@ -1773,6 +1901,7 @@ def _render_text_spans_3d(
     page_h: float,
     opts: ImportOptions,
     scale: float,
+    layout_context: Optional[dict] = None,
 ) -> int:
     """Render extruded ShapeString text for the 3D Text mode."""
     if Draft is None or text_group is None:
@@ -1794,15 +1923,10 @@ def _render_text_spans_3d(
             if not spans:
                 continue
             angle_deg = _line_angle_deg(line)
-            norm_angle = _normalize_text_angle_deg(angle_deg)
-            rot = Rotation(Vector(0, 0, 1), angle_deg)
 
             for span in spans:
                 text = span.get("text", "")
                 if not text or text.isspace():
-                    continue
-                origin = _span_origin_pdf(span)
-                if not origin:
                     continue
                 try:
                     size_pt = float(span.get("size", 0.0) or 0.0)
@@ -1812,16 +1936,26 @@ def _render_text_spans_3d(
                 txt = str(text).strip()
                 if not txt:
                     continue
-                font_size_fc = _fit_font_size_to_span_bbox(txt, font_size_fc, span, scale, angle_deg)
+                is_bom_quantity = _is_bom_quantity_span(span, txt, layout_context or {})
+                span_angle_deg = 0.0 if is_bom_quantity else angle_deg
+                span_norm_angle = _normalize_text_angle_deg(span_angle_deg)
+                font_size_fc = _fit_font_size_to_span_bbox(txt, font_size_fc, span, scale, span_angle_deg)
 
+                if is_bom_quantity:
+                    origin = _horizontal_quantity_origin_pdf(span, txt, font_size_fc, scale)
+                else:
+                    origin = _span_origin_pdf(span)
+                if not origin:
+                    continue
                 pos = _to_fc(origin, page_h, opts, scale)
-                if abs(norm_angle) >= rotated_threshold:
+                if (not is_bom_quantity) and abs(span_norm_angle) >= rotated_threshold:
                     try:
                         desc = float(span.get("descender", -0.2) or -0.2)
                     except (TypeError, ValueError):
                         desc = -0.2
                     offset_fc = _effective_descender(txt, desc) * font_size_fc * 0.35
-                    pos = _apply_text_local_y_offset(pos, angle_deg, offset_fc)
+                    pos = _apply_text_local_y_offset(pos, span_angle_deg, offset_fc)
+                rot = Rotation(Vector(0, 0, 1), span_angle_deg)
 
                 try:
                     make_shapestring = getattr(
@@ -1858,6 +1992,7 @@ def _render_text_spans_3d(
                         ss.Extrusion = extrude
                     except (AttributeError, RuntimeError, TypeError, ValueError):
                         pass
+                    _apply_text_color(ss, _span_source_color(span))
                 except (AttributeError, RuntimeError, TypeError, ValueError):
                     pass
                 try:
@@ -2652,7 +2787,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
     # Batch by (parent, color, width, dash_style) so styling is preserved
     _batch_shapes: Dict[str, List] = {}   # style_key → list of shapes
     _batch_parents: Dict[str, object] = {}  # style_key → parent object
-    _batch_styles: Dict[str, Tuple] = {}   # style_key → (stroke_rgb, width, dashes)
+    _batch_styles: Dict[str, Tuple] = {}   # style_key → (stroke_rgb, fill_rgb, width, dashes)
     _batch_idx: Dict[str, int] = {}        # parent_key → compound index
 
     def _flush_batch(style_key: str = None, force: bool = False):
@@ -2669,12 +2804,12 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             parent_name = parent.Name if hasattr(parent, 'Name') else str(id(parent))
             idx = _batch_idx.get(parent_name, 0) + 1
             _batch_idx[parent_name] = idx
-            stroke_rgb, width, dashes = _batch_styles.get(key, (None, None, None))
+            stroke_rgb, fill_rgb, width, dashes = _batch_styles.get(key, (None, None, None, None))
             try:
                 compound = Part.makeCompound(shapes)
                 obj = fc_doc.addObject("Part::Feature", f"Batch_{idx}")
                 obj.Shape = compound
-                _apply_style(obj, stroke_rgb, width, dashes, opts)
+                _apply_style(obj, stroke_rgb, fill_rgb, width, dashes, opts)
                 parent.addObject(obj)
                 obj_count += 1
             except (RuntimeError, ValueError, TypeError) as e:
@@ -2684,32 +2819,32 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     try:
                         obj = fc_doc.addObject("Part::Feature", "Wire")
                         obj.Shape = shp
-                        _apply_style(obj, stroke_rgb, width, dashes, opts)
+                        _apply_style(obj, stroke_rgb, fill_rgb, width, dashes, opts)
                         parent.addObject(obj)
                         obj_count += 1
                     except (RuntimeError, ValueError, TypeError):
                         pass
             _batch_shapes[key] = []
 
-    def _add_to_batch(shape, parent, stroke_rgb, width, dashes):
+    def _add_to_batch(shape, parent, stroke_rgb, fill_rgb, width, dashes):
         """Add a shape to the batch or create immediately if batching disabled."""
         nonlocal obj_count
         if not _batch_size:
             # No batching — original behavior
             obj = fc_doc.addObject("Part::Feature", "Wire")
             obj.Shape = shape
-            _apply_style(obj, stroke_rgb, width, dashes, opts)
+            _apply_style(obj, stroke_rgb, fill_rgb, width, dashes, opts)
             parent.addObject(obj)
             obj_count += 1
             return
         parent_name = parent.Name if hasattr(parent, 'Name') else str(id(parent))
         # Build a style key so shapes with different visual styles stay separate
         dash_key = tuple(dashes) if dashes else ()
-        style_key = f"{parent_name}|{stroke_rgb}|{width}|{dash_key}"
+        style_key = f"{parent_name}|{stroke_rgb}|{fill_rgb}|{width}|{dash_key}"
         if style_key not in _batch_shapes:
             _batch_shapes[style_key] = []
             _batch_parents[style_key] = parent
-            _batch_styles[style_key] = (stroke_rgb, width, dashes)
+            _batch_styles[style_key] = (stroke_rgb, fill_rgb, width, dashes)
         _batch_shapes[style_key].append(shape)
         if len(_batch_shapes[style_key]) >= _batch_size:
             _flush_batch(style_key, force=True)
@@ -2756,8 +2891,9 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             continue
 
         stroke = path_group.get("color") or path_group.get("stroke")
-        stroke_rgb = _norm_color(stroke)
+        stroke_rgb = _optional_color(stroke)
         fill = path_group.get("fill")
+        fill_rgb = _optional_color(fill)
         close_path = path_group.get("closePath", False)
         width = _as_float(path_group.get("width") or path_group.get("lineWidth"))
         dashes, dash_phase = _parse_dashes(path_group.get("dashes"))  # noqa: F841 — dash_phase stored for QA/adapter use; FC DrawStyle has no phase param
@@ -2780,7 +2916,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             if grp_area > page_area * 0.95:
                 continue
 
-        parent = _parent_for(stroke_rgb, layer_name)
+        parent = _parent_for(stroke_rgb or fill_rgb, layer_name)
 
         # Build edges per sub-path
         current_pt: Optional[Vector] = None
@@ -2989,14 +3125,14 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                             if _len2d(_v(p0.x, p0.y), _v(pN.x, pN.y)) > ZERO_TOL:
                                 closer = Part.LineSegment(pN, p0).toShape()
                                 wire = Part.Wire(edges + [closer])
-                    _add_to_batch(wire, parent, stroke_rgb, width, dashes)
+                    _add_to_batch(wire, parent, stroke_rgb, fill_rgb, width, dashes)
                 except (RuntimeError, ValueError, TypeError, AttributeError):
                     pass
             else:
                 # Faces and non-batchable shapes: create individually
                 obj = _make_shape_obj(edges, is_closed, make_face=want_face, fc_doc=fc_doc)
                 if obj is not None:
-                    _apply_style(obj, stroke_rgb, width, dashes, opts)
+                    _apply_style(obj, stroke_rgb, fill_rgb, width, dashes, opts)
                     parent.addObject(obj)
                     obj_count += 1
 
@@ -3069,12 +3205,13 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         if not svg_text_done:
           try:
             tdict = _preprocess_text_blocks(page.get_text("dict"))
+            layout_context = _build_text_layout_context(tdict)
             text_group = _make_group(top_group or fc_doc, "Text", fc_doc)
 
             # 3D Text uses extruded ShapeStrings; labels use editable Draft text.
             if opts.text_mode == "3d_text":
                 span_count = _render_text_spans_3d(
-                    tdict, text_group, page_h, opts, scale
+                    tdict, text_group, page_h, opts, scale, layout_context=layout_context
                 )
                 if span_count > 0:
                     obj_count += span_count
@@ -3105,7 +3242,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             exact_span_count = 0
             if prefer_exact_labels:
                 exact_span_count = _render_text_spans_exact_labels(
-                    tdict, text_group, page_h, opts, scale
+                    tdict, text_group, page_h, opts, scale, layout_context=layout_context
                 )
                 if exact_span_count > 0:
                     obj_count += exact_span_count
@@ -3137,7 +3274,9 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     prefer_rotated_exact = _env_rot not in ("0", "false", "off", "no")
                 if prefer_rotated_exact:
                     rotated_span_count = _render_text_spans_exact_labels(
-                        tdict, text_group, page_h, opts, scale, only_rotated=True
+                        tdict, text_group, page_h, opts, scale,
+                        only_rotated=True,
+                        layout_context=layout_context,
                     )
                     if rotated_span_count > 0 and opts.verbose:
                         _msg(f"  Text: {rotated_span_count} rotated span labels (exact placement)")
@@ -3262,6 +3401,10 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     all_y1 = max(ln.get("bbox", (0,0,0,-9e9))[3] for ln in grp)
                     _stripped = content.strip()
                     is_short = len(_stripped) <= 40
+                    is_bom_quantity = (
+                        len(all_spans) == 1
+                        and _is_bom_quantity_span(all_spans[0], _stripped, layout_context)
+                    )
 
                     # Use span origins to recover the PDF baseline. Some OCR /
                     # generated PDFs contain outlier span origins, so we use the
@@ -3313,6 +3456,10 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                         dx, dy = 1.0, 0.0
                         is_horizontal = True
                         angle_deg = 0.0
+                    if is_bom_quantity:
+                        dx, dy = 1.0, 0.0
+                        is_horizontal = True
+                        angle_deg = 0.0
 
                     _spans0 = grp[0].get("spans", []) or []
                     _ref_o = _spans0[0].get("origin") if _spans0 else None
@@ -3348,6 +3495,17 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                         size_pt *= 0.85
 
                     font_size_fc = size_pt * scale
+                    if is_bom_quantity:
+                        quantity_origin = _horizontal_quantity_origin_pdf(
+                            all_spans[0],
+                            _stripped,
+                            font_size_fc,
+                            scale,
+                        )
+                        if quantity_origin:
+                            x_pdf, baseline_y = quantity_origin
+                            justification = "Left"
+                            baseline_from_origin_used = True
                     render_width_pdf = _estimate_text_width_mm(content, font_size_fc) / max(scale, 1e-12)
                     orig_width_pdf = max(0.0, all_x1 - all_x0)
 
@@ -3367,6 +3525,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                         "line_key": _gy,
                         "ascender": _asc,
                         "descender": _desc,
+                        "source_color": _span_source_color(all_spans[0]),
                     })
 
                 layout_items = _resolve_horizontal_run_overlaps(layout_items, scale)
@@ -3400,6 +3559,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                             t.ViewObject.Justification = item["justification"]
                         except (AttributeError, RuntimeError, TypeError, ValueError):
                             pass
+                        _apply_text_color(t, item.get("source_color"))
                         text_group.addObject(t)
                         obj_count += 1
                         if text_entity_info is None:
@@ -3427,7 +3587,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 if not items:
                     continue
                 stroke = path_group.get("color") or path_group.get("stroke")
-                stroke_rgb = _norm_color(stroke)
+                stroke_rgb = _optional_color(stroke)
                 current_pt = None
                 sub_edges = []
                 for item in items:
@@ -3440,11 +3600,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                                 obj = fc_doc.addObject("Part::Feature", "Hatch")
                                 obj.Shape = wire
                                 hatch_group.addObject(obj)
-                                if stroke_rgb:
-                                    try:
-                                        obj.ViewObject.LineColor = stroke_rgb
-                                    except (AttributeError, RuntimeError, TypeError):
-                                        pass
+                                _apply_style(obj, stroke_rgb, None, None, None, opts)
                                 obj_count += 1
                             except (RuntimeError, ValueError, TypeError, AttributeError):
                                 pass
@@ -3475,6 +3631,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                         obj = fc_doc.addObject("Part::Feature", "Hatch")
                         obj.Shape = wire
                         hatch_group.addObject(obj)
+                        _apply_style(obj, stroke_rgb, None, None, None, opts)
                         obj_count += 1
                     except (RuntimeError, ValueError, TypeError):
                         pass
@@ -3655,6 +3812,15 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         _err(f"Cannot open PDF: {e}")
         return
 
+    try:
+        pdf_doc_for_import = safe_open(pdf_path)
+    except PdfOpenError as e:
+        _err(str(e))
+        return
+    except (RuntimeError, OSError) as e:
+        _err(f"Cannot open PDF: {e}")
+        return
+
     # Wrap entire import in a FreeCAD transaction so Ctrl+Z undoes it in one step
     fc_doc.openTransaction("Import PDF")
     t_phase = time.perf_counter()
@@ -3671,7 +3837,13 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                 continue
             try:
                 _msg(f"Importing page {p}/{total_pages} ({imported_count+1} of {len(pages)})...")
-                _, page_text_info = import_pdf_page(pdf_path, page_num=p, opts=opts, autofit=False)
+                _, page_text_info = _import_pdf_page_inner(
+                    pdf_doc_for_import,
+                    pdf_path,
+                    p,
+                    opts,
+                    fc_doc,
+                )
                 if page_text_info:
                     if all_text_entity_info is None:
                         all_text_entity_info = page_text_info.copy()
@@ -3720,6 +3892,11 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     except Exception:
         fc_doc.abortTransaction()
         raise
+    finally:
+        try:
+            pdf_doc_for_import.close()
+        except (RuntimeError, AttributeError):
+            pass
 
     t_phase = time.perf_counter()
     fc_doc.recompute()

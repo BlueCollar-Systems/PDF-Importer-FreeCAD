@@ -11,8 +11,12 @@ sys.path.insert(0, str(SRC_DIR))
 
 from PDFImporterCore import (  # noqa: E402
     MM_PER_PT,
+    _build_text_layout_context,
     _effective_descender,
     _fit_font_size_to_span_bbox,
+    _horizontal_quantity_origin_pdf,
+    _is_bom_quantity_span,
+    _norm_color,
     _reconstruct_line_text,
     _repair_fraction_artifact_runs,
 )
@@ -87,6 +91,37 @@ class TestPdfImporterTextReconstruction(unittest.TestCase):
         fitted = _fit_font_size_to_span_bbox("3 3/8", size, span, MM_PER_PT, 90.0)
 
         self.assertLess(fitted, size)
+
+    def test_packed_integer_text_color_decodes_to_rgb(self) -> None:
+        rgb = _norm_color(0x66AA33)
+
+        self.assertAlmostEqual(rgb[0], 0x66 / 255.0, places=4)
+        self.assertAlmostEqual(rgb[1], 0xAA / 255.0, places=4)
+        self.assertAlmostEqual(rgb[2], 0x33 / 255.0, places=4)
+
+    def test_bom_quantity_span_is_kept_horizontal_from_quan_context(self) -> None:
+        tdict = {
+            "blocks": [{
+                "type": 0,
+                "lines": [{
+                    "spans": [{"text": "QUAN", "bbox": (100.0, 20.0, 124.0, 32.0)}],
+                }],
+            }],
+        }
+        quantity_span = {
+            "text": "1",
+            "bbox": (106.0, 78.0, 112.0, 92.0),
+            "size": 8.0,
+            "descender": -0.2,
+        }
+        ctx = _build_text_layout_context(tdict)
+
+        self.assertTrue(_is_bom_quantity_span(quantity_span, "1", ctx))
+        origin = _horizontal_quantity_origin_pdf(quantity_span, "1", 8.0 * MM_PER_PT, MM_PER_PT)
+
+        self.assertIsNotNone(origin)
+        self.assertLess(origin[0], 109.0)
+        self.assertAlmostEqual(origin[1], 90.4, places=2)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

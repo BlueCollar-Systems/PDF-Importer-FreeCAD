@@ -2,11 +2,23 @@
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "PDFVectorImporter"))
 
 from pdfcadcore.semantic_members import plan_semantic_members  # noqa: E402
 
+CORPUS = os.environ.get("BCS_CORPUS_ROOT", r"C:\1pdf-test-corpus")
+CATALOG = os.path.join(CORPUS, "profiles", "aisc_v16_profiles.json")
 
+needs_catalog = pytest.mark.skipif(
+    not os.path.isfile(CATALOG),
+    reason=f"VISIBLE SKIP: profile catalog missing at {CATALOG} "
+           "(regenerate via corpus tools/generate_aisc_profiles.py)",
+)
+
+
+@needs_catalog
 def test_plan_semantic_members_from_1017_intent():
     intent = {
         "feasible": True,

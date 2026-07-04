@@ -65,7 +65,7 @@ def iter_files(root: Path) -> Iterable[Path]:
     elif root.name == "1PDF-Importer-Blender":
         globs = ["README.md", "blender_pdf_vector_importer/**/*.py", "pdf_vector_importer/**/*.py", "tests/**/*.py"]
     elif root.name == "1PDF-Importer-LibreCAD":
-        globs = ["README.md", "librecad_pdf_importer/**/*.py", "*.py", "tests/**/*.py"]
+        globs = ["README.md", "pdfcadcore/**/*.py", "librecad_pdf_importer/**/*.py", "*.py", "tests/**/*.py"]
     else:
         globs = ["README.md", "lib/**/*.dart", "docs/**/*"]
 

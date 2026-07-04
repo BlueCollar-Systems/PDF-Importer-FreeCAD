@@ -18,6 +18,7 @@ import tempfile
 import time
 import traceback
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
 # Ensure bundled PyMuPDF is importable (skip namespace-only stubs in lib/)
@@ -649,6 +650,35 @@ def write_import_report(
         performance_phases=phases or None,
         extra=extra,
     )
+
+    provenance_objects = list(getattr(opts, "_source_provenance_objects", []) or [])
+    if provenance_objects:
+        from pdfcadcore.source_provenance import (
+            ensure_import_session_id,
+            write_source_provenance_sidecar,
+        )
+
+        session_id = ensure_import_session_id(opts)
+        sidecar_path = str(Path(output_path).with_name("source_provenance.json"))
+        build_stamp = str((report.report_meta or {}).get("build_stamp") or "")
+        write_source_provenance_sidecar(
+            output_path=sidecar_path,
+            import_session_id=session_id,
+            pdf_path=pdf_path,
+            objects=provenance_objects,
+            host_app="freecad",
+            importer_version=_importer_version(),
+            build_stamp=build_stamp,
+            page_count=int(total_pages or pages_imported or 0) or None,
+        )
+        extra_ref = report.extra
+        extra_ref["source_provenance_path"] = Path(sidecar_path).name
+        extra_ref["source_provenance"] = {
+            "schema": "bcs.source_provenance/1.0",
+            "import_session_id": session_id,
+            "object_count": len(provenance_objects),
+        }
+
     report.write_json(output_path)
     return output_path
 
@@ -1861,6 +1891,22 @@ def _render_text_spans_exact_labels(
                     text_group.addObject(t)
                 except (AttributeError, RuntimeError, TypeError, ValueError):
                     pass
+                try:
+                    from pdfcadcore.source_provenance import record_text_span_provenance
+
+                    page_num = int(getattr(opts, "_provenance_page", 1) or 1)
+                    record_text_span_provenance(
+                        opts,
+                        page=page_num,
+                        span=span,
+                        text=txt,
+                        created_entity_type="native_label",
+                        parent_handle=str(getattr(text_group, "Name", "") or ""),
+                        import_mode=str(getattr(opts, "import_mode", "") or ""),
+                        text_mode=str(getattr(opts, "text_mode", "") or "labels"),
+                    )
+                except (ImportError, TypeError, ValueError):
+                    pass
                 count += 1
     return count
 
@@ -2450,6 +2496,8 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             "Please remove the encryption (e.g., print to a new PDF) and try again.")
     if page_num < 1 or page_num > len(pdf_doc):
         raise ValueError(f"Page {page_num} out of range 1..{len(pdf_doc)}")
+
+    opts._provenance_page = int(page_num)
 
     page = pdf_doc.load_page(page_num - 1)
     # Use rotation-corrected height for Y-flip — for 90°/270° pages the

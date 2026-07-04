@@ -27,13 +27,13 @@ class TestReportMeta(unittest.TestCase):
     def test_build_report_meta_includes_build_stamp(self) -> None:
         meta = build_report_meta(
             host_app="freecad",
-            importer_version="4.0.57",
+            importer_version="4.0.58",
             report_sha256="abc123",
         )
         self.assertEqual("freecad", meta["host"])
-        self.assertEqual("4.0.57", meta["semver"])
+        self.assertEqual("4.0.58", meta["semver"])
         self.assertIn("freecad", meta["build_stamp"])
-        self.assertIn("4.0.57", meta["build_stamp"])
+        self.assertIn("4.0.58", meta["build_stamp"])
         self.assertIn("abc123", meta["build_stamp"])
 
     def test_import_report_emits_report_meta(self) -> None:
@@ -50,7 +50,7 @@ class TestReportMeta(unittest.TestCase):
             doc.close()
             report = build_import_report(
                 host_app="freecad",
-                importer_version="4.0.57",
+                importer_version="4.0.58",
                 pdf_path=str(pdf_path),
                 pages=1,
                 primitive_count=3,
@@ -61,7 +61,7 @@ class TestReportMeta(unittest.TestCase):
             payload = report.to_dict()
             self.assertIn("report_meta", payload)
             self.assertEqual("freecad", payload["report_meta"]["host"])
-            self.assertEqual("4.0.57", payload["report_meta"]["semver"])
+            self.assertEqual("4.0.58", payload["report_meta"]["semver"])
             self.assertTrue(payload["report_meta"]["build_stamp"])
 
 

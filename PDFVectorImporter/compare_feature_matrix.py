@@ -43,7 +43,7 @@ FEATURES: List[Feature] = [
     Feature("lineweight_modes", "Lineweight handling modes", r"\b(lineweight_mode|lineweight)\b", {"SU", "FC", "BL", "LC"}),
     Feature("doc_profiling", "Document profiling/classification", r"\b(document_profiler|profile_page|primary_type)\b", {"SU", "FC", "BL", "LC"}),
     Feature("scale_reference", "Scale by reference tooling", r"\b(Scale by Reference|scale tool|reference_real_mm|PDFScaleTool)\b", {"SU", "FC", "BL", "LC"}),
-    Feature("cli_surface", "CLI surface", r"\b(argparse|cli\.py|pdf2dxf\.py)\b", {"SU", "FC", "BL", "LC"}),
+    Feature("cli_surface", "CLI surface", r"\b(argparse|OptionParser|cli\.(?:py|rb)|pdf2dxf\.py)\b", {"SU", "FC", "BL", "LC"}),
     Feature("gui_surface", "GUI surface", r"\b(HtmlDialog|QDialog|bpy\.types\.Operator|--gui|Tkinter)\b", {"SU", "FC", "BL", "LC"}),
     Feature("batch_import", "Batch import workflows", r"\b(Batch Import|batch import|BatchImportCommand)\b", {"SU", "FC", "BL", "LC"}),
     Feature("qa_automation", "Automated QA harness", r"\b(run_pdf_vector_importer_tests|qa_config|pytest|smoke_test|qa_smoke)\b", {"SU", "FC", "BL", "LC"}),

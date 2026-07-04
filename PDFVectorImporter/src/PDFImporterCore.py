@@ -448,6 +448,11 @@ class ImportOptions:
     #   raster  — render full page as image, skip vectors
     #   hybrid  — raster background + vector geometry on top
     import_mode: str = "auto"
+    # Optional 3D model generation.  "auto" only runs when text evidence
+    # indicates an honest third dimension; "extrude" forces closed-shape
+    # extrusion with page-background guards.
+    model3d_mode: str = "off"              # "off" | "auto" | "extrude"
+    model3d_depth_mm: float = 3.175        # default 1/8 in plate thickness
     max_bezier_segments: int = 128
     # Arc reconstruction
     detect_arcs: bool = True
@@ -678,6 +683,22 @@ def write_import_report(
             "import_session_id": session_id,
             "object_count": len(provenance_objects),
         }
+
+    from pdfcadcore.parts_bootstrap import write_parts_bootstrap_sidecar
+
+    bootstrap_path = str(Path(output_path).with_name("parts_bootstrap.json"))
+    write_parts_bootstrap_sidecar(
+        bootstrap_path,
+        pdf_path,
+        page_count=int(total_pages or pages_imported or 0) or None,
+    )
+    extra_ref = report.extra
+    extra_ref["parts_bootstrap"] = {
+        "schema": "bcs.parts_bootstrap/1.0",
+        "sidecar_path": Path(bootstrap_path).name,
+        "row_count": 0,
+        "note": "stub emitter — BOM extraction deferred",
+    }
 
     report.write_json(output_path)
     return output_path
@@ -914,6 +935,88 @@ def _make_shape_obj(edges: List, closed: bool, make_face: bool, fc_doc=None):
         return obj
     except (RuntimeError, ValueError, TypeError):
         return None
+
+
+def _normalize_model3d_mode(raw) -> str:
+    mode = str(raw or "off").strip().lower().replace("-", "_").replace(" ", "_")
+    if mode in {"yes", "true", "on", "auto_if_evidence"}:
+        return "auto"
+    if mode in {"closed", "closed_shapes", "extrude_closed_shapes", "force"}:
+        return "extrude"
+    if mode in {"auto", "extrude"}:
+        return mode
+    return "off"
+
+
+def _model3d_depth_units(opts: ImportOptions) -> float:
+    try:
+        depth = float(getattr(opts, "model3d_depth_mm", 3.175) or 3.175)
+    except (TypeError, ValueError):
+        depth = 3.175
+    return max(0.0, depth)
+
+
+def _model3d_should_extrude(
+    opts: ImportOptions,
+    *,
+    is_closed: bool,
+    fill,
+    face_area: float,
+    page_area: float,
+) -> bool:
+    mode = _normalize_model3d_mode(getattr(opts, "model3d_mode", "off"))
+    if mode == "off" or not is_closed:
+        return False
+    if _model3d_depth_units(opts) <= 0.0:
+        return False
+    if face_area <= 1e-6:
+        return False
+    # Skip full-page paper/background fills and border frames.
+    if page_area > 1e-6 and face_area / page_area >= 0.80:
+        return False
+    if mode == "auto":
+        if not bool(getattr(opts, "_model3d_intent_feasible", False)):
+            return False
+        # Auto is deliberately conservative: only extrude filled closed
+        # regions when the drawing text supplies third-dimension evidence.
+        return fill is not None
+    return True
+
+
+def _make_model3d_obj(edges: List, fc_doc=None):
+    if not edges:
+        return None
+    doc = fc_doc or FreeCAD.ActiveDocument
+    try:
+        wire = Part.Wire(edges)
+        if not wire.isClosed() and wire.Vertexes:
+            p0 = wire.Vertexes[0].Point
+            pN = wire.Vertexes[-1].Point
+            if _len2d(_v(p0.x, p0.y), _v(pN.x, pN.y)) > ZERO_TOL:
+                closer = Part.LineSegment(pN, p0).toShape()
+                wire = Part.Wire(edges + [closer])
+        if not wire.isClosed():
+            return None
+        face = Part.Face(wire)
+        if face.Area <= 1e-6:
+            return None
+        obj = doc.addObject("Part::Feature", "PDF_3D_Solid")
+        obj.Shape = face
+        return obj
+    except (RuntimeError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def _extrude_model3d_obj(obj, opts: ImportOptions) -> bool:
+    if obj is None:
+        return False
+    try:
+        depth = _model3d_depth_units(opts)
+        obj.Shape = obj.Shape.extrude(Vector(0, 0, depth))
+        return True
+    except (RuntimeError, ValueError, TypeError, AttributeError) as e:
+        _warn(f"3D extrusion failed: {e}")
+        return False
 
 
 def _apply_style(obj, stroke_rgb, fill_rgb, width, dashes, opts: ImportOptions):
@@ -2510,6 +2613,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         _fc_mb_w, _fc_mb_h = float(page.rect.width), float(page.rect.height)
     page_h = _fc_mb_w if _fc_rot in (90, 270) else _fc_mb_h
     scale = (MM_PER_PT if opts.scale_to_mm else 1.0) * opts.user_scale
+    page_area_units = max(abs(_fc_mb_w * scale * page_h * scale), 1e-9)
 
     # Top-level group
     top_group = None
@@ -3183,6 +3287,23 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     _apply_style(obj, stroke_rgb, fill_rgb, width, dashes, opts)
                     parent.addObject(obj)
                     obj_count += 1
+                    try:
+                        face_area = float(getattr(obj.Shape, "Area", 0.0) or 0.0)
+                    except (AttributeError, TypeError, ValueError):
+                        face_area = 0.0
+                    if _model3d_should_extrude(
+                        opts,
+                        is_closed=is_closed,
+                        fill=fill,
+                        face_area=abs(face_area),
+                        page_area=page_area_units,
+                    ):
+                        solid = _make_model3d_obj(edges, fc_doc=fc_doc)
+                        if solid is not None and _extrude_model3d_obj(solid, opts):
+                            _apply_style(solid, stroke_rgb, fill_rgb, width, dashes, opts)
+                            parent.addObject(solid)
+                            obj_count += 1
+                            opts._model3d_solids = int(getattr(opts, "_model3d_solids", 0) or 0) + 1
 
     # ── Flush remaining batched shapes ──
     if _batch_size:
@@ -3836,6 +3957,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     _unit_scale = (MM_PER_PT if opts.scale_to_mm else 1.0) * opts.user_scale
     page_height_scaled = 792 * _unit_scale  # default: US Letter height in points
     page_heights_scaled: Dict[int, float] = {}
+    model3d_text_evidence: List[str] = []
     t_phase = time.perf_counter()
     try:
         from pdfcadcore.fitz_loader import PdfOpenError, safe_open
@@ -3849,10 +3971,29 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             for p in pages:
                 if 1 <= p <= total_pages:
                     try:
-                        page_heights_scaled[p] = pdoc.load_page(p - 1).rect.height * _unit_scale
+                        _page_for_meta = pdoc.load_page(p - 1)
+                        page_heights_scaled[p] = _page_for_meta.rect.height * _unit_scale
+                        try:
+                            model3d_text_evidence.append(_page_for_meta.get_text("text") or "")
+                        except (RuntimeError, ValueError, AttributeError):
+                            pass
                     except (ValueError, RuntimeError):
                         pass
         opts.phase_timings_ms["open_pdf_ms"] = (time.perf_counter() - t_phase) * 1000.0
+        try:
+            from pdfcadcore.model3d_intent import analyze_model3d_intent
+
+            intent = analyze_model3d_intent(model3d_text_evidence, host_supports_3d=True)
+            opts._model3d_intent = intent.to_dict()
+            opts._model3d_intent_feasible = bool(intent.feasible)
+        except (ImportError, RuntimeError, TypeError, ValueError, AttributeError):
+            opts._model3d_intent = {
+                "feasible": False,
+                "plates": [],
+                "members": [],
+                "skipped_reason": "3D intent analysis unavailable",
+            }
+            opts._model3d_intent_feasible = False
     except PdfOpenError as e:
         _err(str(e))
         return

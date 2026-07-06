@@ -53,3 +53,5 @@ PDFVectorImporter/temp/
 # Local PDF QA/vendor artifacts (keep local, do not track)
 PDFVectorImporter/src/lib/
 test_all_pdfs.py
+
+_LLM_CONTROL_PACK/

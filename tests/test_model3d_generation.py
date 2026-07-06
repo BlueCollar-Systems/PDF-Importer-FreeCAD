@@ -15,10 +15,11 @@ def test_import_config_carries_model3d_options():
 
 def test_freecad_gui_exposes_model3d_controls():
     source = CMD.read_text(encoding="utf-8")
-    assert "Auto (if drawing has 3D evidence)" in source
-    assert "Extrude closed shapes" in source
+    assert "SHAPE_EXTRUSION_UI_ENABLED" in source
     assert "opts.model3d_mode" in source
     assert "opts.model3d_depth_mm" in source
+    assert "Auto (if drawing has 3D evidence)" in source
+    assert "Extrude closed shapes" in source
 
 
 def test_freecad_core_builds_and_reports_model3d_solids():

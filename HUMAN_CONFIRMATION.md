@@ -1,32 +1,34 @@
-# Human Confirmation — PDF Vector Importer (FreeCAD)
+# Human Verification — PDF Vector Importer (FreeCAD)
 
-**Coordination:** see Desktop Q&A COORDINATION-HUB or `_LLM_CONTROL_PACK/QA/QA-2026-06-24_COORDINATION-HUB.md`
+Use **your own shop PDFs** for sign-off. There is no fixed public test matrix.
 
-**Prep:** 2026-06-24 · See `Desktop/PDFTest Files/Q&A/QA-2026-06-24_human-confirmation-script.md`
+## Before you start
 
-## Setup
+1. Install the latest workbench release from GitHub Releases.
+2. Confirm the workbench loads under **Tools → Addon Manager** or your install path.
 
-1. Workbench **v4.0.45+** installed.
-2. `$env:BCS_CORPUS_ROOT = 'C:\1pdf-test-corpus'`
-3. `python C:\1pdf-test-corpus\tools\list_tier1.py --host FC --resolved`
+## Checklist
 
-## Tier-1 matrix
+For each representative shop drawing you import:
 
-Import each resolved Tier-1 PDF with **Labels**, **Glyphs**, and **ShapeString/3D text** where applicable. Save `import_report.json` each time.
+| Check | Pass |
+|-------|------|
+| **Labels** — BOM, dimensions, and notes readable | ☐ |
+| **Glyphs/Outlines** — linework faithful to the PDF | ☐ |
+| **3D Text** (if used) — extruded letterforms present | ☐ |
+| Scale plausible vs the source drawing | ☐ |
+| Multi-page import behaves as expected | ☐ |
 
-| PDF | Labels | Glyphs | 3D text | Notes |
-|-----|--------|--------|---------|-------|
-| 1017 - Rev 0 | ☐ | ☐ | ☐ | Fab steel reference |
-| Welding-Symbol-Chart | ☐ | ☐ | n/a | Symbol fidelity |
-| hello_world_rotated | ☐ | ☐ | ☐ | Rotation |
-| text_only_fontsNotEmbedded | ☐ | ☐ | ☐ | Font fallback |
-| Simple PDF 2.0 | ☐ | ☐ | ☐ | Vector smoke |
+## After each import
 
-## Automated
+- Save `import_report.json` from the import folder
+- If something looks wrong: use [Report Doctor](https://bluecollarsystems.com/report-doctor) or **Send Feedback** with screenshots and your report JSON
 
-```powershell
-python -m pytest tests/test_import_report_human_summary.py -q
-python C:\1pdf-test-corpus\tools\list_tier1.py --host FC --resolved
-```
+## Sign-off
+
+| Role | Name | Date | Result |
+|------|------|------|--------|
+| Shop tester | | | |
+| Engineering | | | |
 
 BUILT. NOT BOUGHT.

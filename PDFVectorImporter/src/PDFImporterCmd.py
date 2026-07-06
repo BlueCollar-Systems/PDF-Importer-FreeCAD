@@ -26,6 +26,9 @@ except ImportError:
     except ImportError:
         fitz = None
 
+# Shelved 2026-07-06: closed-region shape extrusion deferred; code retained.
+SHAPE_EXTRUSION_UI_ENABLED = False
+
 try:
     from PySide6 import QtWidgets
 except ImportError:
@@ -190,8 +193,9 @@ class ImportPDFDialog(QtWidgets.QDialog):
         form.addRow("Text Mode:", self.text_combo)
         form.addRow("Grouping:", self.grouping_combo)
         form.addRow("Page Layout:", self.page_arrangement_combo)
-        form.addRow("3D Model:", self.model3d_combo)
-        form.addRow("3D Depth:", self.model3d_depth_spin)
+        if SHAPE_EXTRUSION_UI_ENABLED:
+            form.addRow("3D Model:", self.model3d_combo)
+            form.addRow("3D Depth:", self.model3d_depth_spin)
         form.addRow(self.advanced_group)
 
         btns = QtWidgets.QDialogButtonBox(
@@ -445,9 +449,13 @@ class ImportPDFDialog(QtWidgets.QDialog):
         opts.cleanup_level = "balanced"
         opts.lineweight_mode = "preserve"
         opts.grouping_mode = _grp_rev.get(self.grouping_combo.currentText(), "per_page")
-        _m3d_rev = {v: k for k, v in self._MODEL3D_MAP.items()}
-        opts.model3d_mode = _m3d_rev.get(self.model3d_combo.currentText(), "off")
-        opts.model3d_depth_mm = float(self.model3d_depth_spin.value())
+        if SHAPE_EXTRUSION_UI_ENABLED:
+            _m3d_rev = {v: k for k, v in self._MODEL3D_MAP.items()}
+            opts.model3d_mode = _m3d_rev.get(self.model3d_combo.currentText(), "off")
+            opts.model3d_depth_mm = float(self.model3d_depth_spin.value())
+        else:
+            opts.model3d_mode = "off"
+            opts.model3d_depth_mm = 3.175
 
         return opts
 

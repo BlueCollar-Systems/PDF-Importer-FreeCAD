@@ -7,8 +7,11 @@ import pytest
 import sys
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'PDFVectorImporter'))
+REPO_ROOT = os.path.join(os.path.dirname(__file__), '..')
+sys.path.insert(0, REPO_ROOT)
+sys.path.insert(0, os.path.join(REPO_ROOT, 'PDFVectorImporter'))
 
+from corpus_paths import resolve_manifest_entry  # noqa: E402
 from pdfcadcore.primitive_extractor import extract_page, _FRAC_STACKED_SCALE
 from pdfcadcore.import_report import TextEntityVerification, ImportReport
 import fitz  # PyMuPDF
@@ -71,10 +74,10 @@ class TestIntegrationSmoke:
 
     def test_fraction_extraction_with_test_pdf(self):
         """Test fraction extraction on real PDF data."""
-        corpus_root = os.environ.get("BCS_CORPUS_ROOT", r"C:\1pdf-test-corpus")
-        pdf_path = os.path.join(corpus_root, "tier1", "user", "1017 - Rev 0.pdf")
-        if not os.path.exists(pdf_path):
-            pytest.skip(f"Test PDF not found: {pdf_path}")
+        pdf_path = resolve_manifest_entry("T1-01")
+        if pdf_path is None or not os.path.exists(pdf_path):
+            pytest.skip("Corpus manifest entry T1-01 not available (set BCS_CORPUS_ROOT)")
+        pdf_path = str(pdf_path)
         
         try:
             doc = fitz.open(pdf_path)

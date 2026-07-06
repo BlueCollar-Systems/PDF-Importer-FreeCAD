@@ -18,8 +18,8 @@ def test_fraction_parsing_exact():
     assert parse_fraction_inches("0/0") is None
 
 
-def test_1017_bom_rows_detect_plates_and_members():
-    # Real rows from '1017 - Rev 0' (T-01 field drawing).
+def test_tier1_user_bom_rows_detect_plates_and_members():
+    # Representative BOM rows from Tier-1 user fabrication drawing (T1-01).
     rows = [
         'p1016 PL3/8"X6 7/8"',
         'p1019 PL3/8"X7 3/4"',

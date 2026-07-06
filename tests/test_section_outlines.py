@@ -39,8 +39,8 @@ def test_w12x30_outline_matches_aisc_dims():
 
 
 @needs_catalog
-def test_1017_drawing_members_all_resolve_to_outlines():
-    # Every rolled shape the T-01 field drawing needs must produce geometry.
+def test_tier1_user_drawing_members_all_resolve_to_outlines():
+    # Every rolled shape the Tier-1 user drawing needs must produce geometry.
     for desig in ("W12X30", "W8X15", "L3X3X3/8"):
         out = section_outline(resolve_profile(desig))
         assert out is not None, desig

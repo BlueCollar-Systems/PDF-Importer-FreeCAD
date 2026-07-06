@@ -19,7 +19,7 @@ needs_catalog = pytest.mark.skipif(
 
 
 @needs_catalog
-def test_plan_semantic_members_from_1017_intent():
+def test_plan_semantic_members_from_tier1_intent():
     intent = {
         "feasible": True,
         "members": [

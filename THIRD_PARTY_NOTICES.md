@@ -30,5 +30,6 @@ A machine-readable manifest of every bundled binary (path, version, license,
 SHA-256) can be regenerated from the shared corpus tool:
 
 ```
-python C:\1pdf-test-corpus\tools\dependency_audit.py
+# From a BCS_CORPUS_ROOT checkout:
+python tools/dependency_audit.py
 ```

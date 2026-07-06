@@ -34,7 +34,7 @@ class PartsBootstrapTest(unittest.TestCase):
         "1017FR1 W12X30",
     ]
 
-    def test_extract_bootstrap_rows_from_1017_bom(self):
+    def test_extract_bootstrap_rows_from_tier1_bom(self):
         items = [{"text": line, "page": 1} for line in self.BOM_LINES]
         rows = extract_bootstrap_rows(items)
         marks = {row["piece_mark"].lower() for row in rows}

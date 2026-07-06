@@ -16,20 +16,12 @@ def corpus_root() -> Path:
     return Path("C:/1pdf-test-corpus")
 
 
-def desktop_mirror(name: str) -> Path | None:
-    desktop = Path.home() / "Desktop" / "PDFTest Files" / name
-    return desktop if desktop.is_file() else None
-
-
 def resolve_entry(root: Path, entry: dict) -> Path | None:
     local = entry.get("local_path")
     if local:
         candidate = root / local.replace("/", os.sep)
         if candidate.is_file():
             return candidate
-    fallback = entry.get("desktop_fallback")
-    if fallback:
-        return desktop_mirror(fallback)
     return None
 
 

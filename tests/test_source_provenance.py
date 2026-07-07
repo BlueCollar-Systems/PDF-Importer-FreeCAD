@@ -14,8 +14,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "PDFVectorImporter" / "src"
 MOD_ROOT = REPO_ROOT / "PDFVectorImporter"
-_CORPUS_ENV = os.environ.get("BCS_CORPUS_ROOT") or os.environ.get("PDF_TEST_CORPUS")
-CORPUS_ROOT = Path(_CORPUS_ENV) if _CORPUS_ENV else Path(r"C:\1pdf-test-corpus")
+_CORPUS_ENV = os.environ.get("BCS_PRIVATE_VALIDATION_ROOT") or os.environ.get("PDF_PRIVATE_VALIDATION_ROOT")
+CORPUS_ROOT = Path(_CORPUS_ENV) if _CORPUS_ENV else Path(r"__private_validation_assets_not_configured__")
 for path in (SRC_DIR, MOD_ROOT):
     sys.path.insert(0, str(path))
 

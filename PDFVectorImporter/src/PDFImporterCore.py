@@ -1817,6 +1817,88 @@ def _fit_font_size_to_span_bbox(
     )
 
 
+def _object_xy_bound_lengths(obj) -> Optional[Tuple[float, float]]:
+    """Return generated object X/Y bound lengths when the host exposes them."""
+    try:
+        shape = getattr(obj, "Shape", None)
+        bb = getattr(shape, "BoundBox", None) or getattr(obj, "BoundBox", None)
+        if bb is None:
+            return None
+        if hasattr(bb, "XLength") and hasattr(bb, "YLength"):
+            return max(0.0, float(bb.XLength)), max(0.0, float(bb.YLength))
+        xmin = float(getattr(bb, "XMin"))
+        xmax = float(getattr(bb, "XMax"))
+        ymin = float(getattr(bb, "YMin"))
+        ymax = float(getattr(bb, "YMax"))
+        return abs(xmax - xmin), abs(ymax - ymin)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _recompute_object_for_bounds(obj) -> None:
+    try:
+        doc = getattr(obj, "Document", None)
+        if doc is not None:
+            try:
+                doc.recompute([obj])
+                return
+            except TypeError:
+                doc.recompute()
+                return
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+    try:
+        if App is not None and getattr(App, "ActiveDocument", None) is not None:
+            App.ActiveDocument.recompute()
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+
+
+def _calibrate_shapestring_to_span_bbox(
+    ss,
+    span: dict,
+    font_size_fc: float,
+    scale: float,
+) -> float:
+    """Shrink generated ShapeString geometry if host font metrics exceed bbox."""
+    bbox = _span_bbox_pdf(span)
+    if not bbox:
+        return font_size_fc
+    x0, y0, x1, y1 = bbox
+    target_x = abs(x1 - x0) * max(float(scale), 1e-12)
+    target_y = abs(y1 - y0) * max(float(scale), 1e-12)
+    if target_x <= 1e-6 or target_y <= 1e-6:
+        return font_size_fc
+
+    _recompute_object_for_bounds(ss)
+    dims = _object_xy_bound_lengths(ss)
+    if not dims:
+        return font_size_fc
+    current_x, current_y = dims
+    factors = []
+    if current_x > target_x * 1.12 and current_x > 1e-9:
+        factors.append((target_x * 1.08) / current_x)
+    if current_y > target_y * 1.16 and current_y > 1e-9:
+        factors.append((target_y * 1.12) / current_y)
+    if not factors:
+        return font_size_fc
+
+    factor = max(0.05, min(1.0, min(factors)))
+    if factor >= 0.999:
+        return font_size_fc
+    new_size = max(0.1, float(font_size_fc) * factor)
+    try:
+        ss.Size = new_size
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return font_size_fc
+    try:
+        ss.Extrusion = max(new_size * 0.12, 0.05)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+    _recompute_object_for_bounds(ss)
+    return new_size
+
+
 def _build_text_layout_context(tdict: dict) -> dict:
     """Collect lightweight page context for table-specific text placement."""
     quan_headers = []
@@ -2170,6 +2252,7 @@ def _render_text_spans_3d(
                         ss.Extrusion = extrude
                     except (AttributeError, RuntimeError, TypeError, ValueError):
                         pass
+                    font_size_fc = _calibrate_shapestring_to_span_bbox(ss, span, font_size_fc, scale)
                     _apply_text_color(ss, _span_source_color(span))
                 except (AttributeError, RuntimeError, TypeError, ValueError):
                     pass

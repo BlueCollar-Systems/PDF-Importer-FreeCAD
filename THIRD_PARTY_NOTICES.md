@@ -27,9 +27,8 @@ For complete metadata in this package, see:
 ## Auditing what is bundled
 
 A machine-readable manifest of every bundled binary (path, version, license,
-SHA-256) can be regenerated from the shared corpus tool:
+SHA-256) can be regenerated from the private dependency-audit tooling:
 
 ```
-# From a BCS_CORPUS_ROOT checkout:
 python tools/dependency_audit.py
 ```

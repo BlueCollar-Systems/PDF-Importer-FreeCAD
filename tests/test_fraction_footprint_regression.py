@@ -19,7 +19,7 @@ from pdfcadcore.primitives import NormalizedText, next_id, reset_ids  # noqa: E4
 VECTOR_FILE = Path(
     os.environ.get(
         "BCS_STACKED_FRACTION_VECTORS",
-        r"C:\1pdf-test-corpus\conformance-vectors\stacked-fraction-merge-vectors.json",
+        r"__private_validation_assets_not_configured__\conformance-vectors\stacked-fraction-merge-vectors.json",
     )
 )
 FALLBACK_VECTORS = [

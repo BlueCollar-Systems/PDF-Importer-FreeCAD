@@ -15,7 +15,7 @@ add a small Ruby harness that:
 3) writes a result JSON file.
 
 Typical use:
-python adapters/sketchup_adapter.py --config qa_config.json --test-id SU-OCG-001 --input "C:/tests/1071 - Rev 0.pdf" --mode vector --dry-run
+python adapters/sketchup_adapter.py --config qa_config.json --test-id SU-OCG-001 --input "C:/path/to/your-drawing.pdf" --mode vector --dry-run
 """
 from __future__ import annotations
 

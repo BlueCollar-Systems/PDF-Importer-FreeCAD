@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Load AISC profile dimensions from the corpus catalog (R8-A / R8-E)."""
+"""Load AISC profile dimensions from the private validation catalog (R8-A / R8-E)."""
 
 from __future__ import annotations
 
@@ -16,14 +16,11 @@ def _normalize_designation(value: str) -> str:
 
 
 def _corpus_profiles_path() -> Optional[Path]:
-    root = os.environ.get("BCS_CORPUS_ROOT")
+    root = os.environ.get("BCS_PRIVATE_VALIDATION_ROOT")
     if root:
         candidate = Path(root) / "profiles" / "aisc_v16_profiles.json"
         if candidate.is_file():
             return candidate
-    default = Path(r"C:\1pdf-test-corpus\profiles\aisc_v16_profiles.json")
-    if default.is_file():
-        return default
     return None
 
 

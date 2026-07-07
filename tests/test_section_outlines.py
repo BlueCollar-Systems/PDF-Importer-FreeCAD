@@ -11,7 +11,7 @@ from pdfcadcore.section_outlines import (  # noqa: E402
     section_outline,
 )
 
-CORPUS = os.environ.get("BCS_CORPUS_ROOT", r"C:\1pdf-test-corpus")
+CORPUS = os.environ.get("BCS_PRIVATE_VALIDATION_ROOT", r"__private_validation_assets_not_configured__")
 CATALOG = os.path.join(CORPUS, "profiles", "aisc_v16_profiles.json")
 
 needs_catalog = pytest.mark.skipif(
@@ -40,7 +40,7 @@ def test_w12x30_outline_matches_aisc_dims():
 
 @needs_catalog
 def test_tier1_user_drawing_members_all_resolve_to_outlines():
-    # Every rolled shape the Tier-1 user drawing needs must produce geometry.
+    # Every rolled shape the private validation user drawing needs must produce geometry.
     for desig in ("W12X30", "W8X15", "L3X3X3/8"):
         out = section_outline(resolve_profile(desig))
         assert out is not None, desig

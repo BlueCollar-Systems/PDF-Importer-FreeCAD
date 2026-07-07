@@ -18,13 +18,13 @@ from pdfcadcore.primitives import NormalizedText, next_id, reset_ids  # noqa: E4
 
 
 def _corpus_root() -> Path:
-    env = os.environ.get("BCS_CORPUS_ROOT") or os.environ.get("PDF_TEST_CORPUS")
+    env = os.environ.get("BCS_PRIVATE_VALIDATION_ROOT") or os.environ.get("PDF_PRIVATE_VALIDATION_ROOT")
     if env:
         return Path(env)
-    default = Path(r"C:\1pdf-test-corpus")
+    default = Path(r"__private_validation_assets_not_configured__")
     if default.is_dir():
         return default
-    pytest.skip("BCS_CORPUS_ROOT not set and default corpus missing")
+    pytest.skip("BCS_PRIVATE_VALIDATION_ROOT not set and default corpus missing")
 
 
 def _vector_file() -> Path:

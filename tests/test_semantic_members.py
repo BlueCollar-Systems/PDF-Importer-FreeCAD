@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "PDFVectorImpor
 
 from pdfcadcore.semantic_members import plan_semantic_members  # noqa: E402
 
-CORPUS = os.environ.get("BCS_CORPUS_ROOT", r"C:\1pdf-test-corpus")
+CORPUS = os.environ.get("BCS_PRIVATE_VALIDATION_ROOT", r"__private_validation_assets_not_configured__")
 CATALOG = os.path.join(CORPUS, "profiles", "aisc_v16_profiles.json")
 
 needs_catalog = pytest.mark.skipif(

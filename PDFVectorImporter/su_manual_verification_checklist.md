@@ -16,13 +16,13 @@ Generated from `qa_results_auto_local_full_combined.json` + workbook `SketchUp T
   Metrics: 
 
 - SU-T019 | P0 | Geometry | Lines import correctly
-  Input: 1071 - Rev 0.pdf
+  Input: your-drawing.pdf
   Steps: Import with mode=auto
   Expected: Straight lines present matching PDF
   Metrics: Edge count > 1000
 
 - SU-T020 | P0 | Geometry | Arcs reconstructed from polyline segments
-  Input: 1071 - Rev 0.pdf
+  Input: your-drawing.pdf
   Steps: Import with mode=auto. Zoom to pipe bends.
   Expected: Smooth arcs, not faceted polylines
   Metrics: Arc count > 10. Radius deviation < 2% RMS
@@ -34,31 +34,31 @@ Generated from `qa_results_auto_local_full_combined.json` + workbook `SketchUp T
   Metrics: 
 
 - SU-T027 | P0 | Geometry | Faces created from closed paths
-  Input: 1071 - Rev 0.pdf
+  Input: your-drawing.pdf
   Steps: Import with mode=auto
   Expected: Faces present on closed filled paths
   Metrics: Face count > 0
 
 - SU-T028 | P0 | Text | Labels mode — text as SketchUp text entities
-  Input: 1071 - Rev 0.pdf
+  Input: your-drawing.pdf
   Steps: Import with Text=Labels
   Expected: Text objects placed near geometry. Readable.
   Metrics: Text count > 50
 
 - SU-T041 | P1 | Mode | Auto mode keeps fidelity invariant
-  Input: 1071 - Rev 0.pdf
+  Input: your-drawing.pdf
   Steps: Import with mode=auto and default text settings
   Expected: Geometry, faces, and text preserve source fidelity.
   Metrics: Record import time and geometry/text counts
 
 - SU-T044 | P0 | Core-1071 | Complete shop drawing import
-  Input: 1071 - Rev 0.pdf
+  Input: your-drawing.pdf
   Steps: Import with mode=auto
   Expected: Geometry complete. Dimensions readable. Part marks visible.
   Metrics: Edges>1000, Arcs>10, Text>50
 
 - SU-T047 | P0 | Core-1071 | Import time
-  Input: 1071 - Rev 0.pdf
+  Input: your-drawing.pdf
   Steps: Time the import
   Expected: < 15 seconds on modern hardware
   Metrics: Record actual time
@@ -88,7 +88,7 @@ Generated from `qa_results_auto_local_full_combined.json` + workbook `SketchUp T
   Metrics: 
 
 - SU-T067 | P0 | Perf | Shop drawing runtime
-  Input: 1071 - Rev 0.pdf
+  Input: your-drawing.pdf
   Steps: Time mode=auto import
   Expected: < 15 seconds
   Metrics: Record time
@@ -100,7 +100,7 @@ Generated from `qa_results_auto_local_full_combined.json` + workbook `SketchUp T
   Metrics: Record time
 
 - SU-T078 | P0 | Undo | Re-import produces identical result
-  Input: 1071 - Rev 0.pdf
+  Input: your-drawing.pdf
   Steps: Import twice with same settings. Compare edge counts.
   Expected: Edge count identical both times.
   Metrics: 

@@ -52,6 +52,7 @@ class TestPdfImporterTextReconstruction(unittest.TestCase):
         self.assertIn("ss.Size = font_size_fc", source)
         self.assertIn("ss.ScaleToSize = True", source)
         self.assertIn("ss.MakeFace = True", source)
+        self.assertIn("_calibrate_shapestring_to_span_bbox(ss, span, font_size_fc, scale)", source)
         self.assertNotIn("ss.ViewObject.FontSize = font_size_fc", source)
 
     def test_raster_background_uses_effective_import_scale(self) -> None:

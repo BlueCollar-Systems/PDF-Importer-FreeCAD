@@ -9,7 +9,7 @@ Purpose:
   and writes a result JSON file.
 
 Typical use:
-python adapters/freecad_adapter.py --config qa_config.json --test-id FC-GEO-001 --input "C:/tests/1071 - Rev 0.pdf" --mode vector --dry-run
+python adapters/freecad_adapter.py --config qa_config.json --test-id FC-GEO-001 --input "C:/path/to/your-drawing.pdf" --mode vector --dry-run
 """
 from __future__ import annotations
 

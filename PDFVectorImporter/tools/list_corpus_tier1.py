@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""List Tier-1 (or Tier-N) corpus entries from manifest.json, optionally per host."""
+"""List private validation entries from manifest.json, optionally per host."""
 
 from __future__ import annotations
 
@@ -10,10 +10,10 @@ from pathlib import Path
 
 
 def corpus_root() -> Path:
-    env = os.environ.get("BCS_CORPUS_ROOT") or os.environ.get("PDF_TEST_CORPUS")
+    env = os.environ.get("BCS_PRIVATE_VALIDATION_ROOT") or os.environ.get("PDF_PRIVATE_VALIDATION_ROOT")
     if env:
         return Path(env).expanduser()
-    return Path("C:/1pdf-test-corpus")
+    return Path("__private_validation_assets_not_configured__")
 
 
 def resolve_entry(root: Path, entry: dict) -> Path | None:
@@ -26,8 +26,8 @@ def resolve_entry(root: Path, entry: dict) -> Path | None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="List BlueCollar PDF test corpus entries")
-    parser.add_argument("--tier", type=int, default=1, help="Tier number (default 1)")
+    parser = argparse.ArgumentParser(description="List BlueCollar private validation entries")
+    parser.add_argument("--tier", type=int, default=1, help="Private validation tier number")
     parser.add_argument("--host", default="", help="Filter hosts: SU, FC, LC, BL, app")
     parser.add_argument("--resolved", action="store_true", help="Only entries with PDF on disk")
     parser.add_argument("--json", action="store_true", help="JSON output")

@@ -19,7 +19,7 @@ def test_fraction_parsing_exact():
 
 
 def test_tier1_user_bom_rows_detect_plates_and_members():
-    # Representative BOM rows from Tier-1 user fabrication drawing (T1-01).
+    # Representative BOM rows from private validation user fabrication drawing (PRIVATE-01).
     rows = [
         'p1016 PL3/8"X6 7/8"',
         'p1019 PL3/8"X7 3/4"',

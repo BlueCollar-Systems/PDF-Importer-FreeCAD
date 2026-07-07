@@ -20,6 +20,7 @@ from PDFImporterCore import (  # noqa: E402
     _reconstruct_line_text,
     _repair_fraction_artifact_runs,
 )
+from pdfcadcore.text_scale import effective_span_font_size_pt  # noqa: E402
 
 
 class TestPdfImporterTextReconstruction(unittest.TestCase):
@@ -91,6 +92,14 @@ class TestPdfImporterTextReconstruction(unittest.TestCase):
         fitted = _fit_font_size_to_span_bbox("3 3/8", size, span, MM_PER_PT, 90.0)
 
         self.assertLess(fitted, size)
+
+    def test_span_bbox_fit_grows_undersized_tf_relative_to_bbox(self) -> None:
+        span = {"bbox": (10.0, 20.0, 70.0, 34.0), "size": 6.0}
+        size = effective_span_font_size_pt(span, 0.0) * MM_PER_PT
+
+        fitted = _fit_font_size_to_span_bbox("W12X30", size, span, MM_PER_PT, 0.0)
+
+        self.assertGreaterEqual(fitted, size * 0.95)
 
     def test_packed_integer_text_color_decodes_to_rgb(self) -> None:
         rgb = _norm_color(0x66AA33)

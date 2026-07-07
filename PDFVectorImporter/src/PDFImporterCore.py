@@ -1792,17 +1792,9 @@ def _span_origin_pdf(span: dict) -> Optional[Tuple[float, float]]:
 
 def _span_bbox_pdf(span: dict) -> Optional[Tuple[float, float, float, float]]:
     """Return a normalized PDF-space bbox for one span, if available."""
-    bbox = span.get("bbox")
-    if bbox and len(bbox) >= 4:
-        try:
-            x0, y0, x1, y1 = [float(v) for v in bbox[:4]]
-        except (TypeError, ValueError):
-            return None
-        vals = (x0, y0, x1, y1)
-        if not all(math.isfinite(v) for v in vals):
-            return None
-        return min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
-    return None
+    from pdfcadcore.text_scale import span_bbox_pdf as _core_span_bbox_pdf
+
+    return _core_span_bbox_pdf(span)
 
 
 def _fit_font_size_to_span_bbox(
@@ -1812,46 +1804,17 @@ def _fit_font_size_to_span_bbox(
     scale: float,
     angle_deg: float = 0.0,
 ) -> float:
-    """Clamp host text size to the source PDF span bbox without growing it.
+    """Clamp or grow host text size to honor the measured PDF span bbox."""
+    from pdfcadcore.text_scale import fit_font_size_to_span_bbox
 
-    Draft Text and ShapeString use host fonts, so the same font-size value can
-    render wider than the source PDF span.  When that happens, shrink uniformly
-    to keep labels and 3D text inside the measured source bbox while preserving
-    the original PDF baseline/rotation and avoiding non-uniform distortion.
-    """
-    try:
-        fitted = float(font_size_fc)
-    except (TypeError, ValueError):
-        return font_size_fc
-    if fitted <= 0.0:
-        return fitted
-
-    bbox = _span_bbox_pdf(span)
-    if not bbox:
-        return max(0.1, fitted)
-
-    x0, y0, x1, y1 = bbox
-    bbox_w_pdf = max(0.0, x1 - x0)
-    bbox_h_pdf = max(0.0, y1 - y0)
-    if bbox_w_pdf <= 1e-6 or bbox_h_pdf <= 1e-6:
-        return max(0.1, fitted)
-
-    s = max(float(scale), 1e-12)
-    norm_angle = abs(_normalize_text_angle_deg(angle_deg))
-    along_pdf = bbox_h_pdf if norm_angle >= 45.0 else bbox_w_pdf
-    normal_pdf = bbox_w_pdf if norm_angle >= 45.0 else bbox_h_pdf
-
-    estimated_width_pdf = _estimate_text_width_mm(text, fitted) / s
-    if estimated_width_pdf > along_pdf * 1.08 and estimated_width_pdf > 1e-9:
-        width_ratio = (along_pdf * 0.98) / estimated_width_pdf
-        if math.isfinite(width_ratio) and width_ratio > 0.0:
-            fitted *= max(0.25, min(1.0, width_ratio))
-
-    height_cap_fc = normal_pdf * s * 1.12
-    if height_cap_fc >= 0.1 and fitted > height_cap_fc * 1.08:
-        fitted = height_cap_fc
-
-    return max(0.1, fitted)
+    return fit_font_size_to_span_bbox(
+        text,
+        font_size_fc,
+        span,
+        scale,
+        angle_deg,
+        estimate_width_units=_estimate_text_width_units,
+    )
 
 
 def _build_text_layout_context(tdict: dict) -> dict:
@@ -1985,12 +1948,17 @@ def _render_text_spans_exact_labels(
                     size_pt = float(span.get("size", 0.0) or 0.0)
                 except (TypeError, ValueError):
                     size_pt = 0.0
-                font_size_fc = max(0.1, (size_pt if size_pt > 0.0 else 3.0) * scale)
+                from pdfcadcore.text_scale import effective_span_font_size_pt
+
                 txt = str(text).strip()
                 if not txt:
                     continue
                 is_bom_quantity = _is_bom_quantity_span(span, txt, layout_context or {})
                 span_angle_deg = 0.0 if is_bom_quantity else angle_deg
+                size_pt = effective_span_font_size_pt(span, span_angle_deg)
+                if size_pt <= 0.0:
+                    size_pt = 3.0
+                font_size_fc = max(0.1, size_pt * scale)
                 font_size_fc = _fit_font_size_to_span_bbox(txt, font_size_fc, span, scale, span_angle_deg)
                 if is_bom_quantity:
                     origin = _horizontal_quantity_origin_pdf(span, txt, font_size_fc, scale)
@@ -2137,13 +2105,18 @@ def _render_text_spans_3d(
                     size_pt = float(span.get("size", 0.0) or 0.0)
                 except (TypeError, ValueError):
                     size_pt = 0.0
-                font_size_fc = max(0.1, (size_pt if size_pt > 0.0 else 3.0) * scale)
+                from pdfcadcore.text_scale import effective_span_font_size_pt
+
                 txt = str(text).strip()
                 if not txt:
                     continue
                 is_bom_quantity = _is_bom_quantity_span(span, txt, layout_context or {})
                 span_angle_deg = 0.0 if is_bom_quantity else angle_deg
                 span_norm_angle = _normalize_text_angle_deg(span_angle_deg)
+                size_pt = effective_span_font_size_pt(span, span_angle_deg)
+                if size_pt <= 0.0:
+                    size_pt = 3.0
+                font_size_fc = max(0.1, size_pt * scale)
                 font_size_fc = _fit_font_size_to_span_bbox(txt, font_size_fc, span, scale, span_angle_deg)
 
                 if is_bom_quantity:

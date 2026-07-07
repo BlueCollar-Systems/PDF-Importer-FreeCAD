@@ -1826,10 +1826,10 @@ def _object_xy_bound_lengths(obj) -> Optional[Tuple[float, float]]:
             return None
         if hasattr(bb, "XLength") and hasattr(bb, "YLength"):
             return max(0.0, float(bb.XLength)), max(0.0, float(bb.YLength))
-        xmin = float(getattr(bb, "XMin"))
-        xmax = float(getattr(bb, "XMax"))
-        ymin = float(getattr(bb, "YMin"))
-        ymax = float(getattr(bb, "YMax"))
+        xmin = float(bb.XMin)
+        xmax = float(bb.XMax)
+        ymin = float(bb.YMin)
+        ymax = float(bb.YMax)
         return abs(xmax - xmin), abs(ymax - ymin)
     except (AttributeError, RuntimeError, TypeError, ValueError):
         return None
@@ -1848,8 +1848,8 @@ def _recompute_object_for_bounds(obj) -> None:
     except (AttributeError, RuntimeError, TypeError, ValueError):
         pass
     try:
-        if App is not None and getattr(App, "ActiveDocument", None) is not None:
-            App.ActiveDocument.recompute()
+        if FreeCAD is not None and getattr(FreeCAD, "ActiveDocument", None) is not None:
+            FreeCAD.ActiveDocument.recompute()
     except (AttributeError, RuntimeError, TypeError, ValueError):
         pass
 

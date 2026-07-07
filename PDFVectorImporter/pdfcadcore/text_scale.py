@@ -11,7 +11,6 @@ honored.
 from __future__ import annotations
 
 import math
-import re
 from typing import Any, Callable, Dict, Optional, Tuple
 
 # Ratio thresholds — tuned on synthetic CTM fixtures and prior shop-drawing QA.
@@ -181,7 +180,6 @@ def fit_font_size_to_span_bbox(
         return max(0.1, fitted)
 
     s = max(float(scale), 1e-12)
-    norm_angle = abs(normalize_text_angle_deg(angle_deg))
     along_pdf = bbox_glyph_width_pt(bbox, angle_deg)
     normal_pdf = bbox_glyph_height_pt(bbox, angle_deg)
 

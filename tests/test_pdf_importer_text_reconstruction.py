@@ -53,6 +53,7 @@ class TestPdfImporterTextReconstruction(unittest.TestCase):
         self.assertIn("ss.ScaleToSize = True", source)
         self.assertIn("ss.MakeFace = True", source)
         self.assertIn("_calibrate_shapestring_to_span_bbox(ss, span, font_size_fc, scale)", source)
+        self.assertIn("bbox data must not resize text", source)
         self.assertNotIn("ss.ViewObject.FontSize = font_size_fc", source)
 
     def test_raster_background_uses_effective_import_scale(self) -> None:
@@ -78,29 +79,29 @@ class TestPdfImporterTextReconstruction(unittest.TestCase):
 
         self.assertAlmostEqual(fitted, size)
 
-    def test_span_bbox_fit_shrinks_oversized_horizontal_text(self) -> None:
+    def test_span_bbox_fit_does_not_shrink_oversized_horizontal_text(self) -> None:
         span = {"bbox": (10.0, 20.0, 34.0, 32.0)}
         size = 12.0 * MM_PER_PT
 
         fitted = _fit_font_size_to_span_bbox("LONG CALLOUT TEXT", size, span, MM_PER_PT, 0.0)
 
-        self.assertLess(fitted, size)
+        self.assertAlmostEqual(fitted, size)
 
-    def test_span_bbox_fit_shrinks_oversized_vertical_text_normal_axis(self) -> None:
+    def test_span_bbox_fit_does_not_shrink_vertical_text_normal_axis(self) -> None:
         span = {"bbox": (10.0, 20.0, 16.0, 70.0)}
         size = 18.0 * MM_PER_PT
 
         fitted = _fit_font_size_to_span_bbox("3 3/8", size, span, MM_PER_PT, 90.0)
 
-        self.assertLess(fitted, size)
+        self.assertAlmostEqual(fitted, size)
 
-    def test_span_bbox_fit_grows_undersized_tf_relative_to_bbox(self) -> None:
+    def test_span_bbox_fit_does_not_grow_undersized_tf_relative_to_bbox(self) -> None:
         span = {"bbox": (10.0, 20.0, 70.0, 34.0), "size": 6.0}
         size = effective_span_font_size_pt(span, 0.0) * MM_PER_PT
 
         fitted = _fit_font_size_to_span_bbox("W12X30", size, span, MM_PER_PT, 0.0)
 
-        self.assertGreaterEqual(fitted, size * 0.95)
+        self.assertAlmostEqual(fitted, size)
 
     def test_packed_integer_text_color_decodes_to_rgb(self) -> None:
         rgb = _norm_color(0x66AA33)
@@ -132,6 +133,7 @@ class TestPdfImporterTextReconstruction(unittest.TestCase):
         self.assertIsNotNone(origin)
         self.assertLess(origin[0], 109.0)
         self.assertAlmostEqual(origin[1], 90.4, places=2)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

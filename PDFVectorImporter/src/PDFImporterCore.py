@@ -1804,7 +1804,7 @@ def _fit_font_size_to_span_bbox(
     scale: float,
     angle_deg: float = 0.0,
 ) -> float:
-    """Clamp or grow host text size to honor the measured PDF span bbox."""
+    """Return nominal host text size; bboxes are placement hints only."""
     from pdfcadcore.text_scale import fit_font_size_to_span_bbox
 
     return fit_font_size_to_span_bbox(
@@ -1860,43 +1860,12 @@ def _calibrate_shapestring_to_span_bbox(
     font_size_fc: float,
     scale: float,
 ) -> float:
-    """Shrink generated ShapeString geometry if host font metrics exceed bbox."""
-    bbox = _span_bbox_pdf(span)
-    if not bbox:
-        return font_size_fc
-    x0, y0, x1, y1 = bbox
-    target_x = abs(x1 - x0) * max(float(scale), 1e-12)
-    target_y = abs(y1 - y0) * max(float(scale), 1e-12)
-    if target_x <= 1e-6 or target_y <= 1e-6:
-        return font_size_fc
-
-    _recompute_object_for_bounds(ss)
-    dims = _object_xy_bound_lengths(ss)
-    if not dims:
-        return font_size_fc
-    current_x, current_y = dims
-    factors = []
-    if current_x > target_x * 1.12 and current_x > 1e-9:
-        factors.append((target_x * 1.08) / current_x)
-    if current_y > target_y * 1.16 and current_y > 1e-9:
-        factors.append((target_y * 1.12) / current_y)
-    if not factors:
-        return font_size_fc
-
-    factor = max(0.05, min(1.0, min(factors)))
-    if factor >= 0.999:
-        return font_size_fc
-    new_size = max(0.1, float(font_size_fc) * factor)
+    """Preserve nominal ShapeString size; bbox data must not resize text."""
+    del ss, span, scale
     try:
-        ss.Size = new_size
-    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return max(0.1, float(font_size_fc))
+    except (TypeError, ValueError):
         return font_size_fc
-    try:
-        ss.Extrusion = max(new_size * 0.12, 0.05)
-    except (AttributeError, RuntimeError, TypeError, ValueError):
-        pass
-    _recompute_object_for_bounds(ss)
-    return new_size
 
 
 def _build_text_layout_context(tdict: dict) -> dict:

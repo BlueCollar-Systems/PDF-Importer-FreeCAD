@@ -63,26 +63,26 @@ Generated from `qa_results_auto_local_full_combined.json` + workbook `SketchUp T
   Expected: < 15 seconds on modern hardware
   Metrics: Record actual time
 
-- SU-T049 | P0 | Core-Topo | P0: All 27 OCG layers created
-  Input: TX_Alvord topo
+- SU-T049 | P0 | Core-Topo | P0: OCG layers created
+  Input: public topo/map PDF with OCG layers
   Steps: Check Layers panel after import
   Expected: 27 PDF::Layer::* tags present
   Metrics: Count layers
 
 - SU-T053 | P0 | Core-Topo | PNG predictor decoding works
-  Input: TX_Alvord topo
+  Input: public topo/map PDF with compressed image streams
   Steps: Import (test passes if import succeeds at all)
   Expected: Parser finds >300 objects from compressed xref
   Metrics: 
 
 - SU-T054 | P0 | Core-Topo | Import time
-  Input: TX_Alvord topo
+  Input: public topo/map PDF
   Steps: Time the import
   Expected: < 120 seconds
   Metrics: Record actual time
 
 - SU-T057 | P0 | Layers | OCG layers detected from PDF
-  Input: TX_Alvord topo
+  Input: public topo/map PDF with OCG layers
   Steps: Import. Check layer count.
   Expected: Layer count matches PDF OCG count (27)
   Metrics: 
@@ -94,7 +94,7 @@ Generated from `qa_results_auto_local_full_combined.json` + workbook `SketchUp T
   Metrics: Record time
 
 - SU-T068 | P0 | Perf | Topo map runtime
-  Input: TX_Alvord topo
+  Input: public topo/map PDF
   Steps: Time mode=auto import
   Expected: < 120 seconds
   Metrics: Record time

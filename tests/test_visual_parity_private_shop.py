@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Visual parity golden checks for private 1015 shop drawing (skip if absent)."""
+"""Visual parity checks for a privately supplied shop drawing.
+
+The private PDF is never bundled with or named by the public repo. Set
+BCS_VISUAL_PARITY_PDF to run these checks against a local validation file.
+"""
 
 from __future__ import annotations
 
@@ -19,25 +23,28 @@ try:
 except ImportError:  # pragma: no cover
     import fitz  # type: ignore  # noqa: E402
 
-PDF_1015 = Path(
-    os.environ.get(
-        "BCS_PDF_1015",
-        r"C:\Users\Rowdy Payton\Desktop\PDFTest Files\1015 - Rev 0.pdf",
-    )
+_configured_pdf = os.environ.get("BCS_VISUAL_PARITY_PDF")
+PRIVATE_PARITY_PDF = (
+    Path(_configured_pdf)
+    if _configured_pdf
+    else Path("__private_validation_assets_not_configured__") / "shop_drawing.pdf"
 )
 MM_PER_PT = 25.4 / 72.0
 
 
-@unittest.skipUnless(PDF_1015.is_file(), f"private reference PDF not found: {PDF_1015}")
-class TestVisualParity1015(unittest.TestCase):
+@unittest.skipUnless(
+    PRIVATE_PARITY_PDF.is_file(),
+    "private visual parity PDF not configured; set BCS_VISUAL_PARITY_PDF",
+)
+class TestVisualParityPrivateShop(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        doc = fitz.open(str(PDF_1015))
+        doc = fitz.open(str(PRIVATE_PARITY_PDF))
         cls.page_rect = doc[0].rect
         cls.page_data = extract_page(doc[0], page_num=1, scale=1.0)
         doc.close()
 
-    def test_page_is_d_size_class(self) -> None:
+    def test_page_is_large_shop_drawing_size(self) -> None:
         w_in = self.page_rect.width / 72.0
         h_in = self.page_rect.height / 72.0
         self.assertGreater(w_in, 30.0)
@@ -48,7 +55,7 @@ class TestVisualParity1015(unittest.TestCase):
         self.assertGreater(count, 200)
         self.assertLess(count, 600)
 
-    def test_bom_quan_readable_size(self) -> None:
+    def test_bom_header_readable_size(self) -> None:
         quan = [t for t in self.page_data.text_items if (t.text or "").strip() == "QUAN"]
         self.assertTrue(quan, "expected BOM header QUAN")
         fs_pt = quan[0].font_size / MM_PER_PT
@@ -71,10 +78,7 @@ class TestVisualParity1015(unittest.TestCase):
             )
 
     def test_no_microscopic_font_sizes_in_bulk(self) -> None:
-        tiny = [
-            t for t in self.page_data.text_items
-            if t.font_size / MM_PER_PT < 1.5
-        ]
+        tiny = [t for t in self.page_data.text_items if t.font_size / MM_PER_PT < 1.5]
         self.assertLess(len(tiny), 5, f"too many microscopic text items: {len(tiny)}")
 
 

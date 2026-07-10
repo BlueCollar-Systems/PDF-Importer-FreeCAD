@@ -27,7 +27,7 @@ assets, generation scripts, checksums, license, and notes.
 |----------|-----------|
 | PDF Parsing | PyMuPDF-powered vector extraction with full path, text, and image support |
 | Import Modes | Auto (default), Vector, Raster, Hybrid — every mode targets maximum fidelity (BCS-ARCH-001) |
-| Text Rendering | Labels, 3D Text, Glyphs, Geometry — orthogonal to mode |
+| Text Rendering | 3D Text (default visual-parity path), Labels, Glyphs, Geometry — orthogonal to mode |
 | Arc Reconstruction | Kasa algebraic circle fit converts polyline segments back to true arcs |
 | Layer Support | OCG layers (PDF Optional Content Groups) map to FreeCAD groups |
 | Color Grouping | Geometry automatically organized by stroke/fill color |
@@ -36,6 +36,11 @@ assets, generation scripts, checksums, license, and notes.
 | Image Import | Embedded raster images extracted and placed at correct coordinates |
 | Scale Detection | Reference-based scaling from known dimensions on the drawing |
 | Steel Detection | Recognizes common structural steel shape profiles |
+
+For Adobe-like visual sign-off, start with **3D Text** at the same zoom/scale as
+the source PDF. Use **Labels** when editable FreeCAD text matters more than
+model-space PDF appearance, and use **Glyphs/Geometry** when exact outline
+geometry is preferred over editability.
 
 ## Installation
 

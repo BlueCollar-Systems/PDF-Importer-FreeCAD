@@ -40,7 +40,8 @@ No system Python, pip, or OS packages required for release users.
 ## Legacy hardware notes
 
 - Large multi-page PDFs: import page ranges on **&lt; 8 GB RAM** machines; see `import_report.extra.performance_hint`.
-- **Glyphs/Geometry** text modes increase sketch complexity — prefer **Labels** on weak PCs.
+- Use **3D Text** first for Adobe-like visual review. **Glyphs/Geometry** text modes increase sketch complexity, so avoid them on weak PCs unless exact outlines are required.
+- Use **Labels** only when editable FreeCAD text matters more than model-space PDF appearance.
 - Windows SmartScreen may warn — installer is unsigned but functional.
 
 ## Offline install
@@ -77,8 +78,8 @@ In FreeCAD GUI: select workbench **PDF Vector Importer** → verify toolbar **PD
 
 | Option | FreeCAD result |
 |--------|----------------|
-| **Labels** | Draft / native text objects |
-| **3D Text** | ShapeString / extruded text |
+| **3D Text** | Default visual-parity path; ShapeString / extruded text |
+| **Labels** | Editable Draft / native text objects |
 | **Glyphs** | Vector glyph geometry |
 | **Geometry** | pdftocairo outlines (non-editable) |
 

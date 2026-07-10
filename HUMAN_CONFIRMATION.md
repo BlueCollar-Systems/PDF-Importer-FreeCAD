@@ -13,9 +13,9 @@ For each representative shop drawing you import:
 
 | Check | Pass |
 |-------|------|
-| **Labels** — BOM, dimensions, and notes readable | ☐ |
-| **Glyphs/Outlines** — linework faithful to the PDF | ☐ |
-| **3D Text** (if used) — extruded letterforms present | ☐ |
+| **3D Text default** — BOM, dimensions, notes, rotation, and scale visually match the PDF at the same zoom | ☐ |
+| **Labels** — editable text remains readable when selected | ☐ |
+| **Glyphs/Outlines** — linework and text outlines faithful to the PDF when selected | ☐ |
 | Scale plausible vs the source drawing | ☐ |
 | Multi-page import behaves as expected | ☐ |
 

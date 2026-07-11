@@ -112,6 +112,26 @@ jobs:
           fi
           python "$BCS_PRIVATE_VALIDATION_ROOT/tools/validate_contract_schemas.py"
 
+      - name: Optional corpus clone (CORPUS_READ_TOKEN)
+        env:
+          CORPUS_READ_TOKEN: ${{ secrets.CORPUS_READ_TOKEN }}
+        run: |
+          if [ -z "$CORPUS_READ_TOKEN" ]; then
+            echo "::notice::CORPUS_READ_TOKEN not set; corpus matrix gate visible-skip (R4-2)"
+            echo "corpus_available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git clone --depth 1 "https://x-access-token:${CORPUS_READ_TOKEN}@github.com/BlueCollar-Systems/pdf-test-corpus.git" "$RUNNER_TEMP/pdf-test-corpus"
+          echo "corpus_available=true" >> "$GITHUB_OUTPUT"
+          echo "BCS_CORPUS_ROOT=$RUNNER_TEMP/pdf-test-corpus" >> "$GITHUB_ENV"
+        id: corpus
+
+      - name: Corpus stacked-fraction + schema smoke
+        if: steps.corpus.outputs.corpus_available == 'true'
+        run: |
+          python "$BCS_CORPUS_ROOT/tools/validate_contract_schemas.py"
+          python "$BCS_CORPUS_ROOT/tools/generate_stacked_fraction_pdf.py" --probe
+
       - name: BCS-ARCH-001 mode smoke test
         run: |
           python -c "

@@ -2317,9 +2317,12 @@ def _resolve_horizontal_run_overlaps(layout_items: List[dict], scale: float) -> 
         if not _same_text_line(item["baseline_y_pdf"], prev["baseline_y_pdf"], item["font_size_fc"], prev["font_size_fc"]):
             prev = item
             continue
-        prev_width = float(prev.get("orig_width_pdf", 0.0) or 0.0)
-        if prev_width <= 1e-6:
-            prev_width = float(prev.get("render_width_pdf", 0.0) or 0.0)
+        # FC-1 dense dims: prefer the *larger* of PDF bbox width vs estimated
+        # render width so a reduced stacked-fraction bbox cannot leave the next
+        # sibling parked under oversized glyphs (reads as "313 16" collisions).
+        orig_w = float(prev.get("orig_width_pdf", 0.0) or 0.0)
+        render_w = float(prev.get("render_width_pdf", 0.0) or 0.0)
+        prev_width = max(orig_w, render_w)
         prev_right = float(prev["x_pdf"]) + prev_width
         this_left = item["x_pdf"]
         overlap = prev_right - float(this_left)

@@ -128,6 +128,8 @@ jobs:
 
       - name: Corpus stacked-fraction + schema smoke
         if: steps.corpus.outputs.corpus_available == 'true'
+        env:
+          BCS_FREECAD_REPO: ${{ github.workspace }}
         run: |
           python "$BCS_CORPUS_ROOT/tools/validate_contract_schemas.py"
           python "$BCS_CORPUS_ROOT/tools/generate_stacked_fraction_pdf.py" --probe

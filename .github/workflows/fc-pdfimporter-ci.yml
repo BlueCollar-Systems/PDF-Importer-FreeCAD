@@ -113,6 +113,7 @@ jobs:
           python "$BCS_PRIVATE_VALIDATION_ROOT/tools/validate_contract_schemas.py"
 
       - name: Optional corpus clone (CORPUS_READ_TOKEN)
+        if: matrix.python-version == '3.12'
         env:
           CORPUS_READ_TOKEN: ${{ secrets.CORPUS_READ_TOKEN }}
         run: |
@@ -127,7 +128,7 @@ jobs:
         id: corpus
 
       - name: Corpus stacked-fraction + schema smoke
-        if: steps.corpus.outputs.corpus_available == 'true'
+        if: matrix.python-version == '3.12' && steps.corpus.outputs.corpus_available == 'true'
         env:
           BCS_FREECAD_REPO: ${{ github.workspace }}
         run: |

@@ -125,37 +125,13 @@ jobs:
           if gh release view "${VERSION}" >/dev/null 2>&1; then
             echo "Release ${VERSION} already exists — skipping."
             echo "minted=false" >> "$GITHUB_OUTPUT"
-            # R21-3: stranded-release detector, warning-first (NEVER hard-fail:
-            # legitimate staging like CI-only -> fix -> bump-later would go red).
-            # If product files changed since the released tag, this push left
-            # them unshipped — the incident class behind FC v4.0.61/64 strandings.
-            STRANDED_EXCLUDES=(
-              ':(exclude)*.md'
-              ':(exclude)docs/**'
-              ':(exclude)tests/**'
-              ':(exclude).github/**'
-              ':(exclude)_archived/**'
-              ':(exclude)dist/_archived/**'
-              ':(exclude)dev_logs/**'
-              ':(exclude)steel_shapes/**'
-            )
-            if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
-              STRANDED_FILES=$(git diff --name-only "${VERSION}..HEAD" -- "${STRANDED_EXCLUDES[@]}" || true)
-              if [ -n "$STRANDED_FILES" ]; then
-                STRANDED_COMMITS=$(git log --no-merges --format='%h %s' "${VERSION}..HEAD" -- "${STRANDED_EXCLUDES[@]}" || true)
-                echo "::warning::Stranded product commits past ${VERSION} (release exists, nothing minted): $(echo "${STRANDED_COMMITS}" | tr '\n' ';')"
-                {
-                  echo "### Stranded product commits past ${VERSION}"
-                  echo ""
-                  echo "Product files changed after tag \`${VERSION}\` but this push minted no release."
-                  echo "Ship them with a version-bump commit (see quick card §4.2)."
-                  echo ""
-                  echo '```'
-                  echo "${STRANDED_COMMITS}"
-                  echo '```'
-                } >> "$GITHUB_STEP_SUMMARY"
-              fi
-            fi
+            # Round 21 Task 5: stateful, bounded stranded-release audit.
+            python scripts/release_safety.py audit-existing-tag \
+              --repo "${GITHUB_REPOSITORY}" \
+              --tag "${VERSION}" \
+              --session-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+              --release-mode \
+              --warnings-file .release-safety/warnings.json
             exit 0
           fi
           # Create the tag via the gh/releases API (GITHUB_TOKEN), NOT `git push
@@ -185,7 +161,7 @@ jobs:
           fi
 
       - name: Dispatch website release update
-        if: steps.website_dispatch_token.outputs.has_token == 'true'
+        if: steps.mint.outputs.minted == 'true' && steps.website_dispatch_token.outputs.has_token == 'true'
         uses: actions/github-script@v9
         with:
           github-token: ${{ secrets.WEBSITE_DISPATCH_TOKEN || secrets.BLUECOLLAR_WEBSITE_DISPATCH_TOKEN || secrets.REPO_DISPATCH_TOKEN }}
@@ -211,7 +187,7 @@ jobs:
             core.info('Dispatched product-release to BlueCollar-Website');
 
       - name: Warn when website dispatch token is missing
-        if: steps.website_dispatch_token.outputs.has_token != 'true'
+        if: steps.mint.outputs.minted == 'true' && steps.website_dispatch_token.outputs.has_token != 'true'
         run: |
           echo "::warning::Skipping website dispatch because no valid dispatch token secret is configured."
           echo "Set WEBSITE_DISPATCH_TOKEN (or BLUECOLLAR_WEBSITE_DISPATCH_TOKEN / REPO_DISPATCH_TOKEN) to enable cross-repo dispatch."

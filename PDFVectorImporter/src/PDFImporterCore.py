@@ -484,6 +484,15 @@ class ImportOptions:
     import_report_path: Optional[str] = None
     # ShapeString telemetry when 3d_text degrades to labels (Round-2 action #12).
     shapestring_skips: Dict[str, int] = field(default_factory=dict)
+    # TEXTMODE-1 (owner directive 2026-07-13): text-mode substitutions are
+    # loud, never silent. Every fallback rung that delivers records an event
+    # {requested, delivered, reason, count}; write_import_report surfaces the
+    # dominant event in fallback.text and all events in extra.
+    text_mode_fallbacks: List[Dict[str, Any]] = field(default_factory=list)
+    # DELIVERED entity counts by bucket (native_3d_text, native_label, ...)
+    # so actual_text_entity_types reflects what was created, not what was
+    # requested (TEXTMODE-1 report honesty).
+    text_delivered_counts: Dict[str, int] = field(default_factory=dict)
     # Scale detection telemetry for import_report cross-check (Round 5).
     resolved_scale: Optional[Dict[str, Any]] = None
     scale_hints: Dict[str, Any] = field(default_factory=dict)
@@ -638,6 +647,11 @@ def write_import_report(
     # Add text entity info to extra if available
     if hasattr(opts, '_report_extra') and opts._report_extra:
         extra.update(opts._report_extra)
+    delivered_counts = {
+        str(k): int(v)
+        for k, v in (getattr(opts, "text_delivered_counts", {}) or {}).items()
+        if int(v or 0) > 0
+    }
     entity_info = extra.get("actual_text_entity_types")
     if isinstance(entity_info, dict):
         extra["actual_text_entity_types"] = build_actual_text_entity_types(
@@ -646,7 +660,23 @@ def write_import_report(
             count=int(entity_info.get("count") or 0),
             font_rendered=bool(entity_info.get("font_rendered")),
             examples=list(entity_info.get("examples") or []),
+            delivered_counts=delivered_counts or None,
         )
+
+    # TEXTMODE-1: surface recorded text-mode substitutions. The dominant
+    # event lands in fallback.text; every event stays in extra for forensics.
+    text_fallback_events = [
+        dict(event)
+        for event in (getattr(opts, "text_mode_fallbacks", []) or [])
+        if int(event.get("count", 0) or 0) > 0
+    ]
+    text_fallback: Optional[Dict[str, Any]] = None
+    if text_fallback_events:
+        text_fallback = dict(
+            max(text_fallback_events, key=lambda ev: int(ev.get("count", 0) or 0))
+        )
+        if len(text_fallback_events) > 1:
+            extra["text_mode_fallbacks"] = text_fallback_events
     if skips:
         extra["shapestring_skips"] = skips
         extra["shapestring_skip_total"] = sum(int(v) for v in skips.values())
@@ -677,6 +707,7 @@ def write_import_report(
         pdf_engine_version=_pymupdf_version(),
         import_text=bool(opts.import_text),
         text_mode=str(opts.text_mode or "3d_text"),
+        text_fallback=text_fallback,
         peak_mb=sample_process_mb(),
         performance_phases=phases or None,
         extra=extra,
@@ -2083,6 +2114,7 @@ def _render_text_spans_exact_labels(
                 except (ImportError, TypeError, ValueError):
                     pass
                 count += 1
+    _record_text_delivery(opts, "native_label", count)
     return count
 
 
@@ -2116,6 +2148,51 @@ def _record_shapestring_skip(opts: ImportOptions, reason: str) -> None:
     skips[reason] = int(skips.get(reason, 0)) + 1
 
 
+def _record_text_delivery(opts: ImportOptions, bucket: str, count: int) -> None:
+    """Accumulate DELIVERED text-entity counts by bucket (TEXTMODE-1)."""
+    if int(count or 0) <= 0:
+        return
+    delivered = getattr(opts, "text_delivered_counts", None)
+    if delivered is None:
+        return
+    delivered[bucket] = int(delivered.get(bucket, 0)) + int(count)
+
+
+def _record_text_mode_fallback(
+    opts: ImportOptions,
+    *,
+    requested: str,
+    delivered: str,
+    reason: str,
+    count: int,
+) -> None:
+    """Record a text-mode substitution event — loud, never silent (TEXTMODE-1)."""
+    requested = str(requested or "").strip().lower()
+    delivered = str(delivered or "").strip().lower()
+    reason = str(reason or "").strip() or "unspecified"
+    if int(count or 0) <= 0 or not requested or not delivered or requested == delivered:
+        return
+    events = getattr(opts, "text_mode_fallbacks", None)
+    if events is None:
+        return
+    for event in events:
+        if (
+            event.get("requested") == requested
+            and event.get("delivered") == delivered
+            and event.get("reason") == reason
+        ):
+            event["count"] = int(event.get("count", 0)) + int(count)
+            return
+    events.append(
+        {
+            "requested": requested,
+            "delivered": delivered,
+            "reason": reason,
+            "count": int(count),
+        }
+    )
+
+
 def _render_text_spans_3d(
     tdict: dict,
     text_group,
@@ -2136,6 +2213,10 @@ def _render_text_spans_3d(
         return 0
 
     rotated_threshold = _rotated_text_threshold_deg()
+    # TEXTMODE-1 P0: spans whose ShapeString creation fails are collected and
+    # delivered through the next FC ladder rung (exact Draft labels) below —
+    # a failed span is never dropped.
+    failed_lines: List[dict] = []
     for block in tdict.get("blocks", []):
         if block.get("type") != 0:
             continue
@@ -2144,6 +2225,7 @@ def _render_text_spans_3d(
             if not spans:
                 continue
             angle_deg = _line_angle_deg(line)
+            failed_spans: List[dict] = []
 
             for span in spans:
                 text = span.get("text", "")
@@ -2194,6 +2276,7 @@ def _render_text_spans_3d(
                     ss = make_shapestring(txt, font_path)
                 except (RuntimeError, ValueError, TypeError, AttributeError):
                     _record_shapestring_skip(opts, "shapestring_failed")
+                    failed_spans.append(span)
                     continue
                 try:
                     ss.Placement = Placement(pos, rot)
@@ -2227,6 +2310,39 @@ def _render_text_spans_3d(
                 except (AttributeError, RuntimeError, TypeError, ValueError):
                     pass
                 count += 1
+
+            if failed_spans:
+                failed_lines.append(
+                    {
+                        "dir": line.get("dir", (1.0, 0.0)),
+                        "bbox": line.get("bbox"),
+                        "spans": failed_spans,
+                    }
+                )
+
+    _record_text_delivery(opts, "native_3d_text", count)
+
+    if failed_lines:
+        # TEXTMODE-1 P0: deliver every failed span via the next FC ladder rung
+        # (exact Draft labels) and report the substitution — never silent.
+        failed_tdict = {"blocks": [{"type": 0, "lines": failed_lines}]}
+        rescued = _render_text_spans_exact_labels(
+            failed_tdict,
+            text_group,
+            page_h,
+            opts,
+            scale,
+            layout_context=layout_context,
+        )
+        if rescued > 0:
+            _record_text_mode_fallback(
+                opts,
+                requested=str(getattr(opts, "text_mode", "") or "3d_text"),
+                delivered="labels",
+                reason="shapestring_failed",
+                count=rescued,
+            )
+            count += rescued
     return count
 
 

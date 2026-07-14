@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import sys
 import tempfile
@@ -110,6 +111,132 @@ class TestImportReportWriter(unittest.TestCase):
             self.assertEqual(data["extra"]["auto_resolved_mode"], "vector")
             self.assertEqual(data["extra"]["shapestring_skips"]["shapestring_failed"], 2)
             self.assertEqual(data["extra"]["shapestring_skip_total"], 2)
+
+
+    def test_3d_text_delivered_as_labels_reports_fallback_text(self) -> None:
+        """TEXTMODE-1 item 7 lock: 3d_text degrading to labels is reported."""
+        with tempfile.TemporaryDirectory(prefix="fc_import_report_") as tmp:
+            report_path = Path(tmp) / "import_report.json"
+            opts = ImportOptions(import_mode="auto", text_mode="3d_text", import_text=True)
+            opts.shapestring_skips["no_ttf_font"] = 1
+            opts._report_extra = {
+                "actual_text_entity_types": {
+                    "entity_type": "labels",
+                    "count": 4,
+                    "font_rendered": True,
+                    "examples": [],
+                }
+            }
+
+            write_import_report(
+                pdf_path=str(Path(tmp) / "sample.pdf"),
+                output_path=str(report_path),
+                opts=opts,
+                pages_imported=1,
+                total_pages=1,
+                primitive_count=3,
+                text_count=4,
+                elapsed_ms=8.0,
+            )
+
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertTrue(data["fallback"]["used"])
+            self.assertEqual(
+                data["fallback"]["text"],
+                {
+                    "requested": "3d_text",
+                    "delivered": "labels",
+                    "reason": "no_ttf_font",
+                    "count": 4,
+                },
+            )
+            self.assertIn(
+                "text_mode_fallback", data["extra"]["diagnostics"]["signals"]
+            )
+
+    def test_3d_text_zero_span_reason_defaults_to_shapestring_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fc_import_report_") as tmp:
+            report_path = Path(tmp) / "import_report.json"
+            opts = ImportOptions(import_mode="auto", text_mode="3d_text", import_text=True)
+            opts._report_extra = {
+                "actual_text_entity_types": {
+                    "entity_type": "labels",
+                    "count": 2,
+                    "font_rendered": True,
+                    "examples": [],
+                }
+            }
+
+            write_import_report(
+                pdf_path=str(Path(tmp) / "sample.pdf"),
+                output_path=str(report_path),
+                opts=opts,
+                pages_imported=1,
+                total_pages=1,
+                elapsed_ms=8.0,
+            )
+
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                data["fallback"]["text"]["reason"], "shapestring_unavailable"
+            )
+
+    def test_requested_mode_delivered_emits_no_fallback_text(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fc_import_report_") as tmp:
+            report_path = Path(tmp) / "import_report.json"
+            opts = ImportOptions(import_mode="auto", text_mode="3d_text", import_text=True)
+            opts._report_extra = {
+                "actual_text_entity_types": {
+                    "entity_type": "3d_text",
+                    "count": 4,
+                    "font_rendered": True,
+                    "examples": [],
+                }
+            }
+
+            write_import_report(
+                pdf_path=str(Path(tmp) / "sample.pdf"),
+                output_path=str(report_path),
+                opts=opts,
+                pages_imported=1,
+                total_pages=1,
+                elapsed_ms=8.0,
+            )
+
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertFalse(data["fallback"]["used"])
+            self.assertNotIn("text", data["fallback"])
+
+    def test_zero_span_fallback_warn_is_not_verbose_gated(self) -> None:
+        """TEXTMODE-1 item 7 lock: the fallback warning is loud, never gated."""
+        source = (SRC_DIR / "PDFImporterCore.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+
+        def _warn_calls(node: ast.AST):
+            for call in ast.walk(node):
+                if (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Name)
+                    and call.func.id == "_warn"
+                    and call.args
+                    and isinstance(call.args[0], ast.Constant)
+                    and isinstance(call.args[0].value, str)
+                    and call.args[0].value.startswith("3D Text mode produced 0 spans")
+                ):
+                    yield call
+
+        # The warn exists...
+        self.assertTrue(list(_warn_calls(tree)), "0-span fallback warn missing")
+
+        # ...and is never nested inside an `if <...>.verbose` gate.
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If):
+                gate = ast.dump(node.test)
+                if "verbose" in gate:
+                    self.assertFalse(
+                        list(_warn_calls(node)),
+                        "0-span fallback warn is verbose-gated (must be unconditional)",
+                    )
 
 
 if __name__ == "__main__":

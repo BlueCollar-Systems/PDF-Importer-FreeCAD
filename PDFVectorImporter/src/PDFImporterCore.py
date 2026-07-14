@@ -677,6 +677,37 @@ def write_import_report(
         )
         if len(text_fallback_events) > 1:
             extra["text_mode_fallbacks"] = text_fallback_events
+
+    if text_fallback is None:
+        # TEXTMODE-1 safety net: derive the substitution from report
+        # divergence (requested mode vs delivered entity type) so the report
+        # stays honest even when runtime event recording was bypassed.
+        requested_mode = str(opts.text_mode or "").strip().lower()
+        entity_dict = extra.get("actual_text_entity_types")
+        delivered_mode = ""
+        delivered_count = 0
+        if isinstance(entity_dict, dict):
+            delivered_mode = str(entity_dict.get("entity_type") or "").strip().lower()
+            delivered_count = int(entity_dict.get("count") or 0)
+        if delivered_mode in ("label", "labels") and delivered_count > 0:
+            if requested_mode == "3d_text":
+                text_fallback = {
+                    "requested": "3d_text",
+                    "delivered": "labels",
+                    "reason": (
+                        "no_ttf_font"
+                        if skips.get("no_ttf_font")
+                        else "shapestring_unavailable"
+                    ),
+                    "count": delivered_count,
+                }
+            elif requested_mode in ("glyphs", "geometry"):
+                text_fallback = {
+                    "requested": requested_mode,
+                    "delivered": "labels",
+                    "reason": "svg_renderer_failed",
+                    "count": delivered_count,
+                }
     if skips:
         extra["shapestring_skips"] = skips
         extra["shapestring_skip_total"] = sum(int(v) for v in skips.values())
@@ -3410,9 +3441,15 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             tdict = _preprocess_text_blocks(page.get_text("dict"))
             layout_context = _build_text_layout_context(tdict)
             text_group = _make_group(top_group or fc_doc, "Text", fc_doc)
+            # TEXTMODE-1: when a whole text mode degrades to Draft labels, the
+            # substitution is recorded once the label rungs report how many
+            # spans they actually delivered (never silent).
+            pending_label_fallback = None
+            labels_delivered = 0
 
             # 3D Text uses extruded ShapeStrings; labels use editable Draft text.
             if opts.text_mode == "3d_text":
+                _skips_before = dict(getattr(opts, "shapestring_skips", {}) or {})
                 span_count = _render_text_spans_3d(
                     tdict, text_group, page_h, opts, scale, layout_context=layout_context
                 )
@@ -3431,9 +3468,20 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                         _msg(f"  Text: {span_count} extruded ShapeString spans")
                     tdict = {"blocks": []}
                 else:
+                    _skips_now = getattr(opts, "shapestring_skips", {}) or {}
+                    if int(_skips_now.get("no_ttf_font", 0)) > int(
+                        _skips_before.get("no_ttf_font", 0)
+                    ):
+                        _reason_3d = "no_ttf_font"
+                    else:
+                        _reason_3d = "shapestring_unavailable"
                     _record_shapestring_skip(opts, "fallback_to_labels")
-                    if opts.verbose:
-                        _warn("3D Text mode produced 0 spans — falling back to labels")
+                    # TEXTMODE-1: fallback warnings are loud — never verbose-gated.
+                    _warn("3D Text mode produced 0 spans — falling back to labels")
+                    pending_label_fallback = {
+                        "requested": "3d_text",
+                        "reason": _reason_3d,
+                    }
 
             # High-fidelity Labels path: render each PDF span at its exact origin.
             # This preserves stacked fractions and micro-positioning much closer
@@ -3449,6 +3497,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 )
                 if exact_span_count > 0:
                     obj_count += exact_span_count
+                    labels_delivered += exact_span_count
                     if text_entity_info is None:
                         text_entity_info = {
                             'entity_type': 'labels',
@@ -3484,6 +3533,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     if rotated_span_count > 0 and opts.verbose:
                         _msg(f"  Text: {rotated_span_count} rotated span labels (exact placement)")
                     obj_count += rotated_span_count
+                    labels_delivered += rotated_span_count
 
             for block in tdict.get("blocks", []):
                 if block.get("type") != 0:
@@ -3756,6 +3806,8 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                         _apply_text_color(t, item.get("source_color"))
                         text_group.addObject(t)
                         obj_count += 1
+                        labels_delivered += 1
+                        _record_text_delivery(opts, "native_label", 1)
                         if text_entity_info is None:
                             text_entity_info = {
                                 'entity_type': 'labels',
@@ -3769,6 +3821,17 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                                 text_entity_info['examples'].append(item["content"][:20])
                     except (RuntimeError, ValueError, TypeError, AttributeError):
                         pass
+
+            # TEXTMODE-1: a whole-mode degrade to labels is reported with the
+            # count the label rungs actually delivered — loud, never silent.
+            if pending_label_fallback and labels_delivered > 0:
+                _record_text_mode_fallback(
+                    opts,
+                    requested=str(pending_label_fallback.get("requested") or ""),
+                    delivered="labels",
+                    reason=str(pending_label_fallback.get("reason") or ""),
+                    count=labels_delivered,
+                )
           except (RuntimeError, ValueError, TypeError, AttributeError) as e:
             _warn(f"Text import failed: {e}")
 

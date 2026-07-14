@@ -56,13 +56,21 @@ def _modes_equivalent(requested: str, delivered: str) -> bool:
     return requested in _PEER_FAMILY and delivered in _PEER_FAMILY
 
 
-def assert_textmode1_invariant(report: dict) -> None:
+def assert_textmode1_invariant(
+    report: dict, *, expected_source_text_spans: int | None = None
+) -> None:
     """(delivered == requested) OR fallback.text{requested,delivered,reason}."""
     extra = report.get("extra") or {}
     requested = _normalize_mode(extra.get("text_mode"))
     entity = extra.get("actual_text_entity_types") or {}
     delivered = _normalize_mode(entity.get("entity_type"))
     delivered_count = int(entity.get("count") or 0)
+
+    if expected_source_text_spans is not None and expected_source_text_spans > 0:
+        assert delivered_count > 0, (
+            "TEXTMODE-1 violated: source text was present but zero spans were "
+            "delivered - the fallback ladder ended in nothing"
+        )
 
     if not requested or requested == "none" or delivered_count <= 0:
         return  # no text requested or none delivered — nothing to pin here
@@ -239,6 +247,14 @@ def test_invariant_checker_rejects_silent_substitution():
     silent["fallback"] = {"used": False, "reason": None}
     with pytest.raises(AssertionError):
         assert_textmode1_invariant(silent)
+
+
+def test_invariant_checker_rejects_zero_delivery_when_source_text_was_present():
+    opts = core.ImportOptions(text_mode="glyphs")
+    report = _write_report(opts, _entity("glyphs", 0))
+
+    with pytest.raises(AssertionError, match="zero spans were delivered"):
+        assert_textmode1_invariant(report, expected_source_text_spans=2)
 
 
 if __name__ == "__main__":

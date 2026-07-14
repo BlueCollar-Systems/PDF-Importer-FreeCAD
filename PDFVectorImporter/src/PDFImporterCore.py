@@ -3486,6 +3486,11 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                         _msg(f"  Text: {result['glyphs']} glyphs from "
                              f"{result['shapes']} unique shapes "
                              f"({result.get('renderer', 'svg')})")
+                else:
+                    svg_failure_reason = "svg_renderer_empty"
+                    _warn(
+                        "SVG text renderer returned no glyphs, walking the "
+                        "text-mode fallback ladder")
             except (RuntimeError, ValueError, TypeError, OSError, ImportError, AttributeError) as e:
                 # TEXTMODE-1: this is a fallback trigger, not a fix — the
                 # ladder below walks 3D Text before Draft labels and reports.

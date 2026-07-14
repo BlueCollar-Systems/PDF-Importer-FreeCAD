@@ -11,6 +11,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -67,6 +68,81 @@ class FakeGroup:
 
     def addObject(self, obj):
         self.objects.append(obj)
+
+
+class FakeDocumentGroup:
+    """Document group stand-in for the production page-import path."""
+
+    def __init__(self, name):
+        self.Name = name
+        self.Group = []
+
+    def addObject(self, obj):
+        self.Group.append(obj)
+
+    def removeObject(self, obj):
+        self.Group.remove(obj)
+
+    def isDerivedFrom(self, kind):
+        return kind == "App::DocumentObjectGroup"
+
+
+class FakeDocument:
+    def __init__(self):
+        self.Objects = []
+
+    def addObject(self, kind, name):
+        assert kind == "App::DocumentObjectGroup"
+        obj = FakeDocumentGroup(name)
+        self.Objects.append(obj)
+        return obj
+
+    def removeObject(self, name):
+        self.Objects = [obj for obj in self.Objects if obj.Name != name]
+
+    def recompute(self):
+        return None
+
+
+class FakePage:
+    def __init__(self, tdict):
+        self.rotation = 0
+        self.mediabox = SimpleNamespace(width=200.0, height=100.0)
+        self.rect = SimpleNamespace(width=200.0, height=100.0)
+        self._tdict = tdict
+
+    def get_drawings(self):
+        return []
+
+    def get_images(self, full=True):
+        return []
+
+    def get_text(self, kind):
+        assert kind == "dict"
+        return self._tdict
+
+
+class FakePdfDocument:
+    is_encrypted = False
+
+    def __init__(self, page):
+        self.page = page
+
+    def __len__(self):
+        return 1
+
+    def load_page(self, index):
+        assert index == 0
+        return self.page
+
+
+class FakeFreeCAD:
+    GuiUp = False
+
+    class Console:
+        PrintMessage = staticmethod(lambda _message: None)
+        PrintWarning = staticmethod(lambda _message: None)
+        PrintError = staticmethod(lambda _message: None)
 
 
 class FakeDraft:
@@ -343,6 +419,70 @@ def test_report_fallback_text_honest_when_svg_falls_to_3d_text(fake_freecad):
         "count": 2,
     }
     assert data["extra"]["actual_text_entity_types"]["native_3d_text"] == 2
+
+
+@pytest.mark.parametrize("empty_svg_result", [None, {}, {"glyphs": 0}])
+def test_production_path_empty_svg_walks_3d_rung_and_reports_fallback(
+    fake_freecad, monkeypatch, empty_svg_result
+):
+    """None/empty/zero-glyph SVG output is failure, not a Labels shortcut."""
+    import PDFVectorImporter.src.PDFSvgTextRenderer as svg_renderer
+
+    draft = fake_freecad(FakeDraft())
+    monkeypatch.setattr(core, "FreeCAD", FakeFreeCAD)
+    monkeypatch.setattr(
+        svg_renderer, "render_text", lambda *args, **kwargs: empty_svg_result
+    )
+
+    opts = core.ImportOptions(
+        text_mode="glyphs",
+        import_mode="vector",
+        layer_mode="none",
+        raster_fallback=False,
+        ignore_images=True,
+        verbose=False,
+    )
+    page = FakePage(_tdict("ONE", "TWO"))
+
+    _group, info = core._import_pdf_page_inner(
+        FakePdfDocument(page), "sample.pdf", 1, opts, FakeDocument()
+    )
+
+    # Production dispatch must attempt the closer 3D Text rung first. A direct
+    # Labels fallback would put label calls here (the bug this test catches).
+    assert draft.calls == [("shapestring", "ONE"), ("shapestring", "TWO")]
+    assert info["entity_type"] == "3d_text"
+    assert info["count"] == 2
+    assert opts.text_mode_fallbacks == [
+        {
+            "requested": "glyphs",
+            "delivered": "3d_text",
+            "reason": "svg_renderer_empty",
+            "count": 2,
+        }
+    ]
+
+    opts._report_extra = {"actual_text_entity_types": dict(info)}
+    with tempfile.TemporaryDirectory(prefix="fc_textmode1_empty_svg_") as tmp:
+        report_path = Path(tmp) / "import_report.json"
+        core.write_import_report(
+            pdf_path="sample.pdf",
+            output_path=str(report_path),
+            opts=opts,
+            pages_imported=1,
+            total_pages=1,
+            text_count=2,
+            elapsed_ms=1.0,
+        )
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert report["fallback"]["text"] == {
+        "requested": "glyphs",
+        "delivered": "3d_text",
+        "reason": "svg_renderer_empty",
+        "count": 2,
+    }
+    assert report["extra"]["actual_text_entity_types"]["native_3d_text"] == 2
 
 
 if __name__ == "__main__":

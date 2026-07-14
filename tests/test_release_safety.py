@@ -596,6 +596,17 @@ class ReleaseSafetyTest:
         assert not re.search(r"^\s*gh release upload\b", workflow, re.MULTILINE)
         assert "--clobber" not in workflow
 
+    def test_windows_release_never_overwrites_existing_assets(self):
+        workflow = (
+            REPO_ROOT / ".github" / "workflows" / "windows-release.yml"
+        ).read_text(encoding="utf-8")
+        publish_at = workflow.index("- name: Publish GitHub Release assets")
+        publish_block = workflow[publish_at:]
+        assert "uses: softprops/action-gh-release@v2" in publish_block
+        assert re.search(
+            r"^\s+overwrite_files:\s*false\s*$", publish_block, re.MULTILINE
+        )
+
     def test_acknowledge_rejects_past_deferral(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "warnings.json"

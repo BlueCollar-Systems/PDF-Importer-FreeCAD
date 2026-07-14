@@ -1635,9 +1635,6 @@ def _estimate_text_width_mm(text: str, font_size_fc: float) -> float:
     return _estimate_text_width_units(text) * font_size_fc
 
 
-def _same_text_line(y1: float, y2: float, size1: float, size2: float) -> bool:
-    tol = 0.25 * max(size1, size2, 1.0)
-    return abs(y1 - y2) <= tol
 
 
 # Lowercase characters whose glyphs genuinely descend below the baseline.
@@ -2289,169 +2286,6 @@ def _preprocess_text_blocks(tdict: dict) -> dict:
     return tdict
 
 
-def _resolve_horizontal_run_overlaps(layout_items: List[dict], scale: float) -> List[dict]:
-    """Push later horizontal sibling runs right only when they truly overlap.
-
-    Uses the measured PDF bbox width when available and only falls back to
-    estimated render width when needed. This avoids false-positive nudges that
-    can misalign callouts in technical drawings.
-    """
-    if not layout_items:
-        return layout_items
-    s = max(scale, 1e-12)
-    # IMPORTANT: tiny baseline jitter (e.g. 334.560 vs 334.562) can invert run
-    # order when sorting primarily by baseline. Preserve left-to-right order
-    # within each logical text line using a coarse line key when available.
-    items = sorted(
-        layout_items,
-        key=lambda d: (d.get("line_key", round(d["baseline_y_pdf"], 1)), d["x_pdf"]),
-    )
-    prev = None
-    for item in items:
-        if not item.get("eligible_for_nudge", False):
-            prev = item if item.get("is_horizontal", False) else prev
-            continue
-        if prev is None or not prev.get("eligible_for_nudge", False):
-            prev = item
-            continue
-        if not _same_text_line(item["baseline_y_pdf"], prev["baseline_y_pdf"], item["font_size_fc"], prev["font_size_fc"]):
-            prev = item
-            continue
-        # FC-1 dense dims: prefer the *larger* of PDF bbox width vs estimated
-        # render width so a reduced stacked-fraction bbox cannot leave the next
-        # sibling parked under oversized glyphs (reads as "313 16" collisions).
-        orig_w = float(prev.get("orig_width_pdf", 0.0) or 0.0)
-        render_w = float(prev.get("render_width_pdf", 0.0) or 0.0)
-        prev_width = max(orig_w, render_w)
-        prev_right = float(prev["x_pdf"]) + prev_width
-        this_left = item["x_pdf"]
-        overlap = prev_right - float(this_left)
-        if overlap > 0.0:
-            # Keep a tiny separation in PDF-space units.
-            pad_pdf = min(
-                0.75,
-                (0.04 * max(prev["font_size_fc"], item["font_size_fc"], 1.0)) / s,
-            )
-            item["x_pdf"] += overlap + pad_pdf
-        prev = item
-    return items
-
-
-
-
-_MIXED_FRACTION_RE = re.compile(
-    r"""(?:
-        \d+\s+\d+/\d+
-        |
-        \d+'-\d+\s+\d+/\d+"?
-    )""",
-    re.VERBOSE,
-)
-
-
-def _is_near_vertical_angle(angle_deg: float, tol_deg: float = 15.0) -> bool:
-    a = angle_deg % 180.0
-    return abs(a - 90.0) <= tol_deg
-
-
-def _has_mixed_fraction_text(text: str) -> bool:
-    return bool(_MIXED_FRACTION_RE.search((text or '').strip()))
-
-
-def _projected_text_extents(item: dict, scale: float, font_size_fc: Optional[float] = None) -> Tuple[float, float, float, float]:
-    """Projected extents in PDF-space for overlap checks.
-
-    Returns (along_min, along_max, normal_min, normal_max). The anchor model
-    matches how this importer places text today: left-justified runs extend
-    forward from the insertion point; centered runs extend equally both ways.
-    """
-    fs = float(font_size_fc if font_size_fc is not None else item.get('font_size_fc', 0.0))
-    s = max(scale, 1e-12)
-    width_pdf = _estimate_text_width_mm(item.get('content', ''), fs) / s
-    height_pdf = fs / s
-
-    a = math.radians(float(item.get('angle_deg', 0.0)))
-    ux, uy = math.cos(a), math.sin(a)
-    nx, ny = -uy, ux
-
-    x = float(item.get('x_pdf', 0.0))
-    y = float(item.get('baseline_y_pdf', 0.0))
-    anchor_along = x * ux + y * uy
-    anchor_normal = x * nx + y * ny
-
-    just = item.get('justification', 'Left')
-    if just == 'Center':
-        along_min = anchor_along - width_pdf / 2.0
-        along_max = anchor_along + width_pdf / 2.0
-    elif just == 'Right':
-        along_min = anchor_along - width_pdf
-        along_max = anchor_along
-    else:
-        along_min = anchor_along
-        along_max = anchor_along + width_pdf
-
-    normal_min = anchor_normal - height_pdf / 2.0
-    normal_max = anchor_normal + height_pdf / 2.0
-    return along_min, along_max, normal_min, normal_max
-
-
-def _intervals_overlap(a0: float, a1: float, b0: float, b1: float, tol: float = 0.0) -> bool:
-    return not (a1 < b0 - tol or b1 < a0 - tol)
-
-
-def _axis_gap(a0: float, a1: float, b0: float, b1: float) -> float:
-    if _intervals_overlap(a0, a1, b0, b1):
-        return 0.0
-    if a1 < b0:
-        return b0 - a1
-    return a0 - b1
-
-
-def _apply_vertical_mixed_fraction_compaction(layout_items: List[dict], scale: float) -> List[dict]:
-    """Shrink risky rotated mixed-fraction runs slightly when they would collide
-    along their text direction.
-
-    This is intentionally conservative: it touches only near-vertical mixed
-    fractions and only when a projected overlap risk exists.
-    """
-    if not layout_items:
-        return layout_items
-
-    for item in layout_items:
-        text = item.get('content', '')
-        angle = float(item.get('angle_deg', 0.0))
-        if not (_is_near_vertical_angle(angle) and _has_mixed_fraction_text(text)):
-            continue
-
-        base_fs = float(item.get('font_size_fc', 0.0))
-        if base_fs <= 0:
-            continue
-
-        def risky(test_fs: float, _item=item) -> bool:
-            a0, a1, n0, n1 = _projected_text_extents(_item, scale, test_fs)
-            normal_tol = 0.20 * max(test_fs / max(scale, 1e-12), 1.0)
-            min_clearance = 0.18 * max(test_fs / max(scale, 1e-12), 1.0)
-            for other in layout_items:
-                if other is _item:
-                    continue
-                oa0, oa1, on0, on1 = _projected_text_extents(other, scale)
-                if not _intervals_overlap(n0, n1, on0, on1, tol=normal_tol):
-                    continue
-                if _axis_gap(a0, a1, oa0, oa1) < min_clearance:
-                    return True
-            return False
-
-        if risky(base_fs):
-            new_fs = base_fs
-            for factor in (0.92, 0.88, 0.84):
-                trial = base_fs * factor
-                if not risky(trial):
-                    new_fs = trial
-                    break
-                new_fs = trial
-            item['font_size_fc'] = new_fs
-
-    return layout_items
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -3759,8 +3593,6 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                             x_pdf, baseline_y = quantity_origin
                             justification = "Left"
                             baseline_from_origin_used = True
-                    render_width_pdf = _estimate_text_width_mm(content, font_size_fc) / max(scale, 1e-12)
-                    orig_width_pdf = max(0.0, all_x1 - all_x0)
 
                     layout_items.append({
                         "content": content,
@@ -3771,18 +3603,11 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                         "baseline_y_pdf": baseline_y,
                         "baseline_is_origin": bool(origin_xy and baseline_from_origin_used),
                         "x_pdf": x_pdf,
-                        "orig_width_pdf": orig_width_pdf,
-                        "render_width_pdf": render_width_pdf,
                         "justification": justification,
-                        "eligible_for_nudge": bool(is_horizontal and justification == "Left" and has_siblings),
-                        "line_key": _gy,
                         "ascender": _asc,
                         "descender": _desc,
                         "source_color": _span_source_color(all_spans[0]),
                     })
-
-                layout_items = _resolve_horizontal_run_overlaps(layout_items, scale)
-                layout_items = _apply_vertical_mixed_fraction_compaction(layout_items, scale)
 
                 for item in layout_items:
                     pos = _to_fc((item["x_pdf"], item["baseline_y_pdf"]), page_h, opts, scale)

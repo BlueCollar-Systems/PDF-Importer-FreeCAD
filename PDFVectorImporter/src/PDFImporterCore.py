@@ -2377,6 +2377,58 @@ def _render_text_spans_3d(
     return count
 
 
+def _walk_glyph_svg_failure_rungs(
+    tdict: dict,
+    text_group,
+    page_h: float,
+    opts: ImportOptions,
+    scale: float,
+    layout_context: Optional[dict],
+    svg_failure_reason: str,
+) -> Tuple[int, Optional[dict], Optional[dict]]:
+    """Walk the final FC ladder when the glyphs/geometry SVG renderer fails.
+
+    TEXTMODE-1: Glyphs/Geometry -> 3D Text (ShapeString) -> Labels. The
+    CLOSER 3D Text rung is attempted first; every delivering rung is
+    recorded as a loud fallback. Returns (delivered_count, text_entity_info,
+    pending_label_fallback). A non-zero delivered_count means the caller
+    must stop walking (the spans are delivered); a pending_label_fallback
+    means the label rungs below must deliver and report.
+    """
+    delivered_before = dict(getattr(opts, "text_delivered_counts", {}) or {})
+    rung_count = _render_text_spans_3d(
+        tdict, text_group, page_h, opts, scale, layout_context=layout_context
+    )
+    if rung_count > 0:
+        delivered_now = getattr(opts, "text_delivered_counts", {}) or {}
+        ss_delivered = int(delivered_now.get("native_3d_text", 0)) - int(
+            delivered_before.get("native_3d_text", 0)
+        )
+        if ss_delivered > 0:
+            _record_text_mode_fallback(
+                opts,
+                requested=str(getattr(opts, "text_mode", "") or ""),
+                delivered="3d_text",
+                reason=svg_failure_reason,
+                count=ss_delivered,
+            )
+        _warn(
+            f"{opts.text_mode} SVG renderer unavailable — delivered "
+            f"{rung_count} spans via the 3D Text ladder rung"
+        )
+        info = {
+            'entity_type': '3d_text' if ss_delivered > 0 else 'labels',
+            'count': rung_count,
+            'font_rendered': True,
+            'examples': [],
+        }
+        return rung_count, info, None
+    return 0, None, {
+        "requested": str(getattr(opts, "text_mode", "") or ""),
+        "reason": svg_failure_reason,
+    }
+
+
 def _is_near_horizontal(dx: float, dy: float) -> bool:
     return abs(dx) > 0.95 and abs(dy) < 0.10
 
@@ -3404,6 +3456,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         # Try SVG vector text (Glyphs / Geometry modes). Poppler/pdftocairo is
         # preferred; bundled PyMuPDF is used when Poppler is absent.
         svg_text_done = False
+        svg_failure_reason = None
         text_entity_info = None
         if opts.text_mode in ("glyphs", "geometry"):
             try:
@@ -3419,6 +3472,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     obj_count += 1
                     n_glyphs = result['glyphs']
                     entity_type = result.get('entity_type', 'glyphs')
+                    _record_text_delivery(opts, "outline_curve_or_mesh", n_glyphs)
                     text_entity_info = {
                         'entity_type': entity_type,
                         'count': n_glyphs,
@@ -3433,7 +3487,10 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                              f"{result['shapes']} unique shapes "
                              f"({result.get('renderer', 'svg')})")
             except (RuntimeError, ValueError, TypeError, OSError, ImportError, AttributeError) as e:
-                _warn(f"SVG text renderer failed, falling back to Draft text: {e}")
+                # TEXTMODE-1: this is a fallback trigger, not a fix — the
+                # ladder below walks 3D Text before Draft labels and reports.
+                svg_failure_reason = "svg_renderer_failed"
+                _warn(f"SVG text renderer failed, walking the text-mode fallback ladder: {e}")
 
         # Fall back to Draft text (Labels mode, or if pdftocairo unavailable)
         if not svg_text_done:
@@ -3446,6 +3503,24 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             # spans they actually delivered (never silent).
             pending_label_fallback = None
             labels_delivered = 0
+
+            # TEXTMODE-1 (final FC ladder): glyphs/geometry whose SVG renderer
+            # failed walk the CLOSER 3D Text (ShapeString) rung before Draft
+            # labels; whichever rung delivers is recorded as a loud fallback.
+            if svg_failure_reason and opts.text_mode in ("glyphs", "geometry"):
+                rung_count, rung_info, pending_label_fallback = (
+                    _walk_glyph_svg_failure_rungs(
+                        tdict, text_group, page_h, opts, scale,
+                        layout_context, svg_failure_reason,
+                    )
+                )
+                if rung_count > 0:
+                    obj_count += rung_count
+                    text_entity_info = rung_info
+                    _progress_update(
+                        89,
+                        f"Rendering fallback text ({rung_count} spans)...")
+                    tdict = {"blocks": []}
 
             # 3D Text uses extruded ShapeStrings; labels use editable Draft text.
             if opts.text_mode == "3d_text":

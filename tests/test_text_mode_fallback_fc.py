@@ -77,8 +77,10 @@ class FakeDraft:
         self.fail_all = bool(fail_all_shapestrings)
         self.shapestrings = []
         self.labels = []
+        self.calls = []  # ordered spy: ("shapestring"|"label", text)
 
     def make_shapestring(self, text, font_path):
+        self.calls.append(("shapestring", text))
         if self.fail_all or text in self.fail_texts:
             raise RuntimeError(f"ShapeString failed for {text!r}")
         obj = FakeObj("shapestring", text)
@@ -86,6 +88,7 @@ class FakeDraft:
         return obj
 
     def make_text(self, texts, placement=None):
+        self.calls.append(("label", str(texts[0])))
         obj = FakeObj("label", str(texts[0]))
         self.labels.append(obj)
         return obj
@@ -234,6 +237,112 @@ def test_import_report_carries_fallback_text_after_span_rescue(fake_freecad):
     assert actual["native_3d_text"] == 1
     assert actual["native_label"] == 1
     assert data["extra"]["shapestring_skips"]["shapestring_failed"] == 1
+
+
+# ── Item 8 (P1): glyphs/geometry SVG failure walks 3D Text before labels ─
+def test_svg_failure_walks_shapestring_rung_first(fake_freecad):
+    draft = fake_freecad(FakeDraft())
+    opts = core.ImportOptions(text_mode="glyphs")
+    group = FakeGroup()
+
+    count, info, pending = core._walk_glyph_svg_failure_rungs(
+        _tdict("ONE", "TWO"), group, 100.0, opts, 1.0, {}, "svg_renderer_failed"
+    )
+
+    # The CLOSER 3D Text rung was attempted (and delivered) — not labels.
+    assert count == 2
+    assert pending is None
+    assert [kind for kind, _ in draft.calls] == ["shapestring", "shapestring"]
+    assert draft.labels == []
+    assert info["entity_type"] == "3d_text"
+    assert opts.text_mode_fallbacks == [
+        {
+            "requested": "glyphs",
+            "delivered": "3d_text",
+            "reason": "svg_renderer_failed",
+            "count": 2,
+        }
+    ]
+
+
+def test_svg_failure_then_shapestring_failure_delivers_labels(fake_freecad):
+    draft = fake_freecad(FakeDraft(fail_all_shapestrings=True))
+    opts = core.ImportOptions(text_mode="geometry")
+    group = FakeGroup()
+
+    count, info, pending = core._walk_glyph_svg_failure_rungs(
+        _tdict("ONE", "TWO"), group, 100.0, opts, 1.0, {}, "svg_renderer_failed"
+    )
+
+    # ShapeString attempted FIRST, then the labels rung delivered every span.
+    assert count == 2
+    assert pending is None
+    assert [kind for kind, _ in draft.calls] == [
+        "shapestring", "shapestring", "label", "label",
+    ]
+    assert sorted(obj.text for obj in draft.labels) == ["ONE", "TWO"]
+    assert info["entity_type"] == "labels"
+    # Honest at each rung: the delivering rung is the one reported.
+    assert opts.text_mode_fallbacks == [
+        {
+            "requested": "geometry",
+            "delivered": "labels",
+            "reason": "shapestring_failed",
+            "count": 2,
+        }
+    ]
+
+
+def test_svg_failure_with_no_shapestring_font_defers_to_label_rungs(
+    fake_freecad, monkeypatch
+):
+    draft = fake_freecad(FakeDraft())
+    monkeypatch.setattr(core, "_resolve_shapestring_font_path", lambda name: None)
+    opts = core.ImportOptions(text_mode="glyphs")
+    group = FakeGroup()
+
+    count, info, pending = core._walk_glyph_svg_failure_rungs(
+        _tdict("ONE",), group, 100.0, opts, 1.0, {}, "svg_renderer_failed"
+    )
+
+    assert count == 0
+    assert info is None
+    assert pending == {"requested": "glyphs", "reason": "svg_renderer_failed"}
+    assert draft.calls == []
+    assert opts.shapestring_skips.get("no_ttf_font") == 1
+
+
+def test_report_fallback_text_honest_when_svg_falls_to_3d_text(fake_freecad):
+    fake_freecad(FakeDraft())
+    opts = core.ImportOptions(text_mode="glyphs")
+    group = FakeGroup()
+
+    count, info, _pending = core._walk_glyph_svg_failure_rungs(
+        _tdict("ONE", "TWO"), group, 100.0, opts, 1.0, {}, "svg_renderer_failed"
+    )
+    opts._report_extra = {"actual_text_entity_types": dict(info)}
+
+    with tempfile.TemporaryDirectory(prefix="fc_textmode1_") as tmp:
+        report_path = Path(tmp) / "import_report.json"
+        core.write_import_report(
+            pdf_path=str(Path(tmp) / "sample.pdf"),
+            output_path=str(report_path),
+            opts=opts,
+            pages_imported=1,
+            total_pages=1,
+            text_count=count,
+            elapsed_ms=5.0,
+        )
+        data = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert data["fallback"]["used"] is True
+    assert data["fallback"]["text"] == {
+        "requested": "glyphs",
+        "delivered": "3d_text",
+        "reason": "svg_renderer_failed",
+        "count": 2,
+    }
+    assert data["extra"]["actual_text_entity_types"]["native_3d_text"] == 2
 
 
 if __name__ == "__main__":

@@ -149,7 +149,42 @@ types, not in quality tier.
 | **Geometry** | Text converted to non-editable geometry |
 
 Plus a separate **Import text** toggle to skip text entirely.
-Glyphs and Geometry prefer Poppler/pdftocairo SVG output when available, then fall back to bundled PyMuPDF SVG paths before degrading to Labels.
+Glyphs and Geometry prefer Poppler/pdftocairo SVG output when available, then fall back to bundled PyMuPDF SVG paths.
+
+### Text-mode fallback ladder (TEXTMODE-1)
+
+**The requested text mode is the delivered text mode.** Alignment, rotation,
+or scaling defects are fixed *inside* the requested mode — never by
+substituting a different mode. Substitution is permitted only when the
+requested mode is genuinely impossible for this importer + option + PDF, must
+walk the documented ladder below (most closely related rung first), must
+always terminate in *some* delivered representation, and is always recorded
+in `import_report.json` (`fallback.text` = requested / delivered / reason /
+count, plus a `text_mode_fallback` diagnostics signal) — never silent.
+(Owner directive 2026-07-13.)
+
+FINAL FreeCAD ladder (left rung first):
+
+| Requested | Ladder |
+|-----------|--------|
+| **3D Text** | Glyphs/Geometry (SVG; Poppler → bundled PyMuPDF) → Labels (Draft text) → page raster |
+| **Glyphs / Geometry** | peer family → 3D Text (ShapeString) → Labels → page raster |
+| **Labels** | Glyphs/Geometry → page raster |
+| **Raster** | terminal — always achievable |
+
+Notes:
+- **Glyphs and Geometry are one peer family** (identical SVG rendering
+  engine), so a fallback between them is a no-op and the ladders treat them
+  as a single rung.
+- Per-span ShapeString failures deliver the failed spans through the Labels
+  rung (`reason: shapestring_failed`) — a failed span is never dropped.
+- A whole-mode 3D Text degrade reports `reason: no_ttf_font` or
+  `shapestring_unavailable`; a Glyphs/Geometry SVG renderer failure walks
+  the closer 3D Text rung before Labels (`reason: svg_renderer_failed`).
+- Labels sit before page raster per the audit's interim ruling (no host has
+  per-span raster patches today); every use is loudly reported.
+- The invariant "requested == delivered OR reported fallback — never
+  neither" is locked by `tests/test_textmode1_invariant_fc.py`.
 
 ## Compatibility
 

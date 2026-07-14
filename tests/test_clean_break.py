@@ -185,6 +185,16 @@ class TestTextDefaults(unittest.TestCase):
         self.assertIn('label = "text geometry" if opts.text_mode == "geometry" else "text glyphs"', source)
 
 
+class TestTextModeLadderDoctrine(unittest.TestCase):
+    """TEXTMODE-1 item 14: the FINAL FC fallback ladder stays documented."""
+
+    def test_readme_documents_final_fallback_ladder(self):
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("### Text-mode fallback ladder (TEXTMODE-1)", readme)
+        self.assertIn("peer family", readme)
+        self.assertIn("never silent", readme)
+
+
 class TestBlenderAdapterCleanBreak(unittest.TestCase):
     """QA adapter for the BL CLI must pass --mode, not --preset."""
 

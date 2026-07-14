@@ -11,9 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "PDFVectorImporter"))
 
 from pdfcadcore.import_report import (
+    build_actual_text_entity_types,
     build_font_embedding_hints,
     build_import_report,
     build_pdf_interactive_note,
+    build_text_mode_fallback,
 )
 
 
@@ -94,6 +96,123 @@ def test_import_report_diagnostics_for_fallback_and_dense_text():
     assert "source_text_seen_but_no_text_entities_created" in diagnostics["signals"]
     assert "dense_text_glyph_workload" in diagnostics["signals"]
     assert any("Vector or Hybrid" in action for action in diagnostics["recommended_actions"])
+
+
+def test_text_mode_fallback_block_carries_requested_delivered_reason():
+    """TEXTMODE-1 lock: a text-mode substitution is loud, never silent."""
+    report = build_import_report(
+        host_app="freecad",
+        pdf_path="sample.pdf",
+        mode="auto",
+        import_text=True,
+        text_mode="3d_text",
+        text_fallback={
+            "requested": "3d_text",
+            "delivered": "labels",
+            "reason": "shapestring_failed",
+            "count": 3,
+        },
+    )
+    data = report.to_dict()
+    fallback = data["fallback"]
+    assert fallback["used"] is True
+    assert fallback["text"] == {
+        "requested": "3d_text",
+        "delivered": "labels",
+        "reason": "shapestring_failed",
+        "count": 3,
+    }
+    assert "text_mode_fallback" in fallback["reason"]
+    diagnostics = data["extra"]["diagnostics"]
+    assert "text_mode_fallback" in diagnostics["signals"]
+    assert any("'3d_text'" in action and "'labels'" in action
+               for action in diagnostics["recommended_actions"])
+
+
+def test_text_mode_fallback_keeps_host_fallback_reason():
+    """A raster fallback reason is not clobbered by the text block."""
+    report = build_import_report(
+        host_app="freecad",
+        pdf_path="sample.pdf",
+        fallback_used=True,
+        fallback_reason="scanned/raster page",
+        text_fallback={
+            "requested": "glyphs",
+            "delivered": "labels",
+            "reason": "svg_renderer_failed",
+            "count": 2,
+        },
+    )
+    fallback = report.to_dict()["fallback"]
+    assert fallback["used"] is True
+    assert fallback["reason"] == "scanned/raster page"
+    assert fallback["text"]["requested"] == "glyphs"
+    assert fallback["text"]["delivered"] == "labels"
+    assert fallback["text"]["reason"] == "svg_renderer_failed"
+
+
+def test_requested_equals_delivered_emits_no_fallback_text():
+    """No substitution -> no fallback.text block and no signal."""
+    report = build_import_report(
+        host_app="freecad",
+        pdf_path="sample.pdf",
+        import_text=True,
+        text_mode="labels",
+        text_fallback={
+            "requested": "labels",
+            "delivered": "labels",
+            "reason": "not_a_substitution",
+        },
+    )
+    data = report.to_dict()
+    assert data["fallback"] == {"used": False, "reason": None}
+    assert "text_mode_fallback" not in data["extra"]["diagnostics"]["signals"]
+
+
+def test_build_text_mode_fallback_normalizes_and_rejects_non_substitutions():
+    assert build_text_mode_fallback(
+        requested=" 3D_Text ", delivered="Labels", reason="", count="4"
+    ) == {
+        "requested": "3d_text",
+        "delivered": "labels",
+        "reason": "unspecified",
+        "count": 4,
+    }
+    assert build_text_mode_fallback(requested="labels", delivered="labels", reason="x") is None
+    assert build_text_mode_fallback(requested="", delivered="labels", reason="x") is None
+
+
+def test_actual_text_entity_types_accepts_delivered_counts():
+    """TEXTMODE-1: buckets reflect DELIVERED entities when the host reports them."""
+    payload = build_actual_text_entity_types(
+        host_app="freecad",
+        text_mode="3d_text",
+        count=0,
+        delivered_counts={"native_3d_text": 1, "native_label": 2},
+    )
+    assert payload["native_3d_text"] == 1
+    assert payload["native_label"] == 2
+    assert payload["count"] == 3
+    assert payload["entity_type"] == "3d_text"
+
+
+def test_actual_text_entity_types_defaults_to_requested_mode_derivation():
+    """Backward compatible: without delivered info the mode string derives buckets."""
+    payload = build_actual_text_entity_types(
+        host_app="freecad",
+        text_mode="3d_text",
+        count=5,
+    )
+    assert payload["native_3d_text"] == 5
+    assert payload["native_label"] == 0
+
+    empty_delivered = build_actual_text_entity_types(
+        host_app="freecad",
+        text_mode="labels",
+        count=4,
+        delivered_counts={},
+    )
+    assert empty_delivered["native_label"] == 4
 
 
 def test_font_embedding_hints_uses_extension_not_referencer():

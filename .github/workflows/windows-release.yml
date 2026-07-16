@@ -90,7 +90,48 @@ jobs:
             dist/*.exe
           if-no-files-found: error
 
+      # R17-1 immutability: a dispatch for an already-published tag must not
+      # re-upload anything (v4.0.66 was clobber-re-uploaded on 2026-07-14,
+      # byte-identical by luck, before overwrite_files:false landed). When the
+      # release already has EVERY asset name this run built, warn and skip the
+      # publish step entirely - mirroring the auto-release existing-release
+      # skip. A partial set (e.g. auto-release uploaded the ZIP, Setup.exe
+      # still missing) proceeds; overwrite_files:false below keeps the
+      # existing assets untouched while the missing ones upload.
+      - name: Guard against re-uploading existing release assets
+        id: asset_guard
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}"
+          shopt -s nullglob
+          built=(dist/*.zip dist/*.exe)
+          if [ "${#built[@]}" -eq 0 ]; then
+            echo "::error::No built assets found under dist/ - nothing to publish."
+            exit 1
+          fi
+          skip=false
+          if gh release view "$TAG" --json assets --jq '.assets[].name' > existing_assets.txt 2>/dev/null; then
+            missing=0
+            for f in "${built[@]}"; do
+              name="$(basename "$f")"
+              if ! grep -Fxq "$name" existing_assets.txt; then
+                missing=$((missing + 1))
+                echo "Release $TAG is missing asset: $name"
+              fi
+            done
+            if [ "$missing" -eq 0 ]; then
+              echo "::warning::Release $TAG already has every asset this run built - release assets are immutable (R17-1); skipping upload."
+              skip=true
+            fi
+          fi
+          rm -f existing_assets.txt
+          echo "skip_upload=$skip" >> "$GITHUB_OUTPUT"
+
       - name: Publish GitHub Release assets
+        if: steps.asset_guard.outputs.skip_upload != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}

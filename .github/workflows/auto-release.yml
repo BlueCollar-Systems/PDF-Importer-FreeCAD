@@ -7,6 +7,13 @@ on:
     # Release-pipeline workflow edits under .github/ are NOT ignored: they must
     # rebuild --latest assets. The job if: guard skips chore: bump version to
     # commits, so there is no release loop.
+    # KNOWN GAP (SWEEP-14): a release commit whose only diff is markdown
+    # (e.g. the v4.0.67 badge-URL correction, 00d158e) never triggers this
+    # workflow. The canonical escape hatch is a manual dispatch:
+    #   gh workflow run auto-release.yml
+    # (documented in README.md > Building Release Artifacts). Kept as-is
+    # rather than dropping "**/*.md" so docs-only pushes stay mint-free per
+    # the board decision above.
     paths-ignore:
       - "**/*.md"
       - "docs/**"

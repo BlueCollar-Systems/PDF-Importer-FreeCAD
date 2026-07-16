@@ -100,6 +100,27 @@ python build_release.py
 2. GitHub Actions workflow `windows-release` builds both artifacts.
 3. The workflow attaches the ZIP and Setup.exe to that GitHub Release.
 
+### Auto-Release Mint on `main` Pushes
+The `auto-release` workflow mints a `vX.Y.Z` release automatically when a
+push to `main` carries a version bump. Two deliberate guards apply:
+
+- Docs-only pushes never mint: the workflow ignores `**/*.md`, `docs/**`,
+  and archive paths (board Q-08-a / ANS-09-1).
+- Commits marked `[skip release]` (docs/test/CI-only by convention) skip
+  the release job entirely.
+
+**Escape hatch (canonical):** if a release commit's only diff is markdown —
+for example a README badge correction that must still ship as a release —
+the push cannot trigger `auto-release`. Mint it manually instead:
+
+```bash
+gh workflow run auto-release.yml
+```
+
+The dispatched run re-reads the committed version, runs the full release
+gates, and mints the tag exactly as a push-triggered run would (this is how
+v4.0.67's badge correction shipped).
+
 ## Free Structural Steel Shapes (CC0)
 
 This repository also hosts the public-domain AISC v16.0 DXF/DWG shape packs

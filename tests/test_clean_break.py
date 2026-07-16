@@ -16,7 +16,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKBENCH_DIR = REPO_ROOT / "PDFVectorImporter"
 SRC_DIR = WORKBENCH_DIR / "src"
 ADAPTERS_DIR = WORKBENCH_DIR / "adapters"
-EMBEDDED_CORE_CONFIG = WORKBENCH_DIR / "pdfcadcore" / "import_config.py"
 IMPORTER_CORE = SRC_DIR / "PDFImporterCore.py"
 
 for p in (str(SRC_DIR), str(WORKBENCH_DIR)):
@@ -175,9 +174,10 @@ class TestTextDefaults(unittest.TestCase):
     """Core config defaults must not silently return to Labels."""
 
     def test_embedded_core_config_defaults_to_3d_text(self):
-        source = EMBEDDED_CORE_CONFIG.read_text(encoding="utf-8")
-        self.assertIn('text_mode: str = "3d_text"', source)
-        self.assertNotIn('text_mode: str = "labels"', source)
+        # RB-11: value lock, not a source-wording lock — the contract is the
+        # default a constructed config carries, not how the source spells it.
+        from pdfcadcore.import_config import ImportConfig as CoreImportConfig
+        self.assertEqual(CoreImportConfig().text_mode, "3d_text")
 
     def test_glyphs_mode_uses_vector_glyph_renderer(self):
         source = IMPORTER_CORE.read_text(encoding="utf-8")

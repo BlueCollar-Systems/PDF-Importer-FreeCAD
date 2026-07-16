@@ -51,7 +51,10 @@ def fake_git_factory(
     return git_command
 
 
-class ReleaseSafetyTest:
+class TestReleaseSafety:
+    # Named Test* so pytest collects it: as `ReleaseSafetyTest` the whole
+    # class was silently skipped by pytest's default Test* pattern and every
+    # lock in this file was dormant in CI (found 2026-07-16).
     def test_packaging_tools_are_product(self):
         assert rs.is_product_path("build_release.py")
         assert rs.is_product_path("tools/build_release.py")
@@ -856,7 +859,7 @@ class ReleaseSafetyTest:
 
 if __name__ == "__main__":
     # Minimal runner; run with pytest or unittest as well.
-    t = ReleaseSafetyTest()
+    t = TestReleaseSafety()
     for name in dir(t):
         if name.startswith("test_"):
             print(f"RUN {name}")

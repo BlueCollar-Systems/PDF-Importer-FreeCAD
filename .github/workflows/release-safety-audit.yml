@@ -1,0 +1,71 @@
+name: release-safety-audit
+
+# SWEEP-05 (Round 21): close the detector blind spot. The auto-release job
+# guards itself with `!contains(head_commit.message, '[skip release]')`, so
+# its stranded-release audit is skipped on exactly the pushes most likely to
+# strand a product fix — a behavior change mislabeled [skip release] (the
+# LC bde8b08 / BL 6ddd4ce+bb0b8a4 incident class, 2026-07-14). This workflow
+# runs the warn-only product-delta audit on EVERY main push with no
+# commit-message or path guards. It never mints and never fails the push:
+# --mode report always exits 0; findings land in the job summary and the
+# run-local .release-safety/warnings.json semantics (persistent
+# acknowledgements live in the committed warnings.json, updated by writer
+# sessions).
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: release-safety-audit-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Audit product delta past the committed version's tag
+        run: |
+          set -e
+          VERSION="$(python - <<'PY'
+          import pathlib
+          import re
+
+          text = pathlib.Path("PDFVectorImporter/package.xml").read_text(encoding="utf-8")
+          match = re.search(r"<version>(\d+\.\d+\.\d+)</version>", text)
+          if not match:
+              raise SystemExit("Could not find <version> in PDFVectorImporter/package.xml")
+          print(match.group(1))
+          PY
+          )"
+          TAG="v${VERSION}"
+          if ! git rev-parse --verify "refs/tags/${TAG}^{commit}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} does not exist yet — this push carries a version bump; auto-release owns the mint." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python scripts/release_safety.py audit-existing-tag \
+            --repo "${GITHUB_REPOSITORY}" \
+            --tag "${TAG}" \
+            --before "${{ github.event.before }}" \
+            --head "$GITHUB_SHA" \
+            --session-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --mode report \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            --warnings-file .release-safety/warnings.json

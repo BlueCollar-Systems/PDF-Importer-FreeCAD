@@ -599,6 +599,31 @@ class TestReleaseSafety:
         assert not re.search(r"^\s*gh release upload\b", workflow, re.MULTILINE)
         assert "--clobber" not in workflow
 
+    def test_audit_workflow_runs_on_every_main_push_without_guards(self):
+        # SWEEP-05: the standalone audit must fire even when the head commit
+        # says [skip release] (the pushes auto-release skips entirely), must
+        # not filter by path, must stay warn-only (report mode), and must
+        # never mint. Comment lines are stripped so the workflow may explain
+        # the guard strings it deliberately omits.
+        raw = (
+            REPO_ROOT / ".github" / "workflows" / "release-safety-audit.yml"
+        ).read_text(encoding="utf-8")
+        workflow = "\n".join(
+            line for line in raw.splitlines() if not line.lstrip().startswith("#")
+        )
+        assert "release_safety.py audit-existing-tag" in workflow
+        assert "--mode report" in workflow
+        assert "--mode release" not in workflow
+        assert '--before "${{ github.event.before }}"' in workflow
+        assert '--head "$GITHUB_SHA"' in workflow
+        assert '--summary "$GITHUB_STEP_SUMMARY"' in workflow
+        assert "[skip release]" not in workflow
+        assert "paths-ignore" not in workflow
+        assert "paths:" not in workflow
+        assert "head_commit.message" not in workflow
+        assert "gh release create" not in workflow
+        assert not re.search(r"^\s*if:", workflow, re.MULTILINE)
+
     def test_windows_release_never_overwrites_existing_assets(self):
         workflow = (
             REPO_ROOT / ".github" / "workflows" / "windows-release.yml"

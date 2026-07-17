@@ -148,6 +148,36 @@ class TestImportReportHumanSummary(unittest.TestCase):
         self.assertTrue(ready["ready"])
         self.assertTrue(ready["checks"]["text_delivery"])
 
+    def test_human_summary_records_importer_version(self) -> None:
+        """Evidence attribution: every report names the importer version in
+        both the JSON importer block and the human summary."""
+        report = build_import_report(
+            host_app="freecad",
+            importer_version="9.9.9",
+            pdf_path="drawing.pdf",
+            mode="auto",
+            pages=1,
+            primitive_count=5,
+        )
+
+        self.assertEqual(report.importer.get("version"), "9.9.9")
+        self.assertEqual(report.to_dict()["importer"]["version"], "9.9.9")
+        summary = report.extra.get("human_summary", "")
+        self.assertIn("Importer v9.9.9", summary)
+        # Standalone builder path stays consistent with the enriched extra.
+        self.assertIn("Importer v9.9.9", build_human_summary(report))
+
+    def test_human_summary_omits_importer_version_when_empty(self) -> None:
+        report = build_import_report(
+            host_app="freecad",
+            pdf_path="drawing.pdf",
+            mode="auto",
+            pages=1,
+            primitive_count=5,
+        )
+
+        self.assertNotIn("Importer v", report.extra.get("human_summary", ""))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -335,5 +335,97 @@ def test_empty_support_geometry_still_fails_closed(monkeypatch):
         )
 
 
+class FakeWire:
+    def __init__(self, tag):
+        self.tag = tag
+        self.translated = False
+
+    def copy(self):
+        return FakeWire(self.tag)
+
+
+class FakePartModule:
+    def __init__(self):
+        self.calls = []
+
+        def makeWireString(string, font_file, size, tracking):
+            self.calls.append((string, font_file, size, tracking))
+            return [[FakeWire("%s:%d" % (string, index))] for index in range(2)]
+
+        self.makeWireString = makeWireString
+
+
+def test_wirestring_memo_dedupes_identical_tessellations():
+    """P3: identical (text, font, size, tracking) calls tessellate once."""
+    part = FakePartModule()
+    memo = core._WireStringMemo(part)
+    memo.install()
+    try:
+        first = part.makeWireString("1/4", "font.otf", 2.5, 0)
+        second = part.makeWireString("1/4", "font.otf", 2.5, 0)
+        third = part.makeWireString("M", "font.otf", 2.5, 0)
+        part.makeWireString("M", "font.otf", 2.5, 0)
+    finally:
+        memo.restore()
+
+    assert len(part.calls) == 2, "only unique keys reach FreeType"
+    assert memo.hits == 2 and memo.misses == 2
+    assert first is not second
+    assert all(
+        hit_wire is not miss_wire
+        for hit_char, miss_char in zip(second, first)
+        for hit_wire, miss_wire in zip(hit_char, miss_char)
+    ), "cache hits must return fresh copies, never shared wire objects"
+    assert third[0][0].tag.startswith("M:")
+
+
+def test_wirestring_memo_is_immune_to_caller_mutation():
+    """ShapeString.execute translates returned wires; the cache stays pristine."""
+    part = FakePartModule()
+    memo = core._WireStringMemo(part)
+    memo.install()
+    try:
+        first = part.makeWireString("AB", "font.otf", 3.0, 0)
+        first[0][0].translated = True  # caller mutates its result in place
+        second = part.makeWireString("AB", "font.otf", 3.0, 0)
+    finally:
+        memo.restore()
+    assert second[0][0].translated is False
+
+
+def test_wirestring_memo_bypasses_unexpected_signatures():
+    part = FakePartModule()
+    original = part.makeWireString
+    memo = core._WireStringMemo(part)
+    memo.install()
+    try:
+        with pytest.raises(TypeError):
+            part.makeWireString("AB", "font.otf", 3.0)  # 3-arg: passthrough
+    finally:
+        memo.restore()
+    assert part.makeWireString is original
+    assert memo.hits == 0 and memo.misses == 0
+
+
+def test_wirestring_memo_scope_installs_and_restores(monkeypatch):
+    part = FakePartModule()
+    original = part.makeWireString
+    monkeypatch.setattr(core, "Part", part)
+    opts = types.SimpleNamespace()
+    with core._wirestring_memo_scope(opts) as memo:
+        assert isinstance(part.makeWireString, core._WireStringMemo)
+        part.makeWireString("AB", "font.otf", 3.0, 0)
+        part.makeWireString("AB", "font.otf", 3.0, 0)
+        assert memo is not None
+    assert part.makeWireString is original
+    assert opts.wirestring_cache_stats == {"hits": 1, "misses": 1}
+
+
+def test_wirestring_memo_scope_without_part_is_inert(monkeypatch):
+    monkeypatch.setattr(core, "Part", None)
+    with core._wirestring_memo_scope(None) as memo:
+        assert memo is None
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

@@ -11,8 +11,10 @@ Converts PDF drawings into editable FreeCAD geometry with text and image support
 from __future__ import annotations
 
 import copy
+import functools
 import hashlib
 import math
+from contextlib import contextmanager
 import os
 import re
 import sys
@@ -6505,8 +6507,105 @@ def _autofit_import_view(fc_doc) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Wire-string tessellation memo (perf levers P3 + P4)
+# ──────────────────────────────────────────────────────────────────────
+class _WireStringMemo:
+    """Per-import memo for Part.makeWireString.
+
+    Dense pages repeat identical (text, font, size) spans (369 -> 266 unique
+    on the owner's dense chart, P3) and Draft's ShapeString.execute
+    re-tessellates the "M" cap-height probe — plus the sticky-font "L" probe
+    on faces paths — on every execute (P4). FreeType tessellation is
+    deterministic for a given (string, font file, size, tracking), so repeat
+    calls return fresh copies of the first result. Copies are returned in
+    both directions (never the cached originals) because ShapeString.execute
+    translates the returned wires in place. Installed per import run and
+    always restored, so no state outlives an import.
+    """
+
+    def __init__(self, part_module):
+        self._part = part_module
+        self._original = part_module.makeWireString
+        self._cache: Dict[Tuple[str, str, float, float], list] = {}
+        self.hits = 0
+        self.misses = 0
+
+    @staticmethod
+    def _copy_result(result):
+        return [[wire.copy() for wire in char] for char in result]
+
+    def __call__(self, *args, **kwargs):
+        if kwargs or len(args) != 4:
+            return self._original(*args, **kwargs)
+        string, font_file, size, tracking = args
+        try:
+            key = (str(string), str(font_file), float(size), float(tracking))
+        except (TypeError, ValueError):
+            return self._original(*args, **kwargs)
+        cached = self._cache.get(key)
+        if cached is not None:
+            self.hits += 1
+            return self._copy_result(cached)
+        result = self._original(*args, **kwargs)
+        try:
+            self._cache[key] = self._copy_result(result)
+        except (AttributeError, RuntimeError, TypeError):
+            return result  # uncacheable result shape — pass through untouched
+        self.misses += 1
+        return result
+
+    def install(self):
+        self._part.makeWireString = self
+
+    def restore(self):
+        if getattr(self._part, "makeWireString", None) is self:
+            self._part.makeWireString = self._original
+        self._cache.clear()
+
+
+@contextmanager
+def _wirestring_memo_scope(opts: Optional["ImportOptions"] = None):
+    """Install the makeWireString memo for one import run (always restored)."""
+    if Part is None or not callable(getattr(Part, "makeWireString", None)):
+        yield None
+        return
+    memo = _WireStringMemo(Part)
+    memo.install()
+    try:
+        yield memo
+    finally:
+        memo.restore()
+        if opts is not None:
+            try:
+                opts.wirestring_cache_stats = {
+                    "hits": int(memo.hits),
+                    "misses": int(memo.misses),
+                }
+            except (AttributeError, TypeError):
+                pass
+
+
+def _memoized_wirestrings(func):
+    """Run an import entry point inside a makeWireString memo scope."""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        opts = kwargs.get("opts")
+        if opts is None:
+            for value in args:
+                if isinstance(value, ImportOptions):
+                    opts = value
+                    break
+        with _wirestring_memo_scope(opts):
+            return func(*args, **kwargs)
+
+    return wrapper
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Page importer
 # ──────────────────────────────────────────────────────────────────────
+@_memoized_wirestrings
 def import_pdf_page(pdf_path: str, page_num: int = 1,
                     opts: Optional[ImportOptions] = None,
                     autofit: bool = True):
@@ -7730,6 +7829,7 @@ def _remove_post_baseline_document_objects(
     }
 
 
+@_memoized_wirestrings
 def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     """Import one or more pages from a PDF file."""
     if opts is None:

@@ -3734,7 +3734,13 @@ def _create_verified_text3d_entity(
     except (AttributeError, RuntimeError, TypeError, ValueError):
         pass
     try:
-        shape_string.MakeFace = True
+        # P2 perf lever: keep the ShapeString as wires only. Draft's
+        # MakeFace=True runs makeFace + Face.validate per character (the two
+        # dominant costs on dense pages) and a per-execute sticky-font probe.
+        # Part::Extrusion(Solid=True) builds identical solids from the wires
+        # (FaceMakerCheese honors glyph counters; measured volume ratio 1.0
+        # against the faces path on hole-bearing glyphs "O8ABe00").
+        shape_string.MakeFace = False
     except (AttributeError, RuntimeError, TypeError, ValueError):
         pass
     # P1 ordering: all custom property writes must land BEFORE this object's
@@ -3751,9 +3757,12 @@ def _create_verified_text3d_entity(
     if (
         support_shape is None
         or bool(getattr(support_shape, "isNull", lambda: True)())
-        or not list(getattr(support_shape, "Faces", []) or [])
+        or not (
+            list(getattr(support_shape, "Faces", []) or [])
+            or list(getattr(support_shape, "Wires", []) or [])
+        )
     ):
-        raise RuntimeError("ShapeString did not produce face geometry")
+        raise RuntimeError("ShapeString did not produce face or wire geometry")
 
     native_advance = _shape_baseline_extent(support_shape, baseline_angle_deg)
     if native_advance is None or native_advance <= 1e-9:
@@ -3792,9 +3801,14 @@ def _create_verified_text3d_entity(
     if (
         calibrated_shape is None
         or bool(getattr(calibrated_shape, "isNull", lambda: True)())
-        or not list(getattr(calibrated_shape, "Faces", []) or [])
+        or not (
+            list(getattr(calibrated_shape, "Faces", []) or [])
+            or list(getattr(calibrated_shape, "Wires", []) or [])
+        )
     ):
-        raise RuntimeError("calibrated ShapeString clone did not produce face geometry")
+        raise RuntimeError(
+            "calibrated ShapeString clone did not produce face or wire geometry"
+        )
     verified_advance = _shape_baseline_extent(calibrated_shape, baseline_angle_deg)
     tolerance = max(0.05, float(target_advance_fc) * 0.03)
     if (

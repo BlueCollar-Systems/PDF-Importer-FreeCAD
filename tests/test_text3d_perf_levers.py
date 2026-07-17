@@ -231,5 +231,109 @@ def test_configure_host_runs_before_every_recompute(monkeypatch):
         ), "custom writes must precede the object's recompute"
 
 
+def _entity_kwargs(group, **overrides):
+    kwargs = dict(
+        font_size_fc=2.5,
+        depth=0.3,
+        target_advance_fc=6.0,
+        baseline_angle_deg=0.0,
+        text_group=group,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def _fake_clone_env(monkeypatch, doc, log, wires_only=False):
+    class FakeClone(FakeHost):
+        @property
+        def Scale(self):
+            return self._scale
+
+        @Scale.setter
+        def Scale(self, value):
+            self._scale = value
+            self.Shape = FakeShape(width=12.0 * float(value.x))
+            if wires_only:
+                self.Shape.Faces = []
+                self.Shape.Wires = [object()]
+
+    def clone(source):
+        host = FakeClone(doc, "Clone", "Part::Part2DObjectPython")
+        doc.Objects.append(host)
+        log.events.append(("add", host))
+        return host
+
+    monkeypatch.setattr(core, "Draft", types.SimpleNamespace(clone=clone))
+    monkeypatch.setattr(
+        core, "Vector", lambda x, y, z: types.SimpleNamespace(x=x, y=y, z=z)
+    )
+
+
+def test_shapestring_baseline_is_wires_only(monkeypatch):
+    """P2: MakeFace must be False when the ShapeString tessellates."""
+    log = EventLog()
+    doc = FakeDoc(log)
+    group = FakeGroup(doc)
+    _fake_clone_env(monkeypatch, doc, log)
+
+    shape_string = FakeHost(doc, "ShapeString", "Part::Part2DObjectPython")
+    doc.Objects.append(shape_string)
+    make_face_at_recompute = []
+    original_recompute = doc.recompute
+
+    def recording_recompute(objs=None):
+        for obj in objs or []:
+            if obj is shape_string:
+                make_face_at_recompute.append(getattr(obj, "MakeFace", None))
+        return original_recompute(objs)
+
+    monkeypatch.setattr(doc, "recompute", recording_recompute)
+
+    core._create_verified_text3d_entity(shape_string, **_entity_kwargs(group))
+
+    assert make_face_at_recompute == [False], (
+        "ShapeString must tessellate wires-only; faces are built once by "
+        "Part::Extrusion(Solid=True)"
+    )
+
+
+def test_wires_only_supports_pass_verification(monkeypatch):
+    """P2: face-less (wire) support geometry is valid for extrusion."""
+    log = EventLog()
+    doc = FakeDoc(log)
+    group = FakeGroup(doc)
+    _fake_clone_env(monkeypatch, doc, log, wires_only=True)
+
+    shape_string = FakeHost(doc, "ShapeString", "Part::Part2DObjectPython")
+    shape_string.Shape.Faces = []
+    shape_string.Shape.Wires = [object()]
+    doc.Objects.append(shape_string)
+
+    extrusion, calibrated, x_scale, advance = core._create_verified_text3d_entity(
+        shape_string, **_entity_kwargs(group)
+    )
+    assert extrusion.Solid is True
+    assert x_scale == pytest.approx(0.5)
+    assert advance == pytest.approx(6.0)
+
+
+def test_empty_support_geometry_still_fails_closed(monkeypatch):
+    """P2 keeps the fail-closed gate: no faces AND no wires is a failure."""
+    log = EventLog()
+    doc = FakeDoc(log)
+    group = FakeGroup(doc)
+    _fake_clone_env(monkeypatch, doc, log)
+
+    shape_string = FakeHost(doc, "ShapeString", "Part::Part2DObjectPython")
+    shape_string.Shape.Faces = []
+    shape_string.Shape.Wires = []
+    doc.Objects.append(shape_string)
+
+    with pytest.raises(RuntimeError, match="face or wire geometry"):
+        core._create_verified_text3d_entity(
+            shape_string, **_entity_kwargs(group)
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
-import tomllib
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -10,10 +10,14 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_dependency_contract_test_uses_only_python_310_stdlib():
+    source = Path(__file__).read_text(encoding="utf-8")
+    assert "\nimport tomllib\n" not in source
+
+
 def test_fonttools_is_declared_for_python_and_freecad_addon_manager():
-    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    dependencies = pyproject["project"]["dependencies"]
-    assert any(value.lower().startswith("fonttools>=") for value in dependencies)
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert re.search(r'(?mi)^\s*"fonttools>=4\.50,<5\.0",\s*$', pyproject)
 
     root = ET.parse(REPO_ROOT / "PDFVectorImporter" / "package.xml").getroot()
     namespace = {"fc": "https://wiki.freecad.org/Package_Metadata"}
@@ -22,6 +26,19 @@ def test_fonttools_is_declared_for_python_and_freecad_addon_manager():
         for node in root.findall(".//fc:depend", namespace)
     }
     assert "fonttools" in declared
+
+
+def test_ci_and_release_gates_install_declared_project_dependencies():
+    workflows = (
+        ".github/workflows/fc-pdfimporter-ci.yml",
+        ".github/workflows/auto-release.yml",
+        ".github/workflows/windows-release.yml",
+    )
+
+    for relative in workflows:
+        source = (REPO_ROOT / relative).read_text(encoding="utf-8")
+        assert "python -m pip install --editable . pytest" in source, relative
+        assert 'pip install "PyMuPDF>=1.24,<2.0" pytest' not in source, relative
 
 
 def test_release_builder_verifies_and_vendors_both_runtime_dependencies():

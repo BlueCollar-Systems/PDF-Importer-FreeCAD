@@ -38,7 +38,7 @@ jobs:
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "PyMuPDF>=1.24,<2.0" pytest
+          python -m pip install --editable . pytest
 
       - name: Validate tag matches package version
         shell: pwsh

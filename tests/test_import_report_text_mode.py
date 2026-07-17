@@ -95,7 +95,16 @@ def test_import_report_diagnostics_for_fallback_and_dense_text():
     assert "warnings_present" in diagnostics["signals"]
     assert "source_text_seen_but_no_text_entities_created" in diagnostics["signals"]
     assert "dense_text_glyph_workload" in diagnostics["signals"]
-    assert any("Vector or Hybrid" in action for action in diagnostics["recommended_actions"])
+    assert not any(
+        "Vector or Hybrid" in action
+        or "another text mode" in action.lower()
+        or "Outlines" in action
+        for action in diagnostics["recommended_actions"]
+    )
+    assert any(
+        "requested representation unchanged" in action
+        for action in diagnostics["recommended_actions"]
+    )
 
 
 def test_text_mode_fallback_block_carries_requested_delivered_reason():
@@ -186,14 +195,21 @@ def test_actual_text_entity_types_accepts_delivered_counts():
     """TEXTMODE-1: buckets reflect DELIVERED entities when the host reports them."""
     payload = build_actual_text_entity_types(
         host_app="freecad",
-        text_mode="3d_text",
+        text_mode="mixed",
         count=0,
-        delivered_counts={"native_3d_text": 1, "native_label": 2},
+        delivered_counts={
+            "native_text": 363,
+            "native_label": 6,
+            "native_3d_text": 1,
+            "raster_text_patch": 2,
+        },
     )
+    assert payload["native_text"] == 363
     assert payload["native_3d_text"] == 1
-    assert payload["native_label"] == 2
-    assert payload["count"] == 3
-    assert payload["entity_type"] == "3d_text"
+    assert payload["native_label"] == 6
+    assert payload["raster_text_patch"] == 2
+    assert payload["count"] == 372
+    assert payload["entity_type"] == "mixed"
 
 
 def test_actual_text_entity_types_defaults_to_requested_mode_derivation():
@@ -204,7 +220,9 @@ def test_actual_text_entity_types_defaults_to_requested_mode_derivation():
         count=5,
     )
     assert payload["native_3d_text"] == 5
+    assert payload["native_text"] == 0
     assert payload["native_label"] == 0
+    assert payload["raster_text_patch"] == 0
 
     empty_delivered = build_actual_text_entity_types(
         host_app="freecad",
@@ -212,7 +230,25 @@ def test_actual_text_entity_types_defaults_to_requested_mode_derivation():
         count=4,
         delivered_counts={},
     )
-    assert empty_delivered["native_label"] == 4
+    assert empty_delivered["native_label"] == 0
+    assert empty_delivered["count"] == 0
+    assert empty_delivered["entity_type"] == "none"
+
+    native_text = build_actual_text_entity_types(
+        host_app="freecad",
+        text_mode="text",
+        count=3,
+    )
+    assert native_text["native_text"] == 3
+    assert native_text["font_rendered"] is True
+
+    raster_text = build_actual_text_entity_types(
+        host_app="freecad",
+        text_mode="raster",
+        count=2,
+    )
+    assert raster_text["raster_text_patch"] == 2
+    assert raster_text["font_rendered"] is False
 
 
 def test_font_embedding_hints_uses_extension_not_referencer():
@@ -234,7 +270,8 @@ def test_font_embedding_hints_uses_extension_not_referencer():
 
     hints = build_font_embedding_hints(Doc())
     assert hints["non_embedded_fonts"] == ["Helvetica-Bold"]
-    assert "Labels mode may substitute" in hints["font_substitution_note"]
+    assert "parent-native font substitution" in hints["font_substitution_note"]
+    assert "source-font non-equivalent" in hints["font_substitution_note"]
 
 
 def test_pdf_interactive_note_ignores_null_catalog_keys():

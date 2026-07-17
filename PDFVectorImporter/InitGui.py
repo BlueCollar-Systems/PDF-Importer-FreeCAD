@@ -142,7 +142,7 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
                 self._prioritize_paths([lib])
             self._evict_stale_modules(base)
 
-        # Check for PyMuPDF
+        # Check every dependency required for exact PDF text/font delivery.
         has_fitz = False
         try:
             try:
@@ -153,10 +153,22 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
         except ImportError:
             pass
 
-        if not has_fitz:
-            self._offer_install(base)
+        has_fonttools = False
+        try:
+            import fontTools  # noqa: F401
+            has_fonttools = True
+        except ImportError:
+            pass
 
-    def _offer_install(self, base):
+        missing = []
+        if not has_fitz:
+            missing.append("PyMuPDF")
+        if not has_fonttools:
+            missing.append("fonttools")
+        if missing:
+            self._offer_install(base, missing)
+
+    def _offer_install(self, base, missing):
         try:
             from PySide6 import QtWidgets
         except ImportError:
@@ -165,8 +177,8 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
         reply = QtWidgets.QMessageBox.question(
             None,
             "PDF Vector Importer — First-Time Setup",
-            "PyMuPDF (the PDF reading engine) needs to be installed.\n\n"
-            "Install it now?  (~30 MB download, no admin needed)\n\n"
+            "Required PDF dependencies are missing: " + ", ".join(missing) + ".\n\n"
+            "Install them now?  (no admin needed)\n\n"
             "This only happens once.",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.Yes,
@@ -194,7 +206,7 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
         if sys.platform == "win32":
             kw["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
 
-        FreeCAD.Console.PrintMessage("Installing PyMuPDF to " + target + "...\n")
+        FreeCAD.Console.PrintMessage("Installing PDF runtime dependencies to " + target + "...\n")
         try:
             try:
                 subprocess.check_call(
@@ -205,7 +217,8 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
 
             subprocess.check_call(
                 [py, "-m", "pip", "install", "--upgrade",
-                 "--only-binary", ":all:", "--target", target, "PyMuPDF>=1.24,<2.0"],
+                 "--only-binary", ":all:", "--target", target,
+                 "PyMuPDF>=1.24,<2.0", "fonttools>=4.50,<5.0"],
                 timeout=300, **kw)
 
             if target not in sys.path:
@@ -217,14 +230,15 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
                     import pymupdf as fitz  # noqa: F401  # PyMuPDF >= 1.24 preferred name
                 except ImportError:
                     import fitz  # noqa: F401  # Legacy fallback
+                import fontTools  # noqa: F401
                 QtWidgets.QMessageBox.information(
                     None, "Ready to Go!",
-                    "PyMuPDF installed!\n\nYou can now import PDFs.")
-                FreeCAD.Console.PrintMessage("PyMuPDF installed and loaded.\n")
+                    "PDF dependencies installed!\n\nYou can now import PDFs.")
+                FreeCAD.Console.PrintMessage("PDF dependencies installed and loaded.\n")
             except ImportError:
                 QtWidgets.QMessageBox.information(
                     None, "Almost There",
-                    "PyMuPDF installed to:\n" + target + "\n\n"
+                    "PDF dependencies installed to:\n" + target + "\n\n"
                     "Please restart FreeCAD to activate it.")
 
         except subprocess.CalledProcessError as e:
@@ -233,7 +247,8 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
                 None, "Install Failed",
                 "Automatic install failed.\n\n"
                 "Try manually in a terminal:\n"
-                '  "' + py + '" -m pip install --target "' + target + '" "PyMuPDF>=1.24,<2.0"')
+                '  "' + py + '" -m pip install --target "' + target
+                + '" "PyMuPDF>=1.24,<2.0" "fonttools>=4.50,<5.0"')
         except (subprocess.SubprocessError, OSError, RuntimeError, ValueError) as e:
             FreeCAD.Console.PrintError("Install error: " + str(e) + "\n")
 
@@ -242,4 +257,3 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
 
 
 FreeCADGui.addWorkbench(PDFVectorImporterWorkbench())
-

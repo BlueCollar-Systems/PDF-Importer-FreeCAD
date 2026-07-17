@@ -69,6 +69,8 @@ EXCLUDE_SUFFIXES = {
 }
 
 PYMUPDF_SPEC = "PyMuPDF>=1.24,<2.0"
+FONTTOOLS_SPEC = "fonttools>=4.50,<5.0"
+RUNTIME_DEPENDENCY_SPECS = (PYMUPDF_SPEC, FONTTOOLS_SPEC)
 VENDORED_LIB_DIR = ADDON_DIR / "src" / "lib"
 
 
@@ -131,21 +133,50 @@ def _python_version(python_exe: Path) -> tuple[int, int]:
     return int(major), int(minor)
 
 
-def _lib_has_pymupdf(python_exe: Path, lib_dir: Path) -> bool:
+def _lib_has_runtime_dependencies(python_exe: Path, lib_dir: Path) -> bool:
     if not lib_dir.is_dir():
         return False
+    lib_root = lib_dir.resolve()
     code = (
-        "import sys; "
-        f"sys.path.insert(0, r'{lib_dir}'); "
-        "import pymupdf as fitz; "
-        "print(getattr(fitz, '__version__', '') or getattr(fitz, 'VersionBind', ''))"
+        "import os, pathlib, sys\n"
+        f"root = pathlib.Path({str(lib_root)!r}).resolve()\n"
+        "sys.path.insert(0, str(root))\n"
+        "import pymupdf as fitz\n"
+        "import fontTools\n"
+        "def local(module):\n"
+        "    origin = pathlib.Path(module.__file__).resolve()\n"
+        "    try:\n"
+        "        origin.relative_to(root)\n"
+        "    except ValueError:\n"
+        "        raise SystemExit(3)\n"
+        "    return origin\n"
+        "local(fitz); local(fontTools)\n"
+        "def version_tuple(value):\n"
+        "    parts = []\n"
+        "    for token in str(value).split('.'):\n"
+        "        digits = ''.join(ch for ch in token if ch.isdigit())\n"
+        "        if not digits: break\n"
+        "        parts.append(int(digits))\n"
+        "    return tuple(parts)\n"
+        "fitz_version = version_tuple(getattr(fitz, '__version__', '') "
+        "or getattr(fitz, 'VersionBind', ''))\n"
+        "font_version = version_tuple(getattr(fontTools, 'version', '') "
+        "or getattr(fontTools, '__version__', ''))\n"
+        "if not ((1, 24) <= fitz_version < (2, 0)):\n"
+        "    raise SystemExit(4)\n"
+        "if not ((4, 50) <= font_version < (5, 0)):\n"
+        "    raise SystemExit(5)\n"
+        "print('OK')\n"
     )
-    proc = subprocess.run(
-        [str(python_exe), "-c", code],
-        capture_output=True,
-        text=True,
-    )
-    return proc.returncode == 0 and bool(proc.stdout.strip())
+    try:
+        proc = subprocess.run(
+            [str(python_exe), "-c", code],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    return proc.returncode == 0 and proc.stdout.strip() == "OK"
 
 
 def _prune_vendored_pymupdf() -> None:
@@ -159,21 +190,21 @@ def _prune_vendored_pymupdf() -> None:
 
 
 def ensure_runtime_dependencies(*, vendor: bool = True) -> Path:
-    """Ensure the release tree has a FreeCAD-compatible private PyMuPDF."""
+    """Ensure the release tree has all private PDF/text runtime dependencies."""
     candidates = _candidate_freecad_pythons()
     if not candidates:
-        raise RuntimeError("No Python executable found for PyMuPDF verification.")
+        raise RuntimeError("No Python executable found for dependency verification.")
 
     preferred = candidates[0]
     for python_exe in candidates:
-        if _lib_has_pymupdf(python_exe, VENDORED_LIB_DIR):
+        if _lib_has_runtime_dependencies(python_exe, VENDORED_LIB_DIR):
             _prune_vendored_pymupdf()
-            print(f"Vendored PyMuPDF OK for {python_exe}: {VENDORED_LIB_DIR}")
+            print(f"Vendored runtime dependencies OK for {python_exe}: {VENDORED_LIB_DIR}")
             return python_exe
 
     if not vendor:
         raise RuntimeError(
-            "PyMuPDF is not bundled in PDFVectorImporter/src/lib. "
+            "PyMuPDF and fonttools are not bundled in PDFVectorImporter/src/lib. "
             "Run build_release.py without --no-vendor-deps or populate src/lib first."
         )
 
@@ -188,7 +219,7 @@ def ensure_runtime_dependencies(*, vendor: bool = True) -> Path:
         shutil.rmtree(VENDORED_LIB_DIR)
     VENDORED_LIB_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"Vendoring {PYMUPDF_SPEC} into {VENDORED_LIB_DIR}")
+    print(f"Vendoring {', '.join(RUNTIME_DEPENDENCY_SPECS)} into {VENDORED_LIB_DIR}")
     print(f"Using Python: {preferred}")
     subprocess.run(
         [
@@ -201,14 +232,16 @@ def ensure_runtime_dependencies(*, vendor: bool = True) -> Path:
             ":all:",
             "--target",
             str(VENDORED_LIB_DIR),
-            PYMUPDF_SPEC,
+            *RUNTIME_DEPENDENCY_SPECS,
         ],
         check=True,
     )
     _prune_vendored_pymupdf()
 
-    if not _lib_has_pymupdf(preferred, VENDORED_LIB_DIR):
-        raise RuntimeError(f"PyMuPDF install completed but import failed from {VENDORED_LIB_DIR}")
+    if not _lib_has_runtime_dependencies(preferred, VENDORED_LIB_DIR):
+        raise RuntimeError(
+            f"Runtime dependency install completed but import failed from {VENDORED_LIB_DIR}"
+        )
     return preferred
 
 

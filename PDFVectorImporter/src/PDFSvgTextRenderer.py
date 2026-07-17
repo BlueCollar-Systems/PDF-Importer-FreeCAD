@@ -4,11 +4,11 @@
 #
 # Renders text as vector glyph outlines using pdftocairo, or bundled PyMuPDF
 # when Poppler is absent.
-# Each unique glyph is built once as a Part.Shape, then translated
-# and compounded into a single Part::Feature for all text on the page.
-#
-# Falls back gracefully to caller-provided label text if no SVG renderer is
-# available.
+# Each unique glyph outline is built once as a Part.Shape, then translated.
+# Glyphs mode preserves each placed glyph as its own host entity. Geometry mode
+# deliberately exposes the placed outline edges as raw Part::Feature entities.
+# A renderer failure is explicit; choosing a different representation belongs
+# to a separately proven, item-specific fallback policy in the caller.
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 try:
     import FreeCAD
@@ -97,23 +97,640 @@ def _glob_paths(pattern: str):
         return []
 
 
+class TextRepresentationRenderError(RuntimeError):
+    """Requested SVG text representation could not be verified."""
+
+    def __init__(self, reason: str, evidence: Optional[dict] = None):
+        self.reason = str(reason or "svg_text_render_failed")
+        self.evidence = dict(evidence or {})
+        super().__init__(self.reason)
+
+
+def _host_object_id(obj) -> str:
+    try:
+        return str(getattr(obj, "Name", "") or getattr(obj, "Label", "") or "")
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return ""
+
+
+def _document_objects(doc) -> List[object]:
+    try:
+        return list(getattr(doc, "Objects", []) or [])
+    except (AttributeError, RuntimeError, TypeError):
+        return []
+
+
+def _cleanup_owned(doc, parent_group, owned: List[object]) -> dict:
+    records = [(obj, _host_object_id(obj)) for obj in owned]
+    removed: List[str] = []
+    cleanup_errors: List[str] = []
+    for obj, obj_id in reversed(records):
+        if not obj_id:
+            cleanup_errors.append("owned host object has no stable entity id")
+            continue
+        try:
+            if parent_group is not None and hasattr(parent_group, "removeObject"):
+                parent_group.removeObject(obj)
+            elif parent_group is not None and isinstance(
+                getattr(parent_group, "objects", None), list
+            ):
+                parent_group.objects[:] = [
+                    candidate
+                    for candidate in parent_group.objects
+                    if candidate is not obj
+                ]
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            cleanup_errors.append(f"{exc.__class__.__name__}: {exc}")
+        try:
+            doc.removeObject(obj_id)
+            removed.append(obj_id)
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            cleanup_errors.append(f"{exc.__class__.__name__}: {exc}")
+    try:
+        live_objects = list(getattr(doc, "Objects", []) or [])
+        live_ids = {_host_object_id(obj) for obj in live_objects}
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        live_ids = {obj_id for _obj, obj_id in records if obj_id}
+        cleanup_errors.append(f"{exc.__class__.__name__}: {exc}")
+    group_objects = None
+    if parent_group is not None:
+        try:
+            if hasattr(parent_group, "Group"):
+                group_objects = list(parent_group.Group or [])
+            elif hasattr(parent_group, "objects"):
+                group_objects = list(parent_group.objects or [])
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            cleanup_errors.append(f"{exc.__class__.__name__}: {exc}")
+    return {
+        "removed_entity_ids": removed,
+        "cleanup_complete": bool(
+            not cleanup_errors
+            and all(obj_id and obj_id not in live_ids for _obj, obj_id in records)
+            and (
+                group_objects is None
+                or all(
+                    not any(candidate is obj for candidate in group_objects)
+                    for obj, _obj_id in records
+                )
+            )
+            and set(removed) == {obj_id for _obj, obj_id in records}
+        ),
+        "cleanup_errors": cleanup_errors,
+    }
+
+
+def _shape_nonempty(shape, *, require_edges: bool = False) -> bool:
+    if shape is None:
+        return False
+    try:
+        if bool(getattr(shape, "isNull", lambda: False)()):
+            return False
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+    if require_edges:
+        try:
+            return bool(list(getattr(shape, "Edges", []) or []))
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return False
+    return True
+
+
+def _annotate_text_entity(
+    obj,
+    source_item_id: str,
+    representation: str,
+    *,
+    parent_source_item_id: Optional[str] = None,
+) -> None:
+    add_property = getattr(obj, "addProperty", None)
+    metadata = [
+        ("PDFSourceItemId", source_item_id),
+        ("PDFRepresentation", representation),
+    ]
+    if parent_source_item_id is not None:
+        metadata.append(("PDFParentSourceItemId", parent_source_item_id))
+    for name, value in metadata:
+        if not hasattr(obj, name):
+            if not callable(add_property):
+                raise RuntimeError(f"host cannot store required {name} metadata")
+            add_property("App::PropertyString", name, "PDF Import")
+        setattr(obj, name, str(value))
+        if str(getattr(obj, name, "") or "") != str(value):
+            raise RuntimeError(f"host did not preserve required {name} metadata")
+
+
+def _shape_host_bbox(shape) -> Optional[Tuple[float, float, float, float]]:
+    try:
+        bound_box = shape.BoundBox
+        values = tuple(
+            float(getattr(bound_box, name))
+            for name in ("XMin", "YMin", "XMax", "YMax")
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    if (
+        not all(math.isfinite(value) for value in values)
+        or values[2] < values[0]
+        or values[3] < values[1]
+    ):
+        return None
+    return values
+
+
+def _serialize_bbox(values) -> str:
+    """Return a stable, locale-independent four-value metadata token."""
+    if values is None:
+        return ""
+    try:
+        bbox = tuple(float(value) for value in values)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("geometry bounds are not numeric") from exc
+    if len(bbox) != 4 or not all(math.isfinite(value) for value in bbox):
+        raise ValueError("geometry bounds are invalid")
+    return ",".join(format(value, ".17g") for value in bbox)
+
+
+def _source_bbox_to_host_bbox(
+    source_bbox: Tuple[float, float, float, float],
+    *,
+    page_rotation_matrix: Tuple[float, float, float, float, float, float],
+    vb_min_x: float,
+    vb_min_y: float,
+    vb_w: float,
+    vb_h: float,
+    page_w: float,
+    page_h: float,
+    x_unit_to_mm: float,
+    y_unit_to_mm: float,
+    flip_y: bool,
+) -> Tuple[float, float, float, float]:
+    """Map a canonical PDF bbox through the renderer's exact viewBox transform."""
+    x0, y0, x1, y1 = source_bbox
+    a, b, c, d, e, f = page_rotation_matrix
+    host_points = []
+    for canonical_x, canonical_y in (
+        (x0, y0),
+        (x0, y1),
+        (x1, y0),
+        (x1, y1),
+    ):
+        page_x = a * canonical_x + c * canonical_y + e
+        page_y = b * canonical_x + d * canonical_y + f
+        svg_x = vb_min_x + (page_x / page_w) * vb_w
+        svg_y = vb_min_y + (page_y / page_h) * vb_h
+        host_x = (svg_x - vb_min_x) * x_unit_to_mm
+        if flip_y:
+            host_y = (vb_h + vb_min_y - svg_y) * y_unit_to_mm
+        else:
+            host_y = (svg_y - vb_min_y) * y_unit_to_mm
+        host_points.append((host_x, host_y))
+    host_x_values = [point[0] for point in host_points]
+    host_y_values = [point[1] for point in host_points]
+    return (
+        min(host_x_values),
+        min(host_y_values),
+        max(host_x_values),
+        max(host_y_values),
+    )
+
+
+def _bboxes_intersect(
+    left: Tuple[float, float, float, float],
+    right: Tuple[float, float, float, float],
+    tolerance: float = 1e-7,
+) -> bool:
+    return bool(
+        max(left[0], right[0]) <= min(left[2], right[2]) + tolerance
+        and max(left[1], right[1]) <= min(left[3], right[3]) + tolerance
+    )
+
+
+def _bbox_intersection_area(
+    left: Tuple[float, float, float, float],
+    right: Tuple[float, float, float, float],
+) -> float:
+    return max(0.0, min(left[2], right[2]) - max(left[0], right[0])) * max(
+        0.0, min(left[3], right[3]) - max(left[1], right[1])
+    )
+
+
+def _visible_text_units(value: str) -> int:
+    """Estimate visible glyph demand without treating whitespace as ink."""
+    return max(1, sum(1 for character in str(value or "") if not character.isspace()))
+
+
+def _allocate_tied_placements(
+    placement_indices: List[int],
+    source_ids: Tuple[str, ...],
+    *,
+    source_units: Dict[str, int],
+    assigned_counts: Dict[str, int],
+) -> Dict[str, List[int]]:
+    """Split an exact geometric tie in stable source order.
+
+    Duplicate PDF text paints can have identical bounds and therefore no
+    geometric discriminator at all. SVG placement order follows paint order,
+    while the canonical source manifest follows extraction order. Proportional
+    contiguous quotas preserve both orders and prevent the first item rendered
+    from consuming every duplicate placement.
+    """
+    ordered_indices = sorted(int(index) for index in placement_indices)
+    ordered_ids = tuple(source_ids)
+    allocation = {source_id: [] for source_id in ordered_ids}
+    if not ordered_indices or not ordered_ids:
+        return allocation
+
+    total = len(ordered_indices)
+    minimum = 1 if total >= len(ordered_ids) else 0
+    quotas = {source_id: minimum for source_id in ordered_ids}
+    remaining_total = total - minimum * len(ordered_ids)
+    if remaining_total > 0:
+        weights = {
+            source_id: max(
+                int(source_units.get(source_id, 1))
+                - int(assigned_counts.get(source_id, 0))
+                - minimum,
+                0,
+            )
+            for source_id in ordered_ids
+        }
+        if sum(weights.values()) <= 0:
+            weights = {
+                source_id: max(int(source_units.get(source_id, 1)), 1)
+                for source_id in ordered_ids
+            }
+        weight_total = float(sum(weights.values()))
+        raw_shares = {
+            source_id: remaining_total * weights[source_id] / weight_total
+            for source_id in ordered_ids
+        }
+        for source_id in ordered_ids:
+            quotas[source_id] += int(math.floor(raw_shares[source_id]))
+        remainder = total - sum(quotas.values())
+        ranked_ids = sorted(
+            ordered_ids,
+            key=lambda source_id: (
+                -(raw_shares[source_id] - math.floor(raw_shares[source_id])),
+                ordered_ids.index(source_id),
+                source_id,
+            ),
+        )
+        for source_id in ranked_ids[:remainder]:
+            quotas[source_id] += 1
+
+    cursor = 0
+    for source_id in ordered_ids:
+        next_cursor = cursor + quotas[source_id]
+        allocation[source_id] = ordered_indices[cursor:next_cursor]
+        cursor = next_cursor
+    return allocation
+
+
+def _build_global_placement_assignments(
+    placed_glyphs,
+    source_manifest,
+    *,
+    page_num: int,
+    pdf_sha256: str,
+    page_rotation_matrix: Tuple[float, float, float, float, float, float],
+    vb_min_x: float,
+    vb_min_y: float,
+    vb_w: float,
+    vb_h: float,
+    page_w: float,
+    page_h: float,
+    x_unit_to_mm: float,
+    y_unit_to_mm: float,
+    flip_y: bool,
+):
+    """Bind every visible SVG placement to one canonical source item.
+
+    The result is computed once per source-bound page cache. Rendering call
+    order never participates in assignment.
+    """
+    if not isinstance(source_manifest, list) or not source_manifest:
+        raise ValueError("SVG source item manifest is missing")
+
+    normalized = []
+    seen_ids = set()
+    seen_orders = set()
+    for raw_entry in source_manifest:
+        if not isinstance(raw_entry, dict):
+            raise ValueError("SVG source item manifest entry is invalid")
+        source_id = raw_entry.get("source_item_id")
+        source_order = raw_entry.get("source_order")
+        source_text = raw_entry.get("text")
+        raw_bbox = raw_entry.get("bbox")
+        try:
+            source_bbox = tuple(float(value) for value in raw_bbox)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SVG source item manifest bbox is invalid") from exc
+        if (
+            not isinstance(source_id, str)
+            or not re.fullmatch(r"p\d+:b\d+:l\d+:s\d+", source_id)
+            or source_id in seen_ids
+            or type(source_order) is not int
+            or source_order < 0
+            or source_order in seen_orders
+            or raw_entry.get("page_number") != int(page_num)
+            or raw_entry.get("pdf_sha256") != pdf_sha256
+            or not isinstance(source_text, str)
+            or not source_text
+            or source_text.isspace()
+            or not isinstance(raw_bbox, tuple)
+            or len(source_bbox) != 4
+            or not all(math.isfinite(value) for value in source_bbox)
+            or source_bbox[2] <= source_bbox[0]
+            or source_bbox[3] <= source_bbox[1]
+        ):
+            raise ValueError("SVG source item manifest entry is invalid")
+        host_bbox = _source_bbox_to_host_bbox(
+            source_bbox,
+            page_rotation_matrix=page_rotation_matrix,
+            vb_min_x=vb_min_x,
+            vb_min_y=vb_min_y,
+            vb_w=vb_w,
+            vb_h=vb_h,
+            page_w=page_w,
+            page_h=page_h,
+            x_unit_to_mm=x_unit_to_mm,
+            y_unit_to_mm=y_unit_to_mm,
+            flip_y=flip_y,
+        )
+        normalized.append(
+            {
+                "source_item_id": source_id,
+                "source_order": source_order,
+                "source_bbox": source_bbox,
+                "host_bbox": host_bbox,
+                "text": source_text,
+            }
+        )
+        seen_ids.add(source_id)
+        seen_orders.add(source_order)
+
+    normalized.sort(key=lambda entry: (entry["source_order"], entry["source_item_id"]))
+    if [entry["source_order"] for entry in normalized] != list(range(len(normalized))):
+        raise ValueError("SVG source item manifest order is not contiguous")
+
+    assignments = {entry["source_item_id"]: [] for entry in normalized}
+    assigned_counts = {entry["source_item_id"]: 0 for entry in normalized}
+    source_units = {
+        entry["source_item_id"]: _visible_text_units(entry["text"])
+        for entry in normalized
+    }
+    host_bboxes = {
+        entry["source_item_id"]: entry["host_bbox"] for entry in normalized
+    }
+    tied_groups: Dict[Tuple[str, ...], List[int]] = {}
+    unmatched_indices = []
+
+    for placement_index, _gid, placed_shape in placed_glyphs:
+        placed_bbox = _shape_host_bbox(placed_shape)
+        if placed_bbox is None:
+            raise ValueError(f"SVG placement {placement_index} has no finite bounds")
+        placed_area = max(
+            (placed_bbox[2] - placed_bbox[0]) * (placed_bbox[3] - placed_bbox[1]),
+            1e-12,
+        )
+        placed_x = (placed_bbox[0] + placed_bbox[2]) / 2.0
+        placed_y = (placed_bbox[1] + placed_bbox[3]) / 2.0
+        candidates = []
+        for entry in normalized:
+            host_bbox = entry["host_bbox"]
+            overlap = _bbox_intersection_area(placed_bbox, host_bbox)
+            if overlap <= 1e-12:
+                continue
+            host_x = (host_bbox[0] + host_bbox[2]) / 2.0
+            host_y = (host_bbox[1] + host_bbox[3]) / 2.0
+            host_area = max(
+                (host_bbox[2] - host_bbox[0]) * (host_bbox[3] - host_bbox[1]),
+                1e-12,
+            )
+            center_inside = (
+                host_bbox[0] <= placed_x <= host_bbox[2]
+                and host_bbox[1] <= placed_y <= host_bbox[3]
+            )
+            # Quantization makes exact geometric ties deterministic across
+            # host floating-point implementations without merging visibly
+            # different candidates.
+            score = (
+                1 if center_inside else 0,
+                round(overlap / placed_area, 12),
+                round(-math.hypot(placed_x - host_x, placed_y - host_y), 12),
+                round(-host_area, 12),
+            )
+            candidates.append((score, entry["source_order"], entry["source_item_id"]))
+        if not candidates:
+            unmatched_indices.append(int(placement_index))
+            continue
+        best_score = max(candidate[0] for candidate in candidates)
+        tied = tuple(
+            source_id
+            for _score, _order, source_id in sorted(
+                (candidate for candidate in candidates if candidate[0] == best_score),
+                key=lambda candidate: (candidate[1], candidate[2]),
+            )
+        )
+        if len(tied) == 1:
+            assignments[tied[0]].append(int(placement_index))
+            assigned_counts[tied[0]] += 1
+        else:
+            tied_groups.setdefault(tied, []).append(int(placement_index))
+
+    for source_ids, placement_indices in sorted(
+        tied_groups.items(), key=lambda entry: min(entry[1])
+    ):
+        allocation = _allocate_tied_placements(
+            placement_indices,
+            source_ids,
+            source_units=source_units,
+            assigned_counts=assigned_counts,
+        )
+        for source_id, indices in allocation.items():
+            assignments[source_id].extend(indices)
+            assigned_counts[source_id] += len(indices)
+
+    for indices in assignments.values():
+        indices.sort()
+    assigned_indices = [index for indices in assignments.values() for index in indices]
+    if len(assigned_indices) != len(set(assigned_indices)):
+        raise ValueError("SVG placement assignment is not one-to-one")
+    return assignments, host_bboxes, sorted(unmatched_indices)
+
+
 def render_text(pdf_path: str, page_num: int, page_h: float,
                 scale: float, page_w: Optional[float] = None,
                 fc_doc=None, parent_group=None,
-                flip_y: bool = True) -> Optional[dict]:
-    """Render text from a PDF page as vector glyph geometry.
+                flip_y: bool = True,
+                representation: str = "glyphs",
+                source_item: Optional[dict] = None,
+                requested_representation: Optional[str] = None,
+                page_rotation_matrix: Optional[
+                    Tuple[float, float, float, float, float, float]
+                ] = None,
+                render_cache: Optional[dict] = None) -> dict:
+    """Render and verify the explicitly requested SVG text representation.
 
-    Returns {"shapes": int, "glyphs": int, "entity_type": str} or None if unavailable.
+    Glyphs creates one placed-outline entity per glyph. Geometry preserves
+    every raw outline edge in one source-item compound. The different object
+    boundaries keep the two modes distinct without making large text pages
+    create hundreds of thousands of individual FreeCAD document objects.
     """
+    representation = str(representation or "").strip().lower()
+    if representation not in {"glyphs", "geometry"}:
+        raise TextRepresentationRenderError(
+            "unsupported_text_representation",
+            {"requested_type": representation},
+        )
+    item_filter_requested = (
+        source_item is not None or requested_representation is not None
+    )
+    item_filter = None
+    if item_filter_requested:
+        requested_type = str(requested_representation or "").strip().lower()
+        try:
+            item_page = source_item.get("page_number")
+            source_item_id = source_item.get("source_item_id")
+            item_requested_type = source_item.get("requested_type")
+            raw_bbox = source_item.get("bbox")
+            source_bbox = tuple(float(value) for value in raw_bbox)
+            rotation_matrix = (
+                tuple(float(value) for value in page_rotation_matrix)
+                if page_rotation_matrix is not None
+                else (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            source_bbox = ()
+            rotation_matrix = ()
+            raw_bbox = None
+            item_page = None
+            source_item_id = None
+            item_requested_type = None
+        expected_source_prefix = f"p{int(page_num)}:b"
+        if (
+            not isinstance(source_item, dict)
+            or requested_type not in {
+                "text", "labels", "3d_text", "glyphs", "geometry"
+            }
+            or item_requested_type != requested_type
+            or type(item_page) is not int
+            or item_page != int(page_num)
+            or not isinstance(source_item_id, str)
+            or not source_item_id.startswith(expected_source_prefix)
+            or not re.fullmatch(r"p\d+:b\d+:l\d+:s\d+", source_item_id)
+            or not isinstance(raw_bbox, tuple)
+            or len(raw_bbox) != 4
+            or len(source_bbox) != 4
+            or not all(math.isfinite(value) for value in source_bbox)
+            or len(rotation_matrix) != 6
+            or not all(math.isfinite(value) for value in rotation_matrix)
+            or source_bbox[2] <= source_bbox[0]
+            or source_bbox[3] <= source_bbox[1]
+        ):
+            raise TextRepresentationRenderError(
+                "invalid_svg_source_item_filter",
+                {
+                    "requested_type": requested_type,
+                    "attempted_type": representation,
+                    "created_entity_ids": [],
+                    "removed_entity_ids": [],
+                    "cleanup_complete": True,
+                },
+            )
+        item_filter = {
+            "source_item_id": source_item_id,
+            "requested_type": requested_type,
+            "source_bbox": source_bbox,
+            "page_rotation_matrix": rotation_matrix,
+        }
+    cache = None
+    if render_cache is not None:
+        if not isinstance(render_cache, dict):
+            raise TextRepresentationRenderError(
+                "invalid_svg_render_cache",
+                {"requested_type": representation},
+            )
+        cache = render_cache
+        source_digest = (
+            str(source_item.get("pdf_sha256") or "")
+            if isinstance(source_item, dict)
+            else ""
+        )
+        cache_binding = {
+            "pdf_path": os.path.normcase(os.path.abspath(str(pdf_path))),
+            "pdf_sha256": source_digest,
+            "page_number": int(page_num),
+            "page_height": float(page_h),
+            "page_width": float(page_w) if page_w is not None else None,
+            "scale": float(scale),
+            "flip_y": bool(flip_y),
+            "page_rotation_matrix": (
+                tuple(float(value) for value in page_rotation_matrix)
+                if page_rotation_matrix is not None
+                else (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+            ),
+        }
+        prior_binding = cache.get("source_binding")
+        if prior_binding is not None and prior_binding != cache_binding:
+            raise TextRepresentationRenderError(
+                "svg_cache_source_mismatch",
+                {
+                    "requested_type": representation,
+                    "source_item_id": (
+                        item_filter["source_item_id"] if item_filter else None
+                    ),
+                    "created_entity_ids": [],
+                    "removed_entity_ids": [],
+                    "cleanup_complete": True,
+                },
+            )
+        cache["source_binding"] = cache_binding
+        claimed = cache.setdefault("claimed_placement_indices", set())
+        if not isinstance(claimed, set) or any(
+            type(index) is not int or index < 0 for index in claimed
+        ):
+            raise TextRepresentationRenderError(
+                "invalid_svg_render_cache",
+                {"requested_type": representation},
+            )
     exe = find_pdftocairo()
     renderer_name = "pdftocairo" if exe else "pymupdf"
 
-    doc = fc_doc or FreeCAD.ActiveDocument
+    doc = fc_doc or (getattr(FreeCAD, "ActiveDocument", None) if FreeCAD else None)
     if doc is None:
-        return None
+        raise TextRepresentationRenderError(
+            "freecad_document_unavailable",
+            {"requested_type": representation},
+        )
+    if Part is None or Vector is None:
+        raise TextRepresentationRenderError(
+            "freecad_part_api_unavailable",
+            {"requested_type": representation},
+        )
+    try:
+        baseline_objects = {
+            id(host_obj) for host_obj in list(getattr(doc, "Objects", []) or [])
+        }
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        raise TextRepresentationRenderError(
+            "host_ownership_snapshot_failed",
+            {
+                "requested_type": (
+                    item_filter["requested_type"] if item_filter else representation
+                ),
+                "attempted_type": representation,
+                "exception": f"{exc.__class__.__name__}: {exc}",
+                "created_entity_ids": [],
+                "removed_entity_ids": [],
+                "cleanup_complete": True,
+            },
+        ) from exc
 
-    svg = None
-    if exe:
+    svg = cache.get("svg") if cache is not None else None
+    if svg is not None:
+        renderer_name = str(cache.get("renderer_name") or renderer_name)
+    elif exe:
         svg = _render_svg_with_pdftocairo(exe, pdf_path, page_num)
     else:
         if FreeCAD:
@@ -124,14 +741,27 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
         svg = _render_svg_with_pymupdf(pdf_path, page_num)
 
     if not svg:
-        return None
+        raise TextRepresentationRenderError(
+            "svg_renderer_unavailable",
+            {"requested_type": representation, "renderer": renderer_name},
+        )
     if _svg_too_large(svg):
         if FreeCAD:
             FreeCAD.Console.PrintWarning(
                 f"PDFSvgTextRenderer: page {page_num} SVG text payload is too large — "
-                "falling back to editable labels.\n"
+                "requested representation was not created.\n"
             )
-        return None
+        raise TextRepresentationRenderError(
+            "svg_payload_too_large",
+            {
+                "requested_type": representation,
+                "renderer": renderer_name,
+                "svg_bytes": len(svg.encode("utf-8", "ignore")),
+            },
+        )
+    if cache is not None:
+        cache["svg"] = svg
+        cache["renderer_name"] = renderer_name
 
     # Parse SVG dimensions / viewBox
     vb_min_x, vb_min_y, vb_w, vb_h = _parse_viewbox(svg)
@@ -145,85 +775,681 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
     x_unit_to_mm = (page_w_eff * scale) / max(vb_w, 1e-12)
     y_unit_to_mm = (page_h_eff * scale) / max(vb_h, 1e-12)
 
-    # Parse glyph definitions
-    glyph_defs = _parse_glyph_defs(svg)
+    # Parse all glyph definitions so an intentional empty outline (normally a
+    # space) is distinguishable from a nonempty outline that failed parsing.
+    all_glyph_defs = _parse_all_glyph_defs(svg)
+    glyph_defs = {
+        glyph_id: path_d
+        for glyph_id, path_d in all_glyph_defs.items()
+        if path_d.strip()
+    }
 
     # Parse use placements
     placements = _parse_use_placements(svg)
 
     if not placements:
-        return {"shapes": 0, "glyphs": 0, "entity_type": "glyphs", "renderer": renderer_name}
+        raise TextRepresentationRenderError(
+            "svg_has_no_glyph_placements",
+            {"requested_type": representation, "renderer": renderer_name},
+        )
 
     # Build Part.Shape for each unique glyph
-    glyph_shapes: Dict[str, Part.Shape] = {}
-    for gid, path_d in glyph_defs.items():
-        edges = _svg_path_to_edges(path_d, x_unit_to_mm, y_unit_to_mm)
-        if edges:
-            try:
-                compound = Part.makeCompound(edges)
-                glyph_shapes[gid] = compound
-            except (RuntimeError, ValueError, TypeError):
-                pass
+    cached_shapes = cache.get("glyph_shapes") if cache is not None else None
+    if cached_shapes is not None and not isinstance(cached_shapes, dict):
+        raise TextRepresentationRenderError(
+            "invalid_svg_render_cache",
+            {"requested_type": representation},
+        )
+    if cached_shapes is not None:
+        glyph_shapes = cached_shapes
+    else:
+        glyph_shapes: Dict[str, Part.Shape] = {}
+        for gid, path_d in glyph_defs.items():
+            edges = _svg_path_to_edges(path_d, x_unit_to_mm, y_unit_to_mm)
+            if edges:
+                try:
+                    compound = Part.makeCompound(edges)
+                    glyph_shapes[gid] = compound
+                except (RuntimeError, ValueError, TypeError):
+                    pass
+        if cache is not None:
+            cache["glyph_shapes"] = glyph_shapes
 
     # Place all glyphs
-    all_shapes = []
-    glyph_count = 0
+    cached_placed = cache.get("placed_glyphs") if cache is not None else None
+    if cached_placed is not None:
+        placed_glyphs = list(cached_placed)
+        failed_placement_indices = list(cache.get("failed_placement_indices") or [])
+        empty_placement_indices = list(cache.get("empty_placement_indices") or [])
+    else:
+        placed_glyphs = []
+        failed_placement_indices: List[int] = []
+        empty_placement_indices: List[int] = []
 
-    for gid, use_x, use_y, matrix in placements:
-        shape = glyph_shapes.get(gid)
-        if shape is None:
-            continue
+        for placement_index, (gid, use_x, use_y, matrix) in enumerate(placements):
+            shape = glyph_shapes.get(gid)
+            if shape is None:
+                if gid in all_glyph_defs and not all_glyph_defs[gid].strip():
+                    empty_placement_indices.append(placement_index)
+                else:
+                    failed_placement_indices.append(placement_index)
+                continue
 
-        # SVG coords → FreeCAD coords
-        # Glyph use positions are in viewBox coordinates.
-        placed = None
-        if matrix and len(matrix) >= 6:
-            a, b, c, d, e, f = [float(v) for v in matrix[:6]]
-            e += float(use_x)
-            f += float(use_y)
-            tx = (e - vb_min_x) * x_unit_to_mm
-            ty = (vb_h + vb_min_y - f) * y_unit_to_mm if flip_y else (f - vb_min_y) * y_unit_to_mm
+            # SVG coords → FreeCAD coords
+            # Glyph use positions are in viewBox coordinates.
+            placed = None
+            if matrix and len(matrix) >= 6:
+                a, b, c, d, e, f = [float(v) for v in matrix[:6]]
+                e += float(use_x)
+                f += float(use_y)
+                tx = (e - vb_min_x) * x_unit_to_mm
+                ty = (vb_h + vb_min_y - f) * y_unit_to_mm if flip_y else (f - vb_min_y) * y_unit_to_mm
 
-            ratio_xy = (x_unit_to_mm / y_unit_to_mm) if abs(y_unit_to_mm) > 1e-12 else 1.0
-            ratio_yx = (y_unit_to_mm / x_unit_to_mm) if abs(x_unit_to_mm) > 1e-12 else 1.0
-            a11 = a
-            a12 = -c * ratio_xy
-            a21 = -b * ratio_yx
-            a22 = d
-            placed = _shape_affine_2d(shape, a11, a12, a21, a22, tx, ty)
-        else:
-            tx = (float(use_x) - vb_min_x) * x_unit_to_mm
-            ty = ((vb_h + vb_min_y - float(use_y)) * y_unit_to_mm) if flip_y else ((float(use_y) - vb_min_y) * y_unit_to_mm)
+                ratio_xy = (x_unit_to_mm / y_unit_to_mm) if abs(y_unit_to_mm) > 1e-12 else 1.0
+                ratio_yx = (y_unit_to_mm / x_unit_to_mm) if abs(x_unit_to_mm) > 1e-12 else 1.0
+                a11 = a
+                a12 = -c * ratio_xy
+                a21 = -b * ratio_yx
+                a22 = d
+                placed = _shape_affine_2d(shape, a11, a12, a21, a22, tx, ty)
+            else:
+                tx = (float(use_x) - vb_min_x) * x_unit_to_mm
+                ty = ((vb_h + vb_min_y - float(use_y)) * y_unit_to_mm) if flip_y else ((float(use_y) - vb_min_y) * y_unit_to_mm)
+                try:
+                    placed = shape.translated(Vector(tx, ty, 0.0))
+                except (AttributeError, RuntimeError, TypeError):
+                    placed = None
+
             try:
-                placed = shape.translated(Vector(tx, ty, 0.0))
+                if placed is not None:
+                    placed_glyphs.append((placement_index, gid, placed))
+                else:
+                    failed_placement_indices.append(placement_index)
             except (AttributeError, RuntimeError, TypeError):
-                placed = None
+                failed_placement_indices.append(placement_index)
+        if cache is not None:
+            cache["placed_glyphs"] = list(placed_glyphs)
+            cache["failed_placement_indices"] = list(failed_placement_indices)
+            cache["empty_placement_indices"] = list(empty_placement_indices)
 
+    if failed_placement_indices:
+        raise TextRepresentationRenderError(
+            "svg_item_placement_unverified",
+            {
+                "requested_type": (
+                    item_filter["requested_type"] if item_filter else representation
+                ),
+                "attempted_type": representation,
+                "source_item_id": (
+                    item_filter["source_item_id"] if item_filter else None
+                ),
+                "renderer": renderer_name,
+                "failed_placement_indices": failed_placement_indices,
+                "empty_placement_indices": empty_placement_indices,
+                "created_entity_ids": [],
+                "removed_entity_ids": [],
+                "cleanup_complete": True,
+            },
+        )
+
+    if not placed_glyphs:
+        raise TextRepresentationRenderError(
+            "svg_glyph_outlines_unavailable",
+            {
+                "requested_type": representation,
+                "renderer": renderer_name,
+                "placement_count": len(placements),
+            },
+        )
+
+    item_filter_evidence = None
+    if item_filter is not None:
         try:
-            if placed is not None:
-                all_shapes.append(placed)
-                glyph_count += 1
-        except (AttributeError, RuntimeError, TypeError):
-            pass
+            if (
+                not all(
+                    math.isfinite(value) and value > 0.0
+                    for value in (page_w_eff, page_h_eff, x_unit_to_mm, y_unit_to_mm)
+                )
+            ):
+                raise ValueError("SVG item filter dimensions are invalid")
+            host_filter_bbox = _source_bbox_to_host_bbox(
+                item_filter["source_bbox"],
+                page_rotation_matrix=item_filter["page_rotation_matrix"],
+                vb_min_x=vb_min_x,
+                vb_min_y=vb_min_y,
+                vb_w=vb_w,
+                vb_h=vb_h,
+                page_w=page_w_eff,
+                page_h=page_h_eff,
+                x_unit_to_mm=x_unit_to_mm,
+                y_unit_to_mm=y_unit_to_mm,
+                flip_y=flip_y,
+            )
+        except (RuntimeError, TypeError, ValueError, ZeroDivisionError) as exc:
+            raise TextRepresentationRenderError(
+                "svg_item_filter_transform_failed",
+                {
+                    "requested_type": item_filter["requested_type"],
+                    "attempted_type": representation,
+                    "source_item_id": item_filter["source_item_id"],
+                    "exception": f"{exc.__class__.__name__}: {exc}",
+                    "created_entity_ids": [],
+                    "removed_entity_ids": [],
+                    "cleanup_complete": True,
+                },
+            ) from exc
 
-    if not all_shapes:
-        return {"shapes": 0, "glyphs": 0, "entity_type": "glyphs"}
+        claimed_indices = (
+            cache["claimed_placement_indices"] if cache is not None else set()
+        )
+        matched_glyphs = []
+        assignment_method = "bounded_greedy_item_filter"
+        source_manifest = cache.get("source_item_manifest") if cache is not None else None
+        if source_manifest is not None:
+            assignments = cache.get("placement_assignments")
+            host_bboxes = cache.get("source_item_host_bboxes")
+            unmatched_indices = cache.get("unmatched_placement_indices")
+            if assignments is None:
+                try:
+                    assignments, host_bboxes, unmatched_indices = (
+                        _build_global_placement_assignments(
+                            placed_glyphs,
+                            source_manifest,
+                            page_num=int(page_num),
+                            pdf_sha256=str(cache["source_binding"]["pdf_sha256"]),
+                            page_rotation_matrix=item_filter["page_rotation_matrix"],
+                            vb_min_x=vb_min_x,
+                            vb_min_y=vb_min_y,
+                            vb_w=vb_w,
+                            vb_h=vb_h,
+                            page_w=page_w_eff,
+                            page_h=page_h_eff,
+                            x_unit_to_mm=x_unit_to_mm,
+                            y_unit_to_mm=y_unit_to_mm,
+                            flip_y=flip_y,
+                        )
+                    )
+                except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+                    raise TextRepresentationRenderError(
+                        "svg_global_assignment_failed",
+                        {
+                            "requested_type": item_filter["requested_type"],
+                            "attempted_type": representation,
+                            "source_item_id": item_filter["source_item_id"],
+                            "exception": f"{exc.__class__.__name__}: {exc}",
+                            "created_entity_ids": [],
+                            "removed_entity_ids": [],
+                            "cleanup_complete": True,
+                        },
+                    ) from exc
+                cache["placement_assignments"] = assignments
+                cache["source_item_host_bboxes"] = host_bboxes
+                cache["unmatched_placement_indices"] = unmatched_indices
+            if (
+                not isinstance(assignments, dict)
+                or not isinstance(host_bboxes, dict)
+                or not isinstance(unmatched_indices, list)
+                or item_filter["source_item_id"] not in assignments
+                or item_filter["source_item_id"] not in host_bboxes
+            ):
+                raise TextRepresentationRenderError(
+                    "invalid_svg_render_cache",
+                    {
+                        "requested_type": item_filter["requested_type"],
+                        "attempted_type": representation,
+                        "source_item_id": item_filter["source_item_id"],
+                        "created_entity_ids": [],
+                        "removed_entity_ids": [],
+                        "cleanup_complete": True,
+                    },
+                )
+            if unmatched_indices:
+                raise TextRepresentationRenderError(
+                    "svg_global_assignment_unmatched",
+                    {
+                        "requested_type": item_filter["requested_type"],
+                        "attempted_type": representation,
+                        "source_item_id": item_filter["source_item_id"],
+                        "unmatched_placement_indices": list(unmatched_indices),
+                        "created_entity_ids": [],
+                        "removed_entity_ids": [],
+                        "cleanup_complete": True,
+                    },
+                )
+            assigned_host_bbox = tuple(host_bboxes[item_filter["source_item_id"]])
+            if len(assigned_host_bbox) != 4 or any(
+                abs(float(left) - float(right)) > 1e-7
+                for left, right in zip(
+                    assigned_host_bbox, host_filter_bbox, strict=True
+                )
+            ):
+                raise TextRepresentationRenderError(
+                    "svg_manifest_item_mismatch",
+                    {
+                        "requested_type": item_filter["requested_type"],
+                        "attempted_type": representation,
+                        "source_item_id": item_filter["source_item_id"],
+                        "created_entity_ids": [],
+                        "removed_entity_ids": [],
+                        "cleanup_complete": True,
+                    },
+                )
+            assigned_indices = list(assignments[item_filter["source_item_id"]])
+            if any(
+                type(index) is not int or index < 0 or index in claimed_indices
+                for index in assigned_indices
+            ):
+                raise TextRepresentationRenderError(
+                    "svg_assignment_reuse_detected",
+                    {
+                        "requested_type": item_filter["requested_type"],
+                        "attempted_type": representation,
+                        "source_item_id": item_filter["source_item_id"],
+                        "assigned_placement_indices": assigned_indices,
+                        "created_entity_ids": [],
+                        "removed_entity_ids": [],
+                        "cleanup_complete": True,
+                    },
+                )
+            placed_by_index = {
+                placement_index: (placement_index, gid, placed_shape)
+                for placement_index, gid, placed_shape in placed_glyphs
+            }
+            if any(index not in placed_by_index for index in assigned_indices):
+                raise TextRepresentationRenderError(
+                    "svg_assignment_missing_placement",
+                    {
+                        "requested_type": item_filter["requested_type"],
+                        "attempted_type": representation,
+                        "source_item_id": item_filter["source_item_id"],
+                        "created_entity_ids": [],
+                        "removed_entity_ids": [],
+                        "cleanup_complete": True,
+                    },
+                )
+            matched_glyphs = [placed_by_index[index] for index in assigned_indices]
+            assignment_method = "source_manifest_global_bounded_v1"
+        else:
+            for placement_index, gid, placed_shape in placed_glyphs:
+                placed_bbox = _shape_host_bbox(placed_shape)
+                if placed_bbox is None:
+                    raise TextRepresentationRenderError(
+                        "svg_item_glyph_bounds_unavailable",
+                        {
+                            "requested_type": item_filter["requested_type"],
+                            "attempted_type": representation,
+                            "source_item_id": item_filter["source_item_id"],
+                            "placement_index": placement_index,
+                            "created_entity_ids": [],
+                            "removed_entity_ids": [],
+                            "cleanup_complete": True,
+                        },
+                    )
+                if (
+                    placement_index not in claimed_indices
+                    and _bboxes_intersect(placed_bbox, host_filter_bbox)
+                ):
+                    matched_glyphs.append((placement_index, gid, placed_shape))
 
-    # Combine all text into one compound object
+        matched_indices = [entry[0] for entry in matched_glyphs]
+        item_filter_evidence = {
+            "source_item_bbox": item_filter["source_bbox"],
+            "host_filter_bbox": host_filter_bbox,
+            "matched_placement_indices": matched_indices,
+            "assignment_method": assignment_method,
+        }
+        if empty_placement_indices:
+            item_filter_evidence["empty_placement_indices"] = list(
+                empty_placement_indices
+            )
+        if not matched_glyphs:
+            raise TextRepresentationRenderError(
+                    (
+                        "svg_item_assignment_empty"
+                        if source_manifest is not None
+                        else "svg_item_filter_empty"
+                    ),
+                {
+                    "requested_type": item_filter["requested_type"],
+                    "attempted_type": representation,
+                    "source_item_id": item_filter["source_item_id"],
+                    "renderer": renderer_name,
+                    "placement_count": len(placements),
+                    **item_filter_evidence,
+                    "created_entity_ids": [],
+                    "removed_entity_ids": [],
+                    "cleanup_complete": True,
+                },
+            )
+        placed_glyphs = matched_glyphs
+
+    owned: List[object] = []
+    created_ids: List[str] = []
+    child_source_ids: List[str] = []
+    attempts: List[dict] = []
+    raw_edge_count = 0
+    geometry_edges: List[object] = []
+    creation_started = False
+
+    def claim_new_object(obj, role: str) -> None:
+        if obj is None:
+            raise RuntimeError(f"{role} factory returned no host object")
+        if id(obj) in baseline_objects:
+            raise RuntimeError(f"{role} factory returned a pre-existing host object")
+        if any(candidate is obj for candidate in owned):
+            raise RuntimeError(f"{role} factory returned a reused host object")
+        owned.append(obj)
+
     try:
-        text_compound = Part.makeCompound(all_shapes)
-        text_obj = doc.addObject("Part::Feature", "Text_Glyphs")
-        text_obj.Shape = text_compound
-        try:
-            text_obj.ViewObject.LineWidth = 1.0
-            text_obj.ViewObject.LineColor = (0.0, 0.0, 0.0)
-        except (AttributeError, RuntimeError, TypeError):
-            pass
-        if parent_group:
-            parent_group.addObject(text_obj)
-        return {"shapes": len(glyph_shapes), "glyphs": glyph_count, "entity_type": "glyphs", "renderer": renderer_name}
-    except (RuntimeError, ValueError, TypeError):
-        return None
+        for glyph_index, _gid, placed_shape in placed_glyphs:
+            parent_source_item_id = (
+                item_filter["source_item_id"] if item_filter is not None else None
+            )
+            glyph_source_id = (
+                f"{parent_source_item_id}:g{glyph_index}"
+                if parent_source_item_id is not None
+                else f"p{int(page_num)}:g{glyph_index}"
+            )
+            glyph_created_ids: List[str] = []
+            if representation == "glyphs":
+                if not _shape_nonempty(placed_shape, require_edges=True):
+                    raise RuntimeError("placed glyph shape is empty")
+                creation_started = True
+                obj = doc.addObject(
+                    "Part::Feature",
+                    f"Text_Glyph_p{int(page_num)}_g{glyph_index}",
+                )
+                claim_new_object(obj, "glyph")
+                obj.Shape = placed_shape
+                if not _shape_nonempty(getattr(obj, "Shape", None), require_edges=True):
+                    raise RuntimeError("host glyph entity failed shape verification")
+                _annotate_text_entity(
+                    obj,
+                    glyph_source_id,
+                    representation,
+                    parent_source_item_id=parent_source_item_id,
+                )
+                glyph_created_ids.append(_host_object_id(obj))
+                child_source_ids.append(glyph_source_id)
+                if parent_group is not None:
+                    parent_group.addObject(obj)
+            else:
+                edges = list(getattr(placed_shape, "Edges", []) or [])
+                if not edges:
+                    raise RuntimeError("placed glyph has no raw geometry edges")
+                geometry_edges.extend(edges)
+                raw_edge_count += len(edges)
+
+            created_ids.extend(glyph_created_ids)
+            if item_filter is None and representation == "glyphs":
+                attempts.append(
+                    {
+                        "source_item_id": glyph_source_id,
+                        "requested_type": representation,
+                        "attempted_type": representation,
+                        "final_type": representation,
+                        "outcome": "verified",
+                        "reason": f"requested {representation} delivered",
+                        "created_entity_ids": glyph_created_ids,
+                        "support_entity_ids": [],
+                        "removed_entity_ids": [],
+                        "cleanup_complete": True,
+                        "evidence": {
+                            "renderer": renderer_name,
+                            "host_entity_type": "Part::Feature",
+                            "raw_edge_count": (
+                                len(glyph_created_ids)
+                                if representation == "geometry"
+                                else None
+                            ),
+                        },
+                    }
+                )
+
+        if representation == "geometry":
+            if not geometry_edges or raw_edge_count != len(geometry_edges):
+                raise RuntimeError("raw geometry edge collection is incomplete")
+            parent_source_item_id = (
+                item_filter["source_item_id"] if item_filter is not None else None
+            )
+            geometry_source_id = (
+                f"{parent_source_item_id}:geometry"
+                if parent_source_item_id is not None
+                else f"p{int(page_num)}:geometry"
+            )
+            creation_started = True
+            obj = doc.addObject(
+                "Part::Feature",
+                f"Text_Geometry_p{int(page_num)}",
+            )
+            claim_new_object(obj, "source-item geometry compound")
+            obj.Shape = Part.makeCompound(geometry_edges)
+            stored_shape = getattr(obj, "Shape", None)
+            stored_edges = list(getattr(stored_shape, "Edges", []) or [])
+            if (
+                not _shape_nonempty(stored_shape, require_edges=True)
+                or len(stored_edges) != raw_edge_count
+            ):
+                raise RuntimeError("host geometry compound lost raw outline edges")
+            _annotate_text_entity(
+                obj,
+                geometry_source_id,
+                representation,
+                parent_source_item_id=parent_source_item_id,
+            )
+            add_property = getattr(obj, "addProperty", None)
+            geometry_metadata = (
+                ("App::PropertyInteger", "PDFRawEdgeCount", int(raw_edge_count)),
+                (
+                    "App::PropertyString",
+                    "PDFSourceBBox",
+                    _serialize_bbox(item_filter["source_bbox"] if item_filter else None),
+                ),
+                (
+                    "App::PropertyString",
+                    "PDFGeometryBounds",
+                    _serialize_bbox(_shape_host_bbox(stored_shape)),
+                ),
+                (
+                    "App::PropertyString",
+                    "PDFGeometryGrouping",
+                    "source_item_compound_v1",
+                ),
+            )
+            for property_type, property_name, property_value in geometry_metadata:
+                if not hasattr(obj, property_name):
+                    if not callable(add_property):
+                        raise RuntimeError(
+                            f"host cannot store required {property_name} metadata"
+                        )
+                    add_property(property_type, property_name, "PDF Import")
+                setattr(obj, property_name, property_value)
+                stored_value = getattr(obj, property_name, None)
+                if property_name == "PDFRawEdgeCount":
+                    verified = int(stored_value) == int(property_value)
+                else:
+                    verified = str(stored_value or "") == str(property_value)
+                if not verified:
+                    raise RuntimeError(
+                        f"host did not preserve required {property_name} metadata"
+                    )
+            geometry_created_id = _host_object_id(obj)
+            created_ids.append(geometry_created_id)
+            child_source_ids.append(geometry_source_id)
+            if parent_group is not None:
+                parent_group.addObject(obj)
+            if item_filter is None:
+                attempts.append(
+                    {
+                        "source_item_id": geometry_source_id,
+                        "requested_type": representation,
+                        "attempted_type": representation,
+                        "final_type": representation,
+                        "outcome": "verified",
+                        "reason": "requested geometry delivered",
+                        "created_entity_ids": [geometry_created_id],
+                        "support_entity_ids": [],
+                        "removed_entity_ids": [],
+                        "cleanup_complete": True,
+                        "delivery_count": raw_edge_count,
+                        "evidence": {
+                            "renderer": renderer_name,
+                            "host_entity_type": "Part::Feature",
+                            "raw_edge_count": raw_edge_count,
+                            "geometry_grouping": "source_item_compound_v1",
+                        },
+                    }
+                )
+
+        doc.recompute()
+        if (
+            not created_ids
+            or len(created_ids) != len(owned)
+            or len(set(created_ids)) != len(created_ids)
+            or any(not entity_id for entity_id in created_ids)
+        ):
+            raise RuntimeError("created SVG text entity IDs could not be verified")
+        current_objects = list(getattr(doc, "Objects", []) or [])
+        if any(
+            not any(candidate is host_obj for candidate in current_objects)
+            for host_obj in owned
+        ):
+            raise RuntimeError("created SVG text host object is not live")
+        if parent_group is not None:
+            if hasattr(parent_group, "Group"):
+                group_objects = list(parent_group.Group or [])
+            elif hasattr(parent_group, "objects"):
+                group_objects = list(parent_group.objects or [])
+            else:
+                raise RuntimeError("SVG text parent group membership is unverifiable")
+            if any(
+                not any(candidate is host_obj for candidate in group_objects)
+                for host_obj in owned
+            ):
+                raise RuntimeError("created SVG text entity is not in its parent group")
+        if len(owned) != len(child_source_ids):
+            raise RuntimeError("created SVG text child identity count is invalid")
+        for child_index, host_obj in enumerate(owned):
+            child_source_id = child_source_ids[child_index]
+            if (
+                str(getattr(host_obj, "TypeId", "") or "") != "Part::Feature"
+                or getattr(host_obj, "PDFSourceItemId", None) != child_source_id
+                or getattr(host_obj, "PDFRepresentation", None) != representation
+                or (
+                    item_filter is not None
+                    and getattr(host_obj, "PDFParentSourceItemId", None)
+                    != item_filter["source_item_id"]
+                )
+            ):
+                raise RuntimeError("created SVG text host metadata is unverifiable")
+            if representation == "geometry":
+                refreshed_shape = getattr(host_obj, "Shape", None)
+                try:
+                    refreshed_edges = list(
+                        getattr(refreshed_shape, "Edges", []) or []
+                    )
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    refreshed_edges = []
+                try:
+                    declared_edge_count = int(host_obj.PDFRawEdgeCount)
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    declared_edge_count = -1
+                if (
+                    not _shape_nonempty(refreshed_shape, require_edges=True)
+                    or declared_edge_count != raw_edge_count
+                    or len(refreshed_edges) != declared_edge_count
+                    or str(getattr(host_obj, "PDFGeometryGrouping", "") or "")
+                    != "source_item_compound_v1"
+                ):
+                    raise RuntimeError(
+                        "recomputed geometry compound raw edge count is invalid"
+                    )
+
+        if item_filter is not None:
+            attempt_evidence = {
+                "renderer": renderer_name,
+                "host_entity_type": "Part::Feature",
+                "raw_edge_count": (
+                    raw_edge_count if representation == "geometry" else None
+                ),
+                **item_filter_evidence,
+                "child_source_item_ids": list(child_source_ids),
+            }
+            attempts.append(
+                {
+                    "source_item_id": item_filter["source_item_id"],
+                    "requested_type": item_filter["requested_type"],
+                    "attempted_type": representation,
+                    "final_type": representation,
+                    "outcome": "verified",
+                    "reason": (
+                        f"requested {representation} delivered for exact source item"
+                    ),
+                    "created_entity_ids": list(created_ids),
+                    "support_entity_ids": [],
+                    "removed_entity_ids": [],
+                    "cleanup_complete": True,
+                    "delivery_count": (
+                        raw_edge_count if representation == "geometry" else len(created_ids)
+                    ),
+                    "evidence": attempt_evidence,
+                }
+            )
+    except Exception as exc:
+        ownership_collection_error = ""
+        if creation_started:
+            try:
+                current_objects = list(getattr(doc, "Objects", []) or [])
+                for host_obj in current_objects:
+                    if (
+                        id(host_obj) not in baseline_objects
+                        and not any(candidate is host_obj for candidate in owned)
+                    ):
+                        owned.append(host_obj)
+            except (AttributeError, RuntimeError, TypeError, ValueError) as collect_exc:
+                ownership_collection_error = (
+                    f"{collect_exc.__class__.__name__}: {collect_exc}"
+                )
+        created_entity_ids = [_host_object_id(obj) for obj in owned]
+        cleanup = _cleanup_owned(doc, parent_group, owned)
+        if ownership_collection_error:
+            cleanup["cleanup_complete"] = False
+        raise TextRepresentationRenderError(
+            "host_entity_verification_failed",
+            {
+                "requested_type": (
+                    item_filter["requested_type"] if item_filter else representation
+                ),
+                "attempted_type": representation,
+                "source_item_id": (
+                    item_filter["source_item_id"] if item_filter else None
+                ),
+                "renderer": renderer_name,
+                "exception": f"{exc.__class__.__name__}: {exc}",
+                "created_entity_ids": created_entity_ids,
+                "ownership_collection_error": ownership_collection_error,
+                **cleanup,
+            },
+        ) from exc
+
+    if cache is not None and item_filter is not None:
+        cache["claimed_placement_indices"].update(
+            item_filter_evidence["matched_placement_indices"]
+        )
+
+    return {
+        "outcome": "verified",
+        "shapes": len(glyph_shapes),
+        "glyphs": len(placed_glyphs),
+        "raw_edges": raw_edge_count,
+        "entities": len(created_ids),
+        "entity_type": representation,
+        "renderer": renderer_name,
+        "created_entity_ids": created_ids,
+        "delivery_attempts": attempts,
+        "source_item_id": item_filter["source_item_id"] if item_filter else None,
+        "item_filter": item_filter_evidence,
+    }
 
 
 def _render_svg_with_pdftocairo(exe: str, pdf_path: str, page_num: int) -> Optional[str]:
@@ -270,7 +1496,7 @@ def _render_svg_with_pdftocairo(exe: str, pdf_path: str, page_num: int) -> Optio
         if FreeCAD:
             FreeCAD.Console.PrintWarning(
                 f"PDFSvgTextRenderer: pdftocairo timed out on page {page_num} — "
-                "falling back to editable labels.\n"
+                "requested SVG text representation was not rendered.\n"
             )
         return None
     except (subprocess.SubprocessError, OSError, ValueError, UnicodeError) as e:
@@ -358,12 +1584,24 @@ def _glyph_reference_id(gid: str) -> bool:
     )
 
 
-def _parse_glyph_defs(svg: str) -> Dict[str, str]:
+def _parse_all_glyph_defs(svg: str) -> Dict[str, str]:
     glyph_defs: Dict[str, str] = {}
     for gid, path_d in re.findall(
             r'<g id="([^"]+)">\s*<path d="([^"]*)"', svg, re.DOTALL):
-        if _glyph_reference_id(gid) and path_d.strip():
+        if _glyph_reference_id(gid):
             glyph_defs[gid] = path_d
+
+    # Poppler represents spaces and other zero-outline glyphs as an empty
+    # ``<g id="glyph-...">``.  Preserve those definitions explicitly so a
+    # valid whitespace placement is not misclassified as a missing visible
+    # outline and allowed to block every item on the page.
+    for gid, body in re.findall(
+        r'<g\b[^>]*\bid="([^"]+)"[^>]*>(.*?)</g>',
+        svg,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        if _glyph_reference_id(gid) and gid not in glyph_defs and not body.strip():
+            glyph_defs[gid] = ""
 
     for tag in re.findall(r'<path\b[^>]*>', svg, re.IGNORECASE | re.DOTALL):
         id_m = re.search(r'\bid="([^"]+)"', tag, re.IGNORECASE)
@@ -372,9 +1610,17 @@ def _parse_glyph_defs(svg: str) -> Dict[str, str]:
             continue
         gid = id_m.group(1)
         path_d = d_m.group(1)
-        if _glyph_reference_id(gid) and path_d.strip():
+        if _glyph_reference_id(gid):
             glyph_defs[gid] = path_d
     return glyph_defs
+
+
+def _parse_glyph_defs(svg: str) -> Dict[str, str]:
+    return {
+        glyph_id: path_d
+        for glyph_id, path_d in _parse_all_glyph_defs(svg).items()
+        if path_d.strip()
+    }
 
 
 def _parse_svg_dim(svg: str, attr: str, fallback: float) -> float:

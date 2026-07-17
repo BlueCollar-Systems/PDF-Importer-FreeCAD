@@ -29,7 +29,10 @@ class TestFcGuiProfessionalImport(unittest.TestCase):
         self.assertIn("self.advanced_group.isChecked()", self.source)
 
     def test_text_modes_include_freecad_capabilities(self) -> None:
-        self.assertIn('["Labels", "3D Text", "Glyphs", "Geometry"]', self.source)
+        self.assertIn(
+            '["Text", "Labels", "3D Text", "Glyphs", "Geometry", "Raster"]',
+            self.source,
+        )
 
     def test_modes_dict_retained_for_advanced(self) -> None:
         for mode in ('"Auto"', '"Vector"', '"Raster"', '"Hybrid"'):

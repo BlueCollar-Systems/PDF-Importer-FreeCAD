@@ -2,7 +2,6 @@
 """SVG text renderer fallback coverage for clean-PC installs."""
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -47,6 +46,23 @@ def test_parses_poppler_glyph_group_ids() -> None:
 
     assert renderer._parse_glyph_defs(svg) == {"glyph-0-1": "M0 0L1 0Z"}
     assert renderer._parse_use_placements(svg) == [("glyph-0-1", 3.0, 4.0, None)]
+
+
+def test_poppler_empty_glyph_group_is_recorded_as_intentional_empty_outline() -> None:
+    svg = (
+        '<svg viewBox="0 0 200 100"><defs>'
+        '<g id="glyph-0-1"><path d="M0 0L1 0Z"/></g>'
+        '<g id="glyph-0-2">\n</g>'
+        "</defs>"
+        '<use href="#glyph-0-1" x="3" y="4"/>'
+        '<use href="#glyph-0-2" x="5" y="4"/>'
+        "</svg>"
+    )
+
+    assert renderer._parse_all_glyph_defs(svg) == {
+        "glyph-0-1": "M0 0L1 0Z",
+        "glyph-0-2": "",
+    }
 
 
 def test_svg_size_guard_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -10,6 +10,7 @@ Converts PDF drawings into editable FreeCAD geometry with text and image support
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import math
 import os
@@ -428,9 +429,9 @@ class ImportOptions:
     curve_step_mm: float = 0.5              # Bezier linearization chord
     make_faces: bool = True                 # close filled paths → Part::Face
     import_text: bool = True
-    text_mode: str = "3d_text"            # "labels" | "3d_text" | "glyphs" | "geometry" | "none"
-    # When enabled, disables text reconstruction and uses glyph-accurate
-    # placement paths only (pdftocairo geometry or exact per-span labels).
+    text_mode: str = "3d_text"            # "text" | "labels" | "3d_text" | "glyphs" | "geometry" | "raster" | "none"
+    # Retained for configuration compatibility. Exact per-span placement is
+    # mandatory for requested Labels and cannot be disabled by this value.
     strict_text_fidelity: bool = True
     group_by_color: bool = True
     assign_linewidth: bool = True
@@ -482,17 +483,23 @@ class ImportOptions:
     raster_page_count: int = 0
     raster_fallback_reasons: List[str] = field(default_factory=list)
     import_report_path: Optional[str] = None
-    # ShapeString telemetry when 3d_text degrades to labels (Round-2 action #12).
+    # ShapeString telemetry. A renderer failure is reported as a failed attempt;
+    # it does not authorize changing the requested representation.
     shapestring_skips: Dict[str, int] = field(default_factory=dict)
-    # TEXTMODE-1 (owner directive 2026-07-13): text-mode substitutions are
-    # loud, never silent. Every fallback rung that delivers records an event
-    # {requested, delivered, reason, count}; write_import_report surfaces the
-    # dominant event in fallback.text and all events in extra.
+    # Representation substitutions are permitted only after item-specific
+    # impossibility is proven. Every authorized fallback carries stable source
+    # ids plus the proof used to authorize it.
     text_mode_fallbacks: List[Dict[str, Any]] = field(default_factory=list)
     # DELIVERED entity counts by bucket (native_3d_text, native_label, ...)
     # so actual_text_entity_types reflects what was created, not what was
     # requested (TEXTMODE-1 report honesty).
     text_delivered_counts: Dict[str, int] = field(default_factory=dict)
+    # Per-item requested-representation attempt ledger.  Entries carry stable
+    # source ids plus exact created/removed host object ids and cleanup state.
+    text_delivery_attempts: List[Dict[str, Any]] = field(default_factory=list)
+    # PyMuPDF extracts in unrotated crop-box coordinates.  The active page's
+    # rotation matrix maps those coordinates to the displayed page exactly once.
+    _page_rotation_matrix: Optional[Tuple[float, float, float, float, float, float]] = None
     # Scale detection telemetry for import_report cross-check (Round 5).
     resolved_scale: Optional[Dict[str, Any]] = None
     scale_hints: Dict[str, Any] = field(default_factory=dict)
@@ -504,15 +511,24 @@ def _default_import_report_path(pdf_path: str) -> str:
     return os.path.join(tempfile.gettempdir(), f"{base}_import_report.json")
 
 
+def _pdf_file_sha256(pdf_path: str) -> str:
+    digest = hashlib.sha256()
+    with open(pdf_path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _report_fallback_state(opts: ImportOptions):
+    # Raster is a first-class requested representation.  Selecting it explicitly
+    # is not evidence that the importer failed to deliver another representation.
+    if opts.import_mode == "raster":
+        return False, None
     fallback_used = (
-        opts.import_mode == "raster"
-        or opts.raster_page_count > 0
+        opts.raster_page_count > 0
         or opts.auto_resolved_mode == "raster"
     )
-    if opts.import_mode == "raster":
-        fallback_reason = "forced_raster_mode"
-    elif opts.raster_page_count > 0:
+    if opts.raster_page_count > 0:
         pages = opts.raster_page_count
         reasons = []
         for reason in getattr(opts, "raster_fallback_reasons", []) or []:
@@ -540,6 +556,22 @@ def _record_raster_page(opts: ImportOptions, reason: Optional[str] = None) -> No
     reason = str(reason or "").strip()
     if reason:
         opts.raster_fallback_reasons.append(reason)
+
+
+def _auto_raster_needs_text_overlay(
+    effective_mode: str,
+    source_text_blocks: int,
+    opts: ImportOptions,
+) -> bool:
+    """Keep auto content strategy from overriding an explicit text choice."""
+    return bool(
+        str(getattr(opts, "import_mode", "") or "").strip().lower() == "auto"
+        and str(effective_mode or "").strip().lower() == "raster"
+        and int(source_text_blocks or 0) > 0
+        and bool(getattr(opts, "import_text", False))
+        and str(getattr(opts, "text_mode", "") or "").strip().lower()
+        in {"text", "labels", "3d_text", "glyphs", "geometry"}
+    )
 
 
 def _merge_page_scale_into_opts(opts: ImportOptions, resolved) -> None:
@@ -663,51 +695,70 @@ def write_import_report(
             delivered_counts=delivered_counts or None,
         )
 
-    # TEXTMODE-1: surface recorded text-mode substitutions. The dominant
-    # event lands in fallback.text; every event stays in extra for forensics.
+    text_attempts = [
+        dict(attempt)
+        for attempt in (getattr(opts, "text_delivery_attempts", []) or [])
+    ]
+    if text_attempts:
+        extra["text_delivery_attempts"] = text_attempts
+
+    font_stage_failures = [
+        dict(failure)
+        for failure in (getattr(opts, "_font_stage_failures", []) or [])
+    ]
+    if font_stage_failures:
+        extra["font_stage_failures"] = font_stage_failures
+
+    # Surface only proof-gated representation substitutions. The dominant
+    # event lands in fallback.text and the complete ledger stays in extra.
     text_fallback_events = [
         dict(event)
         for event in (getattr(opts, "text_mode_fallbacks", []) or [])
         if int(event.get("count", 0) or 0) > 0
+        and bool((event.get("proof") or {}).get("item_specific_proven_impossible"))
+        and bool(event.get("source_item_ids"))
     ]
     text_fallback: Optional[Dict[str, Any]] = None
     if text_fallback_events:
         text_fallback = dict(
             max(text_fallback_events, key=lambda ev: int(ev.get("count", 0) or 0))
         )
-        if len(text_fallback_events) > 1:
-            extra["text_mode_fallbacks"] = text_fallback_events
+        extra["text_mode_fallbacks"] = text_fallback_events
 
-    if text_fallback is None:
-        # TEXTMODE-1 safety net: derive the substitution from report
-        # divergence (requested mode vs delivered entity type) so the report
-        # stays honest even when runtime event recording was bypassed.
-        requested_mode = str(opts.text_mode or "").strip().lower()
-        entity_dict = extra.get("actual_text_entity_types")
-        delivered_mode = ""
-        delivered_count = 0
-        if isinstance(entity_dict, dict):
-            delivered_mode = str(entity_dict.get("entity_type") or "").strip().lower()
-            delivered_count = int(entity_dict.get("count") or 0)
-        if delivered_mode in ("label", "labels") and delivered_count > 0:
-            if requested_mode == "3d_text":
-                text_fallback = {
-                    "requested": "3d_text",
-                    "delivered": "labels",
-                    "reason": (
-                        "no_ttf_font"
-                        if skips.get("no_ttf_font")
-                        else "shapestring_unavailable"
-                    ),
-                    "count": delivered_count,
-                }
-            elif requested_mode in ("glyphs", "geometry"):
-                text_fallback = {
-                    "requested": requested_mode,
-                    "delivered": "labels",
-                    "reason": "svg_renderer_failed",
-                    "count": delivered_count,
-                }
+    requested_mode = str(opts.text_mode or "").strip().lower()
+    requested_mode = {"label": "labels", "text3d": "3d_text", "outlines": "glyphs"}.get(
+        requested_mode, requested_mode
+    )
+    entity_dict = extra.get("actual_text_entity_types")
+    delivered_mode = ""
+    delivered_count = 0
+    if isinstance(entity_dict, dict):
+        delivered_mode = str(entity_dict.get("entity_type") or "").strip().lower()
+        delivered_mode = {
+            "label": "labels",
+            "text3d": "3d_text",
+            "outlines": "glyphs",
+        }.get(delivered_mode, delivered_mode)
+        delivered_count = int(entity_dict.get("count") or 0)
+    proven_pair = bool(
+        text_fallback
+        and str(text_fallback.get("requested") or "").strip().lower() == requested_mode
+        and str(text_fallback.get("delivered") or "").strip().lower() == delivered_mode
+    )
+    if (
+        requested_mode
+        and requested_mode != "none"
+        and delivered_mode
+        and delivered_count > 0
+        and requested_mode != delivered_mode
+        and not proven_pair
+    ):
+        extra["representation_contract_violation"] = {
+            "requested_type": requested_mode,
+            "delivered_type": delivered_mode,
+            "delivered_count": delivered_count,
+            "reason": "unproven_representation_substitution",
+        }
     if skips:
         extra["shapestring_skips"] = skips
         extra["shapestring_skip_total"] = sum(int(v) for v in skips.values())
@@ -728,7 +779,7 @@ def write_import_report(
         importer_version=_importer_version(),
         pdf_path=pdf_path,
         mode=opts.import_mode,
-        pages=pages_imported or total_pages,
+        pages=int(pages_imported),
         primitive_count=primitive_count,
         text_count=text_count,
         layer_count=layer_count,
@@ -743,6 +794,14 @@ def write_import_report(
         performance_phases=phases or None,
         extra=extra,
     )
+
+    if text_fallback and isinstance(getattr(report, "fallback", None), dict):
+        fallback_text = report.fallback.get("text")
+        if isinstance(fallback_text, dict):
+            fallback_text["source_item_ids"] = list(
+                text_fallback.get("source_item_ids") or []
+            )
+            fallback_text["proof"] = dict(text_fallback.get("proof") or {})
 
     provenance_objects = list(getattr(opts, "_source_provenance_objects", []) or [])
     if provenance_objects:
@@ -825,10 +884,38 @@ def write_import_report(
 # ──────────────────────────────────────────────────────────────────────
 # Coordinate transform
 # ──────────────────────────────────────────────────────────────────────
+def _page_matrix_values(opts: ImportOptions) -> Tuple[float, float, float, float, float, float]:
+    raw = getattr(opts, "_page_rotation_matrix", None)
+    if raw and len(raw) >= 6:
+        try:
+            return tuple(float(value) for value in raw[:6])
+        except (TypeError, ValueError):
+            pass
+    return (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+
+def _transform_pdf_direction(
+    direction: Tuple[float, float], opts: Optional[ImportOptions] = None
+) -> Tuple[float, float]:
+    dx, dy = float(direction[0]), float(direction[1])
+    if opts is not None:
+        a, b, c, d, _e, _f = _page_matrix_values(opts)
+        dx, dy = a * dx + c * dy, b * dx + d * dy
+        if opts.flip_y:
+            dy = -dy
+    else:
+        # Historical callers supply an unrotated PDF direction.  FreeCAD is
+        # Y-up, so preserve the established PDF Y-down conversion.
+        dy = -dy
+    return dx, dy
+
+
 def _to_fc(xy: Tuple[float, float], page_h: float,
            opts: ImportOptions, scale: float) -> "Vector":
     """Transform a PDF coordinate pair into a FreeCAD Vector."""
-    x, y = xy
+    x, y = float(xy[0]), float(xy[1])
+    a, b, c, d, e, f = _page_matrix_values(opts)
+    x, y = a * x + c * y + e, b * x + d * y + f
     if opts.flip_y:
         y = page_h - y
     return _v(x * scale, y * scale, 0)
@@ -1379,301 +1466,6 @@ def _polyline_edges_to_arcs(edges: List, opts: ImportOptions) -> List:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Text fraction reconstruction
-# ──────────────────────────────────────────────────────────────────────
-# Common denominators in structural/architectural drawings
-# Engineering drawing inch fractions are overwhelmingly base-2 denominators.
-# Keeping this strict avoids false positives like "206" -> "2/06" for part IDs.
-_VALID_DENOMS = {2, 4, 8, 16, 32, 64}
-
-
-def _try_split_fraction(text: str) -> Optional[Tuple[str, str]]:
-    """Try to split a combined numerator+denominator string like '18' → ('1','8').
-    Returns (numerator, denominator) or None if no valid fraction found."""
-    if not text or len(text) < 2:
-        return None
-    # Try each split point: "916" → ("9","16"), ("91","6")
-    best = None
-    for i in range(1, len(text)):
-        num_s, den_s = text[:i], text[i:]
-        try:
-            num, den = int(num_s), int(den_s)
-        except ValueError:
-            continue
-        if den in _VALID_DENOMS and 0 < num < den:
-            # Prefer the split that gives a standard fraction
-            if best is None:
-                best = (num_s, den_s)
-            # Prefer smaller denominators (more common)
-            elif int(best[1]) > den:
-                best = (num_s, den_s)
-    return best
-
-
-def _is_fraction_slash(span: dict) -> bool:
-    """Check if a span is a fraction bar '/' drawn between stacked numbers."""
-    text = span.get("text", "").strip()
-    return text == "/"
-
-
-def _is_superscript(span: dict) -> bool:
-    """Check if span has the superscript flag (bit 0 of flags)."""
-    return bool(span.get("flags", 0) & 1)
-
-
-def _is_smaller_font(span: dict, ref_size: float) -> bool:
-    """Check if span is noticeably smaller than the reference size."""
-    size = float(span.get("size", 0))
-    return size > 0 and size < ref_size * 0.95
-
-
-def _repair_fraction_artifact_runs(text: str) -> str:
-    """Fix run-on mixed-fraction artifacts produced by fragmented OCR spans.
-
-    Example: "19/163 7/161 9/16" -> "1 9/16 3 7/16 1 9/16"
-    """
-    if not text:
-        return text
-
-    def _to_mixed(num_s: str, den_s: str, tail: str = "") -> str | None:
-        try:
-            num_v = int(num_s)
-            den_v = int(den_s)
-        except ValueError:
-            return None
-        if num_v < den_v:
-            return None
-        if len(num_s) < 2:
-            return None
-        whole_s = num_s[:-1]
-        frac_num_s = num_s[-1]
-        try:
-            whole_v = int(whole_s)
-            frac_num_v = int(frac_num_s)
-        except ValueError:
-            return None
-        if whole_v < 0 or frac_num_v <= 0 or frac_num_v >= den_v:
-            return None
-        return f"{whole_v} {frac_num_v}/{den_v}{tail}"
-
-    def _repl_with_tail(m: re.Match) -> str:
-        num_s = m.group(1)
-        den_s = m.group(2)
-        tail = m.group(3)
-        try:
-            num_v = int(num_s)
-            den_v = int(den_s)
-        except ValueError:
-            return m.group(0)
-        if 0 < num_v < den_v:
-            return f"{num_v}/{den_v} {tail}"
-        mixed = _to_mixed(num_s, den_s, f" {tail}")
-        return mixed if mixed else m.group(0)
-
-    def _repl_no_tail(m: re.Match) -> str:
-        mixed = _to_mixed(m.group(1), m.group(2))
-        return mixed if mixed else m.group(0)
-
-    # "19/163" -> "1 9/16 3"
-    out = re.sub(r"(?<!\d)(\d{1,3})/(16|32|64)(\d)(?!\d)", _repl_with_tail, text)
-    # "19/16" -> "1 9/16" (keep conservative: only denominators common to inch dims)
-    out = re.sub(
-        r"(?<!\d)(\d{2,3})/(16|32|64)(?!\d)",
-        _repl_no_tail,
-        out,
-    )
-    return out
-
-
-def _reconstruct_line_text(spans: list) -> str:
-    """Reconstruct a line of text, converting stacked fractions back to inline.
-
-    PyMuPDF extracts PDF fractions (stacked numerator/denominator) as separate
-    spans. CRITICALLY, the "/" fraction bar often appears on a completely
-    separate PyMuPDF line — so we CANNOT rely on seeing "/" within this line.
-
-    Detection strategy: if we see small-font digit strings that form a valid
-    fraction (numerator < denominator, denominator is a standard value), we
-    reconstruct it as "num/denom" regardless of whether "/" is present.
-    """
-    if not spans:
-        return ""
-
-    # Single span — only try fraction split on longer digit strings (3+ chars)
-    # Short strings like "12" are ambiguous (twelve vs 1/2) and at main text
-    # size they're always the number. Real fractions like "1516" are 3+ chars.
-    if len(spans) == 1:
-        text = spans[0].get("text", "")
-        if text.isdigit() and len(text) >= 3:
-            frac = _try_split_fraction(text)
-            if frac:
-                return _repair_fraction_artifact_runs(frac[0] + "/" + frac[1])
-        return _repair_fraction_artifact_runs(text)
-
-    # Find the dominant non-slash font size in this line. In many CAD PDFs the
-    # fraction slash is rendered slightly larger than nearby digits; using it as
-    # the reference causes mixed-fraction detection to miss common patterns.
-    non_slash_sizes = [
-        float(s.get("size", 0))
-        for s in spans
-        if not _is_fraction_slash(s)
-    ]
-    sizes = [float(s.get("size", 0)) for s in spans]
-    main_size = max(non_slash_sizes) if non_slash_sizes else (max(sizes) if sizes else 10.0)
-
-    result = []
-    i = 0
-
-    def _append_frac(frac_str: str):
-        """Append a fraction string with conservative spacing.
-        Keep fractions tight after hyphens / parens / apostrophes so strings like
-        PIPE1-1/2STD do not become PIPE1-1/2 STD. Only insert a space when the
-        previous token really looks like a separate word/number."""
-        if result and result[-1]:
-            last_char = result[-1][-1]
-            if last_char not in (" ", "-", "(", "[", "/", "'"):
-                if last_char.isalpha() or last_char.isdigit():
-                    result.append(" ")
-        result.append(frac_str)
-
-    while i < len(spans):
-        span = spans[i]
-        text = span.get("text", "")
-        size = float(span.get("size", 0))
-
-        # Skip standalone "/" — fraction bar (content already reconstructed)
-        if _is_fraction_slash(span):
-            if result and "/" in result[-1]:
-                i += 1
-                continue
-            result.append(text)
-            i += 1
-            continue
-
-        # Case A: Superscript numerator + denominator (with or without "/")
-        # Pattern 1: ('7', flags=5) + ('16', small) → "7/16"
-        # Pattern 2: ('7', flags=5) + ('/', slash) + ('16', small) → "7/16"
-        if (_is_superscript(span) and _is_smaller_font(span, main_size)
-                and text.isdigit() and i + 1 < len(spans)):
-            next_span = spans[i + 1]
-            next_text = next_span.get("text", "")
-
-            # Pattern 1: numerator immediately followed by denominator
-            if next_text.isdigit() and _is_smaller_font(next_span, main_size):
-                try:
-                    num_v, den_v = int(text), int(next_text)
-                    if den_v in _VALID_DENOMS and 0 < num_v < den_v:
-                        _append_frac(text + "/" + next_text)
-                        i += 2
-                        if i < len(spans) and _is_fraction_slash(spans[i]):
-                            i += 1
-                        continue
-                except ValueError:
-                    pass
-
-            # Pattern 2: numerator + "/" + denominator (slash merged from adjacent line)
-            if (_is_fraction_slash(next_span) and i + 2 < len(spans)):
-                den_span = spans[i + 2]
-                den_text = den_span.get("text", "")
-                if den_text.isdigit() and _is_smaller_font(den_span, main_size):
-                    try:
-                        num_v, den_v = int(text), int(den_text)
-                        if den_v in _VALID_DENOMS and 0 < num_v < den_v:
-                            _append_frac(text + "/" + den_text)
-                            i += 3  # skip num, slash, denom
-                            continue
-                    except ValueError:
-                        pass
-
-        # Case B: Small-font combined digits (with or without "/")
-        # e.g. ('1516', size=10) → "15/16"
-        # e.g. ('18', size=10) → "1/8"
-        # e.g. ('12', size=10) → "1/2"
-        if _is_smaller_font(span, main_size) and text.isdigit() and len(text) >= 3:
-            frac = _try_split_fraction(text)
-            if frac:
-                _append_frac(frac[0] + "/" + frac[1])
-                i += 1
-                # Skip trailing "/" if present
-                if i < len(spans) and _is_fraction_slash(spans[i]):
-                    i += 1
-                continue
-
-        # Case C: Two same-sized digit spans → standalone fraction
-        # e.g. ('5', size=10) + ('8', size=10) → "5/8"
-        # Also handles: ('5', size=10) + ('/', slash) + ('8', size=10) → "5/8"
-        if (text.isdigit() and _is_smaller_font(span, main_size) and i + 1 < len(spans)):
-            next_span = spans[i + 1]
-            next_text = next_span.get("text", "")
-            next_size = float(next_span.get("size", 0))
-
-            # Pattern 1: num + denom (adjacent)
-            if (next_text.isdigit() and abs(size - next_size) < 1.0):
-                try:
-                    num_v, den_v = int(text), int(next_text)
-                    if den_v in _VALID_DENOMS and 0 < num_v < den_v:
-                        _append_frac(text + "/" + next_text)
-                        i += 2
-                        if i < len(spans) and _is_fraction_slash(spans[i]):
-                            i += 1
-                        continue
-                except ValueError:
-                    pass
-
-            # Pattern 2: num + "/" + denom
-            if (_is_fraction_slash(next_span) and i + 2 < len(spans)):
-                den_span = spans[i + 2]
-                den_text = den_span.get("text", "")
-                den_size = float(den_span.get("size", 0))
-                if (den_text.isdigit() and abs(size - den_size) < 1.0):
-                    try:
-                        num_v, den_v = int(text), int(den_text)
-                        if den_v in _VALID_DENOMS and 0 < num_v < den_v:
-                            _append_frac(text + "/" + den_text)
-                            i += 3
-                            continue
-                    except ValueError:
-                        pass
-
-        # Case D: compact fraction digits followed by trailing slash
-        # e.g. ('34') + ('/') → "3/4"
-        if text.isdigit() and len(text) >= 2 and i + 1 < len(spans):
-            next_span = spans[i + 1]
-            if _is_fraction_slash(next_span):
-                frac = _try_split_fraction(text)
-                if frac:
-                    _append_frac(frac[0] + "/" + frac[1])
-                    i += 2
-                    continue
-
-        # Case E: mixed fraction where slash trails the compact frac span
-        # e.g. ('2') + ('12') + ('/') → "2 1/2"
-        # e.g. ("37'-10") + ('12') + ('/') → "37'-10 1/2"
-        if i + 2 < len(spans):
-            next_span = spans[i + 1]
-            slash_span = spans[i + 2]
-            next_text = next_span.get("text", "")
-            if (
-                next_text.isdigit()
-                and len(next_text) >= 2
-                and _is_fraction_slash(slash_span)
-                and _is_smaller_font(next_span, main_size)
-            ):
-                frac = _try_split_fraction(next_text)
-                if frac:
-                    result.append(text)
-                    _append_frac(frac[0] + "/" + frac[1])
-                    i += 3
-                    continue
-
-        # Default: just append the text
-        result.append(text)
-        i += 1
-
-    return _repair_fraction_artifact_runs("".join(result))
-
-
-# ──────────────────────────────────────────────────────────────────────
 # Text layout helpers
 # ──────────────────────────────────────────────────────────────────────
 def _estimate_text_width_units(text: str) -> float:
@@ -1781,12 +1573,14 @@ def _normalize_pdf_font_name(font_name: str) -> str:
     return family
 
 
-def _line_angle_deg(line: dict) -> float:
+def _line_angle_deg(line: dict, opts: Optional[ImportOptions] = None) -> float:
     text_dir = line.get("dir", (1.0, 0.0))
     if text_dir and len(text_dir) >= 2:
         try:
-            dx, dy = float(text_dir[0]), float(text_dir[1])
-            return -math.degrees(math.atan2(dy, dx))
+            dx, dy = _transform_pdf_direction(
+                (float(text_dir[0]), float(text_dir[1])), opts
+            )
+            return math.degrees(math.atan2(dy, dx))
         except (TypeError, ValueError):
             pass
     return 0.0
@@ -1876,129 +1670,6 @@ def _fit_font_size_to_span_bbox(
     )
 
 
-def _object_xy_bound_lengths(obj) -> Optional[Tuple[float, float]]:
-    """Return generated object X/Y bound lengths when the host exposes them."""
-    try:
-        shape = getattr(obj, "Shape", None)
-        bb = getattr(shape, "BoundBox", None) or getattr(obj, "BoundBox", None)
-        if bb is None:
-            return None
-        if hasattr(bb, "XLength") and hasattr(bb, "YLength"):
-            return max(0.0, float(bb.XLength)), max(0.0, float(bb.YLength))
-        xmin = float(bb.XMin)
-        xmax = float(bb.XMax)
-        ymin = float(bb.YMin)
-        ymax = float(bb.YMax)
-        return abs(xmax - xmin), abs(ymax - ymin)
-    except (AttributeError, RuntimeError, TypeError, ValueError):
-        return None
-
-
-def _recompute_object_for_bounds(obj) -> None:
-    try:
-        doc = getattr(obj, "Document", None)
-        if doc is not None:
-            try:
-                doc.recompute([obj])
-                return
-            except TypeError:
-                doc.recompute()
-                return
-    except (AttributeError, RuntimeError, TypeError, ValueError):
-        pass
-    try:
-        if FreeCAD is not None and getattr(FreeCAD, "ActiveDocument", None) is not None:
-            FreeCAD.ActiveDocument.recompute()
-    except (AttributeError, RuntimeError, TypeError, ValueError):
-        pass
-
-
-def _calibrate_shapestring_to_span_bbox(
-    ss,
-    span: dict,
-    font_size_fc: float,
-    scale: float,
-) -> float:
-    """Preserve nominal ShapeString size; bbox data must not resize text."""
-    del ss, span, scale
-    try:
-        return max(0.1, float(font_size_fc))
-    except (TypeError, ValueError):
-        return font_size_fc
-
-
-def _build_text_layout_context(tdict: dict) -> dict:
-    """Collect lightweight page context for table-specific text placement."""
-    quan_headers = []
-    for block in tdict.get("blocks", []) or []:
-        if block.get("type") != 0:
-            continue
-        for line in block.get("lines", []) or []:
-            for span in line.get("spans", []) or []:
-                text = str(span.get("text", "") or "").strip().upper()
-                if text not in {"QUAN", "QTY", "QTY."}:
-                    continue
-                bbox = _span_bbox_pdf(span)
-                if not bbox:
-                    continue
-                x0, y0, x1, y1 = bbox
-                quan_headers.append({
-                    "cx": (x0 + x1) * 0.5,
-                    "cy": (y0 + y1) * 0.5,
-                    "width": max(1.0, x1 - x0),
-                })
-    return {"quan_headers": quan_headers}
-
-
-def _is_simple_quantity_text(text: str) -> bool:
-    return bool(re.fullmatch(r"\d{1,3}", str(text or "").strip()))
-
-
-def _is_bom_quantity_span(span: dict, text: str, context: dict) -> bool:
-    """Return True for simple BOM quantity cells that should stay horizontal."""
-    if not _is_simple_quantity_text(text):
-        return False
-    bbox = _span_bbox_pdf(span)
-    if not bbox:
-        return False
-    headers = list((context or {}).get("quan_headers") or [])
-    if not headers:
-        return False
-    x0, y0, x1, y1 = bbox
-    cx = (x0 + x1) * 0.5
-    cy = (y0 + y1) * 0.5
-    for header in headers:
-        if cy < float(header["cy"]) - 4.0:
-            continue
-        tol_x = max(10.0, float(header["width"]) * 1.75)
-        if abs(cx - float(header["cx"])) <= tol_x:
-            return True
-    return False
-
-
-def _horizontal_quantity_origin_pdf(
-    span: dict,
-    text: str,
-    font_size_fc: float,
-    scale: float,
-) -> Optional[Tuple[float, float]]:
-    """Place a rotated BOM quantity back as centered horizontal text."""
-    bbox = _span_bbox_pdf(span)
-    if not bbox:
-        return None
-    x0, y0, x1, y1 = bbox
-    center_x = (x0 + x1) * 0.5
-    width_pdf = _estimate_text_width_mm(text, font_size_fc) / max(scale, 1e-12)
-    try:
-        size_pt = max(0.0, float(span.get("size", 0.0) or 0.0))
-        desc = abs(float(span.get("descender", -0.2) or -0.2))
-    except (TypeError, ValueError):
-        size_pt = 0.0
-        desc = 0.2
-    baseline_y = y1 - desc * size_pt
-    return center_x - (width_pdf * 0.5), baseline_y
-
-
 def _span_source_color(span: dict) -> Optional[Tuple[float, float, float]]:
     return _optional_color(span.get("color"))
 
@@ -2027,73 +1698,117 @@ def _render_text_spans_exact_labels(
     only_rotated: bool = False,
     layout_context: Optional[dict] = None,
 ) -> int:
-    """Render one Draft text object per PDF span for highest label fidelity."""
+    """Render and verify exactly one Draft label per eligible PDF span."""
+    del layout_context
     if Draft is None or text_group is None:
-        return 0
+        attempt = {
+            "source_item_id": "page",
+            "requested_type": "labels",
+            "attempted_type": "labels",
+            "final_type": None,
+            "outcome": "failed",
+            "reason": "freecad_draft_or_group_unavailable",
+            "created_entity_ids": [],
+            "removed_entity_ids": [],
+            "cleanup_complete": True,
+        }
+        opts.text_delivery_attempts.append(attempt)
+        raise TextRepresentationFailure(
+            "Labels unavailable: FreeCAD Draft/group missing", attempt
+        )
 
-    count = 0
-    # Per-text placement registry to suppress near-identical duplicate spans
-    # (common in some PDFs with layered text paints), while preserving
-    # genuinely distinct nearby labels.
-    seen = {}
+    delivered: List[Tuple[dict, str, Any, int]] = []
+    owned: List[Any] = []
+    attempts_for_call: List[Dict[str, Any]] = []
+    page_num = int(getattr(opts, "_provenance_page", 1) or 1)
     rotated_threshold = _rotated_text_threshold_deg()
-    for block in tdict.get("blocks", []):
+
+    def fail_attempt(attempt: Dict[str, Any], reason: str, evidence: Dict[str, Any]):
+        doc = _text_host_document(owned[0] if owned else None, text_group)
+        removed, cleanup_complete = (
+            _remove_owned_text_objects(doc, text_group, owned)
+            if doc is not None
+            else ([], not owned)
+        )
+        removed_set = set(removed)
+        for earlier in attempts_for_call:
+            if earlier.get("outcome") == "verified":
+                earlier["outcome"] = "rolled_back"
+                earlier["final_type"] = None
+                earlier["superseded_by"] = attempt.get("source_item_id")
+                earlier["removed_entity_ids"] = [
+                    entity_id
+                    for entity_id in list(earlier.get("created_entity_ids") or [])
+                    if entity_id in removed_set
+                ]
+                earlier["cleanup_complete"] = all(
+                    entity_id in removed_set
+                    for entity_id in list(earlier.get("created_entity_ids") or [])
+                )
+        attempt.update({
+            "outcome": "failed",
+            "reason": reason,
+            "evidence": dict(evidence),
+            "removed_entity_ids": removed,
+            "cleanup_complete": bool(cleanup_complete),
+            "final_type": None,
+        })
+        attempts_for_call.append(attempt)
+        opts.text_delivery_attempts.extend(attempts_for_call)
+        opts.text_delivered_counts.pop("native_label", None)
+        raise TextRepresentationFailure(
+            "Labels failed for %s: %s" % (attempt["source_item_id"], reason),
+            attempt,
+        )
+
+    for block_index, block in enumerate(tdict.get("blocks", [])):
         if block.get("type") != 0:
             continue
-        for line in block.get("lines", []):
+        for line_index, line in enumerate(block.get("lines", [])):
             spans = line.get("spans", []) or []
             if not spans:
                 continue
-            angle_deg = _line_angle_deg(line)
+            angle_deg = _line_angle_deg(line, opts)
             norm_angle = _normalize_text_angle_deg(angle_deg)
             if only_rotated and abs(norm_angle) < rotated_threshold:
                 continue
 
-            for span in spans:
-                text = span.get("text", "")
-                if not text or text.isspace():
+            for span_index, span in enumerate(spans):
+                source_text = str(span.get("text", "") or "")
+                if not source_text or source_text.isspace():
                     continue
-
-                try:
-                    size_pt = float(span.get("size", 0.0) or 0.0)
-                except (TypeError, ValueError):
-                    size_pt = 0.0
                 from pdfcadcore.text_scale import effective_span_font_size_pt
 
-                txt = str(text).strip()
-                if not txt:
-                    continue
-                is_bom_quantity = _is_bom_quantity_span(span, txt, layout_context or {})
-                span_angle_deg = 0.0 if is_bom_quantity else angle_deg
+                source_item_id = "p%d:b%d:l%d:s%d" % (
+                    page_num, block_index, line_index, span_index
+                )
+                attempt = {
+                    "source_item_id": source_item_id,
+                    "requested_type": "labels",
+                    "attempted_type": "labels",
+                    "created_entity_ids": [],
+                    "removed_entity_ids": [],
+                    "cleanup_complete": False,
+                    "superseded_by": None,
+                }
+                # Source direction is authoritative. Content heuristics (for
+                # example, recognizing a BOM quantity) must never rotate or
+                # reposition a requested text representation.
+                span_angle_deg = angle_deg
                 size_pt = effective_span_font_size_pt(span, span_angle_deg)
                 if size_pt <= 0.0:
                     size_pt = 3.0
                 font_size_fc = max(0.1, size_pt * scale)
-                font_size_fc = _fit_font_size_to_span_bbox(txt, font_size_fc, span, scale, span_angle_deg)
-                if is_bom_quantity:
-                    origin = _horizontal_quantity_origin_pdf(span, txt, font_size_fc, scale)
-                else:
-                    origin = _span_origin_pdf(span)
-                if not origin:
-                    continue
-
-                dedupe_key = (
-                    txt,
-                    round(float(_normalize_text_angle_deg(span_angle_deg)), 1),
-                    round(float(font_size_fc), 2),
+                font_size_fc = _fit_font_size_to_span_bbox(
+                    source_text, font_size_fc, span, scale, span_angle_deg
                 )
-                bucket = seen.setdefault(dedupe_key, [])
-                is_duplicate = False
-                ox = float(origin[0])
-                oy = float(origin[1])
-                for px, py in bucket:
-                    # Tight tolerance: only collapse effectively overlaid spans.
-                    if abs(ox - px) <= 0.35 and abs(oy - py) <= 0.35:
-                        is_duplicate = True
-                        break
-                if is_duplicate:
-                    continue
-                bucket.append((ox, oy))
+                origin = _span_origin_pdf(span)
+                if not origin:
+                    fail_attempt(
+                        attempt,
+                        "source_origin_unavailable",
+                        {"source_font": str(span.get("font", "") or "")},
+                    )
 
                 pos = _to_fc(origin, page_h, opts, scale)
                 font_name = _normalize_pdf_font_name(span.get("font", ""))
@@ -2101,19 +1816,46 @@ def _render_text_spans_exact_labels(
                 # spans report a baseline origin. Apply the same local-axis
                 # correction for horizontal and rotated exact labels so leader
                 # callouts do not drift when switching modes.
-                if not is_bom_quantity:
-                    try:
-                        desc = float(span.get("descender", -0.2) or -0.2)
-                    except (TypeError, ValueError):
-                        desc = -0.2
-                    offset_fc = _effective_descender(txt, desc) * font_size_fc * 0.35
-                    if abs(offset_fc) > 1e-12:
-                        pos = _apply_text_local_y_offset(pos, span_angle_deg, offset_fc)
-                rot = Rotation(Vector(0, 0, 1), span_angle_deg)
                 try:
-                    t = Draft.make_text([text], placement=Placement(pos, rot))
-                except (RuntimeError, ValueError, TypeError, AttributeError):
-                    continue
+                    desc = float(span.get("descender", -0.2) or -0.2)
+                except (TypeError, ValueError):
+                    desc = -0.2
+                offset_fc = _effective_descender(source_text, desc) * font_size_fc * 0.35
+                if abs(offset_fc) > 1e-12:
+                    pos = _apply_text_local_y_offset(pos, span_angle_deg, offset_fc)
+                rot = Rotation(Vector(0, 0, 1), span_angle_deg)
+                doc = _text_host_document(None, text_group)
+                before_objects = (
+                    {id(obj) for obj in _document_objects(doc)}
+                    if doc is not None
+                    else set()
+                )
+                try:
+                    t = Draft.make_text(
+                        [source_text], placement=Placement(pos, rot)
+                    )
+                except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
+                    if doc is not None:
+                        owned.extend(
+                            obj for obj in _document_objects(doc)
+                            if id(obj) not in before_objects and obj not in owned
+                        )
+                    fail_attempt(
+                        attempt,
+                        "label creation failed",
+                        {
+                            "source_font": str(span.get("font", "") or ""),
+                            "exception": "%s: %s" % (exc.__class__.__name__, exc),
+                            "item_specific_attempted": True,
+                        },
+                    )
+                if t is None:
+                    fail_attempt(
+                        attempt,
+                        "label creation returned no host object",
+                        {"item_specific_attempted": True},
+                    )
+                owned.append(t)
 
                 try:
                     t.ViewObject.FontSize = font_size_fc
@@ -2126,50 +1868,718 @@ def _render_text_spans_exact_labels(
 
                 try:
                     text_group.addObject(t)
-                except (AttributeError, RuntimeError, TypeError, ValueError):
-                    pass
-                try:
-                    from pdfcadcore.source_provenance import record_text_span_provenance
-
-                    page_num = int(getattr(opts, "_provenance_page", 1) or 1)
-                    record_text_span_provenance(
-                        opts,
-                        page=page_num,
-                        span=span,
-                        text=txt,
-                        created_entity_type="native_label",
-                        parent_handle=str(getattr(text_group, "Name", "") or ""),
-                        import_mode=str(getattr(opts, "import_mode", "") or ""),
-                        text_mode=str(getattr(opts, "text_mode", "") or "labels"),
+                    add_property = getattr(t, "addProperty", None)
+                    if callable(add_property):
+                        add_property("App::PropertyString", "PDFSourceItemId", "PDF Import")
+                        add_property("App::PropertyString", "PDFRepresentation", "PDF Import")
+                        t.PDFSourceItemId = source_item_id
+                        t.PDFRepresentation = "labels"
+                except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                    fail_attempt(
+                        attempt,
+                        "label host annotation failed",
+                        {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
                     )
-                except (ImportError, TypeError, ValueError):
-                    pass
-                count += 1
-    _record_text_delivery(opts, "native_label", count)
-    return count
+
+                actual_text = getattr(t, "Text", None)
+                if isinstance(actual_text, (list, tuple)):
+                    source_text_preserved = list(actual_text) == [source_text]
+                else:
+                    source_text_preserved = str(actual_text or "") == source_text
+                entity_id = _host_object_id(t)
+                if not entity_id or not source_text_preserved:
+                    fail_attempt(
+                        attempt,
+                        "label host verification failed",
+                        {
+                            "host_entity_id": entity_id,
+                            "source_text_preserved": source_text_preserved,
+                            "host_entity_type": str(getattr(t, "TypeId", "") or ""),
+                        },
+                    )
+
+                attempt.update({
+                    "outcome": "verified",
+                    "reason": "requested Labels delivered",
+                    "final_type": "labels",
+                    "created_entity_ids": [entity_id],
+                    "cleanup_complete": True,
+                    "evidence": {
+                        "host_entity_type": str(getattr(t, "TypeId", "") or ""),
+                        "source_text_preserved": True,
+                        "source_font": str(span.get("font", "") or ""),
+                        "font_name": font_name,
+                        "rotation_deg": float(span_angle_deg),
+                        "font_size": float(font_size_fc),
+                    },
+                })
+                attempts_for_call.append(attempt)
+                stable_index = block_index * 1_000_000 + line_index * 10_000 + span_index
+                delivered.append((span, source_item_id, t, stable_index))
+
+    opts.text_delivery_attempts.extend(attempts_for_call)
+    _record_text_delivery(opts, "native_label", len(delivered))
+    try:
+        from pdfcadcore.source_provenance import record_text_span_provenance
+
+        for span, _source_item_id, label_obj, stable_index in delivered:
+            record_text_span_provenance(
+                opts,
+                page=page_num,
+                span=span,
+                text=str(span.get("text", "") or ""),
+                created_entity_type="native_label",
+                parent_handle=_host_object_id(label_obj),
+                import_mode=str(getattr(opts, "import_mode", "") or ""),
+                text_mode="labels",
+                span_index=stable_index,
+            )
+    except (ImportError, TypeError, ValueError):
+        pass
+    return len(delivered)
 
 
-def _resolve_shapestring_font_path(font_name: str) -> Optional[str]:
-    """Resolve a TTF path for Draft ShapeString extruded text."""
-    windir = os.environ.get("WINDIR", r"C:\Windows")
-    lower = (font_name or "").lower()
-    candidates: List[str] = []
-    if "courier" in lower or "mono" in lower:
-        candidates.append(os.path.join(windir, "Fonts", "cour.ttf"))
-    elif "times" in lower or "serif" in lower:
-        candidates.append(os.path.join(windir, "Fonts", "times.ttf"))
-    candidates.extend([
-        os.path.join(windir, "Fonts", "arial.ttf"),
-        os.path.join(windir, "Fonts", "calibri.ttf"),
-        os.path.join(windir, "Fonts", "segoeui.ttf"),
-    ])
-    override = os.environ.get("BC_PDF_SHAPESTRING_FONT", "").strip()
-    if override:
-        candidates.insert(0, override)
-    for path in candidates:
-        if path and os.path.isfile(path):
-            return path
-    return None
+def _shapestring_font_cache_dir() -> Path:
+    try:
+        base = Path(FreeCAD.getUserAppDataDir())
+        return base / "Mod" / "PDFVectorImporter" / "font_cache"
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return Path(tempfile.gettempdir()) / "bc_fc_pdf_font_cache"
+
+
+def _stage_page_shapestring_fonts(
+    pdf_doc,
+    page,
+    opts: ImportOptions,
+    *,
+    pdf_sha256: Optional[str] = None,
+    page_number: Optional[int] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Stage fonts and optionally record one completed proof-bound page session."""
+    from PDFEmbeddedFonts import EmbeddedFontInventoryError, stage_page_fonts
+
+    exact_context_requested = pdf_sha256 is not None or page_number is not None
+    context_digest = ""
+    context_page = 0
+    if exact_context_requested:
+        if not isinstance(pdf_sha256, str):
+            raise ValueError("proof-capable font staging requires a PDF SHA-256")
+        context_digest = pdf_sha256.strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", context_digest) is None:
+            raise ValueError("proof-capable font staging requires a valid PDF SHA-256")
+        if type(page_number) is not int or page_number <= 0:
+            raise ValueError("proof-capable font staging requires a positive page number")
+        context_page = page_number
+        existing_sessions = getattr(
+            opts, "_shapestring_font_staging_sessions", []
+        )
+        if existing_sessions is None:
+            existing_sessions = []
+        if not isinstance(existing_sessions, list):
+            raise ValueError("font staging sessions must be a list")
+        # A retry owns this digest/page slot immediately.  If staging raises,
+        # no stale completed session for the same page may survive and certify
+        # the failed retry as an exact-font absence.
+        opts._shapestring_font_staging_sessions = [
+            existing
+            for existing in existing_sessions
+            if not (
+                isinstance(existing, dict)
+                and existing.get("pdf_sha256") == context_digest
+                and existing.get("page_number") == context_page
+            )
+        ]
+
+    failures = list(getattr(opts, "_font_stage_failures", []) or [])
+    prior_failure_count = len(failures)
+    try:
+        staged = stage_page_fonts(
+            pdf_doc,
+            page,
+            _shapestring_font_cache_dir(),
+            failures=failures,
+        )
+    except Exception as exc:
+        if exact_context_requested:
+            reason = (
+                "embedded_font_inventory_failed"
+                if isinstance(exc, EmbeddedFontInventoryError)
+                else "embedded_font_page_staging_failed"
+            )
+            page_failure = {
+                "reason": reason,
+                "exception": "%s: %s" % (exc.__class__.__name__, exc),
+                "pdf_sha256": context_digest,
+                "page_number": context_page,
+            }
+            sessions = list(
+                getattr(opts, "_shapestring_font_staging_sessions", []) or []
+            )
+            sessions.append(
+                {
+                    "pdf_sha256": context_digest,
+                    "page_number": context_page,
+                    "staging_complete": False,
+                    "records": {},
+                    "failures": copy.deepcopy(failures[prior_failure_count:]),
+                    "page_failure": page_failure,
+                }
+            )
+            opts._shapestring_font_staging_sessions = sessions
+        raise
+    telemetry_page = int(getattr(opts, "_provenance_page", 0) or 0)
+    if telemetry_page > 0:
+        for failure in failures[prior_failure_count:]:
+            failure.setdefault("page", telemetry_page)
+    opts._font_stage_failures = failures
+    merged = dict(getattr(opts, "_shapestring_font_paths", {}) or {})
+    merged.update(staged)
+    opts._shapestring_font_paths = merged
+    if exact_context_requested:
+        session = {
+            "pdf_sha256": context_digest,
+            "page_number": context_page,
+            "staging_complete": True,
+            "records": copy.deepcopy(staged),
+            "failures": copy.deepcopy(failures[prior_failure_count:]),
+        }
+        sessions = list(opts._shapestring_font_staging_sessions)
+        sessions = [
+            existing
+            for existing in sessions
+            if not (
+                isinstance(existing, dict)
+                and existing.get("pdf_sha256") == context_digest
+                and existing.get("page_number") == context_page
+            )
+        ]
+        sessions.append(session)
+        opts._shapestring_font_staging_sessions = sessions
+    return staged
+
+
+def _canonical_font_identity(font_name: str) -> Dict[str, str]:
+    """Bind a stripped PDF font name to the shared exact normalization key."""
+    from PDFEmbeddedFonts import normalize_font_key
+
+    raw_name = str(font_name or "").strip()
+    return {
+        "raw_name": raw_name,
+        "normalized_key": normalize_font_key(raw_name),
+    }
+
+
+def _font_source_result(
+    source: str,
+    outcome: str,
+    font_identity: Dict[str, str],
+    **details,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "source": source,
+        "outcome": outcome,
+        "font_identity": dict(font_identity),
+    }
+    result.update(details)
+    return result
+
+
+def _resolve_shapestring_font_path_with_evidence(
+    font_name: str,
+    opts: Optional[ImportOptions] = None,
+    *,
+    pdf_sha256: Optional[str] = None,
+    page_number: Optional[int] = None,
+    _allow_unbound_compat: bool = False,
+) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """Resolve one exact font and retain auditable embedded/system results.
+
+    Only a clean miss is reported as ``not_found``.  Corrupt metadata, stale
+    staged files, hash/IO failures, and lookup exceptions are ``invalid`` so
+    callers cannot mistake a runtime failure for proof that the font is absent.
+    """
+    context_digest = ""
+    context_page = 0
+    staging_complete = False
+    if not _allow_unbound_compat:
+        if (
+            not isinstance(pdf_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", pdf_sha256) is None
+            or type(page_number) is not int
+            or page_number <= 0
+        ):
+            raw_name = str(font_name or "").strip()
+            identity = {"raw_name": raw_name, "normalized_key": ""}
+            return None, [_font_source_result(
+                "embedded_font",
+                "invalid",
+                identity,
+                pdf_sha256=pdf_sha256,
+                page_number=page_number,
+                staging_complete=False,
+                reason="font_proof_context_invalid",
+            )]
+        context_digest = pdf_sha256
+        context_page = page_number
+
+    def source_result(
+        source: str,
+        outcome: str,
+        identity: Dict[str, str],
+        **details,
+    ) -> Dict[str, Any]:
+        if not _allow_unbound_compat:
+            details.update({
+                "pdf_sha256": context_digest,
+                "page_number": context_page,
+                "staging_complete": staging_complete,
+            })
+        return _font_source_result(source, outcome, identity, **details)
+
+    try:
+        font_identity = _canonical_font_identity(font_name)
+    except Exception as exc:
+        raw_name = str(font_name or "").strip()
+        identity = {"raw_name": raw_name, "normalized_key": ""}
+        return None, [source_result(
+            "embedded_font",
+            "invalid",
+            identity,
+            reason="font_identity_normalization_failed",
+            exception="%s: %s" % (exc.__class__.__name__, exc),
+        )]
+
+    key = font_identity["normalized_key"]
+    if not font_identity["raw_name"] or not key:
+        return None, [source_result(
+            "embedded_font",
+            "invalid",
+            font_identity,
+            reason="malformed_font_identity",
+        )]
+
+    if _allow_unbound_compat:
+        embedded = (
+            getattr(opts, "_shapestring_font_paths", {}) if opts is not None else {}
+        )
+        failures = getattr(opts, "_font_stage_failures", []) if opts is not None else []
+    else:
+        try:
+            sessions = (
+                getattr(opts, "_shapestring_font_staging_sessions", [])
+                if opts is not None
+                else []
+            )
+        except Exception as exc:
+            return None, [source_result(
+                "embedded_font",
+                "invalid",
+                font_identity,
+                reason="font_staging_session_lookup_failed",
+                exception="%s: %s" % (exc.__class__.__name__, exc),
+            )]
+        if not isinstance(sessions, list):
+            return None, [source_result(
+                "embedded_font",
+                "invalid",
+                font_identity,
+                reason="malformed_font_staging_sessions",
+            )]
+        exact_sessions: List[Dict[str, Any]] = []
+        try:
+            for session in sessions:
+                if not isinstance(session, dict):
+                    return None, [source_result(
+                        "embedded_font",
+                        "invalid",
+                        font_identity,
+                        reason="malformed_font_staging_session",
+                    )]
+                session_digest = session.get("pdf_sha256")
+                session_page = session.get("page_number")
+                if (
+                    not isinstance(session_digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", session_digest) is None
+                    or type(session_page) is not int
+                    or session_page <= 0
+                ):
+                    return None, [source_result(
+                        "embedded_font",
+                        "invalid",
+                        font_identity,
+                        reason="malformed_font_staging_session",
+                    )]
+                if (
+                    session_digest == context_digest
+                    and session_page == context_page
+                ):
+                    exact_sessions.append(session)
+        except Exception as exc:
+            return None, [source_result(
+                "embedded_font",
+                "invalid",
+                font_identity,
+                reason="font_staging_session_lookup_failed",
+                exception="%s: %s" % (exc.__class__.__name__, exc),
+            )]
+        if not exact_sessions:
+            return None, [source_result(
+                "embedded_font",
+                "invalid",
+                font_identity,
+                reason=(
+                    "font_staging_session_missing"
+                    if not sessions
+                    else "font_staging_session_mismatch"
+                ),
+            )]
+        if len(exact_sessions) != 1:
+            return None, [source_result(
+                "embedded_font",
+                "invalid",
+                font_identity,
+                reason="duplicate_font_staging_session",
+            )]
+        session = exact_sessions[0]
+        try:
+            page_failure = session.get("page_failure")
+            if session.get("staging_complete") is not True:
+                if page_failure is not None:
+                    if (
+                        not isinstance(page_failure, dict)
+                        or page_failure.get("reason")
+                        not in {
+                            "embedded_font_inventory_failed",
+                            "embedded_font_page_staging_failed",
+                        }
+                        or page_failure.get("pdf_sha256") != context_digest
+                        or page_failure.get("page_number") != context_page
+                        or not isinstance(page_failure.get("exception"), str)
+                        or not page_failure.get("exception")
+                    ):
+                        return None, [source_result(
+                            "embedded_font",
+                            "invalid",
+                            font_identity,
+                            reason="malformed_font_staging_page_failure",
+                        )]
+                    return None, [source_result(
+                        "embedded_font",
+                        "invalid",
+                        font_identity,
+                        reason=page_failure["reason"],
+                        exception=page_failure["exception"],
+                        page_failure=copy.deepcopy(page_failure),
+                    )]
+                return None, [source_result(
+                    "embedded_font",
+                    "invalid",
+                    font_identity,
+                    reason="font_staging_session_incomplete",
+                )]
+            if page_failure not in (None, {}):
+                return None, [source_result(
+                    "embedded_font",
+                    "invalid",
+                    font_identity,
+                    reason="completed_font_session_has_page_failure",
+                )]
+            embedded = session.get("records")
+            failures = session.get("failures")
+        except Exception as exc:
+            return None, [source_result(
+                "embedded_font",
+                "invalid",
+                font_identity,
+                reason="font_staging_session_lookup_failed",
+                exception="%s: %s" % (exc.__class__.__name__, exc),
+            )]
+        staging_complete = True
+
+    try:
+        if embedded is None:
+            if _allow_unbound_compat:
+                embedded = {}
+            else:
+                return None, [source_result(
+                    "embedded_font",
+                    "invalid",
+                    font_identity,
+                    reason="malformed_staged_font_lookup",
+                )]
+        if not isinstance(embedded, dict):
+            return None, [source_result(
+                "embedded_font",
+                "invalid",
+                font_identity,
+                reason="malformed_staged_font_lookup",
+            )]
+        record_present = key in embedded
+        record = embedded[key] if record_present else None
+    except Exception as exc:
+        return None, [source_result(
+            "embedded_font",
+            "invalid",
+            font_identity,
+            reason="staged_font_lookup_failed",
+            exception="%s: %s" % (exc.__class__.__name__, exc),
+        )]
+
+    results: List[Dict[str, Any]] = []
+    if record_present:
+        if not isinstance(record, dict):
+            return None, [source_result(
+                "embedded_font",
+                "invalid",
+                font_identity,
+                reason="malformed_staged_font_record",
+            )]
+
+        try:
+            path_value = record.get("path")
+            sha_value = record.get("sha256")
+            source_value = record.get("source")
+            xref_value = record.get("xref")
+        except Exception as exc:
+            return None, [source_result(
+                "embedded_font",
+                "invalid",
+                font_identity,
+                reason="staged_font_record_lookup_failed",
+                exception="%s: %s" % (exc.__class__.__name__, exc),
+            )]
+        if (
+            not isinstance(path_value, str)
+            or not path_value
+            or path_value != path_value.strip()
+            or not isinstance(sha_value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", sha_value) is None
+            or source_value != "pdf_embedded"
+            or type(xref_value) is not int
+            or xref_value <= 0
+        ):
+            return None, [source_result(
+                "embedded_font",
+                "invalid",
+                font_identity,
+                reason="malformed_staged_font_record",
+            )]
+
+        staged_path = Path(path_value)
+        try:
+            if not staged_path.is_file():
+                return None, [source_result(
+                    "embedded_font",
+                    "invalid",
+                    font_identity,
+                    reason="staged_font_file_missing",
+                    path=path_value,
+                    sha256=sha_value,
+                )]
+            actual_sha = hashlib.sha256(staged_path.read_bytes()).hexdigest()
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return None, [source_result(
+                "embedded_font",
+                "invalid",
+                font_identity,
+                reason="staged_font_file_unreadable",
+                path=path_value,
+                sha256=sha_value,
+                exception="%s: %s" % (exc.__class__.__name__, exc),
+            )]
+        if actual_sha != sha_value:
+            return None, [source_result(
+                "embedded_font",
+                "invalid",
+                font_identity,
+                reason="staged_font_sha256_mismatch",
+                path=path_value,
+                sha256=sha_value,
+                actual_sha256=actual_sha,
+            )]
+        return path_value, [source_result(
+            "embedded_font",
+            "found",
+            font_identity,
+            path=path_value,
+            sha256=sha_value,
+            xref=xref_value,
+        )]
+
+    exact_nonembedded_observation: Optional[Dict[str, Any]] = None
+    try:
+        if failures is None:
+            if _allow_unbound_compat:
+                failures = []
+            else:
+                return None, [source_result(
+                    "embedded_font",
+                    "invalid",
+                    font_identity,
+                    reason="malformed_font_staging_failures",
+                )]
+        if not isinstance(failures, list):
+            return None, [source_result(
+                "embedded_font",
+                "invalid",
+                font_identity,
+                reason="malformed_font_staging_failures",
+            )]
+        for failure in failures:
+            if not isinstance(failure, dict):
+                return None, [source_result(
+                    "embedded_font",
+                    "invalid",
+                    font_identity,
+                    reason="malformed_font_staging_failure",
+                )]
+            failed_name_value = failure.get("font")
+            if not isinstance(failed_name_value, str):
+                return None, [source_result(
+                    "embedded_font",
+                    "invalid",
+                    font_identity,
+                    reason="malformed_font_staging_failure",
+                )]
+            failed_name = failed_name_value.strip()
+            if not failed_name:
+                return None, [source_result(
+                    "embedded_font",
+                    "invalid",
+                    font_identity,
+                    reason=str(
+                        failure.get("reason")
+                        or "malformed_font_staging_failure"
+                    ),
+                    exception=str(failure.get("exception") or ""),
+                )]
+            failed_key = _canonical_font_identity(failed_name)["normalized_key"]
+            if failure.get("outcome") == "not_embedded":
+                if (
+                    failure.get("reason") != "embedded_font_not_present"
+                    or type(failure.get("xref")) is not int
+                    or failure.get("xref") != 0
+                    or str(failure.get("exception") or "")
+                ):
+                    return None, [source_result(
+                        "embedded_font",
+                        "invalid",
+                        font_identity,
+                        reason="malformed_font_inventory_observation",
+                    )]
+                if failed_key == key and exact_nonembedded_observation is None:
+                    exact_nonembedded_observation = copy.deepcopy(failure)
+                continue
+            if failed_key == key:
+                return None, [source_result(
+                    "embedded_font",
+                    "invalid",
+                    font_identity,
+                    reason=str(failure.get("reason") or "embedded_font_staging_failed"),
+                    exception=str(failure.get("exception") or ""),
+                )]
+    except Exception as exc:
+        return None, [source_result(
+            "embedded_font",
+            "invalid",
+            font_identity,
+            reason="font_staging_failure_lookup_failed",
+            exception="%s: %s" % (exc.__class__.__name__, exc),
+        )]
+
+    if exact_nonembedded_observation is None and not _allow_unbound_compat:
+        return None, [source_result(
+            "embedded_font",
+            "invalid",
+            font_identity,
+            reason="font_not_observed_in_completed_inventory",
+        )]
+
+    embedded_absence_details: Dict[str, Any] = {}
+    if exact_nonembedded_observation is not None:
+        embedded_absence_details["inventory_observation"] = (
+            exact_nonembedded_observation
+        )
+    results.append(source_result(
+        "embedded_font",
+        "not_found",
+        font_identity,
+        **embedded_absence_details,
+    ))
+
+    # Exact Windows family/style aliases only.  Helvetica is intentionally not
+    # mapped to Arial: visual similarity is not source-font identity.
+    system_files = {
+        "arial": "arial.ttf",
+        "arialmt": "arial.ttf",
+        "arialbold": "arialbd.ttf",
+        "arialboldmt": "arialbd.ttf",
+        "arialitalic": "ariali.ttf",
+        "arialitalicmt": "ariali.ttf",
+        "arialbolditalic": "arialbi.ttf",
+        "arialbolditalicmt": "arialbi.ttf",
+        "calibri": "calibri.ttf",
+        "calibriregular": "calibri.ttf",
+        "calibribold": "calibrib.ttf",
+        "calibriitalic": "calibrii.ttf",
+        "calibribolditalic": "calibriz.ttf",
+        "timesnewroman": "times.ttf",
+        "timesnewromanpsmt": "times.ttf",
+        "timesnewromanbold": "timesbd.ttf",
+        "timesnewromanpsboldmt": "timesbd.ttf",
+        "timesnewromanitalic": "timesi.ttf",
+        "timesnewromanpsitalicmt": "timesi.ttf",
+        "couriernew": "cour.ttf",
+        "couriernewpsmt": "cour.ttf",
+        "couriernewbold": "courbd.ttf",
+        "couriernewpsboldmt": "courbd.ttf",
+    }
+    filename = system_files.get(key)
+    if not filename:
+        results.append(source_result(
+            "system_font", "not_found", font_identity
+        ))
+        return None, results
+
+    system_path = os.path.join(
+        os.environ.get("WINDIR", r"C:\Windows"), "Fonts", filename
+    )
+    try:
+        if not Path(system_path).is_file():
+            results.append(source_result(
+                "system_font", "not_found", font_identity
+            ))
+            return None, results
+        with open(system_path, "rb") as font_file:
+            font_file.read(1)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        results.append(source_result(
+            "system_font",
+            "invalid",
+            font_identity,
+            reason="system_font_file_unreadable",
+            path=system_path,
+            exception="%s: %s" % (exc.__class__.__name__, exc),
+        ))
+        return None, results
+
+    results.append(source_result(
+        "system_font", "found", font_identity, path=system_path
+    ))
+    return system_path, results
+
+
+def _resolve_shapestring_font_path(
+    font_name: str, opts: Optional[ImportOptions] = None
+) -> Optional[str]:
+    """Compatibility wrapper returning only the old optional exact-font path."""
+    try:
+        path, _source_results = _resolve_shapestring_font_path_with_evidence(
+            font_name, opts, _allow_unbound_compat=True
+        )
+        return path
+    except Exception:
+        return None
 
 
 def _record_shapestring_skip(opts: ImportOptions, reason: str) -> None:
@@ -2189,6 +2599,386 @@ def _record_text_delivery(opts: ImportOptions, bucket: str, count: int) -> None:
     delivered[bucket] = int(delivered.get(bucket, 0)) + int(count)
 
 
+FREECAD_TEXT_IMPORTER_IDENTITY = "bluecollarsystems.freecad.pdf_vector_importer"
+
+
+TEXT_ITEM_FALLBACK_LADDERS = {
+    "text": ("text", "labels", "3d_text", "glyphs", "geometry", "raster"),
+    "labels": ("labels", "text", "3d_text", "glyphs", "geometry", "raster"),
+    "3d_text": ("3d_text", "glyphs", "geometry", "text", "labels", "raster"),
+    "glyphs": ("glyphs", "geometry", "3d_text", "text", "labels", "raster"),
+    "geometry": ("geometry", "glyphs", "3d_text", "text", "labels", "raster"),
+    "raster": ("raster",),
+}
+
+CLOSED_SVG_ITEM_IMPOSSIBILITY_REASONS = frozenset(
+    {
+        "svg_renderer_unavailable",
+        "svg_payload_too_large",
+        "svg_has_no_glyph_placements",
+        "svg_glyph_outlines_unavailable",
+        "svg_item_glyph_bounds_unavailable",
+    }
+)
+
+
+def _normalize_requested_text_type(requested_type: str) -> str:
+    if not isinstance(requested_type, str):
+        raise ValueError("requested text representation must be a string")
+    normalized = re.sub(r"[\s-]+", "_", requested_type.strip().lower())
+    normalized = {
+        "label": "labels",
+        "native_text": "text",
+        "draft_text": "text",
+        "text3d": "3d_text",
+        "3dtext": "3d_text",
+        "3d": "3d_text",
+        "outline": "glyphs",
+        "outlines": "glyphs",
+    }.get(normalized, normalized)
+    if normalized not in TEXT_ITEM_FALLBACK_LADDERS:
+        raise ValueError("unsupported requested text representation")
+    return normalized
+
+
+def _plain_text_source_value(value: Any, field_name: str) -> Any:
+    """Copy PyMuPDF text data into host-independent Python containers."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("%s contains a non-finite number" % field_name)
+        return value
+    if isinstance(value, dict):
+        result = {}
+        for key, child in value.items():
+            if not isinstance(key, (str, int, float, bool)):
+                raise ValueError("%s contains a non-plain dictionary key" % field_name)
+            result[key] = _plain_text_source_value(
+                child, "%s.%s" % (field_name, key)
+            )
+        return result
+    if isinstance(value, tuple):
+        return tuple(
+            _plain_text_source_value(child, field_name) for child in value
+        )
+    if isinstance(value, list):
+        return [
+            _plain_text_source_value(child, field_name) for child in value
+        ]
+    try:
+        if all(hasattr(value, attr) for attr in ("x0", "y0", "x1", "y1")):
+            return tuple(float(getattr(value, attr)) for attr in ("x0", "y0", "x1", "y1"))
+        if all(hasattr(value, attr) for attr in ("x", "y")):
+            return (float(value.x), float(value.y))
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("%s cannot be copied safely" % field_name) from exc
+    raise ValueError("%s contains a host-specific value" % field_name)
+
+
+def _finite_source_tuple(value: Any, length: int, field_name: str) -> Tuple[float, ...]:
+    plain = _plain_text_source_value(value, field_name)
+    if not isinstance(plain, (tuple, list)) or len(plain) != length:
+        raise ValueError("%s must contain %d numeric values" % (field_name, length))
+    numbers: List[float] = []
+    for component in plain:
+        if isinstance(component, bool):
+            raise ValueError("%s contains a non-numeric value" % field_name)
+        try:
+            number = float(component)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("%s contains a non-numeric value" % field_name) from exc
+        if not math.isfinite(number):
+            raise ValueError("%s contains a non-finite number" % field_name)
+        numbers.append(number)
+    return tuple(numbers)
+
+
+def _iter_text_source_items(
+    tdict: dict,
+    page_num: int,
+    pdf_sha256: str,
+    requested_type: str,
+):
+    """Yield canonical, stable, host-independent source items for one page."""
+    if not isinstance(tdict, dict):
+        raise ValueError("text dictionary must be a dictionary")
+    if type(page_num) is not int or page_num <= 0:
+        raise ValueError("page number must be a positive integer")
+    if not isinstance(pdf_sha256, str):
+        raise ValueError("PDF SHA-256 must be a string")
+    digest = pdf_sha256.strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ValueError("PDF SHA-256 must be exactly 64 hexadecimal characters")
+    requested = _normalize_requested_text_type(requested_type)
+
+    blocks = tdict.get("blocks", [])
+    if not isinstance(blocks, list):
+        raise ValueError("text dictionary blocks must be a list")
+    for block_index, block in enumerate(blocks):
+        if not isinstance(block, dict):
+            raise ValueError("text block must be a dictionary")
+        if block.get("type") != 0:
+            continue
+        lines = block.get("lines", [])
+        if not isinstance(lines, list):
+            raise ValueError("text block lines must be a list")
+        for line_index, line in enumerate(lines):
+            if not isinstance(line, dict):
+                raise ValueError("text line must be a dictionary")
+            spans = line.get("spans", [])
+            if not isinstance(spans, list):
+                raise ValueError("text line spans must be a list")
+            for span_index, source_span in enumerate(spans):
+                if not isinstance(source_span, dict):
+                    raise ValueError("text span must be a dictionary")
+                source_text = source_span.get("text", "")
+                if not isinstance(source_text, str):
+                    raise ValueError("text span content must be a string")
+                if not source_text or source_text.isspace():
+                    continue
+
+                source_font = source_span.get("font", "")
+                if not isinstance(source_font, str):
+                    raise ValueError("text span font must be a string")
+                font_identity = _canonical_font_identity(source_font)
+                bbox = _finite_source_tuple(
+                    source_span.get("bbox"), 4, "span.bbox"
+                )
+                origin = _finite_source_tuple(
+                    source_span.get("origin"), 2, "span.origin"
+                )
+                line_direction = _finite_source_tuple(
+                    line.get("dir"), 2, "line.dir"
+                )
+                if math.hypot(line_direction[0], line_direction[1]) <= 1e-12:
+                    raise ValueError("line direction must be non-zero")
+                rotation_deg = _line_angle_deg({"dir": line_direction})
+                if not math.isfinite(rotation_deg):
+                    raise ValueError("line direction angle must be finite")
+                span = _plain_text_source_value(source_span, "span")
+                if type(span) is not dict:
+                    raise ValueError("canonical span must be a plain dictionary")
+
+                yield {
+                    "importer_identity": FREECAD_TEXT_IMPORTER_IDENTITY,
+                    "pdf_sha256": digest,
+                    "page_number": page_num,
+                    "source_item_id": "p%d:b%d:l%d:s%d" % (
+                        page_num, block_index, line_index, span_index
+                    ),
+                    "requested_type": requested,
+                    "text": source_text,
+                    "font_identity": dict(font_identity),
+                    "bbox": bbox,
+                    "origin": origin,
+                    "line_direction": line_direction,
+                    "rotation_deg": float(rotation_deg),
+                    "span": span,
+                    "block_index": block_index,
+                    "line_index": line_index,
+                    "span_index": span_index,
+                }
+
+
+class TextItemImpossible(RuntimeError):
+    """One exact source item cannot use one exact representation."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        attempt: Dict[str, Any],
+        proof: Dict[str, Any],
+    ):
+        super().__init__(message)
+        self.attempt = dict(attempt or {})
+        self.proof = dict(proof or {})
+
+
+def _validated_entity_ids(value, *, field_name: str, allow_empty: bool) -> List[str]:
+    if not isinstance(value, list):
+        raise ValueError("%s must be a list" % field_name)
+    if not allow_empty and not value:
+        raise ValueError("%s must not be empty" % field_name)
+    if any(
+        not isinstance(entity_id, str)
+        or not entity_id
+        or entity_id != entity_id.strip()
+        for entity_id in value
+    ):
+        raise ValueError("%s must contain exact nonempty string ids" % field_name)
+    if len(value) != len(set(value)):
+        raise ValueError("%s must contain unique ids" % field_name)
+    return list(value)
+
+
+def _validate_item_impossibility_proof(
+    item: Dict[str, Any],
+    requested: str,
+    attempted: str,
+    proof: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return a copy only when an impossibility proof is exact and complete."""
+    if not isinstance(item, dict) or not isinstance(proof, dict):
+        raise ValueError("item and impossibility proof must be dictionaries")
+    if proof.get("item_specific_proven_impossible") is not True:
+        raise ValueError("proof is not item-specifically proven impossible")
+    if (
+        item.get("importer_identity") != FREECAD_TEXT_IMPORTER_IDENTITY
+        or proof.get("importer_identity") != FREECAD_TEXT_IMPORTER_IDENTITY
+    ):
+        raise ValueError("proof importer identity does not exactly match FreeCAD")
+
+    pdf_sha256 = proof.get("pdf_sha256")
+    if (
+        not isinstance(pdf_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", pdf_sha256) is None
+        or pdf_sha256 != item.get("pdf_sha256")
+    ):
+        raise ValueError("proof PDF SHA-256 does not exactly match the source item")
+
+    page_number = proof.get("page_number")
+    if (
+        type(page_number) is not int
+        or page_number <= 0
+        or type(item.get("page_number")) is not int
+        or page_number != item.get("page_number")
+    ):
+        raise ValueError("proof page number does not exactly match the source item")
+
+    source_item_id = proof.get("source_item_id")
+    if (
+        not isinstance(source_item_id, str)
+        or not source_item_id
+        or source_item_id != source_item_id.strip()
+        or source_item_id != item.get("source_item_id")
+    ):
+        raise ValueError("proof source item id does not exactly match")
+    if proof.get("requested_type") != requested:
+        raise ValueError("proof requested representation does not exactly match")
+    if proof.get("attempted_type") != attempted:
+        raise ValueError("proof attempted representation does not exactly match")
+    if (
+        requested not in TEXT_ITEM_FALLBACK_LADDERS
+        or attempted not in TEXT_ITEM_FALLBACK_LADDERS[requested]
+        or attempted == "raster"
+    ):
+        raise ValueError("attempted representation is not a fallible ladder rung")
+
+    reason_code = proof.get("reason_code")
+    if attempted in {"glyphs", "geometry"}:
+        if reason_code not in CLOSED_SVG_ITEM_IMPOSSIBILITY_REASONS:
+            raise ValueError("SVG impossibility reason is not a closed predicate")
+        evidence = proof.get("evidence")
+        if not isinstance(evidence, dict) or not evidence:
+            raise ValueError("SVG impossibility evidence is empty")
+        attempted_source_results = proof.get("attempted_source_results")
+        if (
+            not isinstance(attempted_source_results, list)
+            or len(attempted_source_results) != 1
+            or not isinstance(attempted_source_results[0], dict)
+            or attempted_source_results[0].get("source") != "svg_item_renderer"
+            or attempted_source_results[0].get("outcome")
+            != "proven_impossible"
+            or attempted_source_results[0].get("reason_code") != reason_code
+            or attempted_source_results[0].get("pdf_sha256") != pdf_sha256
+            or attempted_source_results[0].get("page_number") != page_number
+            or attempted_source_results[0].get("source_item_id") != source_item_id
+            or proof.get("attempted_sources_complete") is not True
+        ):
+            raise ValueError("SVG impossibility source result is incomplete")
+        created_ids = _validated_entity_ids(
+            proof.get("created_entity_ids"),
+            field_name="created_entity_ids",
+            allow_empty=True,
+        )
+        removed_ids = _validated_entity_ids(
+            proof.get("removed_entity_ids"),
+            field_name="removed_entity_ids",
+            allow_empty=True,
+        )
+        if proof.get("cleanup_complete") is not True:
+            raise ValueError("proof cleanup is incomplete")
+        if set(created_ids) != set(removed_ids):
+            raise ValueError("proof cleanup did not remove exactly the owned entities")
+        return dict(proof)
+
+    if attempted != "3d_text":
+        raise ValueError("representation has no closed impossibility predicate")
+    if reason_code != "exact_font_unavailable":
+        raise ValueError("proof reason is not the closed exact-font predicate")
+
+    font_identity = proof.get("font_identity")
+    item_font_identity = item.get("font_identity")
+    if (
+        not isinstance(font_identity, dict)
+        or not isinstance(item_font_identity, dict)
+        or font_identity != item_font_identity
+    ):
+        raise ValueError("proof font identity does not exactly match")
+    raw_name = font_identity.get("raw_name")
+    normalized_key = font_identity.get("normalized_key")
+    if (
+        not isinstance(raw_name, str)
+        or not raw_name.strip()
+        or raw_name != raw_name.strip()
+        or not isinstance(normalized_key, str)
+        or not normalized_key
+        or normalized_key != normalized_key.strip()
+        or normalized_key != _canonical_font_identity(raw_name)["normalized_key"]
+    ):
+        raise ValueError("proof font identity lacks an exact normalized binding")
+
+    evidence = proof.get("evidence")
+    if (
+        not isinstance(evidence, dict)
+        or not evidence
+        or evidence.get("normalized_key") != normalized_key
+    ):
+        raise ValueError("proof evidence must be a nonempty dictionary")
+
+    attempted_source_results = proof.get("attempted_source_results")
+    if (
+        not isinstance(attempted_source_results, list)
+        or len(attempted_source_results) != 2
+        or [
+            result.get("source") if isinstance(result, dict) else None
+            for result in attempted_source_results
+        ] != ["embedded_font", "system_font"]
+        or any(
+            not isinstance(result, dict)
+            or result.get("outcome") != "not_found"
+            or result.get("font_identity") != font_identity
+            or result.get("pdf_sha256") != pdf_sha256
+            or result.get("page_number") != page_number
+            or result.get("staging_complete") is not True
+            for result in attempted_source_results
+        )
+        or proof.get("attempted_sources_complete") is not True
+    ):
+        raise ValueError(
+            "proof must contain exact embedded/system font not-found results"
+        )
+
+    created_ids = _validated_entity_ids(
+        proof.get("created_entity_ids"),
+        field_name="created_entity_ids",
+        allow_empty=True,
+    )
+    removed_ids = _validated_entity_ids(
+        proof.get("removed_entity_ids"),
+        field_name="removed_entity_ids",
+        allow_empty=True,
+    )
+    if proof.get("cleanup_complete") is not True:
+        raise ValueError("proof cleanup is incomplete")
+    if set(created_ids) != set(removed_ids):
+        raise ValueError("proof cleanup did not remove exactly the owned entities")
+
+    return dict(proof)
+
+
 def _record_text_mode_fallback(
     opts: ImportOptions,
     *,
@@ -2196,23 +2986,53 @@ def _record_text_mode_fallback(
     delivered: str,
     reason: str,
     count: int,
+    source_item_id: str,
+    proof: Dict[str, Any],
 ) -> None:
-    """Record a text-mode substitution event — loud, never silent (TEXTMODE-1)."""
+    """Record only an item-specific, evidence-backed representation fallback."""
     requested = str(requested or "").strip().lower()
     delivered = str(delivered or "").strip().lower()
-    reason = str(reason or "").strip() or "unspecified"
-    if int(count or 0) <= 0 or not requested or not delivered or requested == delivered:
-        return
+    reason = str(reason or "").strip()
+    source_item_id = str(source_item_id or "").strip()
+    proof = dict(proof or {})
+    evidence = str(proof.get("evidence") or "").strip()
+    attempted_types = [
+        str(value or "").strip().lower()
+        for value in list(proof.get("attempted_types") or [])
+        if str(value or "").strip()
+    ]
+    if (
+        not bool(proof.get("item_specific_proven_impossible"))
+        or not evidence
+        or requested not in attempted_types
+    ):
+        raise ValueError(
+            "requested representation must be item-specifically proven impossible"
+        )
+    if (
+        int(count or 0) <= 0
+        or not requested
+        or not delivered
+        or requested == delivered
+        or not reason
+        or not source_item_id
+    ):
+        raise ValueError("fallback record requires exact modes, reason, count, and source id")
     events = getattr(opts, "text_mode_fallbacks", None)
     if events is None:
-        return
+        raise ValueError("fallback ledger unavailable")
     for event in events:
         if (
             event.get("requested") == requested
             and event.get("delivered") == delivered
             and event.get("reason") == reason
+            and event.get("proof") == proof
         ):
-            event["count"] = int(event.get("count", 0)) + int(count)
+            source_ids = list(event.get("source_item_ids") or [])
+            if source_item_id not in source_ids:
+                source_ids.append(source_item_id)
+                event["count"] = int(event.get("count", 0)) + int(count)
+            event["source_item_ids"] = source_ids
             return
     events.append(
         {
@@ -2220,8 +3040,2120 @@ def _record_text_mode_fallback(
             "delivered": delivered,
             "reason": reason,
             "count": int(count),
+            "source_item_ids": [source_item_id],
+            "proof": proof,
         }
     )
+
+
+class TextRepresentationFailure(RuntimeError):
+    """A requested text representation failed without proven fallback authority."""
+
+    def __init__(self, message: str, attempt: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.attempt = dict(attempt or {})
+
+
+def _append_text_item_attempt(opts: ImportOptions, attempt: Dict[str, Any]) -> None:
+    ledger = getattr(opts, "text_delivery_attempts", None)
+    if not isinstance(ledger, list):
+        raise ValueError("text delivery attempt ledger is unavailable")
+    entry = dict(attempt or {})
+    if not ledger or ledger[-1] != entry:
+        ledger.append(entry)
+
+
+def _failed_text_item_attempt(
+    item: Dict[str, Any],
+    requested: str,
+    attempted: str,
+    reason: str,
+    reported: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    reported = reported if isinstance(reported, dict) else {}
+
+    def reported_ids(field_name: str) -> List[str]:
+        value = reported.get(field_name)
+        if not isinstance(value, list):
+            return []
+        return [
+            entity_id
+            for entity_id in value
+            if isinstance(entity_id, str) and entity_id
+        ]
+
+    created_ids = reported_ids("created_entity_ids")
+    removed_ids = reported_ids("removed_entity_ids")
+    cleanup_complete = bool(
+        reported.get("cleanup_complete") is True
+        and set(created_ids) == set(removed_ids)
+    )
+    return {
+        "source_item_id": str(item.get("source_item_id") or ""),
+        "requested_type": requested,
+        "attempted_type": attempted,
+        "final_type": None,
+        "outcome": "failed",
+        "reason": str(reason or "text_delivery_failed"),
+        "created_entity_ids": created_ids,
+        "removed_entity_ids": removed_ids,
+        "cleanup_complete": cleanup_complete,
+    }
+
+
+def _normalize_impossible_attempt(
+    item: Dict[str, Any],
+    requested: str,
+    attempted: str,
+    attempt: Dict[str, Any],
+    proof: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not isinstance(attempt, dict) or not attempt:
+        raise ValueError("typed impossibility must include an exact attempt")
+    if attempt.get("source_item_id") != item.get("source_item_id"):
+        raise ValueError("impossibility attempt source item id does not match")
+    if attempt.get("requested_type") != requested:
+        raise ValueError("impossibility attempt requested representation does not match")
+    if attempt.get("attempted_type") != attempted:
+        raise ValueError("impossibility attempt representation does not match")
+    if attempt.get("final_type") is not None:
+        raise ValueError("impossible attempt cannot have a final representation")
+    if attempt.get("outcome") != "proven_impossible":
+        raise ValueError("impossibility attempt outcome is not proven_impossible")
+    if attempt.get("reason_code") != proof.get("reason_code"):
+        raise ValueError("impossibility attempt reason does not match its proof")
+
+    created_ids = _validated_entity_ids(
+        attempt.get("created_entity_ids"),
+        field_name="attempt.created_entity_ids",
+        allow_empty=True,
+    )
+    removed_ids = _validated_entity_ids(
+        attempt.get("removed_entity_ids"),
+        field_name="attempt.removed_entity_ids",
+        allow_empty=True,
+    )
+    if created_ids != proof.get("created_entity_ids"):
+        raise ValueError("impossibility attempt created ids do not match its proof")
+    if removed_ids != proof.get("removed_entity_ids"):
+        raise ValueError("impossibility attempt removed ids do not match its proof")
+    if attempt.get("cleanup_complete") is not True:
+        raise ValueError("impossibility attempt cleanup is incomplete")
+
+    normalized = dict(attempt)
+    normalized["proof"] = dict(proof)
+    return normalized
+
+
+def _normalize_verified_text_item_result(
+    item: Dict[str, Any],
+    requested: str,
+    attempted: str,
+    result: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not isinstance(result, dict) or not result:
+        raise ValueError("deliverer returned no result")
+    if result.get("outcome") != "verified":
+        raise ValueError("deliverer result is not verified")
+    if result.get("source_item_id") != item.get("source_item_id"):
+        raise ValueError("deliverer result source item id does not match")
+    if "requested_type" in result and result.get("requested_type") != requested:
+        raise ValueError("deliverer result requested representation does not match")
+    if result.get("attempted_type") != attempted:
+        raise ValueError("deliverer result attempted representation does not match")
+    if result.get("final_type") != attempted:
+        raise ValueError("deliverer result final representation does not match")
+    created_ids = _validated_entity_ids(
+        result.get("created_entity_ids"),
+        field_name="created_entity_ids",
+        allow_empty=False,
+    )
+    removed_ids = _validated_entity_ids(
+        result.get("removed_entity_ids", []),
+        field_name="removed_entity_ids",
+        allow_empty=True,
+    )
+    delivery_ids = _validated_entity_ids(
+        result.get("delivery_entity_ids", created_ids),
+        field_name="delivery_entity_ids",
+        allow_empty=False,
+    )
+    support_ids = _validated_entity_ids(
+        result.get("support_entity_ids", []),
+        field_name="support_entity_ids",
+        allow_empty=True,
+    )
+    created_set = set(created_ids)
+    removed_set = set(removed_ids)
+    delivery_set = set(delivery_ids)
+    support_set = set(support_ids)
+    if not removed_set.issubset(created_set):
+        raise ValueError("deliverer result reports removal of an unowned entity")
+    if (
+        not delivery_set.issubset(created_set)
+        or not support_set.issubset(created_set)
+        or delivery_set.intersection(support_set)
+        or delivery_set.union(support_set) != created_set
+    ):
+        raise ValueError("deliverer result delivery/support ownership is invalid")
+    if not created_set.difference(removed_set):
+        raise ValueError("deliverer result has no verified final entity")
+    if result.get("cleanup_complete") is not True:
+        raise ValueError("deliverer result cleanup is unverified")
+    evidence = result.get("evidence")
+    if not isinstance(evidence, dict) or not evidence:
+        raise ValueError("deliverer result evidence is empty or unverified")
+
+    normalized = dict(result)
+    normalized.update(
+        {
+            "requested_type": requested,
+            "attempted_type": attempted,
+            "final_type": attempted,
+            "created_entity_ids": created_ids,
+            "delivery_entity_ids": delivery_ids,
+            "support_entity_ids": support_ids,
+            "removed_entity_ids": removed_ids,
+            "evidence": dict(evidence),
+        }
+    )
+    return normalized
+
+
+def _aggregate_text_item_fallback_proof(
+    item: Dict[str, Any],
+    requested: str,
+    attempted_types: List[str],
+    proofs: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    proof_chain = [dict(proof) for proof in proofs]
+    last_proof = proof_chain[-1]
+    aggregate = {
+        "item_specific_proven_impossible": True,
+        "importer_identity": item.get("importer_identity"),
+        "pdf_sha256": item.get("pdf_sha256"),
+        "page_number": item.get("page_number"),
+        "source_item_id": item.get("source_item_id"),
+        "requested_type": requested,
+        "attempted_type": last_proof["attempted_type"],
+        "reason_code": last_proof["reason_code"],
+        "evidence": {
+            "reason_codes": [proof["reason_code"] for proof in proof_chain],
+            "proof_chain_length": len(proof_chain),
+        },
+        "attempted_types": list(attempted_types),
+        "attempted_source_results": [
+            dict(result)
+            for proof in proof_chain
+            for result in proof["attempted_source_results"]
+        ],
+        "attempted_sources_complete": True,
+        "created_entity_ids": [
+            entity_id
+            for proof in proof_chain
+            for entity_id in proof["created_entity_ids"]
+        ],
+        "removed_entity_ids": [
+            entity_id
+            for proof in proof_chain
+            for entity_id in proof["removed_entity_ids"]
+        ],
+        "cleanup_complete": True,
+        "proof_chain": proof_chain,
+    }
+    for proof in proof_chain:
+        if proof.get("font_identity"):
+            aggregate["font_identity"] = dict(proof["font_identity"])
+            break
+    return aggregate
+
+
+def _run_text_item_fallback_ladder(
+    item: Dict[str, Any],
+    requested: str,
+    deliverers: Dict[str, Any],
+    opts: ImportOptions,
+) -> Dict[str, Any]:
+    """Deliver one source item, advancing only across exact proven impossibility."""
+    requested_mode = requested if isinstance(requested, str) else ""
+    bound_item = copy.deepcopy(item) if isinstance(item, dict) else {}
+    source_item_id = bound_item.get("source_item_id")
+    item_requested = bound_item.get("requested_type")
+    if (
+        requested_mode not in TEXT_ITEM_FALLBACK_LADDERS
+        or not isinstance(item, dict)
+        or bound_item.get("importer_identity") != FREECAD_TEXT_IMPORTER_IDENTITY
+        or not isinstance(source_item_id, str)
+        or not source_item_id
+        or source_item_id != source_item_id.strip()
+        or (item_requested is not None and item_requested != requested_mode)
+        or not isinstance(deliverers, dict)
+    ):
+        failed = _failed_text_item_attempt(
+            bound_item,
+            requested_mode,
+            requested_mode,
+            "invalid_fallback_executor_input",
+        )
+        _append_text_item_attempt(opts, failed)
+        raise TextRepresentationFailure("Invalid text item fallback request", failed)
+
+    attempted_types: List[str] = []
+    validated_proofs: List[Dict[str, Any]] = []
+    for attempted_mode in TEXT_ITEM_FALLBACK_LADDERS[requested_mode]:
+        attempted_types.append(attempted_mode)
+        deliverer = deliverers.get(attempted_mode)
+        if not callable(deliverer):
+            failed = _failed_text_item_attempt(
+                bound_item,
+                requested_mode,
+                attempted_mode,
+                "deliverer_unavailable",
+            )
+            _append_text_item_attempt(opts, failed)
+            raise TextRepresentationFailure(
+                "%s deliverer is unavailable" % attempted_mode,
+                failed,
+            )
+
+        try:
+            result = deliverer(copy.deepcopy(bound_item), attempted_mode, opts)
+        except TextItemImpossible as impossible:
+            try:
+                proof = _validate_item_impossibility_proof(
+                    bound_item,
+                    requested_mode,
+                    attempted_mode,
+                    impossible.proof,
+                )
+                proven_attempt = _normalize_impossible_attempt(
+                    bound_item,
+                    requested_mode,
+                    attempted_mode,
+                    impossible.attempt,
+                    proof,
+                )
+            except Exception as proof_error:
+                failed = _failed_text_item_attempt(
+                    bound_item,
+                    requested_mode,
+                    attempted_mode,
+                    "invalid_impossibility_proof",
+                    impossible.attempt,
+                )
+                _append_text_item_attempt(opts, failed)
+                raise TextRepresentationFailure(
+                    "%s impossibility proof rejected: %s"
+                    % (attempted_mode, proof_error),
+                    failed,
+                ) from impossible
+            _append_text_item_attempt(opts, proven_attempt)
+            validated_proofs.append(proof)
+            if attempted_mode == "raster":
+                raise TextRepresentationFailure(
+                    "Raster is terminal for source item %s" % source_item_id,
+                    proven_attempt,
+                ) from impossible
+            continue
+        except TextRepresentationFailure as failure:
+            if failure.attempt:
+                _append_text_item_attempt(opts, failure.attempt)
+                raise
+            failed = _failed_text_item_attempt(
+                bound_item,
+                requested_mode,
+                attempted_mode,
+                "text_representation_failure",
+            )
+            _append_text_item_attempt(opts, failed)
+            raise TextRepresentationFailure(str(failure), failed) from failure
+        except Exception as error:
+            failed = _failed_text_item_attempt(
+                bound_item,
+                requested_mode,
+                attempted_mode,
+                "generic_exception:%s" % error.__class__.__name__,
+            )
+            _append_text_item_attempt(opts, failed)
+            raise TextRepresentationFailure(
+                "%s delivery failed without a validated impossibility proof: %s"
+                % (attempted_mode, error),
+                failed,
+            ) from error
+
+        try:
+            normalized = _normalize_verified_text_item_result(
+                bound_item,
+                requested_mode,
+                attempted_mode,
+                result,
+            )
+        except Exception as result_error:
+            failed = _failed_text_item_attempt(
+                bound_item,
+                requested_mode,
+                attempted_mode,
+                "empty_mismatched_or_unverified_result",
+                result if isinstance(result, dict) else None,
+            )
+            _append_text_item_attempt(opts, failed)
+            raise TextRepresentationFailure(
+                "%s returned an empty, mismatched, or unverified result: %s"
+                % (attempted_mode, result_error),
+                failed,
+            ) from result_error
+
+        normalized["attempted_types"] = list(attempted_types)
+        normalized["proof_chain"] = [dict(proof) for proof in validated_proofs]
+        _append_text_item_attempt(opts, normalized)
+        if validated_proofs:
+            fallback_proof = _aggregate_text_item_fallback_proof(
+                bound_item,
+                requested_mode,
+                attempted_types,
+                validated_proofs,
+            )
+            _record_text_mode_fallback(
+                opts,
+                requested=requested_mode,
+                delivered=attempted_mode,
+                reason="proof_gated:" + " -> ".join(
+                    "%s:%s" % (proof["attempted_type"], proof["reason_code"])
+                    for proof in validated_proofs
+                ),
+                count=1,
+                source_item_id=source_item_id,
+                proof=fallback_proof,
+            )
+        return normalized
+
+    failed = _failed_text_item_attempt(
+        bound_item,
+        requested_mode,
+        "raster",
+        "fallback_ladder_exhausted",
+    )
+    _append_text_item_attempt(opts, failed)
+    raise TextRepresentationFailure("Text item fallback ladder exhausted", failed)
+
+
+def _write_terminal_representation_failure_report(
+    *,
+    pdf_path: str,
+    opts: ImportOptions,
+    total_pages: int,
+    pages_imported: int,
+    elapsed_ms: float,
+    failure: TextRepresentationFailure,
+) -> str:
+    """Persist the exact failed attempt after the document transaction aborts."""
+    report_extra = dict(getattr(opts, "_report_extra", {}) or {})
+    report_extra.update(
+        {
+            "result_status": "failed",
+            "terminal_failure": {
+                "type": failure.__class__.__name__,
+                "message": str(failure),
+                "attempt": dict(getattr(failure, "attempt", {}) or {}),
+            },
+        }
+    )
+    opts._report_extra = report_extra
+    opts.phase_timings_ms["total_ms"] = float(elapsed_ms)
+    fallback_used, fallback_reason = _report_fallback_state(opts)
+    report_path = opts.import_report_path or _default_import_report_path(pdf_path)
+    return write_import_report(
+        pdf_path=pdf_path,
+        output_path=report_path,
+        opts=opts,
+        pages_imported=int(pages_imported),
+        total_pages=int(total_pages),
+        primitive_count=0,
+        text_count=sum(
+            int(value or 0)
+            for value in (getattr(opts, "text_delivered_counts", {}) or {}).values()
+        ),
+        elapsed_ms=float(elapsed_ms),
+        fallback_used=fallback_used,
+        fallback_reason=fallback_reason,
+    )
+
+
+def _host_object_id(obj) -> str:
+    return str(getattr(obj, "Name", "") or getattr(obj, "Label", "") or "")
+
+
+def _document_objects(doc) -> List[Any]:
+    try:
+        return list(getattr(doc, "Objects", []) or [])
+    except (AttributeError, RuntimeError, TypeError):
+        return []
+
+
+def _text_host_document(shape_string, text_group):
+    for candidate in (
+        getattr(shape_string, "Document", None),
+        getattr(text_group, "Document", None),
+        getattr(FreeCAD, "ActiveDocument", None) if FreeCAD is not None else None,
+    ):
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _remove_owned_text_objects(doc, text_group, owned: List[Any]) -> Tuple[List[str], bool]:
+    """Remove only objects created by the current attempt, in reverse order."""
+    owned_records: List[Tuple[Any, str]] = []
+    for obj in owned:
+        try:
+            obj_id = _host_object_id(obj)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            obj_id = ""
+        owned_records.append((obj, obj_id))
+
+    removed: List[str] = []
+    seen = set()
+    for obj, obj_id in reversed(owned_records):
+        if not obj_id or obj_id in seen:
+            continue
+        seen.add(obj_id)
+        current = None
+        try:
+            current = doc.getObject(obj_id)
+        except (AttributeError, RuntimeError, TypeError):
+            current = next(
+                (candidate for candidate in _document_objects(doc) if candidate is obj),
+                None,
+            )
+        if current is not obj:
+            continue
+        try:
+            remove_from_group = getattr(text_group, "removeObject", None)
+            if callable(remove_from_group):
+                remove_from_group(obj)
+            elif hasattr(text_group, "objects") and obj in text_group.objects:
+                text_group.objects.remove(obj)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+        try:
+            doc.removeObject(obj_id)
+            removed.append(obj_id)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            continue
+
+    live_ids = {_host_object_id(obj) for obj in _document_objects(doc)}
+    complete = all(not obj_id or obj_id not in live_ids for _obj, obj_id in owned_records)
+    return removed, complete
+
+
+def _source_span_advance_fc(span: dict, line: dict, scale: float) -> float:
+    """Return the source span's baseline advance in host units."""
+    bbox = _span_bbox_pdf(span)
+    direction = line.get("dir", (1.0, 0.0)) or (1.0, 0.0)
+    try:
+        dx, dy = float(direction[0]), float(direction[1])
+    except (IndexError, TypeError, ValueError):
+        dx, dy = 1.0, 0.0
+    length = math.hypot(dx, dy)
+    if length <= 1e-12:
+        dx, dy, length = 1.0, 0.0, 1.0
+    ux, uy = dx / length, dy / length
+
+    # Axis-aligned source spans carry their exact advance directly in bbox.
+    # recover_span_quad can expand those bounds using font metrics by ~1%,
+    # which is enough to create visible drift across long table headings.
+    if bbox and abs(uy) <= 1e-7:
+        advance = abs(float(bbox[2]) - float(bbox[0]))
+    elif bbox and abs(ux) <= 1e-7:
+        advance = abs(float(bbox[3]) - float(bbox[1]))
+    else:
+        try:
+            quad = fitz.recover_span_quad(direction, span)
+            left = _xy(quad.ul)
+            right = _xy(quad.ur)
+            advance = math.hypot(right[0] - left[0], right[1] - left[1])
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            if not bbox:
+                return 0.0
+            x0, y0, x1, y1 = bbox
+            advance = abs(ux) * abs(x1 - x0) + abs(uy) * abs(y1 - y0)
+    return max(0.0, float(advance) * abs(float(scale)))
+
+
+def _shape_baseline_extent(shape, angle_deg: float) -> Optional[float]:
+    """Project a host shape onto its rendered text-baseline axis."""
+    try:
+        vertices = list(getattr(shape, "Vertexes", []) or [])
+        if not vertices:
+            return None
+        radians = math.radians(float(angle_deg))
+        ux, uy = math.cos(radians), math.sin(radians)
+        projected = [
+            float(vertex.Point.x) * ux + float(vertex.Point.y) * uy
+            for vertex in vertices
+        ]
+        return max(projected) - min(projected)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _annotate_text_host_object(obj, source_item_id: str, representation: str) -> None:
+    """Persist stable source identity and requested representation on a host object."""
+    properties = set(getattr(obj, "PropertiesList", []) or [])
+    add_property = getattr(obj, "addProperty", None)
+    for name, value in (
+        ("PDFSourceItemId", source_item_id),
+        ("PDFRepresentation", representation),
+    ):
+        if name not in properties and callable(add_property):
+            add_property("App::PropertyString", name, "PDF Import")
+            properties.add(name)
+        setattr(obj, name, str(value))
+
+
+def _persist_text_style_metadata(
+    obj,
+    *,
+    font_name: str,
+    font_size: float,
+    source_color: Optional[Tuple[float, float, float]],
+) -> str:
+    """Persist source style on an App object, including in headless FreeCADCmd."""
+    color_metadata = (
+        ",".join(format(float(channel), ".9g") for channel in source_color)
+        if source_color is not None
+        else ""
+    )
+    properties = set(getattr(obj, "PropertiesList", []) or [])
+    add_property = getattr(obj, "addProperty", None)
+    for property_kind, property_name, property_value in (
+        ("App::PropertyString", "PDFTextFontName", str(font_name)),
+        ("App::PropertyFloat", "PDFTextFontSize", float(font_size)),
+        ("App::PropertyString", "PDFTextJustification", "Left"),
+        ("App::PropertyString", "PDFTextColorRGB", color_metadata),
+    ):
+        if property_name not in properties and callable(add_property):
+            add_property(property_kind, property_name, "PDF Import")
+            properties.add(property_name)
+        setattr(obj, property_name, property_value)
+    return color_metadata
+
+
+def _create_verified_text3d_entity(
+    shape_string,
+    *,
+    font_size_fc: float,
+    depth: float,
+    target_advance_fc: float,
+    baseline_angle_deg: float,
+    text_group,
+    baseline_object_ids: Optional[set] = None,
+):
+    """Create and verify a width-calibrated ShapeString clone + extrusion."""
+    try:
+        protected_baseline_ids = set(baseline_object_ids or ())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("3D Text ownership baseline is invalid") from exc
+    if any(type(object_id) is not int for object_id in protected_baseline_ids):
+        raise RuntimeError("3D Text ownership baseline is invalid")
+    if id(shape_string) in protected_baseline_ids:
+        raise RuntimeError("ShapeString is a pre-existing baseline object")
+
+    doc = _text_host_document(shape_string, text_group)
+    if doc is None:
+        raise RuntimeError("FreeCAD document unavailable for Part::Extrusion")
+
+    shape_string.Size = float(font_size_fc)
+    try:
+        # ScaleToSize normalizes against the font cap-height and changed the
+        # supplied chart's horizontal scale by ~1.8x. Preserve native font
+        # units, then apply the PDF's authoritative text-matrix width below.
+        shape_string.ScaleToSize = False
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+    try:
+        shape_string.MakeFace = True
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+    try:
+        doc.recompute([shape_string])
+    except TypeError:
+        doc.recompute()
+
+    support_shape = getattr(shape_string, "Shape", None)
+    if (
+        support_shape is None
+        or bool(getattr(support_shape, "isNull", lambda: True)())
+        or not list(getattr(support_shape, "Faces", []) or [])
+    ):
+        raise RuntimeError("ShapeString did not produce face geometry")
+
+    native_advance = _shape_baseline_extent(support_shape, baseline_angle_deg)
+    if native_advance is None or native_advance <= 1e-9:
+        raise RuntimeError("ShapeString baseline extent could not be measured")
+    if not math.isfinite(target_advance_fc) or target_advance_fc <= 1e-9:
+        raise RuntimeError("source span baseline advance is unavailable")
+    x_scale = float(target_advance_fc) / float(native_advance)
+    if not math.isfinite(x_scale) or x_scale <= 1e-4 or x_scale >= 1e4:
+        raise RuntimeError("source span horizontal scale is invalid")
+
+    clone_factory = getattr(Draft, "clone", None)
+    if not callable(clone_factory):
+        raise RuntimeError("Draft clone API unavailable for exact text width")
+    calibrated_support = clone_factory(shape_string)
+    if isinstance(calibrated_support, (list, tuple)):
+        calibrated_support = calibrated_support[0] if calibrated_support else None
+    if calibrated_support is None:
+        raise RuntimeError("Draft clone did not create calibrated text support")
+    if id(calibrated_support) in protected_baseline_ids:
+        raise RuntimeError("Draft clone returned a pre-existing baseline object")
+    if calibrated_support is shape_string:
+        raise RuntimeError("Draft clone returned the source ShapeString")
+    calibrated_support.Scale = Vector(float(x_scale), 1.0, 1.0)
+    try:
+        calibrated_support.Label = "PDF 3D Text Calibrated Support"
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+    try:
+        doc.recompute([calibrated_support])
+    except TypeError:
+        doc.recompute()
+
+    calibrated_shape = getattr(calibrated_support, "Shape", None)
+    if (
+        calibrated_shape is None
+        or bool(getattr(calibrated_shape, "isNull", lambda: True)())
+        or not list(getattr(calibrated_shape, "Faces", []) or [])
+    ):
+        raise RuntimeError("calibrated ShapeString clone did not produce face geometry")
+    verified_advance = _shape_baseline_extent(calibrated_shape, baseline_angle_deg)
+    tolerance = max(0.05, float(target_advance_fc) * 0.03)
+    if (
+        verified_advance is None
+        or abs(float(verified_advance) - float(target_advance_fc)) > tolerance
+    ):
+        raise RuntimeError(
+            "calibrated ShapeString width verification failed "
+            "(target %.6g, actual %s)"
+            % (target_advance_fc, verified_advance)
+        )
+
+    extrusion = doc.addObject("Part::Extrusion", "PDF_3D_Text")
+    if extrusion is None:
+        raise RuntimeError("Part::Extrusion factory returned no host object")
+    if id(extrusion) in protected_baseline_ids:
+        raise RuntimeError(
+            "Part::Extrusion factory returned a pre-existing baseline object"
+        )
+    if extrusion is shape_string or extrusion is calibrated_support:
+        raise RuntimeError("Part::Extrusion factory returned an existing support object")
+    extrusion.Base = calibrated_support
+    try:
+        extrusion.DirMode = "Custom"
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+    extrusion.Dir = Vector(0.0, 0.0, float(depth))
+    extrusion.Solid = True
+    try:
+        doc.recompute([extrusion])
+    except TypeError:
+        doc.recompute()
+
+    shape = getattr(extrusion, "Shape", None)
+    solids = list(getattr(shape, "Solids", []) or []) if shape is not None else []
+    volume = float(getattr(shape, "Volume", 0.0) or 0.0) if shape is not None else 0.0
+    if (
+        str(getattr(extrusion, "TypeId", "")) != "Part::Extrusion"
+        or getattr(extrusion, "Base", None) is not calibrated_support
+        or not bool(getattr(extrusion, "Solid", False))
+        or shape is None
+        or bool(getattr(shape, "isNull", lambda: True)())
+        or not solids
+        or volume <= 0.0
+    ):
+        raise RuntimeError("Part::Extrusion did not produce verified solid 3D text")
+
+    for support in (shape_string, calibrated_support):
+        app_visibility_verified = False
+        try:
+            if "Visibility" in set(getattr(support, "PropertiesList", []) or []):
+                support.Visibility = False
+                app_visibility_verified = getattr(support, "Visibility", None) is False
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            app_visibility_verified = False
+        view = getattr(support, "ViewObject", None)
+        view_visibility_verified = False
+        if view is not None:
+            try:
+                view.Visibility = False
+                view_visibility_verified = getattr(view, "Visibility", None) is False
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                view_visibility_verified = False
+        if not app_visibility_verified and not view_visibility_verified:
+            raise RuntimeError("3D Text support visibility could not be disabled")
+    text_group.addObject(shape_string)
+    text_group.addObject(calibrated_support)
+    text_group.addObject(extrusion)
+    return extrusion, calibrated_support, x_scale, float(verified_advance)
+
+
+def _host_text_rotation_deg(obj) -> Optional[float]:
+    """Read the rendered host baseline rotation without trusting source input."""
+    try:
+        if str(getattr(obj, "TypeId", "") or "") == "App::Annotation" and hasattr(
+            obj, "Position"
+        ):
+            return 0.0
+        rotation = obj.Placement.Rotation
+        mult_vec = getattr(rotation, "multVec", None)
+        if callable(mult_vec) and Vector is not None:
+            direction = mult_vec(Vector(1.0, 0.0, 0.0))
+            angle = math.degrees(math.atan2(float(direction.y), float(direction.x)))
+            return angle if math.isfinite(angle) else None
+        if hasattr(rotation, "angle"):
+            angle = float(rotation.angle)
+            return angle if math.isfinite(angle) else None
+        if hasattr(rotation, "Angle"):
+            angle = math.degrees(float(rotation.Angle))
+            axis = getattr(rotation, "Axis", None)
+            if axis is not None and float(getattr(axis, "z", 1.0)) < 0.0:
+                angle = -angle
+            return angle if math.isfinite(angle) else None
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    return None
+
+
+def _host_anchor_xyz(obj) -> Optional[Tuple[float, float, float]]:
+    """Read a host object's rendered anchor as a finite XYZ tuple."""
+    try:
+        if str(getattr(obj, "TypeId", "") or "") == "App::Annotation" and hasattr(
+            obj, "Position"
+        ):
+            base = obj.Position
+        else:
+            base = obj.Placement.Base
+        coordinates = tuple(
+            float(
+                getattr(base, lower)
+                if hasattr(base, lower)
+                else getattr(base, lower.upper())
+            )
+            for lower in ("x", "y", "z")
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    return coordinates if all(math.isfinite(value) for value in coordinates) else None
+
+
+def _rotation_matches(actual: float, expected: float, tolerance: float = 1e-6) -> bool:
+    try:
+        difference = (float(actual) - float(expected) + 180.0) % 360.0 - 180.0
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(difference) and abs(difference) <= float(tolerance)
+
+
+def _deliver_text_item_native(
+    item: Dict[str, Any],
+    attempted_type: str,
+    opts: ImportOptions,
+    *,
+    text_group,
+    page_h: float,
+    scale: float,
+) -> Dict[str, Any]:
+    """Create and reread one exact native Text or Draft Label source item."""
+    try:
+        bound_item = copy.deepcopy(item) if isinstance(item, dict) else {}
+    except Exception:
+        bound_item = {}
+    source_item_id = str(bound_item.get("source_item_id") or "")
+    requested_type = bound_item.get("requested_type")
+    doc = _text_host_document(None, text_group)
+    baseline_objects: set = set()
+    owned: List[Any] = []
+
+    def fail(reason: str, evidence: Optional[Dict[str, Any]] = None):
+        if doc is not None and baseline_objects:
+            try:
+                for host_obj in _document_objects(doc):
+                    if id(host_obj) not in baseline_objects and all(
+                        candidate is not host_obj for candidate in owned
+                    ):
+                        owned.append(host_obj)
+            except Exception:
+                pass
+        created_ids = [_host_object_id(host_obj) for host_obj in owned]
+        removed_ids: List[str] = []
+        cleanup_complete = not owned
+        if doc is not None and owned:
+            try:
+                removed_ids, cleanup_complete = _remove_owned_text_objects(
+                    doc, text_group, owned
+                )
+            except Exception:
+                cleanup_complete = False
+        attempt = {
+            "source_item_id": source_item_id,
+            "requested_type": requested_type,
+            "attempted_type": attempted_type,
+            "final_type": None,
+            "outcome": "failed",
+            "reason": str(reason),
+            "created_entity_ids": created_ids,
+            "removed_entity_ids": removed_ids,
+            "cleanup_complete": bool(
+                cleanup_complete and set(created_ids) == set(removed_ids)
+            ) if created_ids else bool(cleanup_complete and not removed_ids),
+            "evidence": dict(evidence or {}),
+        }
+        raise TextRepresentationFailure(
+            "%s failed for %s: %s"
+            % (attempted_type, source_item_id or "item", reason),
+            attempt,
+        )
+
+    try:
+        page_number = bound_item.get("page_number")
+        indices = (
+            bound_item.get("block_index"),
+            bound_item.get("line_index"),
+            bound_item.get("span_index"),
+        )
+        expected_source_id = "p%d:b%d:l%d:s%d" % ((page_number,) + indices)
+        source_text = bound_item.get("text")
+        span = bound_item.get("span")
+        pdf_sha256 = bound_item.get("pdf_sha256")
+        bbox = _finite_source_tuple(bound_item.get("bbox"), 4, "item.bbox")
+        origin = _finite_source_tuple(bound_item.get("origin"), 2, "item.origin")
+        direction = _finite_source_tuple(
+            bound_item.get("line_direction"), 2, "item.line_direction"
+        )
+        canonical_rotation_deg = float(bound_item.get("rotation_deg"))
+        authoritative_rotation_deg = _line_angle_deg({"dir": direction})
+        if (
+            attempted_type not in {"text", "labels"}
+            or requested_type not in TEXT_ITEM_FALLBACK_LADDERS
+            or attempted_type not in TEXT_ITEM_FALLBACK_LADDERS[requested_type]
+            or bound_item.get("importer_identity") != FREECAD_TEXT_IMPORTER_IDENTITY
+            or type(page_number) is not int
+            or page_number <= 0
+            or any(type(index) is not int or index < 0 for index in indices)
+            or source_item_id != expected_source_id
+            or not isinstance(pdf_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", pdf_sha256) is None
+            or not isinstance(source_text, str)
+            or not source_text
+            or source_text.isspace()
+            or not isinstance(span, dict)
+            or span.get("text") != source_text
+            or bbox != _finite_source_tuple(span.get("bbox"), 4, "span.bbox")
+            or origin != _finite_source_tuple(span.get("origin"), 2, "span.origin")
+            or math.hypot(direction[0], direction[1]) <= 1e-12
+            or not math.isfinite(canonical_rotation_deg)
+            or not _rotation_matches(
+                canonical_rotation_deg, authoritative_rotation_deg
+            )
+            or doc is None
+            or text_group is None
+            or Vector is None
+            or Placement is None
+            or Rotation is None
+            or not math.isfinite(float(page_h))
+            or not math.isfinite(float(scale))
+            or float(scale) <= 0.0
+        ):
+            raise ValueError("canonical native text delivery context is invalid")
+        if attempted_type in {"text", "labels"} and Draft is None:
+            raise ValueError("FreeCAD Draft is unavailable for native Text/Labels")
+        baseline_objects = {id(host_obj) for host_obj in _document_objects(doc)}
+    except Exception as exc:
+        fail(
+            "invalid_native_text_source_item",
+            {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+        )
+
+    try:
+        from pdfcadcore.text_scale import effective_span_font_size_pt
+
+        host_rotation_deg = _line_angle_deg({"dir": direction}, opts)
+        size_pt = float(effective_span_font_size_pt(span, host_rotation_deg))
+        if not math.isfinite(size_pt) or size_pt <= 0.0:
+            raise ValueError("source font size is unavailable")
+        font_size_fc = _fit_font_size_to_span_bbox(
+            source_text,
+            size_pt * float(scale),
+            span,
+            float(scale),
+            host_rotation_deg,
+        )
+        if not math.isfinite(font_size_fc) or font_size_fc <= 0.0:
+            raise ValueError("native text font size is invalid")
+        anchor = _to_fc(origin, float(page_h), opts, float(scale))
+        try:
+            descender = float(span.get("descender", -0.2) or -0.2)
+        except (TypeError, ValueError):
+            descender = -0.2
+        anchor = _apply_text_local_y_offset(
+            anchor,
+            host_rotation_deg,
+            _effective_descender(source_text, descender) * font_size_fc * 0.35,
+        )
+        placement = Placement(
+            anchor,
+            Rotation(Vector(0.0, 0.0, 1.0), host_rotation_deg),
+        )
+    except Exception as exc:
+        fail(
+            "native_text_transform_failed",
+            {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+        )
+
+    try:
+        if attempted_type == "text":
+            host_obj = Draft.make_text([source_text], placement=placement)
+            text_property = "Text"
+            expected_type = "App::FeaturePython"
+            expected_proxy_type = "Text"
+        else:
+            host_obj = Draft.make_label(
+                target_point=anchor,
+                placement=placement,
+                label_type="Custom",
+                custom_text=source_text,
+                direction="Custom",
+                points=[anchor, anchor],
+            )
+            text_property = "Text"
+            expected_type = "App::FeaturePython"
+            expected_proxy_type = "Label"
+        if host_obj is None or id(host_obj) in baseline_objects:
+            raise RuntimeError("native text factory returned no new host object")
+        owned.append(host_obj)
+        text_group.addObject(host_obj)
+        _annotate_text_host_object(host_obj, source_item_id, attempted_type)
+
+        normalized_font = _normalize_pdf_font_name(span.get("font", ""))
+        source_color = _span_source_color(span)
+        color_metadata = (
+            ",".join(format(float(channel), ".9g") for channel in source_color)
+            if source_color is not None
+            else ""
+        )
+        properties = set(getattr(host_obj, "PropertiesList", []) or [])
+        add_property = getattr(host_obj, "addProperty", None)
+        for property_kind, property_name, property_value in (
+            ("App::PropertyString", "PDFTextFontName", normalized_font),
+            ("App::PropertyFloat", "PDFTextFontSize", float(font_size_fc)),
+            ("App::PropertyString", "PDFTextJustification", "Left"),
+            ("App::PropertyString", "PDFTextColorRGB", color_metadata),
+        ):
+            if property_name not in properties and callable(add_property):
+                add_property(property_kind, property_name, "PDF Import")
+                properties.add(property_name)
+            setattr(host_obj, property_name, property_value)
+
+        # FreeCADCmd intentionally has no GUI view provider. Persist and reread
+        # the complete style contract on the document object in every host, then
+        # additionally require the real view-provider style when one exists.
+        view = getattr(host_obj, "ViewObject", None)
+        font_properties = []
+        color_properties = []
+        if view is not None:
+            view.FontSize = float(font_size_fc)
+            for property_name in ("FontName", "Font"):
+                if hasattr(view, property_name):
+                    setattr(view, property_name, normalized_font)
+                    font_properties.append(property_name)
+            if not font_properties:
+                raise RuntimeError("native host exposes no writable font property")
+            if hasattr(view, "Justification"):
+                view.Justification = "Left"
+            if source_color is not None:
+                for property_name in (
+                    "TextColor", "ShapeColor", "LineColor", "PointColor"
+                ):
+                    if hasattr(view, property_name):
+                        setattr(view, property_name, source_color)
+                        color_properties.append(property_name)
+                if not color_properties:
+                    raise RuntimeError("native host exposes no writable color property")
+        doc.recompute()
+    except Exception as exc:
+        fail(
+            "native_text_creation_or_style_failed",
+            {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+        )
+
+    try:
+        entity_id = _host_object_id(host_obj)
+        live_object = doc.getObject(entity_id)
+        actual_text = getattr(host_obj, text_property, None)
+        actual_text_values = (
+            list(actual_text)
+            if isinstance(actual_text, (list, tuple))
+            else [str(actual_text or "")]
+        )
+        actual_anchor = _host_anchor_xyz(host_obj)
+        actual_rotation = _host_text_rotation_deg(host_obj)
+        actual_proxy_type = str(
+            getattr(getattr(host_obj, "Proxy", None), "Type", "") or ""
+        )
+        actual_custom_text = getattr(host_obj, "CustomText", None)
+        actual_custom_text_values = (
+            list(actual_custom_text)
+            if isinstance(actual_custom_text, (list, tuple))
+            else [str(actual_custom_text or "")]
+        )
+        metadata_font_name = str(getattr(host_obj, "PDFTextFontName", "") or "")
+        metadata_font_size = float(host_obj.PDFTextFontSize)
+        metadata_justification = str(
+            getattr(host_obj, "PDFTextJustification", "") or ""
+        )
+        metadata_color = str(getattr(host_obj, "PDFTextColorRGB", "") or "")
+        if view is None:
+            actual_font_size = metadata_font_size
+            actual_fonts = [metadata_font_name]
+            actual_justification = metadata_justification
+            color_verified = metadata_color == color_metadata
+            style_verification = "headless_app_metadata"
+            view_style_verified = False
+        else:
+            actual_font_size = float(view.FontSize)
+            actual_fonts = [
+                str(getattr(view, property_name) or "")
+                for property_name in font_properties
+            ]
+            actual_justification = (
+                str(view.Justification or "")
+                if hasattr(view, "Justification")
+                else "Left"
+            )
+            color_verified = source_color is None or any(
+                isinstance(getattr(view, property_name, None), (tuple, list))
+                and len(getattr(view, property_name)) >= 3
+                and all(
+                    abs(
+                        float(getattr(view, property_name)[index])
+                        - source_color[index]
+                    )
+                    <= 1e-6
+                    for index in range(3)
+                )
+                for property_name in (
+                    "TextColor", "ShapeColor", "LineColor", "PointColor"
+                )
+            )
+            style_verification = "gui_view_and_app_metadata"
+            view_style_verified = True
+        expected_anchor = (float(anchor.x), float(anchor.y), float(anchor.z))
+        if (
+            not entity_id
+            or live_object is not host_obj
+            or host_obj not in _document_objects(doc)
+            or (expected_type and str(getattr(host_obj, "TypeId", "")) != expected_type)
+            or actual_proxy_type != expected_proxy_type
+            or actual_text_values != [source_text]
+            or (
+                attempted_type == "labels"
+                and actual_custom_text_values != [source_text]
+            )
+            or getattr(host_obj, "PDFSourceItemId", None) != source_item_id
+            or getattr(host_obj, "PDFRepresentation", None) != attempted_type
+            or actual_anchor is None
+            or any(
+                abs(actual_anchor[index] - expected_anchor[index]) > 1e-7
+                for index in range(3)
+            )
+            or actual_rotation is None
+            or not _rotation_matches(actual_rotation, host_rotation_deg)
+            or not math.isclose(actual_font_size, font_size_fc, abs_tol=1e-7)
+            or normalized_font not in actual_fonts
+            or actual_justification != "Left"
+            or metadata_font_name != normalized_font
+            or not math.isclose(metadata_font_size, font_size_fc, abs_tol=1e-7)
+            or metadata_justification != "Left"
+            or metadata_color != color_metadata
+            or not color_verified
+        ):
+            raise RuntimeError("native text host evidence could not be verified")
+    except Exception as exc:
+        fail(
+            "native_text_host_verification_failed",
+            {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+        )
+
+    return {
+        "source_item_id": source_item_id,
+        "requested_type": requested_type,
+        "attempted_type": attempted_type,
+        "final_type": attempted_type,
+        "outcome": "verified",
+        "created_entity_ids": [entity_id],
+        "removed_entity_ids": [],
+        "cleanup_complete": True,
+        "evidence": {
+            "host_entity_type": str(getattr(host_obj, "TypeId", "") or ""),
+            "host_proxy_type": actual_proxy_type,
+            "source_text": source_text,
+            "source_text_preserved": True,
+            "source_item_id_verified": True,
+            "expected_anchor_xyz": expected_anchor,
+            "verified_anchor_xyz": tuple(actual_anchor),
+            "rotation_deg": float(actual_rotation),
+            "font_name": normalized_font,
+            "font_size": float(actual_font_size),
+            "source_color": source_color,
+            "color_verified": bool(color_verified),
+            "style_verification": style_verification,
+            "view_style_verified": bool(view_style_verified),
+        },
+    }
+
+
+def _raster_asset_dir() -> Path:
+    """Persistent, content-addressed raster assets owned by this importer."""
+    try:
+        root = Path(FreeCAD.getUserAppDataDir())
+        return root / "Mod" / "PDFVectorImporter" / "raster_cache"
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return Path(tempfile.gettempdir()) / "bc_fc_pdf_raster_cache"
+
+
+def _save_pixmap_atomic(pix, image_path: Path) -> None:
+    """Publish a complete raster atomically so concurrent imports cannot tear it."""
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=image_path.stem + ".",
+        suffix=".png",
+        dir=str(image_path.parent),
+    )
+    os.close(fd)
+    temporary_path = Path(temporary_name)
+    try:
+        pix.save(str(temporary_path))
+        if not temporary_path.is_file() or temporary_path.stat().st_size <= 0:
+            raise RuntimeError("raster renderer produced an empty temporary asset")
+        for attempt_index in range(8):
+            try:
+                os.replace(str(temporary_path), str(image_path))
+                break
+            except PermissionError:
+                if attempt_index >= 7:
+                    raise
+                # Windows can briefly deny replacement while another importer
+                # publishes the same content-addressed key. Keep retries bounded.
+                time.sleep(0.005 * (attempt_index + 1))
+    finally:
+        try:
+            if temporary_path.exists():
+                temporary_path.unlink()
+        except OSError:
+            pass
+
+
+def _path_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _raster_file_evidence(host_obj, source_asset_path: Path) -> Dict[str, Any]:
+    """Verify both FreeCAD raster-file properties by content, not cache pathname."""
+    source_path = Path(source_asset_path)
+    if not source_path.is_file() or source_path.stat().st_size <= 0:
+        raise RuntimeError("persistent source raster asset is unavailable")
+
+    source_sha256 = _path_sha256(source_path)
+    evidence: Dict[str, Any] = {
+        "source_asset_path": str(source_path),
+        "source_asset_sha256": source_sha256,
+    }
+    for property_name, evidence_name in (
+        ("ImageFile", "image_file_path"),
+        ("PDFRasterFile", "included_file_path"),
+    ):
+        actual_path = Path(str(getattr(host_obj, property_name, "") or ""))
+        if not actual_path.is_file() or actual_path.stat().st_size <= 0:
+            raise RuntimeError("%s raster file is unavailable" % property_name)
+        actual_sha256 = _path_sha256(actual_path)
+        if actual_sha256 != source_sha256:
+            raise RuntimeError("%s raster content does not match source" % property_name)
+        evidence[evidence_name] = str(actual_path)
+        evidence[evidence_name + "_sha256"] = actual_sha256
+    evidence["raster_content_verified"] = True
+    return evidence
+
+
+def _deliver_text_item_raster(
+    item: Dict[str, Any],
+    attempted_type: str,
+    opts: ImportOptions,
+    *,
+    page,
+    page_h: float,
+    scale: float,
+    fc_doc,
+    parent_group,
+) -> Dict[str, Any]:
+    """Render one exact source span to a persistent verified ImagePlane patch."""
+    try:
+        bound_item = copy.deepcopy(item) if isinstance(item, dict) else {}
+    except Exception:
+        bound_item = {}
+    source_item_id = str(bound_item.get("source_item_id") or "")
+    requested_type = bound_item.get("requested_type")
+    owned: List[Any] = []
+    baseline_ids: set = set()
+
+    def fail(reason: str, evidence: Optional[Dict[str, Any]] = None):
+        if fc_doc is not None and baseline_ids:
+            for host_obj in _document_objects(fc_doc):
+                if id(host_obj) not in baseline_ids and all(
+                    candidate is not host_obj for candidate in owned
+                ):
+                    owned.append(host_obj)
+        created_ids = [_host_object_id(host_obj) for host_obj in owned]
+        removed_ids: List[str] = []
+        cleanup_complete = not owned
+        if owned:
+            try:
+                removed_ids, cleanup_complete = _remove_owned_text_objects(
+                    fc_doc, parent_group, owned
+                )
+            except Exception:
+                cleanup_complete = False
+        attempt = {
+            "source_item_id": source_item_id,
+            "requested_type": requested_type,
+            "attempted_type": attempted_type,
+            "final_type": None,
+            "outcome": "failed",
+            "reason": str(reason),
+            "created_entity_ids": created_ids,
+            "removed_entity_ids": removed_ids,
+            "cleanup_complete": bool(
+                cleanup_complete and set(created_ids) == set(removed_ids)
+            ) if created_ids else bool(cleanup_complete and not removed_ids),
+            "evidence": dict(evidence or {}),
+        }
+        raise TextRepresentationFailure(
+            "Raster delivery failed for %s: %s"
+            % (source_item_id or "item", reason),
+            attempt,
+        )
+
+    try:
+        page_number = bound_item.get("page_number")
+        indices = (
+            bound_item.get("block_index"),
+            bound_item.get("line_index"),
+            bound_item.get("span_index"),
+        )
+        expected_source_id = "p%d:b%d:l%d:s%d" % ((page_number,) + indices)
+        bbox = _finite_source_tuple(bound_item.get("bbox"), 4, "item.bbox")
+        pdf_sha256 = bound_item.get("pdf_sha256")
+        if (
+            attempted_type != "raster"
+            or requested_type not in TEXT_ITEM_FALLBACK_LADDERS
+            or TEXT_ITEM_FALLBACK_LADDERS[requested_type][-1] != "raster"
+            or bound_item.get("importer_identity") != FREECAD_TEXT_IMPORTER_IDENTITY
+            or source_item_id != expected_source_id
+            or not isinstance(pdf_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", pdf_sha256) is None
+            or bbox[2] <= bbox[0]
+            or bbox[3] <= bbox[1]
+            or page is None
+            or fc_doc is None
+            or parent_group is None
+            or Vector is None
+            or Placement is None
+            or Rotation is None
+            or not math.isfinite(float(page_h))
+            or not math.isfinite(float(scale))
+            or float(scale) <= 0.0
+        ):
+            raise ValueError("canonical raster item delivery context is invalid")
+        baseline_ids = {id(host_obj) for host_obj in _document_objects(fc_doc)}
+    except Exception as exc:
+        fail(
+            "invalid_raster_text_source_item",
+            {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+        )
+
+    try:
+        dpi = max(72, int(getattr(opts, "raster_dpi", 200) or 200))
+        clip = fitz.Rect(*bbox)
+        page_rect = page.rect
+        clip &= fitz.Rect(
+            float(page_rect.x0),
+            float(page_rect.y0),
+            float(page_rect.x1),
+            float(page_rect.y1),
+        )
+        if clip.is_empty or clip.width <= 0.0 or clip.height <= 0.0:
+            raise ValueError("source item raster clip is empty")
+        zoom = dpi / 72.0
+        pix = page.get_pixmap(
+            matrix=fitz.Matrix(zoom, zoom),
+            clip=clip,
+            alpha=True,
+        )
+        if int(getattr(pix, "width", 0) or 0) <= 0 or int(
+            getattr(pix, "height", 0) or 0
+        ) <= 0:
+            raise RuntimeError("source item raster contains no pixels")
+        cache_key = hashlib.sha256(
+            (
+                "%s|%d|%s|%.9g,%.9g,%.9g,%.9g|%d"
+                % (
+                    bound_item.get("pdf_sha256"),
+                    page_number,
+                    source_item_id,
+                    clip.x0,
+                    clip.y0,
+                    clip.x1,
+                    clip.y1,
+                    dpi,
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        asset_dir = _raster_asset_dir()
+        image_path = asset_dir / ("text_%s.png" % cache_key)
+        _save_pixmap_atomic(pix, image_path)
+        if not image_path.is_file() or image_path.stat().st_size <= 0:
+            raise RuntimeError("source item raster was not persisted")
+        raster_sha256 = _path_sha256(image_path)
+    except Exception as exc:
+        fail(
+            "raster_text_render_failed",
+            {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+        )
+
+    try:
+        transformed = [
+            _to_fc(point, float(page_h), opts, float(scale))
+            for point in (
+                (clip.x0, clip.y0),
+                (clip.x0, clip.y1),
+                (clip.x1, clip.y0),
+                (clip.x1, clip.y1),
+            )
+        ]
+        xs = [float(point.x) for point in transformed]
+        ys = [float(point.y) for point in transformed]
+        expected_width = max(xs) - min(xs)
+        expected_height = max(ys) - min(ys)
+        expected_anchor = (min(xs), min(ys), -0.05)
+        if expected_width <= 0.0 or expected_height <= 0.0:
+            raise ValueError("source item raster placement has no area")
+        host_obj = fc_doc.addObject("Image::ImagePlane", "PDF_Text_Raster")
+        if host_obj is None or id(host_obj) in baseline_ids:
+            raise RuntimeError("ImagePlane factory returned no new host object")
+        owned.append(host_obj)
+        host_obj.ImageFile = str(image_path)
+        host_obj.XSize = float(expected_width)
+        host_obj.YSize = float(expected_height)
+        host_obj.Placement = Placement(
+            Vector(*expected_anchor),
+            Rotation(),
+        )
+        add_property = getattr(host_obj, "addProperty", None)
+        if not callable(add_property):
+            raise RuntimeError("ImagePlane cannot embed its raster asset")
+        if "PDFRasterFile" not in set(getattr(host_obj, "PropertiesList", []) or []):
+            add_property("App::PropertyFileIncluded", "PDFRasterFile", "PDF Import")
+        host_obj.PDFRasterFile = str(image_path)
+        if "PDFSourceSHA256" not in set(
+            getattr(host_obj, "PropertiesList", []) or []
+        ):
+            add_property("App::PropertyString", "PDFSourceSHA256", "PDF Import")
+        host_obj.PDFSourceSHA256 = pdf_sha256
+        if "PDFRasterSHA256" not in set(
+            getattr(host_obj, "PropertiesList", []) or []
+        ):
+            add_property("App::PropertyString", "PDFRasterSHA256", "PDF Import")
+        host_obj.PDFRasterSHA256 = raster_sha256
+        _annotate_text_host_object(host_obj, source_item_id, "raster")
+        parent_group.addObject(host_obj)
+        fc_doc.recompute()
+    except Exception as exc:
+        fail(
+            "raster_text_host_creation_failed",
+            {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+        )
+
+    try:
+        entity_id = _host_object_id(host_obj)
+        actual_anchor = _host_anchor_xyz(host_obj)
+        raster_file_evidence = _raster_file_evidence(host_obj, image_path)
+        if (
+            not entity_id
+            or fc_doc.getObject(entity_id) is not host_obj
+            or str(getattr(host_obj, "TypeId", "")) != "Image::ImagePlane"
+            or str(getattr(host_obj, "PDFSourceSHA256", "")) != pdf_sha256
+            or str(getattr(host_obj, "PDFRasterSHA256", ""))
+            != raster_file_evidence["source_asset_sha256"]
+            or not math.isclose(float(host_obj.XSize), expected_width, abs_tol=1e-7)
+            or not math.isclose(float(host_obj.YSize), expected_height, abs_tol=1e-7)
+            or actual_anchor is None
+            or any(
+                abs(actual_anchor[index] - expected_anchor[index]) > 1e-7
+                for index in range(3)
+            )
+            or getattr(host_obj, "PDFSourceItemId", None) != source_item_id
+            or getattr(host_obj, "PDFRepresentation", None) != "raster"
+        ):
+            raise RuntimeError("raster text host evidence could not be verified")
+    except Exception as exc:
+        fail(
+            "raster_text_host_verification_failed",
+            {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+        )
+
+    return {
+        "source_item_id": source_item_id,
+        "requested_type": requested_type,
+        "attempted_type": "raster",
+        "final_type": "raster",
+        "outcome": "verified",
+        "created_entity_ids": [entity_id],
+        "removed_entity_ids": [],
+        "cleanup_complete": True,
+        "evidence": {
+            "host_entity_type": "Image::ImagePlane",
+            "raster_file": str(image_path),
+            "raster_file_included": True,
+            "pdf_sha256": pdf_sha256,
+            "pixel_width": int(pix.width),
+            "pixel_height": int(pix.height),
+            "dpi": dpi,
+            "source_bbox": bbox,
+            "expected_anchor_xyz": expected_anchor,
+            "verified_anchor_xyz": tuple(actual_anchor),
+            "x_size": float(expected_width),
+            "y_size": float(expected_height),
+            **raster_file_evidence,
+        },
+    }
+
+
+def _deliver_text_item_3d(
+    item: Dict[str, Any],
+    attempted_type: str,
+    opts: ImportOptions,
+    *,
+    text_group,
+    page_h: float,
+    scale: float,
+) -> Dict[str, Any]:
+    """Deliver and verify exactly one canonical 3D Text source item."""
+    try:
+        bound_item = copy.deepcopy(item) if isinstance(item, dict) else {}
+    except Exception:
+        bound_item = {}
+    source_item_id = str(bound_item.get("source_item_id") or "")
+    requested_type = bound_item.get("requested_type")
+    owned: List[Any] = []
+    doc = None
+    baseline_objects = set()
+    baseline_valid = False
+    creation_started = False
+    ownership_collection_failed = False
+    ownership_collection_error = ""
+
+    def add_owned(obj) -> None:
+        if obj is not None and baseline_valid and id(obj) in baseline_objects:
+            raise RuntimeError("host factory returned a pre-existing baseline object")
+        if obj is not None and not any(candidate is obj for candidate in owned):
+            owned.append(obj)
+
+    def collect_owned() -> Optional[str]:
+        nonlocal ownership_collection_failed, ownership_collection_error
+        if doc is None:
+            return None
+        if not baseline_valid:
+            return "baseline object snapshot is unavailable"
+        if ownership_collection_failed:
+            return ownership_collection_error or "prior ownership collection failed"
+        try:
+            current_objects = list(getattr(doc, "Objects", []) or [])
+        except Exception as exc:
+            error = "%s: %s" % (exc.__class__.__name__, exc)
+            if creation_started:
+                ownership_collection_failed = True
+                ownership_collection_error = error
+            return error
+        for host_obj in current_objects:
+            if id(host_obj) not in baseline_objects:
+                add_owned(host_obj)
+        return None
+
+    def owned_ids() -> Tuple[List[str], bool]:
+        entity_ids: List[str] = []
+        complete = True
+        for host_obj in owned:
+            try:
+                entity_id = _host_object_id(host_obj)
+            except Exception:
+                entity_id = ""
+            if not entity_id or entity_id in entity_ids:
+                complete = False
+                continue
+            entity_ids.append(entity_id)
+        if len(entity_ids) != len(owned):
+            complete = False
+        return entity_ids, complete
+
+    def terminal_failure(
+        reason: str,
+        evidence: Optional[Dict[str, Any]] = None,
+    ):
+        collection_error = None
+        if baseline_valid and creation_started:
+            collection_error = collect_owned()
+        created_ids, ids_complete = owned_ids()
+        removed_ids: List[str] = []
+        helper_complete = not owned
+        cleanup_error = ""
+        if doc is not None and owned:
+            try:
+                removed_ids, helper_complete = _remove_owned_text_objects(
+                    doc, text_group, owned
+                )
+            except Exception as exc:
+                cleanup_error = "%s: %s" % (exc.__class__.__name__, exc)
+                helper_complete = False
+        live_objects: List[Any] = []
+        owned_still_live = False
+        unknown_post_baseline: List[Any] = []
+        if baseline_valid and creation_started:
+            try:
+                live_objects = list(getattr(doc, "Objects", []) or []) if doc is not None else []
+                owned_still_live = any(
+                    candidate is host_obj
+                    for candidate in live_objects
+                    for host_obj in owned
+                )
+                known_owned = {id(host_obj) for host_obj in owned}
+                unknown_post_baseline = [
+                    candidate
+                    for candidate in live_objects
+                    if id(candidate) not in baseline_objects
+                    and id(candidate) not in known_owned
+                ]
+            except Exception as exc:
+                live_objects = []
+                owned_still_live = True
+                cleanup_error = cleanup_error or "%s: %s" % (
+                    exc.__class__.__name__, exc
+                )
+        unknown_ids: List[str] = []
+        for host_obj in unknown_post_baseline:
+            try:
+                entity_id = _host_object_id(host_obj)
+            except Exception:
+                entity_id = ""
+            unknown_ids.append(entity_id or "unidentified_host_object_%d" % id(host_obj))
+        cleanup_complete = bool(
+            helper_complete
+            and ids_complete
+            and not owned_still_live
+            and set(removed_ids) == set(created_ids)
+            and not ownership_collection_failed
+            and not unknown_ids
+        )
+        failure_evidence = dict(evidence or {})
+        effective_collection_error = ownership_collection_error or collection_error
+        if effective_collection_error:
+            failure_evidence["ownership_collection_error"] = effective_collection_error
+        if unknown_ids:
+            failure_evidence["unknown_post_baseline_entity_ids"] = unknown_ids
+        if cleanup_error:
+            failure_evidence["cleanup_error"] = cleanup_error
+        attempt = {
+            "source_item_id": source_item_id,
+            "requested_type": requested_type,
+            "attempted_type": attempted_type,
+            "final_type": None,
+            "outcome": "failed",
+            "reason": str(reason),
+            "created_entity_ids": created_ids,
+            "removed_entity_ids": removed_ids,
+            "cleanup_complete": cleanup_complete,
+            "evidence": failure_evidence,
+        }
+        raise TextRepresentationFailure(
+            "3D Text failed for %s: %s" % (source_item_id or "item", reason),
+            attempt,
+        )
+
+    if (
+        attempted_type != "3d_text"
+        or requested_type not in TEXT_ITEM_FALLBACK_LADDERS
+        or attempted_type not in TEXT_ITEM_FALLBACK_LADDERS[requested_type]
+    ):
+        terminal_failure(
+            "unsupported_3d_text_attempt",
+            {
+                "accepted_attempted_type": "3d_text",
+                "accepted_requested_types": sorted(TEXT_ITEM_FALLBACK_LADDERS),
+            },
+        )
+
+    try:
+        page_number = bound_item.get("page_number")
+        block_index = bound_item.get("block_index")
+        line_index = bound_item.get("line_index")
+        span_index = bound_item.get("span_index")
+        expected_source_id = "p%d:b%d:l%d:s%d" % (
+            page_number, block_index, line_index, span_index
+        )
+        pdf_sha256 = bound_item.get("pdf_sha256")
+        source_text = bound_item.get("text")
+        font_identity = bound_item.get("font_identity")
+        span = bound_item.get("span")
+        if (
+            bound_item.get("importer_identity") != FREECAD_TEXT_IMPORTER_IDENTITY
+            or type(page_number) is not int
+            or page_number <= 0
+            or any(
+                type(index) is not int or index < 0
+                for index in (block_index, line_index, span_index)
+            )
+            or source_item_id != expected_source_id
+            or not isinstance(pdf_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", pdf_sha256) is None
+            or not isinstance(source_text, str)
+            or not source_text
+            or source_text.isspace()
+            or not isinstance(font_identity, dict)
+            or not isinstance(span, dict)
+            or span.get("text") != source_text
+        ):
+            raise ValueError("canonical item identity is incomplete")
+        source_font = span.get("font")
+        if (
+            not isinstance(source_font, str)
+            or font_identity != _canonical_font_identity(source_font)
+        ):
+            raise ValueError("canonical item font identity does not match its span")
+        bbox = _finite_source_tuple(bound_item.get("bbox"), 4, "item.bbox")
+        origin = _finite_source_tuple(bound_item.get("origin"), 2, "item.origin")
+        line_direction = _finite_source_tuple(
+            bound_item.get("line_direction"), 2, "item.line_direction"
+        )
+        if (
+            not isinstance(bound_item.get("bbox"), tuple)
+            or not isinstance(bound_item.get("origin"), tuple)
+            or not isinstance(bound_item.get("line_direction"), tuple)
+            or bbox != _finite_source_tuple(span.get("bbox"), 4, "span.bbox")
+            or origin != _finite_source_tuple(span.get("origin"), 2, "span.origin")
+            or math.hypot(line_direction[0], line_direction[1]) <= 1e-12
+        ):
+            raise ValueError("canonical item placement does not match its span")
+        rotation_deg = float(bound_item.get("rotation_deg"))
+        authoritative_rotation = _line_angle_deg({"dir": line_direction})
+        if (
+            not math.isfinite(rotation_deg)
+            or not _rotation_matches(rotation_deg, authoritative_rotation)
+        ):
+            raise ValueError("canonical item rotation does not match line direction")
+    except Exception as exc:
+        terminal_failure(
+            "invalid_3d_text_source_item",
+            {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+        )
+
+    try:
+        font_path, source_results = _resolve_shapestring_font_path_with_evidence(
+            font_identity["raw_name"],
+            opts,
+            pdf_sha256=pdf_sha256,
+            page_number=page_number,
+        )
+        source_results = copy.deepcopy(source_results)
+    except Exception as exc:
+        terminal_failure(
+            "exact_font_resolution_failed",
+            {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+        )
+
+    valid_result_list = bool(
+        isinstance(source_results, list)
+        and 1 <= len(source_results) <= 2
+        and all(isinstance(result, dict) for result in source_results)
+        and [result.get("source") for result in source_results]
+        in (["embedded_font"], ["embedded_font", "system_font"])
+        and all(
+            result.get("font_identity") == font_identity
+            and result.get("pdf_sha256") == pdf_sha256
+            and result.get("page_number") == page_number
+            and result.get("staging_complete") is True
+            for result in source_results
+        )
+    )
+    if not valid_result_list:
+        terminal_failure(
+            "exact_font_resolution_invalid",
+            {"attempted_source_results": source_results},
+        )
+
+    exhaustive_absence = bool(
+        font_path is None
+        and len(source_results) == 2
+        and [result.get("source") for result in source_results]
+        == ["embedded_font", "system_font"]
+        and all(result.get("outcome") == "not_found" for result in source_results)
+    )
+    if exhaustive_absence:
+        attempt = {
+            "source_item_id": source_item_id,
+            "requested_type": requested_type,
+            "attempted_type": "3d_text",
+            "final_type": None,
+            "outcome": "proven_impossible",
+            "reason_code": "exact_font_unavailable",
+            "created_entity_ids": [],
+            "removed_entity_ids": [],
+            "cleanup_complete": True,
+        }
+        proof = {
+            "item_specific_proven_impossible": True,
+            "importer_identity": FREECAD_TEXT_IMPORTER_IDENTITY,
+            "pdf_sha256": pdf_sha256,
+            "page_number": page_number,
+            "source_item_id": source_item_id,
+            "requested_type": requested_type,
+            "attempted_type": "3d_text",
+            "reason_code": "exact_font_unavailable",
+            "font_identity": dict(font_identity),
+            "evidence": {
+                "normalized_key": font_identity["normalized_key"],
+                "exact_sources": ["embedded_font", "system_font"],
+                "exhaustive": True,
+            },
+            "attempted_source_results": source_results,
+            "attempted_sources_complete": True,
+            "created_entity_ids": [],
+            "removed_entity_ids": [],
+            "cleanup_complete": True,
+        }
+        raise TextItemImpossible(
+            "Exact source font is unavailable for %s" % source_item_id,
+            attempt=attempt,
+            proof=proof,
+        )
+
+    found_results = [
+        result for result in source_results if result.get("outcome") == "found"
+    ]
+    if (
+        not isinstance(font_path, str)
+        or not font_path
+        or font_path != font_path.strip()
+        or len(found_results) != 1
+        or source_results[-1] is not found_results[0]
+        or found_results[0].get("path") != font_path
+        or any(
+            result.get("outcome") not in {"not_found", "found"}
+            for result in source_results
+        )
+    ):
+        terminal_failure(
+            "exact_font_resolution_invalid",
+            {"attempted_source_results": source_results},
+        )
+    font_source_result = copy.deepcopy(found_results[0])
+
+    if (
+        Draft is None
+        or Vector is None
+        or Placement is None
+        or Rotation is None
+        or text_group is None
+    ):
+        terminal_failure(
+            "freecad_3d_text_host_unavailable",
+            {"attempted_source_results": source_results},
+        )
+    doc = _text_host_document(None, text_group)
+    if doc is None:
+        terminal_failure(
+            "freecad_3d_text_document_unavailable",
+            {"attempted_source_results": source_results},
+        )
+    try:
+        baseline_objects = {
+            id(host_obj) for host_obj in list(getattr(doc, "Objects", []) or [])
+        }
+        baseline_valid = True
+    except Exception as exc:
+        terminal_failure(
+            "freecad_3d_text_document_snapshot_failed",
+            {
+                "attempted_source_results": source_results,
+                "exception": "%s: %s" % (exc.__class__.__name__, exc),
+            },
+        )
+
+    try:
+        page_height = float(page_h)
+        item_scale = float(scale)
+        if (
+            not math.isfinite(page_height)
+            or not math.isfinite(item_scale)
+            or item_scale <= 0.0
+        ):
+            raise ValueError("page height and scale must be finite with positive scale")
+        from pdfcadcore.text_scale import effective_span_font_size_pt
+
+        host_rotation_deg = _line_angle_deg({"dir": line_direction}, opts)
+        if not math.isfinite(host_rotation_deg):
+            raise ValueError("host text rotation is invalid")
+        size_pt = float(effective_span_font_size_pt(span, host_rotation_deg))
+        if not math.isfinite(size_pt) or size_pt <= 0.0:
+            raise ValueError("source font size is unavailable")
+        font_size_fc = _fit_font_size_to_span_bbox(
+            source_text,
+            size_pt * item_scale,
+            span,
+            item_scale,
+            host_rotation_deg,
+        )
+        if not math.isfinite(font_size_fc) or font_size_fc <= 0.0:
+            raise ValueError("source font size transform is invalid")
+        target_advance_fc = _source_span_advance_fc(
+            span, {"dir": line_direction}, item_scale
+        )
+        if not math.isfinite(target_advance_fc) or target_advance_fc <= 1e-9:
+            raise ValueError("source span advance is unavailable")
+        pos = _to_fc(origin, page_height, opts, item_scale)
+        rot = Rotation(Vector(0.0, 0.0, 1.0), host_rotation_deg)
+    except Exception as exc:
+        terminal_failure(
+            "text_transform_or_dimension_failed",
+            {
+                "attempted_source_results": source_results,
+                "exception": "%s: %s" % (exc.__class__.__name__, exc),
+            },
+        )
+
+    try:
+        make_shapestring = getattr(
+            Draft,
+            "make_shapestring",
+            getattr(Draft, "makeShapeString", None),
+        )
+        if not callable(make_shapestring):
+            raise AttributeError("Draft ShapeString API unavailable")
+        creation_started = True
+        shape_string = make_shapestring(source_text, font_path)
+        if shape_string is None:
+            raise RuntimeError("Draft ShapeString returned no host object")
+        add_owned(shape_string)
+        collection_error = collect_owned()
+        if collection_error:
+            raise RuntimeError("owned object collection failed: %s" % collection_error)
+    except Exception as exc:
+        terminal_failure(
+            "shapestring_creation_failed",
+            {
+                "attempted_source_results": source_results,
+                "font_path": font_path,
+                "exception": "%s: %s" % (exc.__class__.__name__, exc),
+            },
+        )
+
+    stage = "placement"
+    try:
+        shape_string.Placement = Placement(pos, rot)
+        depth = max(font_size_fc * 0.12, 0.05)
+        stage = "calibration_extrusion"
+        (
+            extrusion,
+            calibrated_support,
+            horizontal_scale,
+            verified_advance_fc,
+        ) = _create_verified_text3d_entity(
+            shape_string,
+            font_size_fc=font_size_fc,
+            depth=depth,
+            target_advance_fc=target_advance_fc,
+            baseline_angle_deg=host_rotation_deg,
+            text_group=text_group,
+            baseline_object_ids=baseline_objects,
+        )
+        add_owned(calibrated_support)
+        add_owned(extrusion)
+        collection_error = collect_owned()
+        if collection_error:
+            raise RuntimeError("owned object collection failed: %s" % collection_error)
+
+        stage = "host_annotation"
+        for host_obj in (shape_string, calibrated_support, extrusion):
+            _annotate_text_host_object(host_obj, source_item_id, "3d_text")
+
+        stage = "source_color"
+        source_color = _span_source_color(span)
+        normalized_font = _normalize_pdf_font_name(source_font)
+        style_verifications: List[str] = []
+        for host_obj in (shape_string, calibrated_support, extrusion):
+            color_metadata = _persist_text_style_metadata(
+                host_obj,
+                font_name=normalized_font,
+                font_size=font_size_fc,
+                source_color=source_color,
+            )
+            _apply_text_color(host_obj, source_color)
+            if (
+                str(getattr(host_obj, "PDFTextFontName", "") or "")
+                != normalized_font
+                or not math.isclose(
+                    float(host_obj.PDFTextFontSize),
+                    float(font_size_fc),
+                    abs_tol=1e-7,
+                )
+                or str(getattr(host_obj, "PDFTextJustification", "") or "")
+                != "Left"
+                or str(getattr(host_obj, "PDFTextColorRGB", "") or "")
+                != color_metadata
+            ):
+                raise RuntimeError("source text style metadata could not be verified")
+            view = getattr(host_obj, "ViewObject", None)
+            if view is None:
+                style_verifications.append("headless_app_metadata")
+                continue
+            if source_color is not None:
+                rendered_colors = [
+                    getattr(view, prop, None)
+                    for prop in ("TextColor", "ShapeColor", "LineColor", "PointColor")
+                ]
+                if not any(
+                    isinstance(color, (tuple, list))
+                    and len(color) >= 3
+                    and all(
+                        abs(float(color[index]) - float(source_color[index])) <= 1e-6
+                        for index in range(3)
+                    )
+                    for color in rendered_colors
+                ):
+                    raise RuntimeError("source text color could not be verified")
+            style_verifications.append("gui_view_and_app_metadata")
+
+        stage = "host_verification"
+        created_ids, ids_complete = owned_ids()
+        required_objects = (shape_string, calibrated_support, extrusion)
+        required_ids = [_host_object_id(host_obj) for host_obj in required_objects]
+        source_text_preserved = getattr(shape_string, "String", None) == source_text
+        source_item_id_verified = all(
+            getattr(host_obj, "PDFSourceItemId", None) == source_item_id
+            and getattr(host_obj, "PDFRepresentation", None) == "3d_text"
+            for host_obj in required_objects
+        )
+        verified_rotation_deg = _host_text_rotation_deg(shape_string)
+        calibrated_rotation_deg = _host_text_rotation_deg(calibrated_support)
+        verified_anchor_xyz = _host_anchor_xyz(shape_string)
+        calibrated_anchor_xyz = _host_anchor_xyz(calibrated_support)
+        expected_anchor_xyz = (
+            float(pos.x),
+            float(pos.y),
+            float(pos.z),
+        )
+        anchors_match = bool(
+            verified_anchor_xyz is not None
+            and calibrated_anchor_xyz is not None
+            and all(
+                abs(verified_anchor_xyz[index] - expected_anchor_xyz[index]) <= 1e-7
+                for index in range(3)
+            )
+            and all(
+                abs(calibrated_anchor_xyz[index] - expected_anchor_xyz[index]) <= 1e-7
+                for index in range(3)
+            )
+        )
+        shape = getattr(extrusion, "Shape", None)
+        solids = list(getattr(shape, "Solids", []) or []) if shape is not None else []
+        volume = float(getattr(shape, "Volume", 0.0) or 0.0) if shape is not None else 0.0
+        live_objects = list(getattr(doc, "Objects", []) or [])
+        if (
+            not ids_complete
+            or not created_ids
+            or any(not entity_id or entity_id not in created_ids for entity_id in required_ids)
+            or any(not any(candidate is host_obj for candidate in live_objects) for host_obj in owned)
+            or not source_text_preserved
+            or not source_item_id_verified
+            or str(getattr(extrusion, "TypeId", "") or "") != "Part::Extrusion"
+            or shape is None
+            or bool(getattr(shape, "isNull", lambda: True)())
+            or not solids
+            or not math.isfinite(volume)
+            or volume <= 0.0
+            or verified_rotation_deg is None
+            or calibrated_rotation_deg is None
+            or not _rotation_matches(verified_rotation_deg, host_rotation_deg)
+            or not _rotation_matches(calibrated_rotation_deg, host_rotation_deg)
+            or not anchors_match
+            or getattr(extrusion, "Base", None) is not calibrated_support
+            or not math.isfinite(float(verified_advance_fc))
+            or abs(float(verified_advance_fc) - target_advance_fc)
+            > max(0.05, target_advance_fc * 0.03)
+        ):
+            raise RuntimeError("3D Text host evidence could not be verified")
+    except Exception as exc:
+        terminal_failure(
+            "%s_failed" % stage,
+            {
+                "attempted_source_results": source_results,
+                "font_path": font_path,
+                "exception": "%s: %s" % (exc.__class__.__name__, exc),
+            },
+        )
+
+    return {
+        "source_item_id": source_item_id,
+        "requested_type": requested_type,
+        "attempted_type": "3d_text",
+        "final_type": "3d_text",
+        "outcome": "verified",
+        "created_entity_ids": created_ids,
+        "delivery_entity_ids": [required_ids[2]],
+        "support_entity_ids": required_ids[:2],
+        "removed_entity_ids": [],
+        "cleanup_complete": True,
+        "evidence": {
+            "source_text": source_text,
+            "source_text_preserved": True,
+            "source_item_id": source_item_id,
+            "source_item_id_verified": True,
+            "entity_type": str(getattr(extrusion, "TypeId", "") or ""),
+            "solid_count": len(solids),
+            "volume": volume,
+            "rotation_deg": float(verified_rotation_deg),
+            "verified_anchor_xyz": tuple(verified_anchor_xyz),
+            "target_advance": float(target_advance_fc),
+            "verified_advance": float(verified_advance_fc),
+            "font_path": font_path,
+            "font_source_result": font_source_result,
+            "nominal_height": float(font_size_fc),
+            "horizontal_scale": float(horizontal_scale),
+            "extrusion_depth": float(depth),
+            "source_color": source_color,
+            "color_verified": True,
+            "style_verification": (
+                style_verifications[0]
+                if len(set(style_verifications)) == 1
+                else "mixed_view_and_app_metadata"
+            ),
+            "view_style_verified": all(
+                value == "gui_view_and_app_metadata"
+                for value in style_verifications
+            ),
+        },
+    }
 
 
 def _render_text_spans_3d(
@@ -2232,70 +5164,131 @@ def _render_text_spans_3d(
     scale: float,
     layout_context: Optional[dict] = None,
 ) -> int:
-    """Render extruded ShapeString text for the 3D Text mode."""
+    """Render verified native 3D Text without silently changing representation."""
     if Draft is None or text_group is None:
-        return 0
+        attempt = {
+            "source_item_id": "page",
+            "requested_type": "3d_text",
+            "attempted_type": "3d_text",
+            "outcome": "failed",
+            "reason": "freecad_draft_or_group_unavailable",
+            "created_entity_ids": [],
+            "removed_entity_ids": [],
+            "cleanup_complete": True,
+        }
+        opts.text_delivery_attempts.append(attempt)
+        raise TextRepresentationFailure("3D Text unavailable: FreeCAD Draft/group missing", attempt)
 
-    count = 0
-    font_path = _resolve_shapestring_font_path("")
-    if not font_path:
-        _warn("3D Text mode: no TTF font found for ShapeString — falling back to labels")
-        _record_shapestring_skip(opts, "no_ttf_font")
-        return 0
+    delivered: List[Tuple[dict, str, Any, Any, int]] = []
+    owned: List[Any] = []
+    attempts_for_call: List[Dict[str, Any]] = []
+    page_num = int(getattr(opts, "_provenance_page", 1) or 1)
 
-    rotated_threshold = _rotated_text_threshold_deg()
-    # TEXTMODE-1 P0: spans whose ShapeString creation fails are collected and
-    # delivered through the next FC ladder rung (exact Draft labels) below —
-    # a failed span is never dropped.
-    failed_lines: List[dict] = []
-    for block in tdict.get("blocks", []):
+    def fail_attempt(attempt: Dict[str, Any], reason: str, evidence: Dict[str, Any]):
+        doc = _text_host_document(owned[0] if owned else None, text_group)
+        removed, cleanup_complete = (
+            _remove_owned_text_objects(doc, text_group, owned) if doc is not None
+            else ([], not owned)
+        )
+        removed_set = set(removed)
+        for earlier in attempts_for_call:
+            if earlier.get("outcome") == "verified":
+                earlier["outcome"] = "rolled_back"
+                earlier["final_type"] = None
+                earlier["superseded_by"] = attempt.get("source_item_id")
+                earlier["removed_entity_ids"] = [
+                    entity_id
+                    for entity_id in (
+                        list(earlier.get("created_entity_ids") or [])
+                        + list(earlier.get("support_entity_ids") or [])
+                    )
+                    if entity_id in removed_set
+                ]
+                earlier["cleanup_complete"] = all(
+                    entity_id in removed_set
+                    for entity_id in (
+                        list(earlier.get("created_entity_ids") or [])
+                        + list(earlier.get("support_entity_ids") or [])
+                    )
+                )
+        attempt.update(
+            {
+                "outcome": "failed",
+                "reason": reason,
+                "evidence": evidence,
+                "removed_entity_ids": removed,
+                "cleanup_complete": bool(cleanup_complete),
+                "final_type": None,
+            }
+        )
+        attempts_for_call.append(attempt)
+        opts.text_delivery_attempts.extend(attempts_for_call)
+        opts.text_delivered_counts.pop("native_3d_text", None)
+        raise TextRepresentationFailure(
+            "3D Text failed for %s: %s" % (attempt["source_item_id"], reason),
+            attempt,
+        )
+
+    for block_index, block in enumerate(tdict.get("blocks", [])):
         if block.get("type") != 0:
             continue
-        for line in block.get("lines", []):
+        for line_index, line in enumerate(block.get("lines", [])):
             spans = line.get("spans", []) or []
             if not spans:
                 continue
-            angle_deg = _line_angle_deg(line)
-            failed_spans: List[dict] = []
+            angle_deg = _line_angle_deg(line, opts)
 
-            for span in spans:
-                text = span.get("text", "")
-                if not text or text.isspace():
+            for span_index, span in enumerate(spans):
+                source_text = str(span.get("text", "") or "")
+                if not source_text or source_text.isspace():
                     continue
-                try:
-                    size_pt = float(span.get("size", 0.0) or 0.0)
-                except (TypeError, ValueError):
-                    size_pt = 0.0
+                source_item_id = "p%d:b%d:l%d:s%d" % (
+                    page_num, block_index, line_index, span_index
+                )
+                attempt = {
+                    "source_item_id": source_item_id,
+                    "requested_type": "3d_text",
+                    "attempted_type": "3d_text",
+                    "created_entity_ids": [],
+                    "support_entity_ids": [],
+                    "removed_entity_ids": [],
+                    "cleanup_complete": False,
+                    "superseded_by": None,
+                }
                 from pdfcadcore.text_scale import effective_span_font_size_pt
 
-                txt = str(text).strip()
-                if not txt:
-                    continue
-                is_bom_quantity = _is_bom_quantity_span(span, txt, layout_context or {})
-                span_angle_deg = 0.0 if is_bom_quantity else angle_deg
-                span_norm_angle = _normalize_text_angle_deg(span_angle_deg)
+                # Quantity-column heuristics must never change source rotation.
+                # The source line direction is authoritative for 3D Text.
+                span_angle_deg = angle_deg
                 size_pt = effective_span_font_size_pt(span, span_angle_deg)
-                if size_pt <= 0.0:
-                    size_pt = 3.0
                 font_size_fc = max(0.1, size_pt * scale)
-                font_size_fc = _fit_font_size_to_span_bbox(txt, font_size_fc, span, scale, span_angle_deg)
+                font_size_fc = _fit_font_size_to_span_bbox(
+                    source_text, font_size_fc, span, scale, span_angle_deg
+                )
 
-                if is_bom_quantity:
-                    origin = _horizontal_quantity_origin_pdf(span, txt, font_size_fc, scale)
-                else:
-                    origin = _span_origin_pdf(span)
+                origin = _span_origin_pdf(span)
                 if not origin:
-                    continue
+                    fail_attempt(
+                        attempt,
+                        "source_origin_unavailable",
+                        {"source_font": str(span.get("font", "") or "")},
+                    )
                 pos = _to_fc(origin, page_h, opts, scale)
-                if (not is_bom_quantity) and abs(span_norm_angle) >= rotated_threshold:
-                    try:
-                        desc = float(span.get("descender", -0.2) or -0.2)
-                    except (TypeError, ValueError):
-                        desc = -0.2
-                    offset_fc = _effective_descender(txt, desc) * font_size_fc * 0.35
-                    pos = _apply_text_local_y_offset(pos, span_angle_deg, offset_fc)
                 rot = Rotation(Vector(0, 0, 1), span_angle_deg)
+                target_advance_fc = _source_span_advance_fc(span, line, scale)
 
+                source_font = str(span.get("font", "") or "").strip()
+                font_path = _resolve_shapestring_font_path(source_font, opts)
+                if not font_path:
+                    _record_shapestring_skip(opts, "exact_source_font_unavailable")
+                    fail_attempt(
+                        attempt,
+                        "exact source font unavailable",
+                        {"source_font": source_font, "item_specific_attempted": True},
+                    )
+
+                doc = _text_host_document(None, text_group)
+                before_objects = {id(obj) for obj in _document_objects(doc)} if doc is not None else set()
                 try:
                     make_shapestring = getattr(
                         Draft,
@@ -2304,128 +5297,803 @@ def _render_text_spans_3d(
                     )
                     if make_shapestring is None:
                         raise AttributeError("Draft ShapeString API unavailable")
-                    ss = make_shapestring(txt, font_path)
-                except (RuntimeError, ValueError, TypeError, AttributeError):
+                    ss = make_shapestring(source_text, font_path)
+                except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
+                    if doc is not None:
+                        owned.extend(
+                            obj for obj in _document_objects(doc)
+                            if id(obj) not in before_objects and obj not in owned
+                        )
                     _record_shapestring_skip(opts, "shapestring_failed")
-                    failed_spans.append(span)
-                    continue
+                    fail_attempt(
+                        attempt,
+                        "shapestring creation failed",
+                        {
+                            "source_font": source_font,
+                            "font_path": font_path,
+                            "exception": "%s: %s" % (exc.__class__.__name__, exc),
+                            "item_specific_attempted": True,
+                        },
+                    )
+                owned.append(ss)
                 try:
                     ss.Placement = Placement(pos, rot)
-                    # ShapeString is geometry, not Draft label text.  Its
-                    # visible size is controlled by data properties; setting
-                    # ViewObject.FontSize only affects Draft text and can leave
-                    # stale/default ShapeString sizes that dwarf the drawing.
-                    try:
-                        ss.Size = font_size_fc
-                    except (AttributeError, RuntimeError, TypeError, ValueError):
-                        pass
-                    try:
-                        ss.ScaleToSize = True
-                    except (AttributeError, RuntimeError, TypeError, ValueError):
-                        pass
-                    try:
-                        ss.MakeFace = True
-                    except (AttributeError, RuntimeError, TypeError, ValueError):
-                        pass
-                    extrude = max(font_size_fc * 0.12, 0.05)
-                    try:
-                        ss.Extrusion = extrude
-                    except (AttributeError, RuntimeError, TypeError, ValueError):
-                        pass
-                    font_size_fc = _calibrate_shapestring_to_span_bbox(ss, span, font_size_fc, scale)
+                    depth = max(font_size_fc * 0.12, 0.05)
+                    (
+                        extrusion,
+                        calibrated_support,
+                        horizontal_scale,
+                        verified_advance_fc,
+                    ) = _create_verified_text3d_entity(
+                        ss,
+                        font_size_fc=font_size_fc,
+                        depth=depth,
+                        target_advance_fc=target_advance_fc,
+                        baseline_angle_deg=span_angle_deg,
+                        text_group=text_group,
+                    )
+                    owned.extend([calibrated_support, extrusion])
+                    for host_obj in (ss, calibrated_support, extrusion):
+                        _annotate_text_host_object(
+                            host_obj, source_item_id, "3d_text"
+                        )
                     _apply_text_color(ss, _span_source_color(span))
-                except (AttributeError, RuntimeError, TypeError, ValueError):
-                    pass
-                try:
-                    text_group.addObject(ss)
-                except (AttributeError, RuntimeError, TypeError, ValueError):
-                    pass
-                count += 1
+                    _apply_text_color(calibrated_support, _span_source_color(span))
+                    _apply_text_color(extrusion, _span_source_color(span))
+                except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                    if doc is not None:
+                        owned.extend(
+                            obj for obj in _document_objects(doc)
+                            if id(obj) not in before_objects and obj not in owned
+                        )
+                    _record_shapestring_skip(opts, "extrusion_verification_failed")
+                    fail_attempt(
+                        attempt,
+                        "3D extrusion verification failed",
+                        {
+                            "source_font": source_font,
+                            "font_path": font_path,
+                            "exception": "%s: %s" % (exc.__class__.__name__, exc),
+                            "item_specific_attempted": True,
+                        },
+                    )
 
-            if failed_spans:
-                failed_lines.append(
+                attempt.update(
                     {
-                        "dir": line.get("dir", (1.0, 0.0)),
-                        "bbox": line.get("bbox"),
-                        "spans": failed_spans,
+                        "outcome": "verified",
+                        "reason": "requested 3D Text delivered",
+                        "final_type": "3d_text",
+                        "created_entity_ids": [_host_object_id(extrusion)],
+                        "support_entity_ids": [
+                            _host_object_id(ss),
+                            _host_object_id(calibrated_support),
+                        ],
+                        "cleanup_complete": True,
+                        "evidence": {
+                            "entity_type": str(getattr(extrusion, "TypeId", "")),
+                            "source_font": source_font,
+                            "font_path": font_path,
+                            "source_text_preserved": getattr(ss, "String", source_text) == source_text,
+                            "rotation_deg": float(span_angle_deg),
+                            "nominal_height": float(font_size_fc),
+                            "source_advance": float(target_advance_fc),
+                            "verified_advance": float(verified_advance_fc),
+                            "horizontal_scale": float(horizontal_scale),
+                            "extrusion_depth": float(depth),
+                            "solid_count": len(getattr(extrusion.Shape, "Solids", []) or []),
+                            "volume": float(getattr(extrusion.Shape, "Volume", 0.0) or 0.0),
+                        },
                     }
                 )
+                attempts_for_call.append(attempt)
+                stable_index = block_index * 1_000_000 + line_index * 10_000 + span_index
+                delivered.append(
+                    (span, source_item_id, extrusion, calibrated_support, stable_index)
+                )
 
-    _record_text_delivery(opts, "native_3d_text", count)
-
-    if failed_lines:
-        # TEXTMODE-1 P0: deliver every failed span via the next FC ladder rung
-        # (exact Draft labels) and report the substitution — never silent.
-        failed_tdict = {"blocks": [{"type": 0, "lines": failed_lines}]}
-        rescued = _render_text_spans_exact_labels(
-            failed_tdict,
-            text_group,
-            page_h,
-            opts,
-            scale,
-            layout_context=layout_context,
-        )
-        if rescued > 0:
-            _record_text_mode_fallback(
-                opts,
-                requested=str(getattr(opts, "text_mode", "") or "3d_text"),
-                delivered="labels",
-                reason="shapestring_failed",
-                count=rescued,
-            )
-            count += rescued
-    return count
-
-
-def _walk_glyph_svg_failure_rungs(
-    tdict: dict,
-    text_group,
-    page_h: float,
-    opts: ImportOptions,
-    scale: float,
-    layout_context: Optional[dict],
-    svg_failure_reason: str,
-) -> Tuple[int, Optional[dict], Optional[dict]]:
-    """Walk the final FC ladder when the glyphs/geometry SVG renderer fails.
-
-    TEXTMODE-1: Glyphs/Geometry -> 3D Text (ShapeString) -> Labels. The
-    CLOSER 3D Text rung is attempted first; every delivering rung is
-    recorded as a loud fallback. Returns (delivered_count, text_entity_info,
-    pending_label_fallback). A non-zero delivered_count means the caller
-    must stop walking (the spans are delivered); a pending_label_fallback
-    means the label rungs below must deliver and report.
-    """
-    delivered_before = dict(getattr(opts, "text_delivered_counts", {}) or {})
-    rung_count = _render_text_spans_3d(
-        tdict, text_group, page_h, opts, scale, layout_context=layout_context
-    )
-    if rung_count > 0:
-        delivered_now = getattr(opts, "text_delivered_counts", {}) or {}
-        ss_delivered = int(delivered_now.get("native_3d_text", 0)) - int(
-            delivered_before.get("native_3d_text", 0)
-        )
-        if ss_delivered > 0:
-            _record_text_mode_fallback(
-                opts,
-                requested=str(getattr(opts, "text_mode", "") or ""),
-                delivered="3d_text",
-                reason=svg_failure_reason,
-                count=ss_delivered,
-            )
-        _warn(
-            f"{opts.text_mode} SVG renderer unavailable — delivered "
-            f"{rung_count} spans via the 3D Text ladder rung"
-        )
-        info = {
-            'entity_type': '3d_text' if ss_delivered > 0 else 'labels',
-            'count': rung_count,
-            'font_rendered': True,
-            'examples': [],
+    if not delivered:
+        attempt = {
+            "source_item_id": "p%d:page" % page_num,
+            "requested_type": "3d_text",
+            "attempted_type": "3d_text",
+            "created_entity_ids": [],
+            "support_entity_ids": [],
         }
-        return rung_count, info, None
-    return 0, None, {
-        "requested": str(getattr(opts, "text_mode", "") or ""),
-        "reason": svg_failure_reason,
+        fail_attempt(attempt, "no non-whitespace source text items", {"item_specific_attempted": True})
+
+    opts.text_delivery_attempts.extend(attempts_for_call)
+    _record_text_delivery(opts, "native_3d_text", len(delivered))
+    try:
+        from pdfcadcore.source_provenance import record_text_span_provenance
+
+        for span, _source_item_id, extrusion, _support, stable_index in delivered:
+            record_text_span_provenance(
+                opts,
+                page=page_num,
+                span=span,
+                text=str(span.get("text", "") or ""),
+                created_entity_type="native_3d_text",
+                parent_handle=_host_object_id(extrusion),
+                import_mode=str(getattr(opts, "import_mode", "") or ""),
+                text_mode="3d_text",
+                span_index=stable_index,
+            )
+    except (ImportError, TypeError, ValueError):
+        pass
+    return len(delivered)
+
+
+def _render_requested_svg_text(
+    pdf_path: str,
+    page_num: int,
+    page_h: float,
+    page_w: float,
+    scale: float,
+    fc_doc,
+    parent_group,
+    opts: ImportOptions,
+) -> Tuple[dict, dict]:
+    """Render Glyphs or Geometry and prove that the requested type survived."""
+    requested = str(getattr(opts, "text_mode", "") or "").strip().lower()
+    if requested not in {"glyphs", "geometry"}:
+        raise ValueError("SVG text renderer requires glyphs or geometry mode")
+
+    failure_evidence: Dict[str, Any] = {}
+    failure_reason = "svg_text_render_failed"
+    try:
+        from PDFVectorImporter.src.PDFSvgTextRenderer import (
+            TextRepresentationRenderError,
+            render_text,
+        )
+    except (RuntimeError, ValueError, TypeError, OSError, ImportError, AttributeError) as exc:
+        failure_reason = "svg_renderer_exception"
+        failure_evidence = {"exception": "%s: %s" % (exc.__class__.__name__, exc)}
+        result = None
+    else:
+        try:
+            result = render_text(
+                pdf_path,
+                page_num,
+                page_h,
+                scale,
+                page_w,
+                fc_doc=fc_doc,
+                parent_group=parent_group,
+                flip_y=opts.flip_y,
+                representation=requested,
+            )
+        except TextRepresentationRenderError as exc:
+            failure_reason = str(getattr(exc, "reason", "") or failure_reason)
+            failure_evidence = dict(getattr(exc, "evidence", {}) or {})
+            result = None
+        except (RuntimeError, ValueError, TypeError, OSError, ImportError, AttributeError) as exc:
+            failure_reason = "svg_renderer_exception"
+            failure_evidence = {"exception": "%s: %s" % (exc.__class__.__name__, exc)}
+            result = None
+
+    if result:
+        entity_type = str(result.get("entity_type", "") or "").strip().lower()
+        outcome = str(result.get("outcome", "") or "").strip().lower()
+        created_ids = [
+            str(value)
+            for value in list(result.get("created_entity_ids") or [])
+            if str(value or "")
+        ]
+        entity_count = int(result.get("entities", 0) or 0)
+        delivery_count = (
+            int(result.get("raw_edges", 0) or 0)
+            if requested == "geometry"
+            else int(result.get("glyphs", 0) or 0)
+        )
+        result_attempts = list(result.get("delivery_attempts") or [])
+        attempts_match = bool(result_attempts) and all(
+            str(item.get("requested_type", "") or "").strip().lower() == requested
+            and str(item.get("attempted_type", "") or "").strip().lower() == requested
+            and str(item.get("final_type", "") or "").strip().lower() == requested
+            and str(item.get("outcome", "") or "").strip().lower() == "verified"
+            for item in result_attempts
+        )
+        verified = (
+            outcome == "verified"
+            and entity_type == requested
+            and entity_count > 0
+            and delivery_count > 0
+            and len(created_ids) == entity_count
+            and len(set(created_ids)) == entity_count
+            and attempts_match
+        )
+        if verified:
+            opts.text_delivery_attempts.extend(result_attempts)
+            bucket = (
+                "raw_geometry_edges" if requested == "geometry"
+                else "outline_curve_or_mesh"
+            )
+            _record_text_delivery(opts, bucket, delivery_count)
+            return result, {
+                "entity_type": requested,
+                "count": delivery_count,
+                "font_rendered": False,
+                "examples": [],
+            }
+        failure_reason = "requested_representation_verification_failed"
+        failure_evidence = {
+            "renderer_outcome": outcome,
+            "renderer_entity_type": entity_type,
+            "entity_count": entity_count,
+            "delivery_count": delivery_count,
+            "created_entity_ids": created_ids,
+            "attempts_match": attempts_match,
+        }
+
+    attempt = {
+        "source_item_id": "p%d:page" % int(page_num),
+        "requested_type": requested,
+        "attempted_type": requested,
+        "final_type": None,
+        "outcome": "failed",
+        "reason": failure_reason,
+        "created_entity_ids": list(failure_evidence.get("created_entity_ids") or []),
+        "support_entity_ids": [],
+        "removed_entity_ids": list(failure_evidence.get("removed_entity_ids") or []),
+        "cleanup_complete": bool(failure_evidence.get("cleanup_complete", True)),
+        "evidence": failure_evidence,
+    }
+    opts.text_delivery_attempts.append(attempt)
+    opts.text_delivered_counts.pop("outline_curve_or_mesh", None)
+    opts.text_delivered_counts.pop("raw_geometry_edges", None)
+    raise TextRepresentationFailure(
+        "%s rendering failed: %s" % (requested, failure_reason),
+        attempt,
+    )
+
+
+def _deliver_text_item_svg(
+    item: Dict[str, Any],
+    attempted_type: str,
+    opts: ImportOptions,
+    *,
+    pdf_path: str,
+    page_h: float,
+    page_w: float,
+    scale: float,
+    fc_doc,
+    parent_group,
+    render_cache: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Deliver one canonical item as verified SVG Glyphs or raw Geometry."""
+    try:
+        bound_item = copy.deepcopy(item) if isinstance(item, dict) else {}
+    except Exception:
+        bound_item = {}
+    source_item_id = str(bound_item.get("source_item_id") or "")
+    requested_type = bound_item.get("requested_type")
+
+    def raise_attempt(
+        reason: str,
+        evidence: Optional[Dict[str, Any]] = None,
+        *,
+        cleanup_complete: bool = True,
+    ):
+        failure_evidence = dict(evidence or {})
+        attempt = {
+            "source_item_id": source_item_id,
+            "requested_type": requested_type,
+            "attempted_type": attempted_type,
+            "final_type": None,
+            "outcome": "failed",
+            "reason": str(reason),
+            "created_entity_ids": list(
+                failure_evidence.get("created_entity_ids") or []
+            ),
+            "support_entity_ids": [],
+            "removed_entity_ids": list(
+                failure_evidence.get("removed_entity_ids") or []
+            ),
+            "cleanup_complete": bool(cleanup_complete),
+            "evidence": failure_evidence,
+        }
+        raise TextRepresentationFailure(
+            "%s delivery failed for %s: %s"
+            % (attempted_type, source_item_id or "item", reason),
+            attempt,
+        )
+
+    try:
+        page_number = bound_item.get("page_number")
+        block_index = bound_item.get("block_index")
+        line_index = bound_item.get("line_index")
+        span_index = bound_item.get("span_index")
+        pdf_sha256 = bound_item.get("pdf_sha256")
+        bbox = _finite_source_tuple(bound_item.get("bbox"), 4, "item.bbox")
+        source_text = bound_item.get("text")
+        span = bound_item.get("span")
+        span_bbox = _finite_source_tuple(
+            span.get("bbox") if isinstance(span, dict) else None,
+            4,
+            "span.bbox",
+        )
+        expected_source_item_id = "p%d:b%d:l%d:s%d" % (
+            page_number,
+            block_index,
+            line_index,
+            span_index,
+        )
+        if (
+            bound_item.get("importer_identity") != FREECAD_TEXT_IMPORTER_IDENTITY
+            or type(page_number) is not int
+            or page_number <= 0
+            or any(
+                type(index) is not int or index < 0
+                for index in (block_index, line_index, span_index)
+            )
+            or source_item_id != expected_source_item_id
+            or not isinstance(pdf_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", pdf_sha256) is None
+            or not isinstance(source_text, str)
+            or not source_text
+            or source_text.isspace()
+            or not isinstance(span, dict)
+            or span.get("text") != source_text
+            or requested_type not in TEXT_ITEM_FALLBACK_LADDERS
+            or str(getattr(opts, "text_mode", "") or "").strip().lower()
+            != requested_type
+            or attempted_type not in {"glyphs", "geometry"}
+            or attempted_type not in TEXT_ITEM_FALLBACK_LADDERS[requested_type]
+            or not isinstance(bound_item.get("bbox"), tuple)
+            or not isinstance(span.get("bbox"), tuple)
+            or span_bbox != bbox
+            or bbox[2] <= bbox[0]
+            or bbox[3] <= bbox[1]
+            or not isinstance(pdf_path, str)
+            or not pdf_path.strip()
+            or fc_doc is None
+            or any(
+                not math.isfinite(float(value)) or float(value) <= 0.0
+                for value in (page_h, page_w, scale)
+            )
+        ):
+            raise ValueError("canonical SVG text item delivery context is invalid")
+    except Exception as exc:
+        raise_attempt(
+            "invalid_svg_text_source_item",
+            {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+        )
+
+    try:
+        baseline_object_ids = {
+            id(host_obj)
+            for host_obj in list(getattr(fc_doc, "Objects", []) or [])
+        }
+    except Exception as exc:
+        raise_attempt(
+            "svg_text_document_snapshot_failed",
+            {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+        )
+
+    def fail_after_render(
+        reason: str,
+        evidence: Optional[Dict[str, Any]] = None,
+    ):
+        failure_evidence = dict(evidence or {})
+        evidence_created = [
+            value
+            for value in list(failure_evidence.get("created_entity_ids") or [])
+            if isinstance(value, str) and value
+        ]
+        evidence_removed = [
+            value
+            for value in list(failure_evidence.get("removed_entity_ids") or [])
+            if isinstance(value, str) and value
+        ]
+        collection_error = ""
+        owned_now: List[Any] = []
+        try:
+            current_objects = list(getattr(fc_doc, "Objects", []) or [])
+            owned_now = [
+                host_obj
+                for host_obj in current_objects
+                if id(host_obj) not in baseline_object_ids
+            ]
+        except Exception as exc:
+            collection_error = "%s: %s" % (exc.__class__.__name__, exc)
+        current_created = [_host_object_id(host_obj) for host_obj in owned_now]
+        current_removed: List[str] = []
+        helper_complete = not owned_now
+        if owned_now:
+            try:
+                current_removed, helper_complete = _remove_owned_text_objects(
+                    fc_doc, parent_group, owned_now
+                )
+            except Exception as exc:
+                failure_evidence["cleanup_error"] = "%s: %s" % (
+                    exc.__class__.__name__, exc
+                )
+                helper_complete = False
+        created_ids = list(dict.fromkeys(evidence_created + current_created))
+        removed_ids = list(dict.fromkeys(evidence_removed + current_removed))
+        cleanup_complete = bool(
+            not collection_error
+            and helper_complete
+            and failure_evidence.get("cleanup_complete", True) is True
+            and all(created_ids)
+            and set(created_ids) == set(removed_ids)
+        ) if created_ids else bool(
+            not collection_error
+            and helper_complete
+            and failure_evidence.get("cleanup_complete", True) is True
+            and not removed_ids
+        )
+        failure_evidence["created_entity_ids"] = created_ids
+        failure_evidence["removed_entity_ids"] = removed_ids
+        failure_evidence["cleanup_complete"] = cleanup_complete
+        if collection_error:
+            failure_evidence["ownership_collection_error"] = collection_error
+        raise_attempt(
+            reason,
+            failure_evidence,
+            cleanup_complete=cleanup_complete,
+        )
+
+    def impossible_after_render(
+        reason: str,
+        evidence: Optional[Dict[str, Any]] = None,
+    ):
+        cleaned_attempt: Dict[str, Any] = {}
+        try:
+            fail_after_render(reason, evidence)
+        except TextRepresentationFailure as cleaned_failure:
+            cleaned_attempt = dict(cleaned_failure.attempt or {})
+        if cleaned_attempt.get("cleanup_complete") is not True:
+            raise TextRepresentationFailure(
+                "SVG item impossibility cleanup was incomplete",
+                cleaned_attempt,
+            )
+        created_ids = list(cleaned_attempt.get("created_entity_ids") or [])
+        removed_ids = list(cleaned_attempt.get("removed_entity_ids") or [])
+        proof_evidence = {
+            "source_item_id": source_item_id,
+            "source_bbox": bbox,
+            "renderer_reason": reason,
+            "renderer_evidence": dict(evidence or {}),
+        }
+        proof = {
+            "item_specific_proven_impossible": True,
+            "importer_identity": FREECAD_TEXT_IMPORTER_IDENTITY,
+            "pdf_sha256": pdf_sha256,
+            "page_number": page_number,
+            "source_item_id": source_item_id,
+            "requested_type": requested_type,
+            "attempted_type": attempted_type,
+            "reason_code": reason,
+            "evidence": proof_evidence,
+            "attempted_source_results": [
+                {
+                    "source": "svg_item_renderer",
+                    "outcome": "proven_impossible",
+                    "reason_code": reason,
+                    "pdf_sha256": pdf_sha256,
+                    "page_number": page_number,
+                    "source_item_id": source_item_id,
+                }
+            ],
+            "attempted_sources_complete": True,
+            "created_entity_ids": created_ids,
+            "removed_entity_ids": removed_ids,
+            "cleanup_complete": True,
+        }
+        impossible_attempt = dict(cleaned_attempt)
+        impossible_attempt.update(
+            {
+                "final_type": None,
+                "outcome": "proven_impossible",
+                "reason": reason,
+                "reason_code": reason,
+                "proof": proof,
+            }
+        )
+        raise TextItemImpossible(
+            "%s is proven impossible for %s" % (attempted_type, source_item_id),
+            attempt=impossible_attempt,
+            proof=proof,
+        )
+
+    try:
+        from PDFVectorImporter.src.PDFSvgTextRenderer import (
+            TextRepresentationRenderError,
+            render_text,
+        )
+    except Exception as exc:
+        fail_after_render(
+            "svg_renderer_exception",
+            {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+        )
+
+    try:
+        result = render_text(
+            pdf_path,
+            page_number,
+            float(page_h),
+            float(scale),
+            float(page_w),
+            fc_doc=fc_doc,
+            parent_group=parent_group,
+            flip_y=bool(getattr(opts, "flip_y", True)),
+            representation=attempted_type,
+            source_item=bound_item,
+            requested_representation=requested_type,
+            page_rotation_matrix=_page_matrix_values(opts),
+            render_cache=render_cache,
+        )
+    except TextRepresentationRenderError as exc:
+        renderer_reason = str(
+            getattr(exc, "reason", "") or "svg_text_render_failed"
+        )
+        renderer_evidence = dict(getattr(exc, "evidence", {}) or {})
+        if renderer_reason in CLOSED_SVG_ITEM_IMPOSSIBILITY_REASONS:
+            impossible_after_render(renderer_reason, renderer_evidence)
+        fail_after_render(renderer_reason, renderer_evidence)
+    except Exception as exc:
+        fail_after_render(
+            "svg_renderer_exception",
+            {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+        )
+
+    try:
+        created_ids = result.get("created_entity_ids")
+        attempts = result.get("delivery_attempts")
+        attempt = attempts[0]
+        entity_count = result.get("entities")
+        delivery_count = (
+            result.get("raw_edges")
+            if attempted_type == "geometry"
+            else result.get("glyphs")
+        )
+        item_filter_evidence = result.get("item_filter")
+        attempt_evidence = attempt.get("evidence")
+        child_ids = attempt_evidence.get("child_source_item_ids")
+        child_id_pattern = re.compile(
+            re.escape(source_item_id)
+            + (r":geometry" if attempted_type == "geometry" else r":g\d+")
+        )
+        if (
+            not isinstance(result, dict)
+            or result.get("outcome") != "verified"
+            or result.get("entity_type") != attempted_type
+            or result.get("source_item_id") != source_item_id
+            or type(entity_count) is not int
+            or entity_count <= 0
+            or type(delivery_count) is not int
+            or delivery_count <= 0
+            or not isinstance(created_ids, list)
+            or len(created_ids) != entity_count
+            or any(not isinstance(value, str) or not value for value in created_ids)
+            or len(set(created_ids)) != entity_count
+            or not isinstance(attempts, list)
+            or len(attempts) != 1
+            or not isinstance(attempt, dict)
+            or attempt.get("source_item_id") != source_item_id
+            or attempt.get("requested_type") != requested_type
+            or attempt.get("attempted_type") != attempted_type
+            or attempt.get("final_type") != attempted_type
+            or attempt.get("outcome") != "verified"
+            or attempt.get("created_entity_ids") != created_ids
+            or type(attempt.get("delivery_count")) is not int
+            or attempt.get("delivery_count") != delivery_count
+            or attempt.get("support_entity_ids") != []
+            or attempt.get("removed_entity_ids") != []
+            or attempt.get("cleanup_complete") is not True
+            or not isinstance(item_filter_evidence, dict)
+            or not item_filter_evidence.get("matched_placement_indices")
+            or not isinstance(attempt_evidence, dict)
+            or attempt_evidence.get("source_item_bbox") != bbox
+            or attempt_evidence.get("matched_placement_indices")
+            != item_filter_evidence.get("matched_placement_indices")
+            or not isinstance(child_ids, list)
+            or len(child_ids) != entity_count
+            or any(
+                not isinstance(child_id, str)
+                or child_id_pattern.fullmatch(child_id) is None
+                for child_id in child_ids
+            )
+            or len(set(child_ids)) != entity_count
+        ):
+            raise ValueError("item-filtered SVG result contract is invalid")
+
+        current_objects = list(getattr(fc_doc, "Objects", []) or [])
+        delivered_objects = [
+            host_obj
+            for host_obj in current_objects
+            if id(host_obj) not in baseline_object_ids
+        ]
+        delivered_ids = [_host_object_id(host_obj) for host_obj in delivered_objects]
+        live_child_ids = [
+            getattr(host_obj, "PDFSourceItemId", None)
+            for host_obj in delivered_objects
+        ]
+        if (
+            len(delivered_objects) != entity_count
+            or set(delivered_ids) != set(created_ids)
+            or len(live_child_ids) != entity_count
+            or len(set(live_child_ids)) != entity_count
+            or set(live_child_ids) != set(child_ids)
+            or any(
+                str(getattr(host_obj, "TypeId", "") or "") != "Part::Feature"
+                or getattr(host_obj, "PDFParentSourceItemId", None) != source_item_id
+                or getattr(host_obj, "PDFRepresentation", None) != attempted_type
+                for host_obj in delivered_objects
+            )
+        ):
+            raise ValueError("item-filtered SVG host entities are invalid")
+    except Exception as exc:
+        result_summary = {
+            "exception": "%s: %s" % (exc.__class__.__name__, exc),
+            "created_entity_ids": (
+                list(result.get("created_entity_ids") or [])
+                if isinstance(result, dict)
+                else []
+            ),
+        }
+        fail_after_render(
+            "requested_representation_verification_failed",
+            result_summary,
+        )
+
+    return copy.deepcopy(attempt)
+
+
+def _render_canonical_text_items(
+    *,
+    pdf_doc,
+    page,
+    pdf_path: str,
+    page_num: int,
+    page_h: float,
+    page_w: float,
+    scale: float,
+    fc_doc,
+    parent_group,
+    opts: ImportOptions,
+    pdf_sha256: str,
+    raw_tdict: Optional[dict] = None,
+) -> Dict[str, Any]:
+    """Deliver raw PDF spans through the finite item representation contract."""
+    requested = _normalize_requested_text_type(str(opts.text_mode or ""))
+    source_dict = raw_tdict if raw_tdict is not None else page.get_text("dict")
+    items = list(
+        _iter_text_source_items(source_dict, int(page_num), pdf_sha256, requested)
+    )
+
+    font_stage_complete = False
+    svg_render_cache: Dict[str, Any] = {
+        "source_item_manifest": [
+            {
+                "source_order": source_order,
+                "source_item_id": item["source_item_id"],
+                "page_number": item["page_number"],
+                "pdf_sha256": item["pdf_sha256"],
+                "bbox": item["bbox"],
+                "text": item["text"],
+            }
+            for source_order, item in enumerate(items)
+        ]
+    }
+
+    def deliver_3d(item, attempted, state):
+        nonlocal font_stage_complete
+        if not font_stage_complete:
+            _stage_page_shapestring_fonts(
+                pdf_doc,
+                page,
+                opts,
+                pdf_sha256=pdf_sha256,
+                page_number=int(page_num),
+            )
+            font_stage_complete = True
+        return _deliver_text_item_3d(
+            item,
+            attempted,
+            state,
+            text_group=parent_group,
+            page_h=page_h,
+            scale=scale,
+        )
+
+    deliverers = {
+        "text": lambda item, attempted, state: _deliver_text_item_native(
+            item,
+            attempted,
+            state,
+            text_group=parent_group,
+            page_h=page_h,
+            scale=scale,
+        ),
+        "labels": lambda item, attempted, state: _deliver_text_item_native(
+            item,
+            attempted,
+            state,
+            text_group=parent_group,
+            page_h=page_h,
+            scale=scale,
+        ),
+        "3d_text": deliver_3d,
+        "glyphs": lambda item, attempted, state: _deliver_text_item_svg(
+            item,
+            attempted,
+            state,
+            pdf_path=pdf_path,
+            page_h=page_h,
+            page_w=page_w,
+            scale=scale,
+            fc_doc=fc_doc,
+            parent_group=parent_group,
+            render_cache=svg_render_cache,
+        ),
+        "geometry": lambda item, attempted, state: _deliver_text_item_svg(
+            item,
+            attempted,
+            state,
+            pdf_path=pdf_path,
+            page_h=page_h,
+            page_w=page_w,
+            scale=scale,
+            fc_doc=fc_doc,
+            parent_group=parent_group,
+            render_cache=svg_render_cache,
+        ),
+        "raster": lambda item, attempted, state: _deliver_text_item_raster(
+            item,
+            attempted,
+            state,
+            page=page,
+            page_h=page_h,
+            scale=scale,
+            fc_doc=fc_doc,
+            parent_group=parent_group,
+        ),
+    }
+
+    results: List[Dict[str, Any]] = []
+    delivered_source_ids: List[str] = []
+    final_types: List[str] = []
+    delivered_entity_count = 0
+    bucket_by_type = {
+        "text": "native_text",
+        "labels": "native_label",
+        "3d_text": "native_3d_text",
+        "glyphs": "outline_curve_or_mesh",
+        "geometry": "raw_geometry_edges",
+        "raster": "raster_text_patch",
+    }
+    for item in items:
+        result = _run_text_item_fallback_ladder(item, requested, deliverers, opts)
+        results.append(result)
+        source_item_id = str(result["source_item_id"])
+        final_type = str(result["final_type"])
+        delivery_ids = result.get(
+            "delivery_entity_ids", result.get("created_entity_ids")
+        )
+        reported_delivery_count = result.get("delivery_count")
+        created_count = (
+            int(reported_delivery_count)
+            if type(reported_delivery_count) is int and reported_delivery_count > 0
+            else len(list(delivery_ids or []))
+        )
+        delivered_source_ids.append(source_item_id)
+        final_types.append(final_type)
+        delivered_entity_count += created_count
+        _record_text_delivery(opts, bucket_by_type[final_type], created_count)
+
+    unique_final_types = sorted(set(final_types))
+    return {
+        "entity_type": (
+            unique_final_types[0] if len(unique_final_types) == 1 else "mixed"
+        ),
+        "count": delivered_entity_count,
+        "source_item_count": len(results),
+        "source_item_ids": delivered_source_ids,
+        "font_rendered": any(value in {"text", "labels", "3d_text"} for value in final_types),
+        "examples": [],
+        "attempts": results,
     }
 
 
@@ -2493,12 +6161,8 @@ def _preprocess_text_blocks(tdict: dict) -> dict:
 def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
                            opts: ImportOptions, scale: float,
                            parent, fc_doc):
-    """Render a PDF page as a raster image and place it as an ImagePlane.
-
-    Used for scanned PDFs, map/art PDFs, or pages with no usable vector content.
-    DPI is auto-scaled to page physical size so small pages stay crisp and
-    very large pages don't exhaust memory.
-    """
+    """Render, persist, place, and reread one verified full-page ImagePlane."""
+    del pdf_doc, page_h
     dpi = opts.raster_dpi or 200
 
     # Adaptive DPI: scale with page physical size so the image is always
@@ -2541,17 +6205,27 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
                 f"Page {page_num}: raster render failed at {candidate} DPI: {e}"
             )
     if pix is None:
-        _warn(f"Raster render failed after retries: {last_error}")
-        return
+        raise RuntimeError(
+            "Raster render failed after retries: %s" % (last_error or "unknown error")
+        )
 
-    # Save to temp file
-    tmpdir = os.path.join(FreeCAD.getUserAppDataDir(),
-                          "Mod", "PDFVectorImporter", "temp")
-    os.makedirs(tmpdir, exist_ok=True)
-    img_path = os.path.join(tmpdir, f"page_{page_num}_{dpi}dpi.png")
-    pix.save(img_path)
-    # Register cleanup: remove temp image when document is closed or on next import
-    _register_temp_cleanup(img_path)
+    digest = str(getattr(opts, "_pdf_sha256", "") or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        digest = hashlib.sha256(
+            ("page=%d|dpi=%d|w=%.9g|h=%.9g" % (
+                page_num, dpi, float(page.rect.width), float(page.rect.height)
+            )).encode("utf-8")
+        ).hexdigest()
+    asset_dir = _raster_asset_dir()
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    img_path = asset_dir / ("page_%s_p%d_%ddpi.png" % (digest, page_num, dpi))
+    try:
+        _save_pixmap_atomic(pix, img_path)
+    except (RuntimeError, OSError, ValueError, TypeError) as exc:
+        raise RuntimeError("Raster asset could not be persisted: %s" % exc) from exc
+    if not img_path.is_file() or img_path.stat().st_size <= 0:
+        raise RuntimeError("Raster asset was not persisted")
+    raster_sha256 = _path_sha256(img_path)
 
     # Match the vector/text transform exactly: PDF page units multiplied by the
     # effective import scale (MM_PER_PT when scale_to_mm is enabled, plus any
@@ -2559,17 +6233,82 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
     w_units = page.rect.width * scale
     h_units = page.rect.height * scale
 
+    baseline_ids = {id(host_obj) for host_obj in _document_objects(fc_doc)}
+    ip = None
     try:
         ip = fc_doc.addObject("Image::ImagePlane", f"Page_{page_num}_raster")
-        ip.ImageFile = img_path
+        if ip is None or id(ip) in baseline_ids:
+            raise RuntimeError("ImagePlane factory returned no new host object")
+        ip.ImageFile = str(img_path)
         ip.XSize = w_units
         ip.YSize = h_units
         ip.Placement = Placement(_v(0, 0, -0.1), Rotation())  # slightly behind vectors
+        add_property = getattr(ip, "addProperty", None)
+        if not callable(add_property):
+            raise RuntimeError("ImagePlane cannot embed its raster asset")
+        if "PDFRasterFile" not in set(getattr(ip, "PropertiesList", []) or []):
+            add_property("App::PropertyFileIncluded", "PDFRasterFile", "PDF Import")
+        ip.PDFRasterFile = str(img_path)
+        if "PDFSourceSHA256" not in set(getattr(ip, "PropertiesList", []) or []):
+            add_property("App::PropertyString", "PDFSourceSHA256", "PDF Import")
+        ip.PDFSourceSHA256 = digest
+        if "PDFRasterSHA256" not in set(getattr(ip, "PropertiesList", []) or []):
+            add_property("App::PropertyString", "PDFRasterSHA256", "PDF Import")
+        ip.PDFRasterSHA256 = raster_sha256
+        _annotate_text_host_object(ip, "p%d:page" % int(page_num), "raster")
         parent.addObject(ip)
-        _msg(f"Placed page {page_num} as {dpi} DPI raster ({w_units:.0f} x {h_units:.0f} model units)")
-    except (RuntimeError, OSError, ValueError, TypeError) as e:
-        _warn(f"Raster placement failed: {e}\n"
-              f"Image saved to: {img_path}")
+        fc_doc.recompute()
+        entity_id = _host_object_id(ip)
+        live = fc_doc.getObject(entity_id)
+        anchor = _host_anchor_xyz(ip)
+        raster_file_evidence = _raster_file_evidence(ip, img_path)
+        if (
+            not entity_id
+            or live is not ip
+            or str(getattr(ip, "TypeId", "")) != "Image::ImagePlane"
+            or str(getattr(ip, "PDFSourceSHA256", "")) != digest
+            or str(getattr(ip, "PDFRasterSHA256", ""))
+            != raster_file_evidence["source_asset_sha256"]
+            or not math.isclose(float(ip.XSize), float(w_units), abs_tol=1e-7)
+            or not math.isclose(float(ip.YSize), float(h_units), abs_tol=1e-7)
+            or anchor is None
+            or any(
+                abs(anchor[index] - expected) > 1e-7
+                for index, expected in enumerate((0.0, 0.0, -0.1))
+            )
+            or getattr(ip, "PDFSourceItemId", None) != "p%d:page" % int(page_num)
+            or getattr(ip, "PDFRepresentation", None) != "raster"
+        ):
+            raise RuntimeError("full-page raster host evidence could not be verified")
+    except Exception as exc:
+        if ip is not None:
+            try:
+                _remove_owned_text_objects(fc_doc, parent, [ip])
+            except Exception:
+                pass
+        raise RuntimeError("Raster placement failed: %s" % exc) from exc
+
+    _msg(
+        f"Placed page {page_num} as {dpi} DPI raster "
+        f"({w_units:.0f} x {h_units:.0f} model units)"
+    )
+    return {
+        "outcome": "verified",
+        "entity_type": "raster",
+        "created_entity_ids": [entity_id],
+        "evidence": {
+            "host_entity_type": "Image::ImagePlane",
+            "raster_file": str(img_path),
+            "raster_file_included": True,
+            "pdf_sha256": digest,
+            "dpi": int(dpi),
+            "pixel_width": int(getattr(pix, "width", 0) or 0),
+            "pixel_height": int(getattr(pix, "height", 0) or 0),
+            "x_size": float(w_units),
+            "y_size": float(h_units),
+            **raster_file_evidence,
+        },
+    }
 
 
 def _raster_pixel_budget() -> int:
@@ -2688,6 +6427,7 @@ def import_pdf_page(pdf_path: str, page_num: int = 1,
     """Import a single PDF page into the active FreeCAD document."""
     if opts is None:
         opts = ImportOptions(ignore_images=not IMAGE_WB)
+    _reset_import_run_state(opts)
     fc_doc = _ensure_doc()  # Store reference — don't rely on ActiveDocument later
 
     # Validate PDF before opening
@@ -2720,17 +6460,16 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
     opts._provenance_page = int(page_num)
 
     page = pdf_doc.load_page(page_num - 1)
-    # Use rotation-corrected height for Y-flip — for 90°/270° pages the
-    # display height equals the raw mediabox *width*, not height.
-    _fc_rot = int(getattr(page, "rotation", 0) or 0) % 360
+    # PyMuPDF drawing/text coordinates are in unrotated crop-box space.  Apply
+    # its authoritative rotation matrix once, then flip the displayed page's Y.
     try:
-        _fc_mb = page.mediabox
-        _fc_mb_w, _fc_mb_h = float(_fc_mb.width), float(_fc_mb.height)
-    except AttributeError:
-        _fc_mb_w, _fc_mb_h = float(page.rect.width), float(page.rect.height)
-    page_h = _fc_mb_w if _fc_rot in (90, 270) else _fc_mb_h
+        opts._page_rotation_matrix = tuple(float(v) for v in page.rotation_matrix)
+    except (AttributeError, TypeError, ValueError):
+        opts._page_rotation_matrix = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    page_w = float(page.rect.width)
+    page_h = float(page.rect.height)
     scale = (MM_PER_PT if opts.scale_to_mm else 1.0) * opts.user_scale
-    page_area_units = max(abs(_fc_mb_w * scale * page_h * scale), 1e-9)
+    page_area_units = max(abs(page_w * scale * page_h * scale), 1e-9)
 
     # Top-level group
     top_group = None
@@ -2837,10 +6576,10 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
 
     # ── Determine effective import mode ──
     effective_mode = opts.import_mode
+    n_text_blocks = 0
     if effective_mode == "auto":
         # Auto-detect: profile the page content to choose best mode
         _progress_update(2, "Analyzing page content...")
-        n_text_blocks = 0
         try:
             # blocks is far cheaper than dict on text-heavy shop drawings.
             blocks = page.get_text("blocks") or []
@@ -2951,34 +6690,57 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                  + (" (use Import Mode = Vectors to override)"
                     if effective_mode == "raster" and _flood_reason else ""))
 
+    auto_raster_text_overlay = _auto_raster_needs_text_overlay(
+        effective_mode,
+        n_text_blocks,
+        opts,
+    )
+    if auto_raster_text_overlay:
+        opts.auto_resolved_mode = "hybrid"
+        opts.auto_reason = (
+            str(opts.auto_reason or "Raster content strategy").rstrip()
+            + "; requested text representation preserved"
+        )
+
     if _progress_check_cancel():
         if progress:
             progress.close()
         fc_doc.recompute()
-        return top_group
+        return top_group, None
 
     placed_full_page_raster_background = False
+    full_page_raster_result = None
 
-    # ── Raster-only mode ──
+    # ── Raster-only mode, optionally with the separately requested text layer ──
     if effective_mode == "raster":
         _record_raster_page(opts, opts.auto_reason or "raster mode")
         _msg(f"Page {page_num}: rendering at {opts.raster_dpi} DPI (raster mode)")
         _progress_update(5, f"Rendering raster image at {opts.raster_dpi} DPI...")
-        _import_page_as_raster(
+        full_page_raster_result = _import_page_as_raster(
             pdf_doc, page, page_num, page_h, opts, scale,
             top_group or fc_doc, fc_doc)
-        if progress:
-            progress.setValue(100)
-            progress.close()
-        fc_doc.recompute()
-        _msg(f"Page {page_num}: imported as raster image")
-        return top_group
+        if auto_raster_text_overlay:
+            placed_full_page_raster_background = True
+            drawings = []
+            n_drawings = 0
+            effective_mode = "raster_text_overlay"
+            _msg(
+                f"Page {page_num}: raster background placed; rendering requested "
+                f"{opts.text_mode} text representation"
+            )
+        else:
+            if progress:
+                progress.setValue(100)
+                progress.close()
+            fc_doc.recompute()
+            _msg(f"Page {page_num}: imported as raster image")
+            return top_group, None
 
     # ── Hybrid mode: place raster background, then overlay vectors ──
     if effective_mode == "hybrid":
         _msg(f"Page {page_num}: placing {opts.raster_dpi} DPI raster background…")
         _progress_update(5, f"Rendering raster image at {opts.raster_dpi} DPI...")
-        _import_page_as_raster(
+        full_page_raster_result = _import_page_as_raster(
             pdf_doc, page, page_num, page_h, opts, scale,
             top_group or fc_doc, fc_doc)
         placed_full_page_raster_background = True
@@ -2997,7 +6759,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 opts,
                 "legacy_vector_raster_fallback: scanned/raster page"
             )
-            _import_page_as_raster(
+            full_page_raster_result = _import_page_as_raster(
                 pdf_doc, page, page_num, page_h, opts, scale,
                 top_group or fc_doc, fc_doc)
             if progress:
@@ -3005,7 +6767,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 progress.close()
             fc_doc.recompute()
             _msg(f"Page {page_num}: imported as raster image")
-            return top_group
+            return top_group, None
 
     # ── Hatch detection ──
     hatch_indices = set()
@@ -3147,7 +6909,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     _flush_batch(force=True)
                 progress.close()
                 fc_doc.recompute()
-                return top_group
+                return top_group, None
 
         items = path_group.get("items", [])
         if not items:
@@ -3438,12 +7200,14 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                         f"Building compound {_flush_idx}/{n_style_keys}...")
                 if _progress_check_cancel():
                     fc_doc.recompute()
-                    return top_group
+                    return top_group, None
                 _flush_batch(_fk, force=True)
         if opts.verbose:
             total_batches = sum(_batch_idx.values())
             _msg(f"Page {page_num}: geometry batched into {total_batches} "
                  f"compound(s) (batch_size={_batch_size})")
+
+    text_entity_info = None
 
     # ── Text import ──
     if opts.import_text and opts.text_mode != "none":
@@ -3451,469 +7215,162 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
 
         if _progress_check_cancel():
             fc_doc.recompute()
-            return top_group
+            return top_group, None
+        text_group = _make_group(top_group or fc_doc, "Text", fc_doc)
+        try:
+            raw_tdict = page.get_text("dict")
+        except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
+            attempt = {
+                "source_item_id": "p%d:page" % int(page_num),
+                "requested_type": str(opts.text_mode),
+                "attempted_type": str(opts.text_mode),
+                "final_type": None,
+                "outcome": "failed",
+                "reason": "source_text_extraction_failed",
+                "created_entity_ids": [],
+                "removed_entity_ids": [],
+                "cleanup_complete": True,
+                "evidence": {
+                    "exception": "%s: %s" % (exc.__class__.__name__, exc)
+                },
+            }
+            opts.text_delivery_attempts.append(attempt)
+            raise TextRepresentationFailure(
+                "Source text extraction failed for page %d" % int(page_num),
+                attempt,
+            ) from exc
 
-        # Try SVG vector text (Glyphs / Geometry modes). Poppler/pdftocairo is
-        # preferred; bundled PyMuPDF is used when Poppler is absent.
-        svg_text_done = False
-        svg_failure_reason = None
-        text_entity_info = None
-        if opts.text_mode in ("glyphs", "geometry"):
-            try:
-                from PDFVectorImporter.src.PDFSvgTextRenderer import render_text
-                text_parent = top_group or fc_doc
-                label = "text geometry" if opts.text_mode == "geometry" else "text glyphs"
-                _progress_update(87, f"Rendering {label} via SVG renderer...")
-                result = render_text(
-                    pdf_path, page_num, page_h, scale, page.rect.width,
-                    fc_doc=fc_doc, parent_group=text_parent, flip_y=opts.flip_y)
-                if result and result.get("glyphs", 0) > 0:
-                    svg_text_done = True
-                    obj_count += 1
-                    n_glyphs = result['glyphs']
-                    entity_type = result.get('entity_type', 'glyphs')
-                    _record_text_delivery(opts, "outline_curve_or_mesh", n_glyphs)
-                    text_entity_info = {
-                        'entity_type': entity_type,
-                        'count': n_glyphs,
-                        'font_rendered': False,
-                        'examples': []
-                    }
-                    _progress_update(
-                        89,
-                        f"Rendering {label} ({n_glyphs} items)...")
-                    if opts.verbose:
-                        _msg(f"  Text: {result['glyphs']} glyphs from "
-                             f"{result['shapes']} unique shapes "
-                             f"({result.get('renderer', 'svg')})")
-                else:
-                    svg_failure_reason = "svg_renderer_empty"
-                    _warn(
-                        "SVG text renderer returned no glyphs, walking the "
-                        "text-mode fallback ladder")
-            except (RuntimeError, ValueError, TypeError, OSError, ImportError, AttributeError) as e:
-                # TEXTMODE-1: this is a fallback trigger, not a fix — the
-                # ladder below walks 3D Text before Draft labels and reports.
-                svg_failure_reason = "svg_renderer_failed"
-                _warn(f"SVG text renderer failed, walking the text-mode fallback ladder: {e}")
-
-        # Fall back to Draft text (Labels mode, or if pdftocairo unavailable)
-        if not svg_text_done:
-          try:
-            tdict = _preprocess_text_blocks(page.get_text("dict"))
-            layout_context = _build_text_layout_context(tdict)
-            text_group = _make_group(top_group or fc_doc, "Text", fc_doc)
-            # TEXTMODE-1: when a whole text mode degrades to Draft labels, the
-            # substitution is recorded once the label rungs report how many
-            # spans they actually delivered (never silent).
-            pending_label_fallback = None
-            labels_delivered = 0
-
-            # TEXTMODE-1 (final FC ladder): glyphs/geometry whose SVG renderer
-            # failed walk the CLOSER 3D Text (ShapeString) rung before Draft
-            # labels; whichever rung delivers is recorded as a loud fallback.
-            if svg_failure_reason and opts.text_mode in ("glyphs", "geometry"):
-                rung_count, rung_info, pending_label_fallback = (
-                    _walk_glyph_svg_failure_rungs(
-                        tdict, text_group, page_h, opts, scale,
-                        layout_context, svg_failure_reason,
-                    )
+        pdf_sha256 = str(getattr(opts, "_pdf_sha256", "") or "")
+        if re.fullmatch(r"[0-9a-f]{64}", pdf_sha256) is None:
+            pdf_sha256 = _pdf_file_sha256(pdf_path)
+            opts._pdf_sha256 = pdf_sha256
+        text_entity_info = _render_canonical_text_items(
+            pdf_doc=pdf_doc,
+            page=page,
+            pdf_path=pdf_path,
+            page_num=int(page_num),
+            page_h=float(page_h),
+            page_w=float(page.rect.width),
+            scale=float(scale),
+            fc_doc=fc_doc,
+            parent_group=text_group,
+            opts=opts,
+            pdf_sha256=pdf_sha256,
+            raw_tdict=raw_tdict,
+        )
+        if int(text_entity_info.get("source_item_count", 0) or 0) <= 0:
+            requested = _normalize_requested_text_type(str(opts.text_mode or ""))
+            page_source_id = "p%d:page" % int(page_num)
+            if full_page_raster_result is None:
+                full_page_raster_result = _import_page_as_raster(
+                    pdf_doc,
+                    page,
+                    page_num,
+                    page_h,
+                    opts,
+                    scale,
+                    text_group,
+                    fc_doc,
                 )
-                if rung_count > 0:
-                    obj_count += rung_count
-                    text_entity_info = rung_info
-                    _progress_update(
-                        89,
-                        f"Rendering fallback text ({rung_count} spans)...")
-                    tdict = {"blocks": []}
-
-            # 3D Text uses extruded ShapeStrings; labels use editable Draft text.
-            if opts.text_mode == "3d_text":
-                _skips_before = dict(getattr(opts, "shapestring_skips", {}) or {})
-                span_count = _render_text_spans_3d(
-                    tdict, text_group, page_h, opts, scale, layout_context=layout_context
+                placed_full_page_raster_background = True
+            raster_ids = list(
+                full_page_raster_result.get("created_entity_ids") or []
+            )
+            if not raster_ids:
+                raise TextRepresentationFailure(
+                    "Raster fallback produced no verified page entity",
+                    {
+                        "source_item_id": page_source_id,
+                        "requested_type": requested,
+                        "attempted_type": "raster",
+                        "final_type": None,
+                        "outcome": "failed",
+                        "reason": "empty_verified_raster_result",
+                        "created_entity_ids": [],
+                        "removed_entity_ids": [],
+                        "cleanup_complete": True,
+                    },
                 )
-                if span_count > 0:
-                    obj_count += span_count
-                    text_entity_info = {
-                        'entity_type': '3d_text',
-                        'count': span_count,
-                        'font_rendered': True,
-                        'examples': []
-                    }
-                    _progress_update(
-                        89,
-                        f"Rendering 3D text ({span_count} spans)...")
-                    if opts.verbose:
-                        _msg(f"  Text: {span_count} extruded ShapeString spans")
-                    tdict = {"blocks": []}
-                else:
-                    _skips_now = getattr(opts, "shapestring_skips", {}) or {}
-                    if int(_skips_now.get("no_ttf_font", 0)) > int(
-                        _skips_before.get("no_ttf_font", 0)
-                    ):
-                        _reason_3d = "no_ttf_font"
-                    else:
-                        _reason_3d = "shapestring_unavailable"
-                    _record_shapestring_skip(opts, "fallback_to_labels")
-                    # TEXTMODE-1: fallback warnings are loud — never verbose-gated.
-                    _warn("3D Text mode produced 0 spans — falling back to labels")
-                    pending_label_fallback = {
-                        "requested": "3d_text",
-                        "reason": _reason_3d,
-                    }
-
-            # High-fidelity Labels path: render each PDF span at its exact origin.
-            # This preserves stacked fractions and micro-positioning much closer
-            # to the source PDF than reconstructed line text.
-            prefer_exact_labels = bool(getattr(opts, "strict_text_fidelity", True))
-            _env_exact = os.environ.get("BC_PDF_EXACT_LABELS", "").strip().lower()
-            if _env_exact:
-                prefer_exact_labels = _env_exact not in ("0", "false", "off", "no")
-            exact_span_count = 0
-            if prefer_exact_labels:
-                exact_span_count = _render_text_spans_exact_labels(
-                    tdict, text_group, page_h, opts, scale, layout_context=layout_context
-                )
-                if exact_span_count > 0:
-                    obj_count += exact_span_count
-                    labels_delivered += exact_span_count
-                    if text_entity_info is None:
-                        text_entity_info = {
-                            'entity_type': 'labels',
-                            'count': exact_span_count,
-                            'font_rendered': True,
-                            'examples': []
+            if requested != "raster":
+                proof = {
+                    "item_specific_proven_impossible": True,
+                    "importer_identity": FREECAD_TEXT_IMPORTER_IDENTITY,
+                    "pdf_sha256": pdf_sha256,
+                    "page_number": int(page_num),
+                    "source_item_id": page_source_id,
+                    "requested_type": requested,
+                    "attempted_type": requested,
+                    "reason_code": "no_source_text_items",
+                    "evidence": {
+                        "text_dictionary_present": isinstance(raw_tdict, dict),
+                        "canonical_source_item_count": 0,
+                    },
+                    "attempted_types": [requested],
+                    "attempted_source_results": [
+                        {
+                            "source": "pymupdf_text_dictionary",
+                            "outcome": "not_found",
+                            "pdf_sha256": pdf_sha256,
+                            "page_number": int(page_num),
                         }
-                    else:
-                        text_entity_info['count'] += exact_span_count
-                    _progress_update(
-                        89,
-                        f"Rendering text labels ({exact_span_count} spans)...")
-                    if opts.verbose:
-                        _msg(f"  Text: {exact_span_count} span labels (exact placement)")
-                elif opts.verbose:
-                    _warn("Strict text fidelity enabled, but exact span labels produced 0 items.")
-                # In strict mode, never run legacy line reconstruction.
-                tdict["blocks"] = []
-            else:
-                # Route rotated text through exact span placement even when
-                # strict mode is off. Legacy reconstruction remains for
-                # horizontal text only.
-                prefer_rotated_exact = True
-                _env_rot = os.environ.get("BC_PDF_ROTATED_EXACT_LABELS", "").strip().lower()
-                if _env_rot:
-                    prefer_rotated_exact = _env_rot not in ("0", "false", "off", "no")
-                if prefer_rotated_exact:
-                    rotated_span_count = _render_text_spans_exact_labels(
-                        tdict, text_group, page_h, opts, scale,
-                        only_rotated=True,
-                        layout_context=layout_context,
-                    )
-                    if rotated_span_count > 0 and opts.verbose:
-                        _msg(f"  Text: {rotated_span_count} rotated span labels (exact placement)")
-                    obj_count += rotated_span_count
-                    labels_delivered += rotated_span_count
-
-            for block in tdict.get("blocks", []):
-                if block.get("type") != 0:
-                    continue
-
-                # Group lines within this block by Y + X proximity, but ONLY
-                # merge when at least one line is a fraction fragment (pure digits
-                # or "/").  This prevents BOM table cells from merging while still
-                # recombining split fractions with their main dimension text.
-                block_lines = block.get("lines", [])
-                if not prefer_exact_labels:
-                    horizontal_lines = []
-                    rotated_threshold = _rotated_text_threshold_deg()
-                    for _ln in block_lines:
-                        _ang = _line_angle_deg(_ln)
-                        # Keep legacy reconstruction for horizontal-ish lines.
-                        # Rotated/diagonal lines are handled via exact spans above.
-                        if abs(_normalize_text_angle_deg(_ang)) < rotated_threshold:
-                            horizontal_lines.append(_ln)
-                    block_lines = horizontal_lines
-                y_groups: List[List] = []
-
-                def _is_frac_fragment(ln, main_sz=0) -> bool:
-                    """Is this line a fraction part (small-font orphaned digits or slash)?"""
-                    spans = ln.get("spans", [])
-                    txt = "".join(s.get("text", "") for s in spans).strip()
-                    if txt == "/":
-                        return True
-                    # Pure digits at SMALLER font size = fraction numerator/denominator
-                    if txt.isdigit() and spans:
-                        span_size = float(spans[0].get("size", 0))
-                        if main_sz > 0 and span_size < main_sz * 0.95:
-                            return True
-                    return False
-
-                # Find the dominant font size in this block for reference
-                block_main_size = 0
-                for ln in block_lines:
-                    for s in ln.get("spans", []):
-                        sz = float(s.get("size", 0))
-                        if sz > block_main_size:
-                            block_main_size = sz
-
-                for line in block_lines:
-                    spans = line.get("spans", [])
-                    if not spans:
-                        continue
-                    origin = spans[0].get("origin")
-                    ly = origin[1] if origin else line.get("bbox", (0, 0, 0, 0))[1]
-                    lbbox = line.get("bbox", (0, 0, 0, 0))
-                    lx_start = lbbox[0]
-                    lx_end = lbbox[2]
-                    line_is_frac = _is_frac_fragment(line, block_main_size)
-
-                    placed = False
-                    for grp in y_groups:
-                        _ref_spans = grp[0].get("spans") or []
-                        ref_origin = _ref_spans[0].get("origin") if _ref_spans else None
-                        ref_y = ref_origin[1] if ref_origin else grp[0].get("bbox", (0, 0, 0, 0))[1]
-                        if abs(ly - ref_y) < 2.0:  # same Y
-                            grp_has_frac = any(_is_frac_fragment(g, block_main_size) for g in grp)
-                            grp_has_nonfrac = any(not _is_frac_fragment(g, block_main_size) for g in grp)
-
-                            # Only merge if at least one side is a fraction fragment.
-                            # NEVER merge two non-fragment lines into the same group —
-                            # that creates jumbled span sequences like "6'-9 15/16 (PIPE1-..."
-                            can_merge = False
-                            if line_is_frac:
-                                can_merge = True  # fragments always welcome
-                            elif grp_has_frac and not grp_has_nonfrac:
-                                can_merge = True  # non-frag joining a frag-only group
-                            # else: non-frag trying to join a group that already has a non-frag → refuse
-
-                            if can_merge:
-                                for existing in grp:
-                                    eb = existing.get("bbox", (0, 0, 0, 0))
-                                    gap = min(abs(lx_start - eb[2]), abs(eb[0] - lx_end))
-                                    if gap < 20:
-                                        grp.append(line)
-                                        placed = True
-                                        break
-                            if placed:
-                                break
-                    if not placed:
-                        y_groups.append([line])
-
-                # Count sibling groups on the same Y level so short horizontal
-                # text is not accidentally centered into neighboring runs.
-                _grp_y_map: Dict[int, int] = {}
-                for grp in y_groups:
-                    if not grp:
-                        continue
-                    spans0 = grp[0].get("spans", []) or []
-                    ref_o = spans0[0].get("origin") if spans0 else None
-                    gy = round(ref_o[1] if ref_o else grp[0].get("bbox", (0,0,0,0))[1])
-                    _grp_y_map[gy] = _grp_y_map.get(gy, 0) + 1
-
-                # Build layout items first so we can resolve same-line overlap
-                layout_items = []
-                for grp in y_groups:
-                    def _line_x(ln):
-                        o = ln.get("spans", [{}])[0].get("origin")
-                        return o[0] if o else ln.get("bbox", (0, 0, 0, 0))[0]
-                    grp.sort(key=_line_x)
-
-                    all_spans = []
-                    for line in grp:
-                        all_spans.extend(line.get("spans", []))
-                    if not all_spans:
-                        continue
-
-                    content = _reconstruct_line_text(all_spans)
-                    if not content.strip() or content.strip() == "/":
-                        continue
-
-                    all_x0 = min(ln.get("bbox", (9e9,0,0,0))[0] for ln in grp)
-                    all_x1 = max(ln.get("bbox", (0,0,-9e9,0))[2] for ln in grp)
-                    all_y1 = max(ln.get("bbox", (0,0,0,-9e9))[3] for ln in grp)
-                    _stripped = content.strip()
-                    is_short = len(_stripped) <= 40
-                    is_bom_quantity = (
-                        len(all_spans) == 1
-                        and _is_bom_quantity_span(all_spans[0], _stripped, layout_context)
-                    )
-
-                    # Use span origins to recover the PDF baseline. Some OCR /
-                    # generated PDFs contain outlier span origins, so we use the
-                    # median origin and sanity-check it against a bbox-derived
-                    # baseline estimate.
-                    _first_span = grp[0].get("spans", [{}])[0]
-                    origin_xy = []
-                    for _sp in all_spans:
-                        _o = _sp.get("origin")
-                        if _o and len(_o) >= 2:
-                            try:
-                                origin_xy.append((float(_o[0]), float(_o[1])))
-                            except (TypeError, ValueError):
-                                pass
-
-                    size_pt = max(float(s.get("size", 3)) for s in all_spans)
-                    _desc_abs = abs(float(_first_span.get("descender", 0.15)))
-                    baseline_from_bbox = all_y1 - _desc_abs * size_pt
-
-                    if origin_xy:
-                        ys = sorted(p[1] for p in origin_xy)
-                        mid = len(ys) // 2
-                        if len(ys) % 2 == 1:
-                            baseline_from_origin = ys[mid]
-                        else:
-                            baseline_from_origin = (ys[mid - 1] + ys[mid]) * 0.5
-
-                        # If origin baseline disagrees strongly with bbox-based
-                        # estimate, trust bbox. This prevents occasional low/high
-                        # label drift in title blocks.
-                        drift = abs(baseline_from_origin - baseline_from_bbox)
-                        drift_tol = max(0.9, size_pt * 0.28)
-                        baseline_from_origin_used = drift <= drift_tol
-                        baseline_y = (
-                            baseline_from_bbox
-                            if drift > drift_tol
-                            else baseline_from_origin
-                        )
-                    else:
-                        baseline_from_origin_used = False
-                        baseline_y = baseline_from_bbox
-
-                    text_dir = grp[0].get("dir", (1.0, 0.0))
-                    if text_dir and len(text_dir) >= 2:
-                        dx, dy = float(text_dir[0]), float(text_dir[1])
-                        is_horizontal = _is_near_horizontal(dx, dy)
-                        angle_deg = -math.degrees(math.atan2(dy, dx))
-                    else:
-                        dx, dy = 1.0, 0.0
-                        is_horizontal = True
-                        angle_deg = 0.0
-                    if is_bom_quantity:
-                        dx, dy = 1.0, 0.0
-                        is_horizontal = True
-                        angle_deg = 0.0
-
-                    _spans0 = grp[0].get("spans", []) or []
-                    _ref_o = _spans0[0].get("origin") if _spans0 else None
-                    _gy = round(_ref_o[1] if _ref_o else grp[0].get("bbox", (0,0,0,0))[1])
-                    has_siblings = _grp_y_map.get(_gy, 1) > 1
-
-                    if is_short and is_horizontal and not has_siblings:
-                        x_pdf = (all_x0 + all_x1) / 2.0
-                        justification = "Center"
-                    else:
-                        # Left-anchored rows should start from the true left-most
-                        # text origin, not whichever span happened to come first.
-                        if (not is_horizontal) and origin_xy and baseline_from_origin_used:
-                            dlen = math.hypot(dx, dy)
-                            if dlen <= 1e-12:
-                                ux, uy = 1.0, 0.0
-                            else:
-                                ux, uy = dx / dlen, dy / dlen
-                            anchor = min(origin_xy, key=lambda p: (p[0] * ux + p[1] * uy))
-                            x_pdf = float(anchor[0])
-                            baseline_y = float(anchor[1])
-                        else:
-                            x_pdf = min((p[0] for p in origin_xy), default=all_x0)
-                        justification = "Left"
-
-                    font = _normalize_pdf_font_name(all_spans[0].get("font", ""))
-                    # Grab PyMuPDF normalised font metrics for baseline offset
-                    _asc = float(all_spans[0].get("ascender", 0.8))
-                    _desc = float(all_spans[0].get("descender", -0.2))
-                    if "/" in _stripped and _stripped.replace("/", "").isdigit():
-                        size_pt *= 0.65
-                    elif not is_horizontal and " " in _stripped and "/" in _stripped:
-                        size_pt *= 0.85
-
-                    font_size_fc = size_pt * scale
-                    if is_bom_quantity:
-                        quantity_origin = _horizontal_quantity_origin_pdf(
-                            all_spans[0],
-                            _stripped,
-                            font_size_fc,
-                            scale,
-                        )
-                        if quantity_origin:
-                            x_pdf, baseline_y = quantity_origin
-                            justification = "Left"
-                            baseline_from_origin_used = True
-
-                    layout_items.append({
-                        "content": content,
-                        "font": font,
-                        "font_size_fc": font_size_fc,
-                        "angle_deg": angle_deg,
-                        "is_horizontal": is_horizontal,
-                        "baseline_y_pdf": baseline_y,
-                        "baseline_is_origin": bool(origin_xy and baseline_from_origin_used),
-                        "x_pdf": x_pdf,
-                        "justification": justification,
-                        "ascender": _asc,
-                        "descender": _desc,
-                        "source_color": _span_source_color(all_spans[0]),
-                    })
-
-                for item in layout_items:
-                    pos = _to_fc((item["x_pdf"], item["baseline_y_pdf"]), page_h, opts, scale)
-                    # Draft.make_text anchors at the bottom-left of the text
-                    # box, but we have the PDF baseline position.  Shift down
-                    # (in FreeCAD Y-up space) by the descender so the glyph
-                    # baseline lands where the PDF specified it.
-                    # SKIP this correction when baseline came from span origins
-                    # (which are already the true baseline — no descender needed).
-                    if not item.get("baseline_is_origin", False):
-                        _d = _effective_descender(
-                            item["content"],
-                            float(item.get("descender", -0.2)),
-                        )
-                        pos = _apply_text_local_y_offset(
-                            pos,
-                            float(item.get("angle_deg", 0.0)),
-                            _d * float(item["font_size_fc"]),
-                        )
-                    try:
-                        rot = Rotation(Vector(0, 0, 1), item["angle_deg"])
-                        t = Draft.make_text([item["content"]], placement=Placement(pos, rot))
-                        try:
-                            t.ViewObject.FontSize = item["font_size_fc"]
-                            if item["font"]:
-                                t.ViewObject.FontName = item["font"]
-                            t.ViewObject.Justification = item["justification"]
-                        except (AttributeError, RuntimeError, TypeError, ValueError):
-                            pass
-                        _apply_text_color(t, item.get("source_color"))
-                        text_group.addObject(t)
-                        obj_count += 1
-                        labels_delivered += 1
-                        _record_text_delivery(opts, "native_label", 1)
-                        if text_entity_info is None:
-                            text_entity_info = {
-                                'entity_type': 'labels',
-                                'count': 1,
-                                'font_rendered': True,
-                                'examples': [item["content"][:20]]
-                            }
-                        else:
-                            text_entity_info['count'] += 1
-                            if len(text_entity_info['examples']) < 3:
-                                text_entity_info['examples'].append(item["content"][:20])
-                    except (RuntimeError, ValueError, TypeError, AttributeError):
-                        pass
-
-            # TEXTMODE-1: a whole-mode degrade to labels is reported with the
-            # count the label rungs actually delivered — loud, never silent.
-            if pending_label_fallback and labels_delivered > 0:
+                    ],
+                    "attempted_sources_complete": True,
+                    "created_entity_ids": [],
+                    "removed_entity_ids": [],
+                    "cleanup_complete": True,
+                }
+                impossible_attempt = {
+                    "source_item_id": page_source_id,
+                    "requested_type": requested,
+                    "attempted_type": requested,
+                    "final_type": None,
+                    "outcome": "proven_impossible",
+                    "reason": "no_source_text_items",
+                    "reason_code": "no_source_text_items",
+                    "created_entity_ids": [],
+                    "removed_entity_ids": [],
+                    "cleanup_complete": True,
+                    "proof": proof,
+                }
+                opts.text_delivery_attempts.append(impossible_attempt)
                 _record_text_mode_fallback(
                     opts,
-                    requested=str(pending_label_fallback.get("requested") or ""),
-                    delivered="labels",
-                    reason=str(pending_label_fallback.get("reason") or ""),
-                    count=labels_delivered,
+                    requested=requested,
+                    delivered="raster",
+                    reason="proof_gated:%s:no_source_text_items" % requested,
+                    count=1,
+                    source_item_id=page_source_id,
+                    proof=proof,
                 )
-          except (RuntimeError, ValueError, TypeError, AttributeError) as e:
-            _warn(f"Text import failed: {e}")
+            verified_attempt = {
+                "source_item_id": page_source_id,
+                "requested_type": requested,
+                "attempted_type": "raster",
+                "final_type": "raster",
+                "outcome": "verified",
+                "reason": "verified full-page raster for page without source text items",
+                "created_entity_ids": raster_ids,
+                "removed_entity_ids": [],
+                "cleanup_complete": True,
+                "evidence": dict(full_page_raster_result.get("evidence") or {}),
+            }
+            opts.text_delivery_attempts.append(verified_attempt)
+            _record_text_delivery(opts, "raster_text_patch", len(raster_ids))
+            text_entity_info = {
+                "entity_type": "raster",
+                "count": len(raster_ids),
+                "source_item_count": 0,
+                "source_item_ids": [page_source_id],
+                "font_rendered": False,
+                "examples": [],
+                "attempts": [verified_attempt],
+            }
+        obj_count += int(text_entity_info.get("count", 0) or 0)
+        _progress_update(
+            89,
+            "Rendering %s (%d source items)..."
+            % (opts.text_mode, text_entity_info["source_item_count"]),
+        )
 
     # ── Build hatch group (if group mode) ──
     if hatch_drawings and opts.hatch_mode == "group":
@@ -4101,17 +7558,108 @@ def _page_stack_step(page_height: float, arrangement: str, gap_ratio: float) -> 
     return h + max(h * gap_ratio, min_gap_mm)
 
 
+def _reset_import_run_state(opts: ImportOptions) -> None:
+    """Clear output evidence from a prior run while preserving user choices."""
+    opts.phase_timings_ms.clear()
+    opts.shapestring_skips.clear()
+    opts.text_mode_fallbacks.clear()
+    opts.text_delivered_counts.clear()
+    opts.text_delivery_attempts.clear()
+    opts.raster_page_count = 0
+    opts.raster_fallback_reasons.clear()
+    opts.auto_resolved_mode = None
+    opts.auto_reason = None
+    opts.resolved_scale = None
+    opts.scale_hints.clear()
+    opts._page_rotation_matrix = None
+    opts._font_stage_failures = []
+    opts._shapestring_font_paths = {}
+    opts._shapestring_font_staging_sessions = []
+    opts._report_extra = {}
+    opts._model3d_solids = 0
+    opts._model3d_intent = None
+    opts._model3d_intent_feasible = False
+    opts._model3d_text_evidence = []
+    opts._bootstrap_text_items = []
+    opts._pdf_sha256 = ""
+
+
+def _remove_post_baseline_document_objects(
+    fc_doc,
+    baseline_object_ids: set,
+    baseline_object_names: set,
+) -> Dict[str, Any]:
+    """Remove every object created after the import snapshot and verify absence."""
+    post_baseline = [
+        host_obj
+        for host_obj in _document_objects(fc_doc)
+        if id(host_obj) not in baseline_object_ids
+        and _host_object_id(host_obj) not in baseline_object_names
+    ]
+    created_ids = [_host_object_id(host_obj) for host_obj in post_baseline]
+    removed_ids: List[str] = []
+    errors: List[str] = []
+    for host_obj in reversed(post_baseline):
+        entity_id = _host_object_id(host_obj)
+        if not entity_id:
+            errors.append("post-baseline object has no stable id")
+            continue
+        try:
+            current = fc_doc.getObject(entity_id)
+        except (AttributeError, RuntimeError, TypeError) as exc:
+            current = None
+            errors.append("getObject(%s): %s" % (entity_id, exc))
+        if current is None:
+            removed_ids.append(entity_id)
+            continue
+        if current is not host_obj:
+            errors.append("post-baseline identity changed for %s" % entity_id)
+            continue
+        try:
+            fc_doc.removeObject(entity_id)
+            removed_ids.append(entity_id)
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            errors.append("removeObject(%s): %s" % (entity_id, exc))
+    try:
+        fc_doc.recompute()
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        errors.append("recompute: %s" % exc)
+    live_post_baseline_ids = [
+        _host_object_id(host_obj)
+        for host_obj in _document_objects(fc_doc)
+        if id(host_obj) not in baseline_object_ids
+        and _host_object_id(host_obj) not in baseline_object_names
+    ]
+    cleanup_complete = bool(
+        not errors
+        and not live_post_baseline_ids
+        and set(created_ids).issubset(set(removed_ids))
+    )
+    return {
+        "created_entity_ids": created_ids,
+        "removed_entity_ids": list(dict.fromkeys(removed_ids)),
+        "live_post_baseline_entity_ids": live_post_baseline_ids,
+        "cleanup_errors": errors,
+        "cleanup_complete": cleanup_complete,
+    }
+
+
 def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     """Import one or more pages from a PDF file."""
     if opts is None:
         opts = ImportOptions(ignore_images=not IMAGE_WB)
     fc_doc = _ensure_doc()
     t_import_start = time.perf_counter()
-    opts.phase_timings_ms.clear()
-    opts.shapestring_skips.clear()
-    opts._model3d_solids = 0
-    opts._bootstrap_text_items = []
+    _reset_import_run_state(opts)
     obj_count_before = len(fc_doc.Objects)
+    baseline_objects = _document_objects(fc_doc)
+    baseline_object_ids = {id(host_obj) for host_obj in baseline_objects}
+    baseline_object_names = {_host_object_id(host_obj) for host_obj in baseline_objects}
+    try:
+        opts._pdf_sha256 = _pdf_file_sha256(pdf_path)
+    except OSError as exc:
+        _err("Cannot read PDF for source identity: %s" % exc)
+        return
 
     # Reset ID counter once at the start of a multi-page import
     try:
@@ -4252,12 +7800,53 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                                 pass
                 first_page = False
                 imported_count += 1
+            except TextRepresentationFailure:
+                raise
             except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as e:
                 _err(f"Failed to import page {p}: {e}\n{traceback.format_exc()}")
+                raise
         fc_doc.commitTransaction()
         opts.phase_timings_ms["pages_import_ms"] = (time.perf_counter() - t_phase) * 1000.0
-    except Exception:
+    except TextRepresentationFailure as failure:
         fc_doc.abortTransaction()
+        rollback = _remove_post_baseline_document_objects(
+            fc_doc, baseline_object_ids, baseline_object_names
+        )
+        report_extra = dict(getattr(opts, "_report_extra", {}) or {})
+        report_extra["rollback"] = rollback
+        opts._report_extra = report_extra
+        elapsed_ms = (time.perf_counter() - t_import_start) * 1000.0
+        opts.phase_timings_ms["pages_import_ms"] = (
+            time.perf_counter() - t_phase
+        ) * 1000.0
+        try:
+            failure_report = _write_terminal_representation_failure_report(
+                pdf_path=pdf_path,
+                opts=opts,
+                total_pages=total_pages,
+                pages_imported=imported_count,
+                elapsed_ms=elapsed_ms,
+                failure=failure,
+            )
+            _err(
+                f"Import stopped because requested {opts.text_mode} could not be "
+                f"delivered. Failure report: {failure_report}"
+            )
+        except (OSError, RuntimeError, TypeError, ValueError, ImportError) as report_error:
+            _err(f"Terminal import failure report could not be written: {report_error}")
+        if not rollback["cleanup_complete"]:
+            failure.attempt["cleanup_complete"] = False
+            failure.attempt["rollback"] = rollback
+        raise
+    except Exception as failure:
+        fc_doc.abortTransaction()
+        rollback = _remove_post_baseline_document_objects(
+            fc_doc, baseline_object_ids, baseline_object_names
+        )
+        if not rollback["cleanup_complete"]:
+            raise RuntimeError(
+                "Import failed and rollback was incomplete: %s" % rollback
+            ) from failure
         raise
     finally:
         try:
@@ -4306,6 +7895,8 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             opts._report_extra = {}
         if all_text_entity_info:
             opts._report_extra['actual_text_entity_types'] = all_text_entity_info
+        opts._report_extra["result_status"] = "success"
+        opts._report_extra.pop("terminal_failure", None)
 
         if bool(getattr(opts, "model3d_semantic", False)):
             intent = getattr(opts, "_model3d_intent", None) or {}
@@ -4336,6 +7927,9 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             pages_imported=imported_count,
             total_pages=total_pages,
             primitive_count=max(0, len(fc_doc.Objects) - obj_count_before),
+            text_count=int(
+                (all_text_entity_info or {}).get("count", 0) or 0
+            ),
             elapsed_ms=elapsed_ms,
             fallback_used=fallback_used,
             fallback_reason=fallback_reason,

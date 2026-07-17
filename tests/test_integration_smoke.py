@@ -22,7 +22,7 @@ class TestIntegrationSmoke:
 
     def test_fraction_stack_scale_constant(self):
         """Test that the fraction stack scale constant is defined."""
-        assert hasattr(extract_page, '__call__'), "extract_page should be callable"
+        assert callable(extract_page), "extract_page should be callable"
         assert _FRAC_STACKED_SCALE == 0.6, f"Expected 0.6, got {_FRAC_STACKED_SCALE}"
 
     def test_text_entity_verification_dataclass(self):

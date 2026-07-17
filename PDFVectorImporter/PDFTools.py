@@ -278,13 +278,13 @@ class BatchImportCommand:
 
 # ──────────────────────────────────────────────────────────────────────
 class InstallPyMuPDFCommand:
-    """One-click installer for PyMuPDF into the workbench's lib folder."""
+    """One-click installer for the workbench's PDF runtime dependencies."""
 
     def GetResources(self):
         return {
             "Pixmap": "",
-            "MenuText": "Install / Update PyMuPDF",
-            "ToolTip": "Download and install PyMuPDF into this workbench (no admin needed).",
+            "MenuText": "Install / Update PDF Dependencies",
+            "ToolTip": "Install PyMuPDF and fonttools into this workbench (no admin needed).",
         }
 
     def IsActive(self):
@@ -303,7 +303,7 @@ class InstallPyMuPDFCommand:
 
         py = _find_python()
 
-        _msg(f"Installing PyMuPDF to: {target}")
+        _msg(f"Installing PDF runtime dependencies to: {target}")
         _msg(f"Using Python: {py}")
 
         _kw = {}
@@ -320,22 +320,31 @@ class InstallPyMuPDFCommand:
         try:
             subprocess.check_call(
                 [py, "-m", "pip", "install", "--upgrade",
-                 "--only-binary", ":all:", "--target", target, "PyMuPDF>=1.24,<2.0"],
+                 "--only-binary", ":all:", "--target", target,
+                 "PyMuPDF>=1.24,<2.0", "fonttools>=4.50,<5.0"],
                 timeout=300, **_kw)
-            _msg("PyMuPDF installed successfully.  Please restart FreeCAD.")
+            if target not in sys.path:
+                sys.path.insert(0, target)
+            try:
+                import pymupdf as fitz  # noqa: F401
+            except ImportError:
+                import fitz  # noqa: F401
+            import fontTools  # noqa: F401
+            _msg("PDF dependencies installed successfully.  Please restart FreeCAD.")
             if QtWidgets:
                 QtWidgets.QMessageBox.information(
                     None, "Success",
-                    f"PyMuPDF installed to:\n{target}\n\n"
+                    f"PDF dependencies installed to:\n{target}\n\n"
                     "Please restart FreeCAD.")
         except subprocess.CalledProcessError as e:
             _err(f"pip install failed: {e}")
             if QtWidgets:
                 QtWidgets.QMessageBox.critical(
                     None, "Install Failed",
-                    f"pip install PyMuPDF>=1.24,<2.0 failed:\n{e}\n\n"
+                    f"pip install PDF dependencies failed:\n{e}\n\n"
                     "Try running manually in a terminal:\n"
-                    f'  "{py}" -m pip install --target "{target}" "PyMuPDF>=1.24,<2.0"')
+                    f'  "{py}" -m pip install --target "{target}" '
+                    '"PyMuPDF>=1.24,<2.0" "fonttools>=4.50,<5.0"')
         except (subprocess.SubprocessError, OSError, RuntimeError, ValueError) as e:
             _err(f"Installer error: {e}\n{traceback.format_exc()}")
 

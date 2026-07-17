@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import json
 import sys
 import tempfile
@@ -18,12 +17,12 @@ from PDFImporterCore import ImportOptions, _report_fallback_state, write_import_
 
 
 class TestImportReportWriter(unittest.TestCase):
-    def test_report_fallback_state_forced_raster(self) -> None:
+    def test_report_requested_raster_is_not_a_fallback(self) -> None:
         opts = ImportOptions(import_mode="raster")
 
         self.assertEqual(
             _report_fallback_state(opts),
-            (True, "forced_raster_mode"),
+            (False, None),
         )
 
     def test_report_fallback_state_counts_raster_pages(self) -> None:
@@ -82,6 +81,14 @@ class TestImportReportWriter(unittest.TestCase):
             opts.phase_timings_ms["open_pdf_ms"] = 1.25
             opts.phase_timings_ms["pages_import_ms"] = 8.75
             opts.shapestring_skips["shapestring_failed"] = 2
+            opts._font_stage_failures = [{
+                "page": 1,
+                "xref": 9,
+                "font": "Broken",
+                "outcome": "failed",
+                "reason": "embedded_font_staging_failed",
+                "exception": "ValueError: broken",
+            }]
 
             result = write_import_report(
                 pdf_path=str(Path(tmp) / "sample.pdf"),
@@ -111,75 +118,16 @@ class TestImportReportWriter(unittest.TestCase):
             self.assertEqual(data["extra"]["auto_resolved_mode"], "vector")
             self.assertEqual(data["extra"]["shapestring_skips"]["shapestring_failed"], 2)
             self.assertEqual(data["extra"]["shapestring_skip_total"], 2)
-
-
-    def test_3d_text_delivered_as_labels_reports_fallback_text(self) -> None:
-        """TEXTMODE-1 item 7 lock: 3d_text degrading to labels is reported."""
-        with tempfile.TemporaryDirectory(prefix="fc_import_report_") as tmp:
-            report_path = Path(tmp) / "import_report.json"
-            opts = ImportOptions(import_mode="auto", text_mode="3d_text", import_text=True)
-            opts.shapestring_skips["no_ttf_font"] = 1
-            opts._report_extra = {
-                "actual_text_entity_types": {
-                    "entity_type": "labels",
-                    "count": 4,
-                    "font_rendered": True,
-                    "examples": [],
-                }
-            }
-
-            write_import_report(
-                pdf_path=str(Path(tmp) / "sample.pdf"),
-                output_path=str(report_path),
-                opts=opts,
-                pages_imported=1,
-                total_pages=1,
-                primitive_count=3,
-                text_count=4,
-                elapsed_ms=8.0,
-            )
-
-            data = json.loads(report_path.read_text(encoding="utf-8"))
-            self.assertTrue(data["fallback"]["used"])
-            self.assertEqual(
-                data["fallback"]["text"],
+            self.assertEqual(data["extra"]["font_stage_failures"], [
                 {
-                    "requested": "3d_text",
-                    "delivered": "labels",
-                    "reason": "no_ttf_font",
-                    "count": 4,
-                },
-            )
-            self.assertIn(
-                "text_mode_fallback", data["extra"]["diagnostics"]["signals"]
-            )
-
-    def test_3d_text_zero_span_reason_defaults_to_shapestring_unavailable(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="fc_import_report_") as tmp:
-            report_path = Path(tmp) / "import_report.json"
-            opts = ImportOptions(import_mode="auto", text_mode="3d_text", import_text=True)
-            opts._report_extra = {
-                "actual_text_entity_types": {
-                    "entity_type": "labels",
-                    "count": 2,
-                    "font_rendered": True,
-                    "examples": [],
+                    "page": 1,
+                    "xref": 9,
+                    "font": "Broken",
+                    "outcome": "failed",
+                    "reason": "embedded_font_staging_failed",
+                    "exception": "ValueError: broken",
                 }
-            }
-
-            write_import_report(
-                pdf_path=str(Path(tmp) / "sample.pdf"),
-                output_path=str(report_path),
-                opts=opts,
-                pages_imported=1,
-                total_pages=1,
-                elapsed_ms=8.0,
-            )
-
-            data = json.loads(report_path.read_text(encoding="utf-8"))
-            self.assertEqual(
-                data["fallback"]["text"]["reason"], "shapestring_unavailable"
-            )
+            ])
 
     def test_requested_mode_delivered_emits_no_fallback_text(self) -> None:
         with tempfile.TemporaryDirectory(prefix="fc_import_report_") as tmp:
@@ -207,37 +155,25 @@ class TestImportReportWriter(unittest.TestCase):
             self.assertFalse(data["fallback"]["used"])
             self.assertNotIn("text", data["fallback"])
 
-    def test_zero_span_fallback_warn_is_not_verbose_gated(self) -> None:
-        """TEXTMODE-1 item 7 lock: the fallback warning is loud, never gated."""
-        source = (SRC_DIR / "PDFImporterCore.py").read_text(encoding="utf-8")
-        tree = ast.parse(source)
+    def test_zero_imported_pages_and_real_text_count_are_not_masked(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fc_import_report_") as tmp:
+            report_path = Path(tmp) / "import_report.json"
+            opts = ImportOptions(import_mode="vector", text_mode="labels")
+            opts._report_extra = {"result_status": "success"}
 
-        def _warn_calls(node: ast.AST):
-            for call in ast.walk(node):
-                if (
-                    isinstance(call, ast.Call)
-                    and isinstance(call.func, ast.Name)
-                    and call.func.id == "_warn"
-                    and call.args
-                    and isinstance(call.args[0], ast.Constant)
-                    and isinstance(call.args[0].value, str)
-                    and call.args[0].value.startswith("3D Text mode produced 0 spans")
-                ):
-                    yield call
+            write_import_report(
+                pdf_path=str(Path(tmp) / "sample.pdf"),
+                output_path=str(report_path),
+                opts=opts,
+                pages_imported=0,
+                total_pages=4,
+                text_count=37,
+            )
 
-        # The warn exists...
-        self.assertTrue(list(_warn_calls(tree)), "0-span fallback warn missing")
-
-        # ...and is never nested inside an `if <...>.verbose` gate.
-        for node in ast.walk(tree):
-            if isinstance(node, ast.If):
-                gate = ast.dump(node.test)
-                if "verbose" in gate:
-                    self.assertFalse(
-                        list(_warn_calls(node)),
-                        "0-span fallback warn is verbose-gated (must be unconditional)",
-                    )
-
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["input"]["pages"], 0)
+            self.assertEqual(data["result"]["text_entities"], 37)
+            self.assertEqual(data["extra"]["result_status"], "success")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

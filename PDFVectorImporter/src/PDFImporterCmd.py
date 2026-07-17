@@ -118,14 +118,18 @@ class ImportPDFDialog(QtWidgets.QDialog):
 
         # ── Text Mode (orthogonal selector — BCS-ARCH-001) ──
         self.text_combo = QtWidgets.QComboBox()
-        self.text_combo.addItems(["Labels", "3D Text", "Glyphs", "Geometry"])
+        self.text_combo.addItems(
+            ["Text", "Labels", "3D Text", "Glyphs", "Geometry", "Raster"]
+        )
         self.text_combo.setCurrentText("3D Text")
         self.text_combo.setToolTip(
             "How text is rendered when Import text is enabled:\n"
+            "Text — native FreeCAD annotation text, editable\n"
             "Labels — FreeCAD Draft Text labels, editable\n"
             "3D Text — extruded 3D letterforms\n"
             "Glyphs — exact glyph geometry from the PDF font\n"
-            "Geometry — fall back to reconstructed line geometry")
+            "Geometry — raw text-outline edges grouped per source text item\n"
+            "Raster — one visually exact raster patch per source text item")
 
         # Enable/disable text mode based on the toggle.
         self.import_text_chk.toggled.connect(self.text_combo.setEnabled)
@@ -248,7 +252,9 @@ class ImportPDFDialog(QtWidgets.QDialog):
                 text_mode = "3D Text"
                 grp.SetString("LastTextMode", text_mode)
                 grp.SetBool("TextDefaultMigratedV407", True)
-            if text_mode and text_mode in ("Labels", "3D Text", "Glyphs", "Geometry"):
+            if text_mode and text_mode in (
+                "Text", "Labels", "3D Text", "Glyphs", "Geometry", "Raster"
+            ):
                 self.text_combo.setCurrentText(text_mode)
             # Import-text toggle is a separate pref (BCS-ARCH-001 orthogonal control).
             import_text = grp.GetBool("LastImportText", True)
@@ -395,12 +401,14 @@ class ImportPDFDialog(QtWidgets.QDialog):
         # Text controls (orthogonal per BCS-ARCH-001).
         import_text = self.import_text_chk.isChecked()
         text_ui = self.text_combo.currentText()
-        # Map the 4-option text combo to ImportOptions.text_mode internal values.
+        # Map every first-class requested text representation to its internal value.
         text_mode_map = {
+            "Text":     "text",
             "Labels":   "labels",
             "3D Text":  "3d_text",
             "Glyphs":   "glyphs",
             "Geometry": "geometry",
+            "Raster":   "raster",
         }
         text_mode = text_mode_map.get(text_ui, "3d_text")
         if not import_text:

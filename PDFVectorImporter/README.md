@@ -1,7 +1,7 @@
 # PDF Vector Importer for FreeCAD
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Version: 4.0.67](https://img.shields.io/badge/Version-4.0.67-green.svg)
+![Version: 4.0.68](https://img.shields.io/badge/Version-4.0.68-green.svg)
 ![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
 
 **Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.**
@@ -47,7 +47,7 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 
 2. Restart FreeCAD.
 3. Switch to the **PDF Vector Importer** workbench from the workbench selector.
-4. Release ZIP/Setup installs include the private PyMuPDF runtime under `PDFVectorImporter/src/lib`; source checkouts can stage it with `python build_release.py` or **PDF Vector Importer > Install / Update PyMuPDF**.
+4. Release ZIP/Setup installs include private PyMuPDF and fontTools runtimes under `PDFVectorImporter/src/lib`; source checkouts can stage both with `python build_release.py` or **PDF Vector Importer > Install / Update PDF Dependencies**.
 
 ---
 
@@ -57,6 +57,7 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 |---|---|---|
 | **FreeCAD** | 0.21+ | Tested through 1.0 |
 | **PyMuPDF** | Yes | Bundled in release ZIP/Setup installs (`>=1.24,<2.0`); source checkouts can stage it locally |
+| **fontTools** | Yes | Bundled (`>=4.50,<5.0`) to preserve embedded PDF fonts and Unicode mappings for native 3D Text |
 | **pdftocairo** | Optional | Preferred SVG renderer for text-as-geometry; bundled PyMuPDF is used when Poppler is absent |
 
 ---

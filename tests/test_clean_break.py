@@ -131,8 +131,18 @@ class TestDialogCleanBreak(unittest.TestCase):
 
     def test_text_mode_combo_has_four_entries(self):
         # The text-mode selector must list exactly the BCS-ARCH-001 options.
-        self.assertIn('["Labels", "3D Text", "Glyphs", "Geometry"]', self.source,
-                      "Dialog text-mode combo must list Labels/3D Text/Glyphs/Geometry.")
+        self.assertIn(
+            '["Text", "Labels", "3D Text", "Glyphs", "Geometry", "Raster"]',
+            self.source,
+            "Dialog text-mode combo must list all six requested representations.",
+        )
+
+    def test_geometry_tooltip_describes_requested_output_not_a_fallback(self):
+        self.assertIn(
+            "Geometry — raw text-outline edges grouped per source text item",
+            self.source,
+        )
+        self.assertNotIn("Geometry — fall back", self.source)
 
     def test_text_default_is_scale_stable(self):
         self.assertIn('self.text_combo.setCurrentText("3D Text")', self.source)
@@ -181,18 +191,23 @@ class TestTextDefaults(unittest.TestCase):
 
     def test_glyphs_mode_uses_vector_glyph_renderer(self):
         source = IMPORTER_CORE.read_text(encoding="utf-8")
-        self.assertIn('if opts.text_mode in ("glyphs", "geometry"):', source)
-        self.assertIn('label = "text geometry" if opts.text_mode == "geometry" else "text glyphs"', source)
+        self.assertIn('"glyphs": lambda item, attempted, state:', source)
+        self.assertIn('"geometry": lambda item, attempted, state:', source)
+        self.assertIn("_deliver_text_item_svg(", source)
+        self.assertIn("_render_canonical_text_items(", source)
 
 
 class TestTextModeLadderDoctrine(unittest.TestCase):
-    """TEXTMODE-1 item 14: the FINAL FC fallback ladder stays documented."""
+    """TEXTMODE-1: proof-gated, representation-distinct policy stays documented."""
 
-    def test_readme_documents_final_fallback_ladder(self):
+    def test_readme_documents_representation_contract(self):
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("### Text-mode fallback ladder (TEXTMODE-1)", readme)
-        self.assertIn("peer family", readme)
+        self.assertIn("### Text-representation contract (TEXTMODE-1)", readme)
+        self.assertIn("Glyphs and Geometry are distinct deliverables", readme)
+        self.assertIn("item-specific impossibility evidence", readme)
         self.assertIn("never silent", readme)
+        self.assertNotIn("Glyphs and Geometry are one peer family", readme)
+        self.assertNotIn("Per-span ShapeString failures deliver", readme)
 
 
 class TestBlenderAdapterCleanBreak(unittest.TestCase):

@@ -3,7 +3,7 @@
 **BUILT. NOT BOUGHT.**
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
-![Version: 4.0.67](https://img.shields.io/badge/Version-4.0.67-blue.svg)
+![Version: 4.0.68](https://img.shields.io/badge/Version-4.0.68-blue.svg)
 ![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
 
 Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.
@@ -75,7 +75,7 @@ See **[INSTALL.md](INSTALL.md)** for Windows FreeCAD 1.1 paths, dev junction ins
    - **Windows (FreeCAD 0.21):** `%APPDATA%\FreeCAD\Mod\`
    - **macOS:** `~/Library/Application Support/FreeCAD/Mod/`
    - **Linux:** `~/.local/share/FreeCAD/Mod/`
-3. For release ZIP/Setup installs, PyMuPDF is already bundled under `PDFVectorImporter/src/lib`. For source checkouts, run `python build_release.py` to stage the private runtime, or use **PDF Vector Importer > Install / Update PyMuPDF** after loading the workbench.
+3. Release ZIP/Setup installs bundle PyMuPDF and fontTools under `PDFVectorImporter/src/lib`. For source checkouts, run `python build_release.py` to stage both private runtime dependencies, or use **PDF Vector Importer > Install / Update PDF Dependencies** after loading the workbench.
 4. Restart FreeCAD
 
 ## Building Release Artifacts
@@ -172,40 +172,45 @@ types, not in quality tier.
 Plus a separate **Import text** toggle to skip text entirely.
 Glyphs and Geometry prefer Poppler/pdftocairo SVG output when available, then fall back to bundled PyMuPDF SVG paths.
 
-### Text-mode fallback ladder (TEXTMODE-1)
+### Text-representation contract (TEXTMODE-1)
 
 **The requested text mode is the delivered text mode.** Alignment, rotation,
 or scaling defects are fixed *inside* the requested mode — never by
 substituting a different mode. Substitution is permitted only when the
-requested mode is genuinely impossible for this importer + option + PDF, must
-walk the documented ladder below (most closely related rung first), must
-always terminate in *some* delivered representation, and is always recorded
-in `import_report.json` (`fallback.text` = requested / delivered / reason /
-count, plus a `text_mode_fallback` diagnostics signal) — never silent.
+requested mode is genuinely impossible for the exact source item. A generic
+exception, a missing helper, an empty result, or a visual defect is not proof
+of impossibility. Any authorized substitution must walk the closest remaining
+representation first and is recorded per source item in `import_report.json`
+with the attempted types, exact created/removed host IDs, cleanup result, and
+the evidence that proved the requested type impossible. It is never silent.
 (Owner directive 2026-07-13.)
 
-FINAL FreeCAD ladder (left rung first):
+Authorized order after item-specific proof (left rung first):
 
 | Requested | Ladder |
 |-----------|--------|
-| **3D Text** | Glyphs/Geometry (SVG; Poppler → bundled PyMuPDF) → Labels (Draft text) → page raster |
-| **Glyphs / Geometry** | peer family → 3D Text (ShapeString) → Labels → page raster |
-| **Labels** | Glyphs/Geometry → page raster |
+| **3D Text** | Glyphs → Geometry → Labels → Raster |
+| **Glyphs** | Geometry → 3D Text → Labels → Raster |
+| **Geometry** | Glyphs → 3D Text → Labels → Raster |
+| **Labels** | 3D Text → Glyphs → Geometry → Raster |
 | **Raster** | terminal — always achievable |
 
 Notes:
-- **Glyphs and Geometry are one peer family** (identical SVG rendering
-  engine), so a fallback between them is a no-op and the ladders treat them
-  as a single rung.
-- Per-span ShapeString failures deliver the failed spans through the Labels
-  rung (`reason: shapestring_failed`) — a failed span is never dropped.
-- A whole-mode 3D Text degrade reports `reason: no_ttf_font` or
-  `shapestring_unavailable`; a Glyphs/Geometry SVG renderer failure walks
-  the closer 3D Text rung before Labels (`reason: svg_renderer_failed`).
-- Labels sit before page raster per the audit's interim ruling (no host has
-  per-span raster patches today); every use is loudly reported.
-- The invariant "requested == delivered OR reported fallback — never
-  neither" is locked by `tests/test_textmode1_invariant_fc.py`.
+- **Glyphs and Geometry are distinct deliverables.** Glyphs preserve one
+  grouped outline object per placed character; Geometry exposes the raw edge
+  entities. Sharing an SVG source does not make the host representations
+  interchangeable.
+- Renderer or font failures stop the transaction unless the failed source item
+  has item-specific impossibility evidence and an implemented, verified next
+  rung. They never authorize a whole-page or whole-mode substitution.
+- Automatic raster classification may add a raster background, but it does not
+  discard an explicitly requested text representation. Explicit Raster remains
+  raster-only.
+- The invariant is "requested type delivered and verified, or an exact failed
+  attempt is reported and the transaction stops, or a proof-gated per-item
+  fallback is reported." It is locked by
+  `tests/test_textmode1_invariant_fc.py` and
+  `tests/test_freecad_representation_contract.py`.
 
 ## Compatibility
 
@@ -229,6 +234,7 @@ Evidence levels:
 - **FreeCAD** 0.21 or later
 - **Python** 3.10+ (adapters use PEP 604 union types)
 - **PyMuPDF** `>=1.24,<2.0` (bundled in release ZIP/Setup installs under `PDFVectorImporter/src/lib`; source checkouts can stage it with `python build_release.py` or the workbench installer). When Poppler/pdftocairo is absent, bundled PyMuPDF also backs Glyphs/Geometry text rendering.
+- **fontTools** `>=4.50,<5.0` (bundled and installed through the same paths as PyMuPDF). It preserves embedded PDF font outlines and Unicode mappings for native 3D Text instead of substituting a visually similar font.
 
 ## Known Limitations
 

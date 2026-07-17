@@ -3611,6 +3611,18 @@ def _annotate_text_host_object(obj, source_item_id: str, representation: str) ->
         setattr(obj, name, str(value))
 
 
+def _format_color_metadata(
+    source_color: Optional[Tuple[float, float, float]],
+) -> str:
+    """Format a source color as persisted metadata (read-only companion of
+    _persist_text_style_metadata so verifiers never re-write properties)."""
+    return (
+        ",".join(format(float(channel), ".9g") for channel in source_color)
+        if source_color is not None
+        else ""
+    )
+
+
 def _persist_text_style_metadata(
     obj,
     *,
@@ -3619,11 +3631,7 @@ def _persist_text_style_metadata(
     source_color: Optional[Tuple[float, float, float]],
 ) -> str:
     """Persist source style on an App object, including in headless FreeCADCmd."""
-    color_metadata = (
-        ",".join(format(float(channel), ".9g") for channel in source_color)
-        if source_color is not None
-        else ""
-    )
+    color_metadata = _format_color_metadata(source_color)
     properties = set(getattr(obj, "PropertiesList", []) or [])
     add_property = getattr(obj, "addProperty", None)
     for property_kind, property_name, property_value in (
@@ -3639,6 +3647,59 @@ def _persist_text_style_metadata(
     return color_metadata
 
 
+def _make_shapestring_host(doc, source_text: str, font_path: str):
+    """Create a ShapeString host WITHOUT tessellating it (perf lever P1).
+
+    Draft.make_shapestring recomputes immediately at its default Size=100
+    (draftmake/make_shapestring.py), so every span used to tessellate twice:
+    once at the wrong size in the factory and again after the caller set the
+    real Size. Constructing the Part::Part2DObjectPython with the Draft
+    ShapeString proxy directly defers the one real tessellation to
+    _create_verified_text3d_entity's recompute at final properties.
+
+    Falls back to the Draft factory (identical semantics, slower) whenever the
+    Draft internals are unavailable, so behavior never changes — only cost.
+    """
+    proxy_cls = None
+    try:
+        from draftobjects.shapestring import ShapeString as proxy_cls  # type: ignore
+    except ImportError:
+        proxy_cls = None
+    if proxy_cls is not None and doc is not None and hasattr(doc, "addObject"):
+        obj = None
+        try:
+            obj = doc.addObject("Part::Part2DObjectPython", "ShapeString")
+            proxy_cls(obj)
+            obj.String = source_text
+            obj.FontFile = font_path
+            obj.Tracking = 0
+            if FreeCAD is not None and bool(getattr(FreeCAD, "GuiUp", False)):
+                try:
+                    from draftviewproviders.view_shapestring import (
+                        ViewProviderShapeString,
+                    )
+
+                    ViewProviderShapeString(obj.ViewObject)
+                except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
+                    pass
+            return obj
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            # Never leak a half-built host object into the document.
+            if obj is not None:
+                try:
+                    doc.removeObject(obj.Name)
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    pass
+    make_shapestring = getattr(
+        Draft,
+        "make_shapestring",
+        getattr(Draft, "makeShapeString", None),
+    )
+    if not callable(make_shapestring):
+        raise AttributeError("Draft ShapeString API unavailable")
+    return make_shapestring(source_text, font_path)
+
+
 def _create_verified_text3d_entity(
     shape_string,
     *,
@@ -3648,6 +3709,7 @@ def _create_verified_text3d_entity(
     baseline_angle_deg: float,
     text_group,
     baseline_object_ids: Optional[set] = None,
+    configure_host=None,
 ):
     """Create and verify a width-calibrated ShapeString clone + extrusion."""
     try:
@@ -3675,6 +3737,11 @@ def _create_verified_text3d_entity(
         shape_string.MakeFace = True
     except (AttributeError, RuntimeError, TypeError, ValueError):
         pass
+    # P1 ordering: all custom property writes must land BEFORE this object's
+    # only recompute — post-recompute writes re-touch the object and force the
+    # page-end doc.recompute() to tessellate every span again (measured ~2x).
+    if callable(configure_host):
+        configure_host(shape_string)
     try:
         doc.recompute([shape_string])
     except TypeError:
@@ -3714,6 +3781,8 @@ def _create_verified_text3d_entity(
         calibrated_support.Label = "PDF 3D Text Calibrated Support"
     except (AttributeError, RuntimeError, TypeError, ValueError):
         pass
+    if callable(configure_host):
+        configure_host(calibrated_support)
     try:
         doc.recompute([calibrated_support])
     except TypeError:
@@ -3754,6 +3823,8 @@ def _create_verified_text3d_entity(
         pass
     extrusion.Dir = Vector(0.0, 0.0, float(depth))
     extrusion.Solid = True
+    if callable(configure_host):
+        configure_host(extrusion)
     try:
         doc.recompute([extrusion])
     except TypeError:
@@ -4943,15 +5014,10 @@ def _deliver_text_item_3d(
         )
 
     try:
-        make_shapestring = getattr(
-            Draft,
-            "make_shapestring",
-            getattr(Draft, "makeShapeString", None),
-        )
-        if not callable(make_shapestring):
-            raise AttributeError("Draft ShapeString API unavailable")
         creation_started = True
-        shape_string = make_shapestring(source_text, font_path)
+        shape_string = _make_shapestring_host(
+            _text_host_document(None, text_group), source_text, font_path
+        )
         if shape_string is None:
             raise RuntimeError("Draft ShapeString returned no host object")
         add_owned(shape_string)
@@ -4972,6 +5038,26 @@ def _deliver_text_item_3d(
     try:
         shape_string.Placement = Placement(pos, rot)
         depth = max(font_size_fc * 0.12, 0.05)
+        source_color = _span_source_color(span)
+        normalized_font = _normalize_pdf_font_name(source_font)
+
+        def _configure_item_host(host_obj):
+            # P1 ordering: every custom property write happens BEFORE the host
+            # object's recompute inside _create_verified_text3d_entity, so the
+            # page-end document recompute has nothing left to re-execute.
+            nonlocal stage
+            stage = "host_annotation"
+            _annotate_text_host_object(host_obj, source_item_id, "3d_text")
+            stage = "source_color"
+            _persist_text_style_metadata(
+                host_obj,
+                font_name=normalized_font,
+                font_size=font_size_fc,
+                source_color=source_color,
+            )
+            _apply_text_color(host_obj, source_color)
+            stage = "calibration_extrusion"
+
         stage = "calibration_extrusion"
         (
             extrusion,
@@ -4986,6 +5072,7 @@ def _deliver_text_item_3d(
             baseline_angle_deg=host_rotation_deg,
             text_group=text_group,
             baseline_object_ids=baseline_objects,
+            configure_host=_configure_item_host,
         )
         add_owned(calibrated_support)
         add_owned(extrusion)
@@ -4993,22 +5080,10 @@ def _deliver_text_item_3d(
         if collection_error:
             raise RuntimeError("owned object collection failed: %s" % collection_error)
 
-        stage = "host_annotation"
-        for host_obj in (shape_string, calibrated_support, extrusion):
-            _annotate_text_host_object(host_obj, source_item_id, "3d_text")
-
         stage = "source_color"
-        source_color = _span_source_color(span)
-        normalized_font = _normalize_pdf_font_name(source_font)
+        color_metadata = _format_color_metadata(source_color)
         style_verifications: List[str] = []
         for host_obj in (shape_string, calibrated_support, extrusion):
-            color_metadata = _persist_text_style_metadata(
-                host_obj,
-                font_name=normalized_font,
-                font_size=font_size_fc,
-                source_color=source_color,
-            )
-            _apply_text_color(host_obj, source_color)
             if (
                 str(getattr(host_obj, "PDFTextFontName", "") or "")
                 != normalized_font
@@ -5290,14 +5365,7 @@ def _render_text_spans_3d(
                 doc = _text_host_document(None, text_group)
                 before_objects = {id(obj) for obj in _document_objects(doc)} if doc is not None else set()
                 try:
-                    make_shapestring = getattr(
-                        Draft,
-                        "make_shapestring",
-                        getattr(Draft, "makeShapeString", None),
-                    )
-                    if make_shapestring is None:
-                        raise AttributeError("Draft ShapeString API unavailable")
-                    ss = make_shapestring(source_text, font_path)
+                    ss = _make_shapestring_host(doc, source_text, font_path)
                 except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
                     if doc is not None:
                         owned.extend(
@@ -5319,6 +5387,16 @@ def _render_text_spans_3d(
                 try:
                     ss.Placement = Placement(pos, rot)
                     depth = max(font_size_fc * 0.12, 0.05)
+                    span_color = _span_source_color(span)
+
+                    def _configure_span_host(
+                        host_obj, _sid=source_item_id, _color=span_color
+                    ):
+                        # P1 ordering: writes land before each host object's
+                        # only recompute (see _create_verified_text3d_entity).
+                        _annotate_text_host_object(host_obj, _sid, "3d_text")
+                        _apply_text_color(host_obj, _color)
+
                     (
                         extrusion,
                         calibrated_support,
@@ -5331,15 +5409,9 @@ def _render_text_spans_3d(
                         target_advance_fc=target_advance_fc,
                         baseline_angle_deg=span_angle_deg,
                         text_group=text_group,
+                        configure_host=_configure_span_host,
                     )
                     owned.extend([calibrated_support, extrusion])
-                    for host_obj in (ss, calibrated_support, extrusion):
-                        _annotate_text_host_object(
-                            host_obj, source_item_id, "3d_text"
-                        )
-                    _apply_text_color(ss, _span_source_color(span))
-                    _apply_text_color(calibrated_support, _span_source_color(span))
-                    _apply_text_color(extrusion, _span_source_color(span))
                 except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
                     if doc is not None:
                         owned.extend(

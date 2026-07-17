@@ -569,11 +569,45 @@ def _auto_raster_needs_text_overlay(
     return bool(
         str(getattr(opts, "import_mode", "") or "").strip().lower() == "auto"
         and str(effective_mode or "").strip().lower() == "raster"
-        and int(source_text_blocks or 0) > 0
+        and _raster_page_requires_text_contract_probe(opts)
+    )
+
+
+def _raster_page_requires_text_contract_probe(opts: ImportOptions) -> bool:
+    """Return whether a non-explicit Raster path must still prove text delivery."""
+    return bool(
+        str(getattr(opts, "import_mode", "") or "").strip().lower() != "raster"
         and bool(getattr(opts, "import_text", False))
         and str(getattr(opts, "text_mode", "") or "").strip().lower()
         in {"text", "labels", "3d_text", "glyphs", "geometry"}
     )
+
+
+def _resolve_raster_text_contract_mode(
+    effective_mode: str,
+    source_text_blocks: int,
+    opts: ImportOptions,
+) -> Tuple[str, bool]:
+    """Preserve a structural text request without a masking page raster.
+
+    The boolean result means a page raster may be placed provisionally while
+    canonical source inspection runs.  It is true only for an Auto-classified
+    image-only page; the later proof ledger must either certify that page-bound
+    fallback or fail the import.  Pages with source text continue through the
+    structural Hybrid path and retain embedded images instead of receiving a
+    complete-page raster background.
+    """
+    normalized = str(effective_mode or "").strip().lower()
+    if not _auto_raster_needs_text_overlay(normalized, source_text_blocks, opts):
+        return normalized, False
+    if int(source_text_blocks or 0) > 0:
+        return "hybrid", False
+    return "raster", True
+
+
+def _should_place_full_page_raster(effective_mode: str) -> bool:
+    """Full-page raster is reserved for the Raster path, never Hybrid."""
+    return str(effective_mode or "").strip().lower() == "raster"
 
 
 def _merge_page_scale_into_opts(opts: ImportOptions, resolved) -> None:
@@ -3046,6 +3080,172 @@ def _record_text_mode_fallback(
             "proof": proof,
         }
     )
+
+
+def _record_no_source_text_page_fallback(
+    opts: ImportOptions,
+    *,
+    page_num: int,
+    pdf_sha256: str,
+    raw_tdict: Dict[str, Any],
+    raster_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Record a finite page-bound ladder when canonical source text is absent."""
+    requested = _normalize_requested_text_type(str(getattr(opts, "text_mode", "") or ""))
+    page_number = int(page_num)
+    source_item_id = "p%d:page" % page_number
+    digest = str(pdf_sha256 or "").strip().lower()
+    if (
+        page_number < 1
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or not isinstance(raw_tdict, dict)
+        or not isinstance(raster_result, dict)
+        or raster_result.get("outcome", "verified") != "verified"
+    ):
+        raise ValueError("no-source page fallback context is invalid")
+    raster_ids = _validated_entity_ids(
+        raster_result.get("created_entity_ids"),
+        field_name="raster_result.created_entity_ids",
+        allow_empty=False,
+    )
+    raster_evidence = dict(raster_result.get("evidence") or {})
+    if not raster_evidence:
+        raise ValueError("verified page raster evidence is required")
+
+    blocks = list(raw_tdict.get("blocks") or [])
+    source_observation = {
+        "text_dictionary_present": True,
+        "canonical_source_item_count": 0,
+        "raw_text_block_count": sum(
+            1 for block in blocks if isinstance(block, dict) and block.get("type") == 0
+        ),
+        "source_inspection_reused": True,
+        "visible_source_text_found": False,
+    }
+    ladder = list(TEXT_ITEM_FALLBACK_LADDERS[requested])
+    attempted_types: List[str] = []
+    proof_chain: List[Dict[str, Any]] = []
+    attempts: List[Dict[str, Any]] = []
+
+    for index, attempted_type in enumerate(ladder):
+        attempted_types.append(attempted_type)
+        if attempted_type == "raster":
+            break
+        following_type = ladder[index + 1]
+        proof = {
+            "item_specific_proven_impossible": True,
+            "importer_identity": FREECAD_TEXT_IMPORTER_IDENTITY,
+            "pdf_sha256": digest,
+            "page_number": page_number,
+            "source_item_id": source_item_id,
+            "requested_type": requested,
+            "attempted_type": attempted_type,
+            "reason_code": "no_source_text_items",
+            "evidence": dict(source_observation),
+            "attempted_types": list(attempted_types),
+            "attempted_source_results": [
+                {
+                    "source": "pymupdf_text_dictionary",
+                    "outcome": "not_found",
+                    "pdf_sha256": digest,
+                    "page_number": page_number,
+                }
+            ],
+            "attempted_sources_complete": True,
+            "created_entity_ids": [],
+            "removed_entity_ids": [],
+            "cleanup_complete": True,
+        }
+        attempt = {
+            "source_item_id": source_item_id,
+            "requested_type": requested,
+            "attempted_type": attempted_type,
+            "final_type": None,
+            "outcome": "proven_impossible",
+            "reason": "no_source_text_items",
+            "reason_code": "no_source_text_items",
+            "transition_from": attempted_type,
+            "transition_to": following_type,
+            "created_entity_ids": [],
+            "removed_entity_ids": [],
+            "cleanup_complete": True,
+            "proof": proof,
+        }
+        _append_text_item_attempt(opts, attempt)
+        attempts.append(attempt)
+        proof_chain.append(proof)
+
+    verified_attempt = {
+        "source_item_id": source_item_id,
+        "requested_type": requested,
+        "attempted_type": "raster",
+        "final_type": "raster",
+        "outcome": "verified",
+        "reason": (
+            "explicit requested page Raster"
+            if requested == "raster"
+            else "verified page Raster after finite no-source-text proof chain"
+        ),
+        "created_entity_ids": list(raster_ids),
+        "removed_entity_ids": [],
+        "cleanup_complete": True,
+        "attempted_types": list(attempted_types),
+        "proof_chain": [dict(proof) for proof in proof_chain],
+        "evidence": raster_evidence,
+    }
+    _append_text_item_attempt(opts, verified_attempt)
+    attempts.append(verified_attempt)
+
+    if requested != "raster":
+        fallback_proof = {
+            "item_specific_proven_impossible": True,
+            "importer_identity": FREECAD_TEXT_IMPORTER_IDENTITY,
+            "pdf_sha256": digest,
+            "page_number": page_number,
+            "source_item_id": source_item_id,
+            "requested_type": requested,
+            "attempted_type": requested,
+            "reason_code": "no_source_text_items",
+            "evidence": dict(source_observation),
+            "attempted_types": list(attempted_types),
+            "attempted_source_results": [
+                {
+                    "source": "pymupdf_text_dictionary",
+                    "outcome": "not_found",
+                    "pdf_sha256": digest,
+                    "page_number": page_number,
+                }
+            ],
+            "attempted_sources_complete": True,
+            "created_entity_ids": [],
+            "removed_entity_ids": [],
+            "cleanup_complete": True,
+            "proof_chain": [dict(proof) for proof in proof_chain],
+            "transition_chain": [
+                {"from": left, "to": right}
+                for left, right in zip(ladder, ladder[1:])
+            ],
+        }
+        _record_text_mode_fallback(
+            opts,
+            requested=requested,
+            delivered="raster",
+            reason="proof_gated:%s:no_source_text_items" % requested,
+            count=1,
+            source_item_id=source_item_id,
+            proof=fallback_proof,
+        )
+
+    _record_text_delivery(opts, "raster_text_patch", len(raster_ids))
+    return {
+        "entity_type": "raster",
+        "count": len(raster_ids),
+        "source_item_count": 0,
+        "source_item_ids": [source_item_id],
+        "font_rendered": False,
+        "examples": [],
+        "attempts": attempts,
+    }
 
 
 class TextRepresentationFailure(RuntimeError):
@@ -6875,16 +7075,19 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                  + (" (use Import Mode = Vectors to override)"
                     if effective_mode == "raster" and _flood_reason else ""))
 
-    auto_raster_text_overlay = _auto_raster_needs_text_overlay(
+    prior_effective_mode = effective_mode
+    effective_mode, auto_raster_text_overlay = _resolve_raster_text_contract_mode(
         effective_mode,
         n_text_blocks,
         opts,
     )
-    if auto_raster_text_overlay:
-        opts.auto_resolved_mode = "hybrid"
+    if prior_effective_mode == "raster" and (
+        effective_mode != prior_effective_mode or auto_raster_text_overlay
+    ):
+        opts.auto_resolved_mode = effective_mode
         opts.auto_reason = (
             str(opts.auto_reason or "Raster content strategy").rstrip()
-            + "; requested text representation preserved"
+            + "; requested text representation contract retained"
         )
 
     if _progress_check_cancel():
@@ -6897,7 +7100,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
     full_page_raster_result = None
 
     # ── Raster-only mode, optionally with the separately requested text layer ──
-    if effective_mode == "raster":
+    if _should_place_full_page_raster(effective_mode):
         _record_raster_page(opts, opts.auto_reason or "raster mode")
         _msg(f"Page {page_num}: rendering at {opts.raster_dpi} DPI (raster mode)")
         _progress_update(5, f"Rendering raster image at {opts.raster_dpi} DPI...")
@@ -6921,16 +7124,13 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             _msg(f"Page {page_num}: imported as raster image")
             return top_group, None
 
-    # ── Hybrid mode: place raster background, then overlay vectors ──
+    # ── Hybrid mode: preserve structural vectors and genuine source images ──
     if effective_mode == "hybrid":
-        _msg(f"Page {page_num}: placing {opts.raster_dpi} DPI raster background…")
-        _progress_update(5, f"Rendering raster image at {opts.raster_dpi} DPI...")
-        full_page_raster_result = _import_page_as_raster(
-            pdf_doc, page, page_num, page_h, opts, scale,
-            top_group or fc_doc, fc_doc)
-        placed_full_page_raster_background = True
-        _msg(f"Page {page_num}: overlaying vector geometry…")
-        # Fall through to vector import below
+        _msg(
+            f"Page {page_num}: preserving vector geometry and genuine embedded "
+            "images without a complete-page masking raster"
+        )
+        # Fall through to vector import; embedded images are imported below.
 
     # ── Legacy raster fallback (vectors mode, backwards compat) ──
     if effective_mode == "vector" and opts.raster_fallback and n_drawings < 5:
@@ -6947,12 +7147,22 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             full_page_raster_result = _import_page_as_raster(
                 pdf_doc, page, page_num, page_h, opts, scale,
                 top_group or fc_doc, fc_doc)
-            if progress:
-                progress.setValue(100)
-                progress.close()
-            fc_doc.recompute()
-            _msg(f"Page {page_num}: imported as raster image")
-            return top_group, None
+            if _raster_page_requires_text_contract_probe(opts):
+                placed_full_page_raster_background = True
+                drawings = []
+                n_drawings = 0
+                effective_mode = "raster_text_overlay"
+                _msg(
+                    f"Page {page_num}: page Raster placed provisionally; "
+                    f"proving requested {opts.text_mode} representation contract"
+                )
+            else:
+                if progress:
+                    progress.setValue(100)
+                    progress.close()
+                fc_doc.recompute()
+                _msg(f"Page {page_num}: imported as raster image")
+                return top_group, None
 
     # ── Hatch detection ──
     hatch_indices = set()
@@ -7444,8 +7654,6 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             raw_tdict=raw_tdict,
         )
         if int(text_entity_info.get("source_item_count", 0) or 0) <= 0:
-            requested = _normalize_requested_text_type(str(opts.text_mode or ""))
-            page_source_id = "p%d:page" % int(page_num)
             if full_page_raster_result is None:
                 full_page_raster_result = _import_page_as_raster(
                     pdf_doc,
@@ -7458,98 +7666,32 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     fc_doc,
                 )
                 placed_full_page_raster_background = True
-            raster_ids = list(
-                full_page_raster_result.get("created_entity_ids") or []
-            )
-            if not raster_ids:
+            try:
+                text_entity_info = _record_no_source_text_page_fallback(
+                    opts,
+                    page_num=int(page_num),
+                    pdf_sha256=pdf_sha256,
+                    raw_tdict=raw_tdict,
+                    raster_result=full_page_raster_result,
+                )
+            except Exception as exc:
                 raise TextRepresentationFailure(
-                    "Raster fallback produced no verified page entity",
+                    "No-source text page fallback could not be verified: %s" % exc,
                     {
-                        "source_item_id": page_source_id,
-                        "requested_type": requested,
+                        "source_item_id": "p%d:page" % int(page_num),
+                        "requested_type": str(opts.text_mode or ""),
                         "attempted_type": "raster",
                         "final_type": None,
                         "outcome": "failed",
-                        "reason": "empty_verified_raster_result",
+                        "reason": "invalid_no_source_text_page_fallback",
                         "created_entity_ids": [],
                         "removed_entity_ids": [],
                         "cleanup_complete": True,
+                        "evidence": {
+                            "exception": "%s: %s" % (exc.__class__.__name__, exc)
+                        },
                     },
-                )
-            if requested != "raster":
-                proof = {
-                    "item_specific_proven_impossible": True,
-                    "importer_identity": FREECAD_TEXT_IMPORTER_IDENTITY,
-                    "pdf_sha256": pdf_sha256,
-                    "page_number": int(page_num),
-                    "source_item_id": page_source_id,
-                    "requested_type": requested,
-                    "attempted_type": requested,
-                    "reason_code": "no_source_text_items",
-                    "evidence": {
-                        "text_dictionary_present": isinstance(raw_tdict, dict),
-                        "canonical_source_item_count": 0,
-                    },
-                    "attempted_types": [requested],
-                    "attempted_source_results": [
-                        {
-                            "source": "pymupdf_text_dictionary",
-                            "outcome": "not_found",
-                            "pdf_sha256": pdf_sha256,
-                            "page_number": int(page_num),
-                        }
-                    ],
-                    "attempted_sources_complete": True,
-                    "created_entity_ids": [],
-                    "removed_entity_ids": [],
-                    "cleanup_complete": True,
-                }
-                impossible_attempt = {
-                    "source_item_id": page_source_id,
-                    "requested_type": requested,
-                    "attempted_type": requested,
-                    "final_type": None,
-                    "outcome": "proven_impossible",
-                    "reason": "no_source_text_items",
-                    "reason_code": "no_source_text_items",
-                    "created_entity_ids": [],
-                    "removed_entity_ids": [],
-                    "cleanup_complete": True,
-                    "proof": proof,
-                }
-                opts.text_delivery_attempts.append(impossible_attempt)
-                _record_text_mode_fallback(
-                    opts,
-                    requested=requested,
-                    delivered="raster",
-                    reason="proof_gated:%s:no_source_text_items" % requested,
-                    count=1,
-                    source_item_id=page_source_id,
-                    proof=proof,
-                )
-            verified_attempt = {
-                "source_item_id": page_source_id,
-                "requested_type": requested,
-                "attempted_type": "raster",
-                "final_type": "raster",
-                "outcome": "verified",
-                "reason": "verified full-page raster for page without source text items",
-                "created_entity_ids": raster_ids,
-                "removed_entity_ids": [],
-                "cleanup_complete": True,
-                "evidence": dict(full_page_raster_result.get("evidence") or {}),
-            }
-            opts.text_delivery_attempts.append(verified_attempt)
-            _record_text_delivery(opts, "raster_text_patch", len(raster_ids))
-            text_entity_info = {
-                "entity_type": "raster",
-                "count": len(raster_ids),
-                "source_item_count": 0,
-                "source_item_ids": [page_source_id],
-                "font_rendered": False,
-                "examples": [],
-                "attempts": [verified_attempt],
-            }
+                ) from exc
         obj_count += int(text_entity_info.get("count", 0) or 0)
         _progress_update(
             89,

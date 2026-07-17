@@ -126,9 +126,129 @@ def test_auto_raster_content_classification_cannot_discard_requested_text(mode):
     assert core._auto_raster_needs_text_overlay("raster", 12, opts) is True
 
 
-def test_explicit_raster_and_pages_without_source_text_remain_raster_only():
+def test_explicit_raster_is_terminal_but_image_only_structural_request_needs_proof():
     explicit = core.ImportOptions(import_mode="raster", import_text=True, text_mode="3d_text")
     no_text = core.ImportOptions(import_mode="auto", import_text=True, text_mode="3d_text")
 
     assert core._auto_raster_needs_text_overlay("raster", 12, explicit) is False
-    assert core._auto_raster_needs_text_overlay("raster", 0, no_text) is False
+    assert core._auto_raster_needs_text_overlay("raster", 0, no_text) is True
+
+
+@pytest.mark.parametrize("mode", ["labels", "text", "3d_text", "glyphs", "geometry"])
+def test_image_only_page_records_adjacent_proof_gated_raster_fallback(mode):
+    opts = core.ImportOptions(import_mode="auto", import_text=True, text_mode=mode)
+    raster_result = {
+        "created_entity_ids": ["PageRaster001"],
+        "evidence": {
+            "host_entity_type": "Image::ImagePlane",
+            "save_reopen_identity_verified": True,
+        },
+    }
+
+    info = core._record_no_source_text_page_fallback(
+        opts,
+        page_num=1,
+        pdf_sha256="a" * 64,
+        raw_tdict={"blocks": [{"type": 1}]},
+        raster_result=raster_result,
+    )
+
+    ladder = list(core.TEXT_ITEM_FALLBACK_LADDERS[mode])
+    assert opts.text_mode == mode
+    assert [attempt["attempted_type"] for attempt in opts.text_delivery_attempts] == ladder
+    assert all(
+        attempt["source_item_id"] == "p1:page"
+        and attempt["requested_type"] == mode
+        for attempt in opts.text_delivery_attempts
+    )
+    impossible = opts.text_delivery_attempts[:-1]
+    assert impossible
+    assert all(attempt["outcome"] == "proven_impossible" for attempt in impossible)
+    assert all(attempt["reason_code"] == "no_source_text_items" for attempt in impossible)
+    assert all(attempt["cleanup_complete"] is True for attempt in impossible)
+    assert all(attempt["created_entity_ids"] == [] for attempt in impossible)
+    assert all(attempt["removed_entity_ids"] == [] for attempt in impossible)
+    assert all(
+        attempt["proof"]["item_specific_proven_impossible"] is True
+        and attempt["proof"]["source_item_id"] == "p1:page"
+        and attempt["proof"]["attempted_type"] == attempt["attempted_type"]
+        for attempt in impossible
+    )
+    assert list(zip(ladder, ladder[1:])) == [
+        (attempted, following)
+        for attempted, following in zip(
+            [attempt["attempted_type"] for attempt in opts.text_delivery_attempts],
+            [attempt["attempted_type"] for attempt in opts.text_delivery_attempts][1:],
+        )
+    ]
+    final = opts.text_delivery_attempts[-1]
+    assert final["outcome"] == "verified"
+    assert final["final_type"] == "raster"
+    assert final["created_entity_ids"] == ["PageRaster001"]
+    assert info["entity_type"] == "raster"
+    assert info["count"] == 1
+    assert info["source_item_ids"] == ["p1:page"]
+    assert opts.text_mode_fallbacks[-1]["requested"] == mode
+    assert opts.text_mode_fallbacks[-1]["delivered"] == "raster"
+    assert opts.text_mode_fallbacks[-1]["proof"]["attempted_types"] == ladder
+
+
+def test_explicit_requested_raster_has_no_false_fallback_chain():
+    opts = core.ImportOptions(import_mode="raster", import_text=True, text_mode="raster")
+
+    info = core._record_no_source_text_page_fallback(
+        opts,
+        page_num=2,
+        pdf_sha256="b" * 64,
+        raw_tdict={"blocks": []},
+        raster_result={
+            "created_entity_ids": ["PageRaster002"],
+            "evidence": {"host_entity_type": "Image::ImagePlane"},
+        },
+    )
+
+    assert info["entity_type"] == "raster"
+    assert [attempt["attempted_type"] for attempt in opts.text_delivery_attempts] == [
+        "raster"
+    ]
+    assert opts.text_delivery_attempts[0]["outcome"] == "verified"
+    assert opts.text_mode_fallbacks == []
+
+
+def test_auto_and_hybrid_structural_pages_do_not_request_full_page_masking_raster():
+    auto = core.ImportOptions(import_mode="auto", import_text=True, text_mode="labels")
+    explicit_hybrid = core.ImportOptions(
+        import_mode="hybrid", import_text=True, text_mode="labels"
+    )
+
+    auto_mode, auto_probe = core._resolve_raster_text_contract_mode(
+        "raster", 12, auto
+    )
+    image_only_mode, image_only_probe = core._resolve_raster_text_contract_mode(
+        "raster", 0, auto
+    )
+
+    assert (auto_mode, auto_probe) == ("hybrid", False)
+    assert (image_only_mode, image_only_probe) == ("raster", True)
+    assert core._should_place_full_page_raster(auto_mode) is False
+    assert core._should_place_full_page_raster("hybrid") is False
+    assert core._should_place_full_page_raster(explicit_hybrid.import_mode) is False
+    assert core._should_place_full_page_raster("raster") is True
+
+
+def test_legacy_vector_image_only_raster_must_continue_to_text_proof():
+    vector = core.ImportOptions(
+        import_mode="vector", import_text=True, text_mode="geometry"
+    )
+    auto = core.ImportOptions(import_mode="auto", import_text=True, text_mode="text")
+    explicit_raster = core.ImportOptions(
+        import_mode="raster", import_text=True, text_mode="3d_text"
+    )
+    no_text_contract = core.ImportOptions(
+        import_mode="vector", import_text=False, text_mode="geometry"
+    )
+
+    assert core._raster_page_requires_text_contract_probe(vector) is True
+    assert core._raster_page_requires_text_contract_probe(auto) is True
+    assert core._raster_page_requires_text_contract_probe(explicit_raster) is False
+    assert core._raster_page_requires_text_contract_probe(no_text_contract) is False

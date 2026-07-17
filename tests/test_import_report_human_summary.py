@@ -130,6 +130,24 @@ class TestImportReportHumanSummary(unittest.TestCase):
         self.assertTrue(ready["checks"]["scale_crosscheck"])
         self.assertFalse(ready["checks"]["actual_text_entity_types"])
 
+    def test_import_contract_ready_ignores_source_spans_when_text_is_disabled(self) -> None:
+        report = build_import_report(
+            host_app="freecad",
+            importer_version="4.0.70",
+            pdf_path="drawing.pdf",
+            mode="vector",
+            pages=1,
+            primitive_count=40,
+            import_text=False,
+            text_mode="none",
+            text_source_spans=7,
+        )
+
+        ready = report.extra.get("import_contract_ready")
+        self.assertIsInstance(ready, dict)
+        self.assertTrue(ready["ready"])
+        self.assertTrue(ready["checks"]["text_delivery"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

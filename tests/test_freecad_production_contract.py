@@ -113,6 +113,7 @@ class _Placement:
 
 class _View:
     def __init__(self):
+        self.Visibility = False
         self.FontSize = 0.0
         self.FontName = ""
         self.Font = ""
@@ -121,6 +122,14 @@ class _View:
         self.ShapeColor = (1.0, 1.0, 1.0)
         self.LineColor = (1.0, 1.0, 1.0)
         self.PointColor = (1.0, 1.0, 1.0)
+        self.Line = True
+        self.Frame = "Rectangle"
+        self.ArrowTypeStart = "Dot"
+        self.DisplayMode = "Screen"
+        self.ScaleMultiplier = 2.0
+        self.LineSpacing = 3.0
+        self.TextAlignment = "Top"
+        self.MaxChars = 12
 
 
 class _HostObject:
@@ -190,7 +199,7 @@ class _Draft:
         label_type,
         custom_text,
         direction,
-        points,
+        points=None,
     ):
         obj = self.document.addObject("App::FeaturePython", "PDF_Label")
         obj.TargetPoint = target_point
@@ -199,7 +208,7 @@ class _Draft:
         obj.CustomText = [custom_text] if isinstance(custom_text, str) else list(custom_text)
         obj.Text = list(obj.CustomText)
         obj.StraightDirection = direction
-        obj.Points = list(points)
+        obj.Points = list(points or [])
         obj.Proxy = SimpleNamespace(Type="Label")
         return obj
 
@@ -212,6 +221,20 @@ def _install_native_host(monkeypatch):
     monkeypatch.setattr(core, "Rotation", _Rotation)
     monkeypatch.setattr(core, "Placement", _Placement)
     return document, group
+
+
+def test_shared_text_style_metadata_does_not_add_native_visibility_by_default():
+    host = _HostObject(_Document(), "ShapeString", "Part::FeaturePython")
+
+    core._persist_text_style_metadata(
+        host,
+        font_name="Arial",
+        font_size=12.0,
+        source_color=(0.2, 0.4, 0.6),
+    )
+
+    assert "PDFTextVisibility" not in host.PropertiesList
+    assert not hasattr(host, "PDFTextVisibility")
 
 
 def test_all_requested_representations_have_finite_raster_terminal_ladders():
@@ -554,11 +577,22 @@ def test_native_item_delivery_rereads_live_text_transform_style_and_metadata(
     assert host.PDFTextFontSize == pytest.approx(host.ViewObject.FontSize)
     assert host.PDFTextJustification == "Left"
     assert host.PDFTextColorRGB == "0.2,0.4,0.6"
+    assert host.PDFTextVisibility is True
+    assert host.ViewObject.Visibility is True
+    assert host.ViewObject.DisplayMode == "World"
+    assert host.ViewObject.ScaleMultiplier == pytest.approx(1.0)
+    assert host.ViewObject.LineSpacing == pytest.approx(1.0)
     assert result["evidence"]["style_verification"] == "gui_view_and_app_metadata"
     assert result["evidence"]["view_style_verified"] is True
     if attempted_type == "labels":
-        assert result["evidence"]["label_marker_absent"] is False
-        assert result["evidence"]["label_marker_verification"] == "pending"
+        assert host.Points == []
+        assert host.ViewObject.Line is False
+        assert host.ViewObject.Frame == "None"
+        assert host.ViewObject.ArrowTypeStart == "None"
+        assert host.ViewObject.TextAlignment == "Bottom"
+        assert host.ViewObject.MaxChars == 0
+        assert result["evidence"]["label_marker_absent"] is True
+        assert result["evidence"]["label_marker_verification"] == "gui_view"
     assert core._host_anchor_xyz(host) == pytest.approx(
         result["evidence"]["expected_anchor_xyz"]
     )
@@ -605,12 +639,49 @@ def test_native_item_delivery_headless_rereads_honest_app_style_metadata(
     assert host.PDFTextFontSize > 0.0
     assert host.PDFTextJustification == "Left"
     assert host.PDFTextColorRGB == "0.2,0.4,0.6"
+    assert host.PDFTextVisibility is True
     assert result["outcome"] == "verified"
     assert result["evidence"]["style_verification"] == "headless_app_metadata"
     assert result["evidence"]["view_style_verified"] is False
     if attempted_type == "labels":
         assert result["evidence"]["label_marker_absent"] is False
         assert result["evidence"]["label_marker_verification"] == "pending"
+
+
+def test_native_text_with_unknown_source_font_keeps_supported_host_default(monkeypatch):
+    document, group = _install_native_host(monkeypatch)
+    original_add_object = document.addObject
+
+    def add_object_with_host_font(kind, name):
+        obj = original_add_object(kind, name)
+        obj.ViewObject.FontName = "Supported Host Font"
+        obj.ViewObject.Font = "Supported Host Font"
+        return obj
+
+    monkeypatch.setattr(document, "addObject", add_object_with_host_font)
+    item = _canonical_item("text")
+    item["span"]["font"] = ""
+
+    result = core._deliver_text_item_native(
+        item,
+        "text",
+        core.ImportOptions(
+            text_mode="text",
+            import_text=True,
+            scale_to_mm=False,
+            user_scale=1.0,
+        ),
+        text_group=group,
+        page_h=100.0,
+        scale=1.0,
+    )
+
+    host = document.getObject(result["created_entity_ids"][0])
+    assert result["outcome"] == "verified"
+    assert result["final_type"] == "text"
+    assert host.PDFRepresentation == "text"
+    assert host.PDFTextFontName == ""
+    assert host.ViewObject.FontName == "Supported Host Font"
 
 
 def test_rotated_native_text_remains_text_with_verified_persistent_placement(

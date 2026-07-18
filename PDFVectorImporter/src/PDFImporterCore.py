@@ -5378,17 +5378,21 @@ def _persist_text_style_metadata(
     font_name: str,
     font_size: float,
     source_color: Optional[Tuple[float, float, float]],
+    visibility: Optional[bool] = None,
 ) -> str:
     """Persist source style on an App object, including in headless FreeCADCmd."""
     color_metadata = _format_color_metadata(source_color)
     properties = set(getattr(obj, "PropertiesList", []) or [])
     add_property = getattr(obj, "addProperty", None)
-    for property_kind, property_name, property_value in (
+    metadata = [
         ("App::PropertyString", "PDFTextFontName", str(font_name)),
         ("App::PropertyFloat", "PDFTextFontSize", float(font_size)),
         ("App::PropertyString", "PDFTextJustification", "Left"),
         ("App::PropertyString", "PDFTextColorRGB", color_metadata),
-    ):
+    ]
+    if visibility is not None:
+        metadata.append(("App::PropertyBool", "PDFTextVisibility", bool(visibility)))
+    for property_kind, property_name, property_value in metadata:
         if property_name not in properties and callable(add_property):
             add_property(property_kind, property_name, "PDF Import")
             properties.add(property_name)
@@ -5857,7 +5861,6 @@ def _deliver_text_item_native(
                 label_type="Custom",
                 custom_text=source_text,
                 direction="Custom",
-                points=[anchor, anchor],
             )
             text_property = "Text"
             expected_type = "App::FeaturePython"
@@ -5870,49 +5873,34 @@ def _deliver_text_item_native(
 
         normalized_font = _normalize_pdf_font_name(span.get("font", ""))
         source_color = _span_source_color(span)
-        color_metadata = (
-            ",".join(format(float(channel), ".9g") for channel in source_color)
-            if source_color is not None
-            else ""
+        color_metadata = _persist_text_style_metadata(
+            host_obj,
+            font_name=normalized_font,
+            font_size=font_size_fc,
+            source_color=source_color,
+            visibility=True,
         )
-        properties = set(getattr(host_obj, "PropertiesList", []) or [])
-        add_property = getattr(host_obj, "addProperty", None)
-        for property_kind, property_name, property_value in (
-            ("App::PropertyString", "PDFTextFontName", normalized_font),
-            ("App::PropertyFloat", "PDFTextFontSize", float(font_size_fc)),
-            ("App::PropertyString", "PDFTextJustification", "Left"),
-            ("App::PropertyString", "PDFTextColorRGB", color_metadata),
-        ):
-            if property_name not in properties and callable(add_property):
-                add_property(property_kind, property_name, "PDF Import")
-                properties.add(property_name)
-            setattr(host_obj, property_name, property_value)
 
         # FreeCADCmd intentionally has no GUI view provider. Persist and reread
         # the complete style contract on the document object in every host, then
         # additionally require the real view-provider style when one exists.
         view = getattr(host_obj, "ViewObject", None)
         font_properties = []
-        color_properties = []
         if view is not None:
-            view.FontSize = float(font_size_fc)
-            for property_name in ("FontName", "Font"):
-                if hasattr(view, property_name):
-                    setattr(view, property_name, normalized_font)
-                    font_properties.append(property_name)
-            if not font_properties:
-                raise RuntimeError("native host exposes no writable font property")
-            if hasattr(view, "Justification"):
-                view.Justification = "Left"
-            if source_color is not None:
-                for property_name in (
-                    "TextColor", "ShapeColor", "LineColor", "PointColor"
-                ):
-                    if hasattr(view, property_name):
-                        setattr(view, property_name, source_color)
-                        color_properties.append(property_name)
-                if not color_properties:
-                    raise RuntimeError("native host exposes no writable color property")
+            try:
+                from PDFVectorImporter.src.PDFGuiStyleRestorer import (
+                    restore_importer_text_object,
+                )
+            except ImportError:
+                from PDFGuiStyleRestorer import restore_importer_text_object
+
+            if not restore_importer_text_object(host_obj):
+                raise RuntimeError("native host view style could not be restored")
+            font_properties = [
+                property_name
+                for property_name in ("FontName", "Font")
+                if hasattr(view, property_name)
+            ]
         doc.recompute()
     except Exception as exc:
         fail(
@@ -5946,6 +5934,8 @@ def _deliver_text_item_native(
             getattr(host_obj, "PDFTextJustification", "") or ""
         )
         metadata_color = str(getattr(host_obj, "PDFTextColorRGB", "") or "")
+        metadata_visibility = getattr(host_obj, "PDFTextVisibility", None)
+        label_marker_absent = False
         if view is None:
             actual_font_size = metadata_font_size
             actual_fonts = [metadata_font_name]
@@ -5980,7 +5970,39 @@ def _deliver_text_item_native(
                 )
             )
             style_verification = "gui_view_and_app_metadata"
-            view_style_verified = True
+            view_style_verified = bool(
+                getattr(view, "Visibility", False)
+                and (
+                    not hasattr(view, "DisplayMode")
+                    or str(view.DisplayMode or "") == "World"
+                )
+                and (
+                    not hasattr(view, "ScaleMultiplier")
+                    or math.isclose(float(view.ScaleMultiplier), 1.0, abs_tol=1e-7)
+                )
+                and (
+                    not hasattr(view, "LineSpacing")
+                    or math.isclose(float(view.LineSpacing), 1.0, abs_tol=1e-7)
+                )
+            )
+            if attempted_type == "labels":
+                arrow_properties = [
+                    property_name
+                    for property_name in ("ArrowTypeStart", "ArrowType")
+                    if hasattr(view, property_name)
+                ]
+                label_marker_absent = bool(
+                    not list(getattr(host_obj, "Points", []) or [])
+                    and hasattr(view, "Line")
+                    and view.Line is False
+                    and hasattr(view, "Frame")
+                    and str(view.Frame or "") == "None"
+                    and arrow_properties
+                    and all(
+                        str(getattr(view, property_name) or "") == "None"
+                        for property_name in arrow_properties
+                    )
+                )
         expected_anchor = (float(anchor.x), float(anchor.y), float(anchor.z))
         if (
             not entity_id
@@ -6003,13 +6025,20 @@ def _deliver_text_item_native(
             or actual_rotation is None
             or not _rotation_matches(actual_rotation, host_rotation_deg)
             or not math.isclose(actual_font_size, font_size_fc, abs_tol=1e-7)
-            or normalized_font not in actual_fonts
+            or (normalized_font and normalized_font not in actual_fonts)
             or actual_justification != "Left"
             or metadata_font_name != normalized_font
             or not math.isclose(metadata_font_size, font_size_fc, abs_tol=1e-7)
             or metadata_justification != "Left"
             or metadata_color != color_metadata
+            or metadata_visibility is not True
             or not color_verified
+            or (view is not None and not view_style_verified)
+            or (
+                attempted_type == "labels"
+                and view is not None
+                and not label_marker_absent
+            )
         ):
             raise RuntimeError("native text host evidence could not be verified")
     except Exception as exc:
@@ -6035,13 +6064,12 @@ def _deliver_text_item_native(
         "view_style_verified": bool(view_style_verified),
     }
     if attempted_type == "labels":
-        # A coincident Draft Label leader can still display a visible marker.
-        # Until the reopened GUI proves that marker absent, the report must
-        # remain pending instead of treating placement metadata as appearance.
         delivery_evidence.update(
             {
-                "label_marker_absent": False,
-                "label_marker_verification": "pending",
+                "label_marker_absent": bool(label_marker_absent),
+                "label_marker_verification": (
+                    "gui_view" if view is not None else "pending"
+                ),
             }
         )
 

@@ -257,3 +257,12 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
 
 
 FreeCADGui.addWorkbench(PDFVectorImporterWorkbench())
+
+# Install at GUI module load, not lazy workbench activation, so documents
+# opened before this workbench is selected still receive their stored style.
+try:
+    from PDFVectorImporter.src.PDFGuiStyleRestorer import register_gui_style_restorer
+
+    _PDF_GUI_STYLE_RESTORER = register_gui_style_restorer()
+except (ImportError, AttributeError, RuntimeError, TypeError, ValueError) as e:
+    FreeCAD.Console.PrintError("PDF GUI style restorer: " + str(e) + "\n")

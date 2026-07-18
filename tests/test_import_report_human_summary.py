@@ -88,6 +88,7 @@ class TestImportReportHumanSummary(unittest.TestCase):
             "duplicate_actual_entity_ids": [],
             "unexpected_entity_ids": [],
             "mismatched_entities": [],
+            "geometry_comparisons": [],
             "expected_counts": counts,
             "actual_counts": counts,
             "counts_match": True,

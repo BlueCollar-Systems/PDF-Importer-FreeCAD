@@ -497,8 +497,499 @@ def build_model_3d_extra(
     }
 
 
-_FREECAD_SHAPE_FINGERPRINT_SCHEMA = "bcs.freecad_shape_fingerprint/1.0"
+_FREECAD_SHAPE_FINGERPRINT_SCHEMA = "bcs.freecad_shape_fingerprint/1.1"
 _FREECAD_SHAPE_FINGERPRINT_QUANTUM = "1e-07"
+_FREECAD_SHAPE_FINGERPRINT_TOLERANCE = 1e-7
+_FREECAD_RAW_SHAPE_GEOMETRY_SCHEMA = "bcs.freecad_raw_shape_geometry/1.0"
+_FREECAD_SHAPE_GEOMETRY_SCHEMA = "bcs.freecad_shape_geometry_digest/1.0"
+_FREECAD_SHAPE_COMPARISON_SCHEMA = "bcs.freecad_shape_persistence_comparison/1.0"
+
+
+def _freecad_finite_number(value: Any) -> Optional[float]:
+    """Read a report number without accepting bools, NaN, or infinities."""
+
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _freecad_point(value: Any) -> Optional[List[float]]:
+    if not isinstance(value, list) or len(value) != 3:
+        return None
+    point = [_freecad_finite_number(coordinate) for coordinate in value]
+    if any(coordinate is None for coordinate in point):
+        return None
+    return [float(coordinate) for coordinate in point if coordinate is not None]
+
+
+def _freecad_points_close(left: Any, right: Any) -> bool:
+    left_point = _freecad_point(left)
+    right_point = _freecad_point(right)
+    return bool(
+        left_point is not None
+        and right_point is not None
+        and all(
+            abs(left_coordinate - right_coordinate)
+            <= _FREECAD_SHAPE_FINGERPRINT_TOLERANCE
+            for left_coordinate, right_coordinate in zip(
+                left_point, right_point, strict=True
+            )
+        )
+    )
+
+
+def _freecad_unordered_alignment(left: Any, right: Any, predicate):
+    """Return a one-to-one right-index alignment or None."""
+
+    if not isinstance(left, list) or not isinstance(right, list) or len(left) != len(right):
+        return None
+    adjacency = [
+        [right_index for right_index, right_item in enumerate(right) if predicate(left_item, right_item)]
+        for left_item in left
+    ]
+    if any(not candidates for candidates in adjacency):
+        return None
+    order = sorted(range(len(left)), key=lambda index: len(adjacency[index]))
+    matched_left_by_right: Dict[int, int] = {}
+
+    def augment(left_index: int, visited: set[int]) -> bool:
+        for right_index in adjacency[left_index]:
+            if right_index in visited:
+                continue
+            visited.add(right_index)
+            previous = matched_left_by_right.get(right_index)
+            if previous is None or augment(previous, visited):
+                matched_left_by_right[right_index] = left_index
+                return True
+        return False
+
+    if not all(augment(left_index, set()) for left_index in order):
+        return None
+    return {
+        left_index: right_index
+        for right_index, left_index in matched_left_by_right.items()
+    }
+
+
+def _freecad_unordered_match(left: Any, right: Any, predicate) -> bool:
+    """Return whether two lists have a one-to-one predicate match."""
+
+    return _freecad_unordered_alignment(left, right, predicate) is not None
+
+
+def _freecad_path_close(left: Any, right: Any, closed: bool) -> bool:
+    if not isinstance(left, list) or not isinstance(right, list) or len(left) != len(right):
+        return False
+    if not left:
+        return False
+
+    def linear_match(first: List[Any], second: List[Any]) -> bool:
+        return all(
+            _freecad_points_close(a, b)
+            for a, b in zip(first, second, strict=True)
+        )
+
+    if not closed:
+        return linear_match(left, right) or linear_match(left, list(reversed(right)))
+
+    left_cycle = list(left)
+    right_cycle = list(right)
+    if len(left_cycle) > 1 and _freecad_points_close(left_cycle[0], left_cycle[-1]):
+        left_cycle.pop()
+    if len(right_cycle) > 1 and _freecad_points_close(right_cycle[0], right_cycle[-1]):
+        right_cycle.pop()
+    if not left_cycle or len(left_cycle) != len(right_cycle):
+        return False
+    for oriented in (right_cycle, list(reversed(right_cycle))):
+        for offset in range(len(oriented)):
+            rotated = oriented[offset:] + oriented[:offset]
+            if linear_match(left_cycle, rotated):
+                return True
+    return False
+
+
+def _freecad_edge_close(left: Any, right: Any) -> bool:
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    if (
+        left.get("curve_type") != right.get("curve_type")
+        or type(left.get("closed")) is not bool
+        or type(right.get("closed")) is not bool
+        or left.get("closed") != right.get("closed")
+    ):
+        return False
+    left_length = _freecad_finite_number(left.get("length"))
+    right_length = _freecad_finite_number(right.get("length"))
+    if left_length is None or right_length is None:
+        return False
+    if abs(left_length - right_length) > _FREECAD_SHAPE_FINGERPRINT_TOLERANCE:
+        return False
+    return _freecad_path_close(
+        left.get("points"), right.get("points"), bool(left.get("closed"))
+    )
+
+
+def _freecad_point_delta(left: Any, right: Any) -> Optional[float]:
+    left_point = _freecad_point(left)
+    right_point = _freecad_point(right)
+    if left_point is None or right_point is None:
+        return None
+    return max(
+        abs(left_coordinate - right_coordinate)
+        for left_coordinate, right_coordinate in zip(
+            left_point, right_point, strict=True
+        )
+    )
+
+
+def _freecad_path_delta(left: Any, right: Any, closed: bool) -> Optional[float]:
+    if not isinstance(left, list) or not isinstance(right, list) or len(left) != len(right):
+        return None
+
+    def linear_delta(first: List[Any], second: List[Any]) -> Optional[float]:
+        deltas = [
+            _freecad_point_delta(a, b)
+            for a, b in zip(first, second, strict=True)
+        ]
+        if not deltas or any(delta is None for delta in deltas):
+            return None
+        return max(float(delta) for delta in deltas if delta is not None)
+
+    candidates: List[float] = []
+    if not closed:
+        for oriented in (right, list(reversed(right))):
+            delta = linear_delta(left, oriented)
+            if delta is not None and delta <= _FREECAD_SHAPE_FINGERPRINT_TOLERANCE:
+                candidates.append(delta)
+        return min(candidates) if candidates else None
+
+    left_cycle = list(left)
+    right_cycle = list(right)
+    if len(left_cycle) > 1 and _freecad_points_close(left_cycle[0], left_cycle[-1]):
+        left_cycle.pop()
+    if len(right_cycle) > 1 and _freecad_points_close(right_cycle[0], right_cycle[-1]):
+        right_cycle.pop()
+    if not left_cycle or len(left_cycle) != len(right_cycle):
+        return None
+    for oriented in (right_cycle, list(reversed(right_cycle))):
+        for offset in range(len(oriented)):
+            delta = linear_delta(left_cycle, oriented[offset:] + oriented[:offset])
+            if delta is not None and delta <= _FREECAD_SHAPE_FINGERPRINT_TOLERANCE:
+                candidates.append(delta)
+    return min(candidates) if candidates else None
+
+
+def _freecad_edge_delta(left: Any, right: Any) -> Optional[float]:
+    if not _freecad_edge_close(left, right):
+        return None
+    left_length = _freecad_finite_number(left.get("length"))
+    right_length = _freecad_finite_number(right.get("length"))
+    path_delta = _freecad_path_delta(
+        left.get("points"), right.get("points"), bool(left.get("closed"))
+    )
+    if left_length is None or right_length is None or path_delta is None:
+        return None
+    return max(abs(left_length - right_length), path_delta)
+
+
+def _freecad_raw_shape_geometry_valid(geometry: Any) -> bool:
+    if not isinstance(geometry, dict):
+        return False
+    vertices = geometry.get("vertices")
+    edges = geometry.get("edges")
+    if (
+        geometry.get("schema") != _FREECAD_RAW_SHAPE_GEOMETRY_SCHEMA
+        or geometry.get("tolerance") != _FREECAD_SHAPE_FINGERPRINT_QUANTUM
+        or not isinstance(vertices, list)
+        or not isinstance(edges, list)
+        or any(_freecad_point(vertex) is None for vertex in vertices)
+    ):
+        return False
+    return all(_freecad_edge_close(edge, edge) for edge in edges)
+
+
+def _freecad_shape_geometry_equivalent(left: Any, right: Any) -> bool:
+    """Compare canonical samples with a continuous absolute tolerance."""
+
+    if not _freecad_raw_shape_geometry_valid(
+        left
+    ) or not _freecad_raw_shape_geometry_valid(right):
+        return False
+    return bool(
+        _freecad_unordered_match(
+            left.get("vertices"), right.get("vertices"), _freecad_points_close
+        )
+        and _freecad_unordered_match(
+            left.get("edges"), right.get("edges"), _freecad_edge_close
+        )
+    )
+
+
+def _freecad_shape_geometry_comparison(left: Any, right: Any) -> Dict[str, Any]:
+    """Return live one-to-one comparison evidence for two raw sample sets."""
+
+    if not _freecad_raw_shape_geometry_valid(
+        left
+    ) or not _freecad_raw_shape_geometry_valid(right):
+        return {"verified": False, "max_delta": None}
+    left_vertices = left.get("vertices")
+    right_vertices = right.get("vertices")
+    left_edges = left.get("edges")
+    right_edges = right.get("edges")
+    vertex_alignment = _freecad_unordered_alignment(
+        left_vertices, right_vertices, _freecad_points_close
+    )
+    edge_alignment = _freecad_unordered_alignment(
+        left_edges, right_edges, _freecad_edge_close
+    )
+    if vertex_alignment is None or edge_alignment is None:
+        return {"verified": False, "max_delta": None}
+    deltas: List[float] = []
+    for left_index, right_index in vertex_alignment.items():
+        delta = _freecad_point_delta(
+            left_vertices[left_index], right_vertices[right_index]
+        )
+        if delta is None:
+            return {"verified": False, "max_delta": None}
+        deltas.append(delta)
+    for left_index, right_index in edge_alignment.items():
+        delta = _freecad_edge_delta(left_edges[left_index], right_edges[right_index])
+        if delta is None:
+            return {"verified": False, "max_delta": None}
+        deltas.append(delta)
+    max_delta = max(deltas) if deltas else 0.0
+    return {
+        "verified": max_delta <= _FREECAD_SHAPE_FINGERPRINT_TOLERANCE,
+        "max_delta": max_delta,
+    }
+
+
+def _freecad_shape_geometry_digest_valid(geometry: Any) -> bool:
+    """Validate the compact public binding to transient raw shape samples."""
+
+    if not isinstance(geometry, dict):
+        return False
+    digest = geometry.get("sample_digest")
+    vertex_count = geometry.get("vertex_count")
+    edge_count = geometry.get("edge_count")
+    sampled_point_count = geometry.get("sampled_point_count")
+    return bool(
+        geometry.get("schema") == _FREECAD_SHAPE_GEOMETRY_SCHEMA
+        and geometry.get("tolerance") == _FREECAD_SHAPE_FINGERPRINT_QUANTUM
+        and isinstance(digest, str)
+        and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+        and type(vertex_count) is int
+        and vertex_count >= 0
+        and type(edge_count) is int
+        and edge_count >= 0
+        and type(sampled_point_count) is int
+        and sampled_point_count >= edge_count
+        and vertex_count + sampled_point_count > 0
+    )
+
+
+def _freecad_numeric_mapping_equivalent(left: Any, right: Any) -> bool:
+    if not isinstance(left, dict) or not isinstance(right, dict) or set(left) != set(right):
+        return False
+    for key in left:
+        left_number = _freecad_finite_number(left.get(key))
+        right_number = _freecad_finite_number(right.get(key))
+        if (
+            left_number is None
+            or right_number is None
+            or abs(left_number - right_number) > _FREECAD_SHAPE_FINGERPRINT_TOLERANCE
+        ):
+            return False
+    return True
+
+
+def _freecad_raw_shape_digest(geometry: Any) -> Optional[str]:
+    if not _freecad_raw_shape_geometry_valid(geometry):
+        return None
+    payload = json.dumps(
+        geometry, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _freecad_shape_content_static_fields_match(left: Any, right: Any) -> bool:
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    if not _freecad_numeric_mapping_equivalent(
+        left.get("shape_metrics"), right.get("shape_metrics")
+    ) or not _freecad_numeric_mapping_equivalent(
+        left.get("shape_bounds"), right.get("shape_bounds")
+    ):
+        return False
+    digest_pattern = re.compile(r"[0-9a-f]{64}")
+    if not all(
+        isinstance(content.get("shape_digest"), str)
+        and digest_pattern.fullmatch(content.get("shape_digest")) is not None
+        for content in (left, right)
+    ):
+        return False
+    ignored = {
+        "_shape_comparison_geometry",
+        "shape_fingerprint_geometry",
+        "shape_metrics",
+        "shape_bounds",
+        "shape_digest",
+    }
+    return {
+        key: value for key, value in left.items() if key not in ignored
+    } == {key: value for key, value in right.items() if key not in ignored}
+
+
+def _freecad_shape_comparison_digest(certificate: Dict[str, Any]) -> str:
+    payload = {
+        key: value
+        for key, value in certificate.items()
+        if key != "comparison_digest"
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _freecad_host_content_comparison(
+    left: Any,
+    right: Any,
+    entity_id: str = "",
+) -> Dict[str, Any]:
+    """Compare live content and issue a compact certificate for shape roundoff."""
+
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return {"verified": False, "certificate": None}
+    left_public = left.get("shape_fingerprint_geometry")
+    right_public = right.get("shape_fingerprint_geometry")
+    if left_public is None and right_public is None:
+        return {"verified": left == right, "certificate": None}
+    left_raw = left.get("_shape_comparison_geometry")
+    right_raw = right.get("_shape_comparison_geometry")
+    left_raw_digest = _freecad_raw_shape_digest(left_raw)
+    right_raw_digest = _freecad_raw_shape_digest(right_raw)
+    left_sampled_point_count = (
+        sum(len(edge.get("points", [])) for edge in left_raw.get("edges", []))
+        if isinstance(left_raw, dict)
+        else -1
+    )
+    right_sampled_point_count = (
+        sum(len(edge.get("points", [])) for edge in right_raw.get("edges", []))
+        if isinstance(right_raw, dict)
+        else -1
+    )
+    if (
+        not _freecad_shape_geometry_digest_valid(left_public)
+        or not _freecad_shape_geometry_digest_valid(right_public)
+        or left_raw_digest != left_public.get("sample_digest")
+        or right_raw_digest != right_public.get("sample_digest")
+        or left_public.get("vertex_count") != len(left_raw.get("vertices", []))
+        or right_public.get("vertex_count") != len(right_raw.get("vertices", []))
+        or left_public.get("edge_count") != len(left_raw.get("edges", []))
+        or right_public.get("edge_count") != len(right_raw.get("edges", []))
+        or left_public.get("sampled_point_count") != left_sampled_point_count
+        or right_public.get("sampled_point_count") != right_sampled_point_count
+        or not _freecad_shape_content_static_fields_match(left, right)
+    ):
+        return {"verified": False, "certificate": None}
+    geometry_comparison = _freecad_shape_geometry_comparison(left_raw, right_raw)
+    max_delta = _freecad_finite_number(geometry_comparison.get("max_delta"))
+    if geometry_comparison.get("verified") is not True or max_delta is None:
+        return {"verified": False, "certificate": None}
+    certificate: Dict[str, Any] = {
+        "schema": _FREECAD_SHAPE_COMPARISON_SCHEMA,
+        "tolerance": _FREECAD_SHAPE_FINGERPRINT_QUANTUM,
+        "entity_id": str(entity_id or ""),
+        "expected_sample_digest": left_raw_digest,
+        "actual_sample_digest": right_raw_digest,
+        "vertex_count": left_public.get("vertex_count"),
+        "edge_count": left_public.get("edge_count"),
+        "sampled_point_count": left_sampled_point_count,
+        "max_delta": max_delta,
+        "verified": True,
+    }
+    certificate["comparison_digest"] = _freecad_shape_comparison_digest(certificate)
+    return {"verified": True, "certificate": certificate}
+
+
+def _freecad_host_content_equivalent(left: Any, right: Any) -> bool:
+    """Compatibility bool for live persisted-content comparisons."""
+
+    return _freecad_host_content_comparison(left, right).get("verified") is True
+
+
+def _freecad_shape_comparison_certificate_valid(
+    certificate: Any,
+    left: Dict[str, Any],
+    right: Dict[str, Any],
+    entity_id: str,
+) -> bool:
+    if not isinstance(certificate, dict):
+        return False
+    left_geometry = left.get("shape_fingerprint_geometry")
+    right_geometry = right.get("shape_fingerprint_geometry")
+    max_delta = _freecad_finite_number(certificate.get("max_delta"))
+    comparison_digest = certificate.get("comparison_digest")
+    return bool(
+        _freecad_shape_geometry_digest_valid(left_geometry)
+        and _freecad_shape_geometry_digest_valid(right_geometry)
+        and certificate.get("schema") == _FREECAD_SHAPE_COMPARISON_SCHEMA
+        and certificate.get("tolerance") == _FREECAD_SHAPE_FINGERPRINT_QUANTUM
+        and certificate.get("entity_id") == entity_id
+        and certificate.get("expected_sample_digest")
+        == left_geometry.get("sample_digest")
+        and certificate.get("actual_sample_digest")
+        == right_geometry.get("sample_digest")
+        and certificate.get("vertex_count") == left_geometry.get("vertex_count")
+        and certificate.get("vertex_count") == right_geometry.get("vertex_count")
+        and certificate.get("edge_count") == left_geometry.get("edge_count")
+        and certificate.get("edge_count") == right_geometry.get("edge_count")
+        and certificate.get("sampled_point_count")
+        == left_geometry.get("sampled_point_count")
+        and certificate.get("sampled_point_count")
+        == right_geometry.get("sampled_point_count")
+        and max_delta is not None
+        and 0.0 <= max_delta <= _FREECAD_SHAPE_FINGERPRINT_TOLERANCE
+        and certificate.get("verified") is True
+        and isinstance(comparison_digest, str)
+        and re.fullmatch(r"[0-9a-f]{64}", comparison_digest) is not None
+        and comparison_digest == _freecad_shape_comparison_digest(certificate)
+    )
+
+
+def _freecad_host_record_equivalent(
+    left: Any, right: Any, certificate: Any = None
+) -> bool:
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    ignored = {"content"}
+    if {key: value for key, value in left.items() if key not in ignored} != {
+        key: value for key, value in right.items() if key not in ignored
+    }:
+        return False
+    left_content = left.get("content")
+    right_content = right.get("content")
+    if not isinstance(left_content, dict) or not isinstance(right_content, dict):
+        return False
+    left_geometry = left_content.get("shape_fingerprint_geometry")
+    right_geometry = right_content.get("shape_fingerprint_geometry")
+    if left_geometry is None and right_geometry is None:
+        return certificate is None and left_content == right_content
+    return bool(
+        _freecad_shape_content_static_fields_match(left_content, right_content)
+        and _freecad_shape_comparison_certificate_valid(
+            certificate,
+            left_content,
+            right_content,
+            str(left.get("entity_id") or ""),
+        )
+    )
 
 
 def _freecad_shape_fingerprint_verified(content: Any) -> bool:
@@ -510,6 +1001,7 @@ def _freecad_shape_fingerprint_verified(content: Any) -> bool:
     vertex_count = content.get("shape_fingerprint_vertex_count")
     edge_count = content.get("shape_fingerprint_edge_count")
     sampled_edge_count = content.get("shape_fingerprint_sampled_edge_count")
+    geometry = content.get("shape_fingerprint_geometry")
     if (
         content.get("shape_fingerprint_verified") is not True
         or content.get("shape_fingerprint_schema")
@@ -523,8 +1015,11 @@ def _freecad_shape_fingerprint_verified(content: Any) -> bool:
         or edge_count < 0
         or type(sampled_edge_count) is not int
         or sampled_edge_count < 0
-        or sampled_edge_count > edge_count
+        or sampled_edge_count != edge_count
         or vertex_count + sampled_edge_count <= 0
+        or not _freecad_shape_geometry_digest_valid(geometry)
+        or geometry.get("vertex_count") != vertex_count
+        or geometry.get("edge_count") != edge_count
     ):
         return False
     if "vertexes" in topology and topology.get("vertexes") != vertex_count:
@@ -849,22 +1344,70 @@ def _freecad_save_reopen_inventory_verified(
     ):
         return False
 
-    for field in (
+    for evidence_field in (
         "missing_entity_ids",
         "duplicate_actual_entity_ids",
         "unexpected_entity_ids",
         "mismatched_entities",
     ):
-        if not isinstance(save_reopen.get(field), list) or save_reopen.get(field):
+        if not isinstance(save_reopen.get(evidence_field), list) or save_reopen.get(
+            evidence_field
+        ):
             return False
+
+    expected_objects = save_reopen.get("expected_objects")
+    actual_objects = save_reopen.get("actual_objects")
+    geometry_comparisons = save_reopen.get("geometry_comparisons")
+    if (
+        expected_objects != inventory_objects
+        or not isinstance(actual_objects, list)
+        or not isinstance(geometry_comparisons, list)
+    ):
+        return False
+    expected_by_id = {
+        record.get("entity_id"): record
+        for record in expected_objects
+        if isinstance(record, dict) and isinstance(record.get("entity_id"), str)
+    }
+    actual_by_id = {
+        record.get("entity_id"): record
+        for record in actual_objects
+        if isinstance(record, dict) and isinstance(record.get("entity_id"), str)
+    }
+    comparison_by_id = {
+        certificate.get("entity_id"): certificate
+        for certificate in geometry_comparisons
+        if isinstance(certificate, dict)
+        and isinstance(certificate.get("entity_id"), str)
+    }
+    shape_ids = {
+        entity_id
+        for entity_id, record in expected_by_id.items()
+        if isinstance(record.get("content"), dict)
+        and record["content"].get("shape_fingerprint_geometry") is not None
+    }
+    objects_match = bool(
+        len(expected_by_id) == len(expected_objects)
+        and len(actual_by_id) == len(actual_objects)
+        and len(comparison_by_id) == len(geometry_comparisons)
+        and set(expected_by_id) == set(actual_by_id)
+        and set(comparison_by_id) == shape_ids
+        and all(
+            _freecad_host_record_equivalent(
+                expected_by_id[entity_id],
+                actual_by_id[entity_id],
+                comparison_by_id.get(entity_id),
+            )
+            for entity_id in expected_by_id
+        )
+    )
 
     return bool(
         save_reopen.get("expected_entity_ids") == inventory_ids
         and save_reopen.get("expected_counts") == inventory_counts
         and save_reopen.get("actual_counts") == inventory_counts
         and save_reopen.get("counts_match") is True
-        and save_reopen.get("expected_objects") == inventory_objects
-        and save_reopen.get("actual_objects") == inventory_objects
+        and objects_match
     )
 
 

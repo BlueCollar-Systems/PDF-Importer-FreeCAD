@@ -1047,7 +1047,9 @@ def _build_text_representation_delivery(
         if final_type and final_type != requested:
             expected_transitions = [
                 {"from": left, "to": right}
-                for left, right in zip(attempted_sequence, attempted_sequence[1:])
+                for left, right in zip(
+                    attempted_sequence, attempted_sequence[1:], strict=False
+                )
             ]
             expected_created_ids = [
                 entity_id
@@ -1121,6 +1123,22 @@ def _build_text_representation_delivery(
     }
 
 
+def _public_report_value(value: Any) -> Any:
+    """Remove transient raw geometry while retaining its bound public digest."""
+
+    if isinstance(value, dict):
+        return {
+            key: _public_report_value(child)
+            for key, child in value.items()
+            if key != "_shape_comparison_geometry"
+        }
+    if isinstance(value, list):
+        return [_public_report_value(child) for child in value]
+    if isinstance(value, tuple):
+        return [_public_report_value(child) for child in value]
+    return value
+
+
 def write_import_report(
     *,
     pdf_path: str,
@@ -1160,7 +1178,7 @@ def write_import_report(
     
     # Add text entity info to extra if available
     if hasattr(opts, '_report_extra') and opts._report_extra:
-        extra.update(opts._report_extra)
+        extra.update(_public_report_value(opts._report_extra))
     raw_delivered_counts = getattr(opts, "text_delivered_counts", {}) or {}
     raw_delivered_count_items = (
         list(raw_delivered_counts.items())
@@ -3785,7 +3803,7 @@ def _record_no_source_text_page_fallback(
                 "proof_chain": [dict(proof) for proof in proof_chain],
                 "transition_chain": [
                     {"from": left, "to": right}
-                    for left, right in zip(ladder, ladder[1:])
+                    for left, right in zip(ladder, ladder[1:], strict=False)
                 ],
             }
             _record_text_mode_fallback(
@@ -4037,7 +4055,9 @@ def _aggregate_text_item_fallback_proof(
         "proof_chain": proof_chain,
         "transition_chain": [
             {"from": left, "to": right}
-            for left, right in zip(attempted_types, attempted_types[1:])
+            for left, right in zip(
+                attempted_types, attempted_types[1:], strict=False
+            )
         ],
     }
     for proof in proof_chain:
@@ -4384,6 +4404,20 @@ def _quantized_shape_number(value: Any) -> Optional[int]:
     return int(round(scaled))
 
 
+def _raw_shape_number(value: Any) -> Optional[float]:
+    """Return a finite round-trip value for pairwise tolerance comparison."""
+
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, RuntimeError, AttributeError, OverflowError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return 0.0 if number == 0.0 else number
+
+
 def _stable_shape_number(value: Any) -> Optional[str]:
     """Return a readable token backed by the canonical shape quantum."""
 
@@ -4415,6 +4449,25 @@ def _host_point_token(point: Any) -> Optional[Tuple[int, int, int]]:
     return coordinates[0], coordinates[1], coordinates[2]
 
 
+def _host_point_sample(point: Any) -> Optional[List[float]]:
+    """Read a point without introducing discontinuous pre-comparison rounding."""
+
+    coordinates: List[float] = []
+    for lower_name, upper_name in (("x", "X"), ("y", "Y"), ("z", "Z")):
+        try:
+            value = getattr(point, lower_name)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            try:
+                value = getattr(point, upper_name)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                return None
+        coordinate = _raw_shape_number(value)
+        if coordinate is None:
+            return None
+        coordinates.append(coordinate)
+    return coordinates
+
+
 def _canonical_point_path(
     points: List[Tuple[int, int, int]],
 ) -> Tuple[bool, Tuple[Tuple[int, int, int], ...]]:
@@ -4438,8 +4491,10 @@ def _canonical_point_path(
     return False, min(sequence, tuple(reversed(sequence)))
 
 
-def _host_edge_fingerprint(edge: Any) -> Tuple[Any, ...]:
-    """Fingerprint an edge without trusting volatile BREP serialization."""
+def _host_edge_fingerprint(
+    edge: Any,
+) -> Tuple[Tuple[Any, ...], Dict[str, Any], bool]:
+    """Fingerprint an edge and retain independently comparable sample points."""
 
     try:
         curve = getattr(edge, "Curve", None)
@@ -4450,6 +4505,10 @@ def _host_edge_fingerprint(edge: Any) -> Tuple[Any, ...]:
         length_token = _quantized_shape_number(edge.Length)
     except (AttributeError, RuntimeError, TypeError, ValueError):
         length_token = None
+    try:
+        raw_length = _raw_shape_number(edge.Length)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        raw_length = None
 
     sampled_points: List[Any] = []
     try:
@@ -4463,7 +4522,7 @@ def _host_edge_fingerprint(edge: Any) -> Tuple[Any, ...]:
             )
         except (AttributeError, RuntimeError, TypeError, ValueError):
             sampled_points = []
-    if not sampled_points:
+    if not sampled_points and not callable(discretize):
         try:
             sampled_points = [
                 vertex.Point
@@ -4472,17 +4531,46 @@ def _host_edge_fingerprint(edge: Any) -> Tuple[Any, ...]:
         except (AttributeError, RuntimeError, TypeError, ValueError):
             sampled_points = []
 
-    point_tokens = [
-        token
-        for token in (_host_point_token(point) for point in sampled_points)
-        if token is not None
-    ]
+    point_tokens: List[Tuple[int, int, int]] = []
+    point_samples: List[List[float]] = []
+    samples_valid = bool(sampled_points)
+    for point in sampled_points:
+        token = _host_point_token(point)
+        sample = _host_point_sample(point)
+        if token is None or sample is None:
+            samples_valid = False
+            continue
+        point_tokens.append(token)
+        point_samples.append(sample)
+    samples_valid = bool(
+        samples_valid
+        and len(point_tokens) == len(sampled_points)
+        and raw_length is not None
+    )
     closed, canonical_path = _canonical_point_path(point_tokens)
+    sample_closed = bool(
+        len(point_samples) > 2
+        and all(
+            abs(first - last) <= _SHAPE_FINGERPRINT_QUANTUM
+            for first, last in zip(
+                point_samples[0], point_samples[-1], strict=True
+            )
+        )
+    )
     return (
-        curve_type,
-        length_token if length_token is not None else "",
-        1 if closed else 0,
-        canonical_path,
+        (
+            curve_type,
+            length_token if length_token is not None else "",
+            1 if closed else 0,
+            canonical_path,
+        ),
+        {
+            "curve_type": curve_type,
+            "length": raw_length,
+            "closed": sample_closed,
+            "points": point_samples,
+        },
+        samples_valid,
     )
 
 
@@ -4494,6 +4582,7 @@ def _host_shape_geometry_fingerprint(shape: Any) -> Dict[str, Any]:
     except (AttributeError, RuntimeError, TypeError, ValueError):
         vertices = []
     vertex_tokens = []
+    vertex_samples: List[List[float]] = []
     invalid_vertex_count = 0
     for vertex in vertices:
         try:
@@ -4502,17 +4591,23 @@ def _host_shape_geometry_fingerprint(shape: Any) -> Dict[str, Any]:
             invalid_vertex_count += 1
             continue
         token = _host_point_token(point)
-        if token is None:
+        sample = _host_point_sample(point)
+        if token is None or sample is None:
             invalid_vertex_count += 1
         else:
             vertex_tokens.append(token)
+            vertex_samples.append(sample)
     vertex_tokens.sort()
+    vertex_samples.sort()
 
     try:
         edges = list(getattr(shape, "Edges", []) or [])
     except (AttributeError, RuntimeError, TypeError, ValueError):
         edges = []
-    edge_tokens = [_host_edge_fingerprint(edge) for edge in edges]
+    edge_results = [_host_edge_fingerprint(edge) for edge in edges]
+    edge_tokens = [result[0] for result in edge_results]
+    edge_samples = [result[1] for result in edge_results]
+    edge_validity = [result[2] for result in edge_results]
     edge_tokens.sort(
         key=lambda token: json.dumps(
             token,
@@ -4520,9 +4615,30 @@ def _host_shape_geometry_fingerprint(shape: Any) -> Dict[str, Any]:
             separators=(",", ":"),
         )
     )
-    sampled_edge_count = sum(1 for token in edge_tokens if token[-1])
+    edge_samples.sort(
+        key=lambda sample: json.dumps(
+            sample,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    sampled_edge_count = sum(1 for valid in edge_validity if valid)
+    comparison_geometry = {
+        "schema": "bcs.freecad_raw_shape_geometry/1.0",
+        "tolerance": format(_SHAPE_FINGERPRINT_QUANTUM, ".12g"),
+        "vertices": vertex_samples,
+        "edges": edge_samples,
+    }
+    comparison_digest = hashlib.sha256(
+        json.dumps(
+            comparison_geometry,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
     return {
-        "schema": "bcs.freecad_shape_fingerprint/1.0",
+        "schema": "bcs.freecad_shape_fingerprint/1.1",
         "quantum": format(_SHAPE_FINGERPRINT_QUANTUM, ".12g"),
         "vertices": vertex_tokens,
         "edges": edge_tokens,
@@ -4530,7 +4646,19 @@ def _host_shape_geometry_fingerprint(shape: Any) -> Dict[str, Any]:
         "invalid_vertex_count": invalid_vertex_count,
         "edge_count": len(edges),
         "sampled_edge_count": sampled_edge_count,
+        "invalid_edge_count": len(edges) - sampled_edge_count,
         "canonical_geometry_present": bool(vertex_tokens or sampled_edge_count),
+        "comparison_geometry": comparison_geometry,
+        "public_geometry": {
+            "schema": "bcs.freecad_shape_geometry_digest/1.0",
+            "tolerance": format(_SHAPE_FINGERPRINT_QUANTUM, ".12g"),
+            "sample_digest": comparison_digest,
+            "vertex_count": len(vertex_samples),
+            "edge_count": len(edge_samples),
+            "sampled_point_count": sum(
+                len(edge_sample.get("points", [])) for edge_sample in edge_samples
+            ),
+        },
     }
 
 
@@ -4635,9 +4763,16 @@ def _host_shape_content_snapshot(obj, type_id: str) -> Dict[str, Any]:
         "shape_fingerprint_sampled_edge_count": geometry_fingerprint.get(
             "sampled_edge_count", 0
         ),
+        "shape_fingerprint_geometry": geometry_fingerprint.get(
+            "public_geometry", {}
+        ),
+        "_shape_comparison_geometry": geometry_fingerprint.get(
+            "comparison_geometry", {}
+        ),
         "shape_fingerprint_verified": bool(
             geometry_fingerprint.get("canonical_geometry_present")
             and geometry_fingerprint.get("invalid_vertex_count") == 0
+            and geometry_fingerprint.get("invalid_edge_count") == 0
         ),
     }
 
@@ -4869,6 +5004,7 @@ def _crosscheck_host_object_inventory(
 
     missing: List[str] = []
     mismatches: List[Dict[str, Any]] = []
+    geometry_comparisons: List[Dict[str, Any]] = []
     matched_objects: List[Any] = []
     for expected in expected_records:
         entity_id = str(expected.get("entity_id") or "")
@@ -4909,7 +5045,17 @@ def _crosscheck_host_object_inventory(
                 mismatch["expected_parent_source_item_id"] = expected_parent_source_id
                 mismatch["actual_parent_source_item_id"] = actual_parent_source_id
             mismatches.append(mismatch)
-        elif isinstance(expected_content, dict) and actual_content != expected_content:
+        elif isinstance(expected_content, dict):
+            from pdfcadcore.import_report import _freecad_host_content_comparison
+
+            content_comparison = _freecad_host_content_comparison(
+                expected_content, actual_content, entity_id
+            )
+            if content_comparison.get("verified") is True:
+                certificate = content_comparison.get("certificate")
+                if isinstance(certificate, dict):
+                    geometry_comparisons.append(certificate)
+                continue
             mismatches.append(
                 {
                     "entity_id": entity_id,
@@ -4941,6 +5087,7 @@ def _crosscheck_host_object_inventory(
         "duplicate_actual_entity_ids": list(dict.fromkeys(duplicate_actual_ids)),
         "unexpected_entity_ids": unexpected,
         "mismatched_entities": mismatches,
+        "geometry_comparisons": geometry_comparisons,
         "expected_counts": expected_counts,
         "actual_counts": actual_counts,
         "counts_match": counts_match,
@@ -4965,6 +5112,7 @@ def _save_reopen_host_object_inventory(
         "duplicate_actual_entity_ids": [],
         "unexpected_entity_ids": [],
         "mismatched_entities": [],
+        "geometry_comparisons": [],
         "expected_counts": dict(inventory.get("counts") or {}),
         "actual_counts": {},
         "counts_match": False,
@@ -8221,7 +8369,9 @@ def import_pdf_page(pdf_path: str, page_num: int = 1,
                 transaction_open = False
             removed_by_abort = [
                 entity_id
-                for host_obj, entity_id in zip(created_objects, created_ids)
+                for host_obj, entity_id in zip(
+                    created_objects, created_ids, strict=False
+                )
                 if entity_id and fc_doc.getObject(entity_id) is not host_obj
             ]
             cleanup = _remove_post_baseline_document_objects(

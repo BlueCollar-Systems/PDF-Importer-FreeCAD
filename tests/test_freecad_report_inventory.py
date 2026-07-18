@@ -227,7 +227,7 @@ def _aws_fallback_opts(raster_path: str = "") -> core.ImportOptions:
         "proof_chain": proofs,
         "transition_chain": [
             {"from": left, "to": right}
-            for left, right in zip(ladder, ladder[1:])
+            for left, right in zip(ladder, ladder[1:], strict=False)
         ],
     }
     opts.text_mode_fallbacks.append(
@@ -1769,7 +1769,7 @@ def test_reopen_crosscheck_tolerates_vertex_and_edge_enumeration_order() -> None
     second = list(reversed(first))
     before.Shape.Vertexes = first
     after.Shape.Vertexes = second
-    before.Shape.Edges = [object(), object()]
+    before.Shape.Edges = [ShapeEdge(), ShapeEdge()]
     after.Shape.Edges = list(reversed(before.Shape.Edges))
     expected = core._build_host_object_inventory([before])
 
@@ -1854,6 +1854,193 @@ def test_reopen_crosscheck_tolerates_real_freecad_bound_box_roundoff() -> None:
     crosscheck = core._crosscheck_host_object_inventory(expected, [after])
 
     assert crosscheck["verified"] is True
+
+
+def test_reopen_crosscheck_tolerates_roundoff_across_quantization_boundary() -> None:
+    """A tolerance cannot become discontinuous at an arbitrary hash bin edge."""
+
+    before = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    after = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    before.Shape.Vertexes = [
+        ShapeVertex(1.000000049999, 0.0),
+        ShapeVertex(2.0, 0.0),
+    ]
+    after.Shape.Vertexes = [
+        ShapeVertex(1.000000050001, 0.0),
+        ShapeVertex(2.0, 0.0),
+    ]
+    before.Shape.Edges = []
+    after.Shape.Edges = []
+    expected = core._build_host_object_inventory([before])
+
+    crosscheck = core._crosscheck_host_object_inventory(expected, [after])
+
+    assert crosscheck["verified"] is True
+
+
+def test_reopen_crosscheck_tolerates_closed_edge_roundoff_across_hash_boundary() -> None:
+    """Closed-edge truth must use continuous tolerance, not rounded-bin equality."""
+
+    class BoundaryEdge:
+        Length = 2.0
+
+        def __init__(self, seam_x: float) -> None:
+            self._seam_x = seam_x
+
+        def discretize(self, **_kwargs):
+            return [
+                ShapePoint(0.0, 0.0),
+                ShapePoint(1.0, 0.0),
+                ShapePoint(self._seam_x, 0.0),
+            ]
+
+    before = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    after = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    before.Shape.Edges = [BoundaryEdge(0.000000049999)]
+    after.Shape.Edges = [BoundaryEdge(0.000000050001)]
+    expected = core._build_host_object_inventory([before])
+
+    crosscheck = core._crosscheck_host_object_inventory(expected, [after])
+
+    assert crosscheck["verified"] is True
+
+
+def test_structural_shape_fingerprint_rejects_an_unsampled_edge() -> None:
+    """Every claimed edge needs observable geometry, not merely other vertices."""
+
+    class UnsampledEdge:
+        Length = 1.0
+        Vertexes = [ShapeVertex(0.0, 0.0), ShapeVertex(1.0, 0.0)]
+
+        def discretize(self, **_kwargs):
+            raise RuntimeError("edge sampling unavailable")
+
+    glyph = HostObject(
+        "Glyph001",
+        "Part::Feature",
+        representation="glyphs",
+        source_item_id="p1:b0:l0:s0:g0",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    glyph.Shape.Edges = [UnsampledEdge()]
+
+    inventory = core._build_host_object_inventory([glyph])
+    content = inventory["objects"][0]["content"]
+
+    assert content["shape_fingerprint_edge_count"] == 1
+    assert content["shape_fingerprint_sampled_edge_count"] == 0
+    assert content["shape_fingerprint_verified"] is False
+
+
+def test_tolerated_shape_roundoff_emits_a_bound_public_certificate() -> None:
+    """Raw samples stay transient while the report binds both observations."""
+
+    before = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    after = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    before.Shape.Vertexes[0] = ShapeVertex(1.000000049999, 0.0)
+    after.Shape.Vertexes[0] = ShapeVertex(1.000000050001, 0.0)
+    expected = core._build_host_object_inventory([before])
+    crosscheck = core._crosscheck_host_object_inventory(expected, [after])
+
+    public_expected = core._public_report_value(expected)
+    public_crosscheck = core._public_report_value(crosscheck)
+    encoded = json.dumps(
+        {"inventory": public_expected, "save_reopen": public_crosscheck},
+        sort_keys=True,
+    )
+
+    assert crosscheck["verified"] is True
+    assert len(crosscheck["geometry_comparisons"]) == 1
+    assert "_shape_comparison_geometry" not in encoded
+    assert report_contract._freecad_save_reopen_inventory_verified(
+        public_expected, public_crosscheck
+    ) is True
+
+    tampered_delta = json.loads(json.dumps(public_crosscheck))
+    tampered_delta["geometry_comparisons"][0]["max_delta"] = 0.0
+    assert report_contract._freecad_save_reopen_inventory_verified(
+        public_expected, tampered_delta
+    ) is False
+
+    tampered_digest = json.loads(json.dumps(public_crosscheck))
+    tampered_digest["actual_objects"][0]["content"][
+        "shape_fingerprint_geometry"
+    ]["sample_digest"] = "f" * 64
+    assert report_contract._freecad_save_reopen_inventory_verified(
+        public_expected, tampered_digest
+    ) is False
+
+    tampered_sample_count = json.loads(json.dumps(public_crosscheck))
+    tampered_sample_count["actual_objects"][0]["content"][
+        "shape_fingerprint_geometry"
+    ]["sampled_point_count"] += 1
+    assert report_contract._freecad_save_reopen_inventory_verified(
+        public_expected, tampered_sample_count
+    ) is False
+
+    missing_certificate = json.loads(json.dumps(public_crosscheck))
+    missing_certificate["geometry_comparisons"] = []
+    assert report_contract._freecad_save_reopen_inventory_verified(
+        public_expected, missing_certificate
+    ) is False
+
+
+def test_public_inventory_does_not_serialize_transient_edge_samples() -> None:
+    """Detailed live comparison data must not scale the report per edge sample."""
+
+    geometry = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    geometry.Shape.Edges = [ShapeEdge() for _ in range(100)]
+    inventory = core._build_host_object_inventory([geometry])
+
+    public_inventory = core._public_report_value(inventory)
+    raw_bytes = len(json.dumps(inventory, sort_keys=True).encode("utf-8"))
+    public_json = json.dumps(public_inventory, sort_keys=True)
+
+    assert "_shape_comparison_geometry" not in public_json
+    assert len(public_json.encode("utf-8")) < 5_000
+    assert raw_bytes > len(public_json.encode("utf-8")) * 5
 
 
 def test_ready_rejects_unrecognized_delivered_count_bucket(tmp_path) -> None:

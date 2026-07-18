@@ -362,11 +362,12 @@ def test_image_only_page_records_adjacent_proof_gated_raster_fallback(mode):
         and attempt["proof"]["attempted_type"] == attempt["attempted_type"]
         for attempt in impossible
     )
-    assert list(zip(ladder, ladder[1:])) == [
+    assert list(zip(ladder, ladder[1:], strict=False)) == [
         (attempted, following)
         for attempted, following in zip(
             [attempt["attempted_type"] for attempt in opts.text_delivery_attempts],
             [attempt["attempted_type"] for attempt in opts.text_delivery_attempts][1:],
+            strict=False,
         )
     ]
     final = opts.text_delivery_attempts[-1]

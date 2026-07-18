@@ -373,8 +373,8 @@ def test_wirestring_memo_dedupes_identical_tessellations():
     assert first is not second
     assert all(
         hit_wire is not miss_wire
-        for hit_char, miss_char in zip(second, first)
-        for hit_wire, miss_wire in zip(hit_char, miss_char)
+        for hit_char, miss_char in zip(second, first, strict=False)
+        for hit_wire, miss_wire in zip(hit_char, miss_char, strict=False)
     ), "cache hits must return fresh copies, never shared wire objects"
     assert third[0][0].tag.startswith("M:")
 

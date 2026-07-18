@@ -22,6 +22,33 @@ from PDFVectorImporter.src import PDFSvgTextRenderer as renderer  # noqa: E402
 
 def _report(tmp_path, requested, delivered, count):
     opts = core.ImportOptions(text_mode=requested)
+    bucket_by_type = {
+        "labels": "native_label",
+        "text": "native_text",
+        "3d_text": "native_3d_text",
+        "glyphs": "outline_curve_or_mesh",
+        "geometry": "raw_geometry_edges",
+        "raster": "raster_text_patch",
+    }
+    entity_ids = ["Delivered%03d" % index for index in range(count)]
+    opts.text_delivery_attempts.append(
+        {
+            "source_item_id": "p1:text:0",
+            "requested_type": requested,
+            "attempted_type": delivered,
+            "final_type": delivered,
+            "outcome": "verified",
+            "created_entity_ids": entity_ids,
+            "delivery_entity_ids": entity_ids,
+            "support_entity_ids": [],
+            "removed_entity_ids": [],
+            "cleanup_complete": True,
+            "attempted_types": [delivered],
+            "proof_chain": [],
+            "evidence": {"host_entity_type": "Part::Feature"},
+        }
+    )
+    opts.text_delivered_counts[bucket_by_type[delivered]] = count
     opts._report_extra = {
         "actual_text_entity_types": {
             "entity_type": delivered,
@@ -46,12 +73,9 @@ def test_glyphs_and_geometry_are_not_treated_as_equivalent_peer_modes(tmp_path):
     report = _report(tmp_path, "glyphs", "geometry", 3)
 
     violation = report["extra"]["representation_contract_violation"]
-    assert violation == {
-        "requested_type": "glyphs",
-        "delivered_type": "geometry",
-        "delivered_count": 3,
-        "reason": "unproven_representation_substitution",
-    }
+    assert violation["requested_type"] == "glyphs"
+    assert violation["reason"] == "invalid_item_bound_representation_delivery"
+    assert "p1:text:0_non_adjacent_or_repeated_ladder" in violation["invalid_reasons"]
 
 
 @pytest.mark.parametrize("mode", ["labels", "3d_text", "glyphs", "geometry"])
@@ -547,6 +571,102 @@ def test_explicit_requested_raster_has_no_false_fallback_chain():
         "raster"
     ]
     assert opts.text_delivery_attempts[0]["outcome"] == "verified"
+    assert opts.text_mode_fallbacks == []
+
+
+def test_explicit_requested_raster_live_branch_records_verified_delivery(monkeypatch):
+    class HostObject:
+        def __init__(self, document, kind, name):
+            self.Document = document
+            self.TypeId = kind
+            self.Name = name
+            self.Label = name
+            if kind == "App::DocumentObjectGroup":
+                self.Group = []
+
+        def addObject(self, obj):
+            if obj not in self.Group:
+                self.Group.append(obj)
+
+        def isDerivedFrom(self, kind):
+            return self.TypeId == kind
+
+    class Document:
+        def __init__(self):
+            self.Objects = []
+
+        def addObject(self, kind, name):
+            obj = HostObject(self, kind, name)
+            self.Objects.append(obj)
+            return obj
+
+        def recompute(self):
+            return None
+
+    class Page:
+        rect = SimpleNamespace(width=100.0, height=100.0)
+        rotation_matrix = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+        def get_drawings(self):
+            return []
+
+        def get_images(self, full=True):
+            assert full is True
+            return []
+
+    class Pdf:
+        is_encrypted = False
+
+        def __len__(self):
+            return 1
+
+        def load_page(self, _index):
+            return Page()
+
+        def get_ocgs(self):
+            return {}
+
+    raster_result = {
+        "outcome": "verified",
+        "entity_type": "raster",
+        "created_entity_ids": ["PageRaster001"],
+        "evidence": {
+            "host_entity_type": "Image::ImagePlane",
+            "pdf_sha256": "c" * 64,
+        },
+    }
+    monkeypatch.setattr(core, "FreeCAD", SimpleNamespace(GuiUp=False))
+    monkeypatch.setattr(core, "_msg", lambda *_args: None)
+    monkeypatch.setattr(core, "_warn", lambda *_args: None)
+    monkeypatch.setattr(core, "_pdf_file_sha256", lambda _path: "c" * 64)
+    monkeypatch.setattr(core, "_import_page_as_raster", lambda *_args: raster_result)
+    opts = core.ImportOptions(
+        import_mode="raster",
+        import_text=True,
+        text_mode="raster",
+        ignore_images=True,
+    )
+
+    _group, text_info = core._import_pdf_page_inner(
+        Pdf(), "fixture.pdf", 1, opts, Document()
+    )
+
+    assert text_info["entity_type"] == "raster"
+    assert text_info["count"] == 1
+    assert opts.text_delivered_counts == {"raster_text_patch": 1}
+    assert opts.text_delivery_attempts == [
+        {
+            "source_item_id": "p1:page",
+            "requested_type": "raster",
+            "attempted_type": "raster",
+            "final_type": "raster",
+            "outcome": "verified",
+            "created_entity_ids": ["PageRaster001"],
+            "removed_entity_ids": [],
+            "cleanup_complete": True,
+            "evidence": raster_result["evidence"],
+        }
+    ]
     assert opts.text_mode_fallbacks == []
 
 

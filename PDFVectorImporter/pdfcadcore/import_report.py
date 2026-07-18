@@ -496,6 +496,276 @@ def build_model_3d_extra(
     }
 
 
+def _freecad_delivery_inventory_binding_verified(
+    delivery: Any,
+    inventory: Any,
+) -> bool:
+    """Bind each terminal text delivery to its exact persisted host object."""
+
+    if not isinstance(delivery, dict) or delivery.get("verified") is not True:
+        return False
+    if not isinstance(inventory, dict) or inventory.get("verified") is not True:
+        return False
+
+    records = inventory.get("objects")
+    terminals = delivery.get("terminal_attempts")
+    if not isinstance(records, list) or not isinstance(terminals, list) or not terminals:
+        return False
+
+    records_by_id: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            return False
+        entity_id = str(record.get("entity_id") or "").strip()
+        if not entity_id or entity_id in records_by_id:
+            return False
+        records_by_id[entity_id] = record
+
+    for terminal in terminals:
+        if not isinstance(terminal, dict) or terminal.get("outcome") != "verified":
+            return False
+        source_item_id = str(terminal.get("source_item_id") or "").strip()
+        final_type = (
+            str(terminal.get("final_type") or terminal.get("attempted_type") or "")
+            .strip()
+            .lower()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+        delivery_ids = terminal.get("delivery_entity_ids")
+        if delivery_ids is None:
+            delivery_ids = terminal.get("created_entity_ids")
+        if (
+            not source_item_id
+            or not final_type
+            or not isinstance(delivery_ids, list)
+            or not delivery_ids
+        ):
+            return False
+
+        for raw_entity_id in delivery_ids:
+            entity_id = str(raw_entity_id or "").strip()
+            record = records_by_id.get(entity_id)
+            if record is None:
+                return False
+            representation = (
+                str(record.get("representation") or "")
+                .strip()
+                .lower()
+                .replace("-", "_")
+                .replace(" ", "_")
+            )
+            if representation != final_type:
+                return False
+            if str(record.get("source_item_id") or "") != source_item_id:
+                return False
+            category = str(record.get("category") or "")
+            type_id = str(record.get("type_id") or "")
+            if final_type == "raster":
+                if category != "images" or not type_id.startswith("Image::"):
+                    return False
+            elif category != "text_representation_objects":
+                return False
+
+    return True
+
+
+def _freecad_save_reopen_inventory_verified(
+    inventory: Any,
+    save_reopen: Any,
+) -> bool:
+    """Reject self-contradictory persistence evidence even when marked verified."""
+
+    if not isinstance(inventory, dict) or inventory.get("verified") is not True:
+        return False
+    if not isinstance(save_reopen, dict) or save_reopen.get("verified") is not True:
+        return False
+
+    inventory_ids = inventory.get("entity_ids")
+    inventory_counts = inventory.get("counts")
+    inventory_objects = inventory.get("objects")
+    if (
+        not isinstance(inventory_ids, list)
+        or not inventory_ids
+        or any(not isinstance(entity_id, str) or not entity_id for entity_id in inventory_ids)
+        or len(inventory_ids) != len(set(inventory_ids))
+        or not isinstance(inventory_counts, dict)
+        or not isinstance(inventory_objects, list)
+        or len(inventory_objects) != len(inventory_ids)
+    ):
+        return False
+
+    for field in (
+        "missing_entity_ids",
+        "duplicate_actual_entity_ids",
+        "unexpected_entity_ids",
+        "mismatched_entities",
+    ):
+        if not isinstance(save_reopen.get(field), list) or save_reopen.get(field):
+            return False
+
+    return bool(
+        save_reopen.get("expected_entity_ids") == inventory_ids
+        and save_reopen.get("expected_counts") == inventory_counts
+        and save_reopen.get("actual_counts") == inventory_counts
+        and save_reopen.get("counts_match") is True
+    )
+
+
+def _freecad_host_inventory_verified(inventory: Any, result: Any) -> bool:
+    """Recompute inventory identities, categories, types, and result counts."""
+
+    if (
+        not isinstance(inventory, dict)
+        or inventory.get("verified") is not True
+        or not isinstance(result, dict)
+    ):
+        return False
+    records = inventory.get("objects")
+    entity_ids = inventory.get("entity_ids")
+    categories = inventory.get("categories")
+    counts = inventory.get("counts")
+    type_counts = inventory.get("type_counts")
+    category_names = (
+        "containers",
+        "images",
+        "vector_primitives",
+        "text_representation_objects",
+        "unclassified",
+    )
+    if (
+        not isinstance(records, list)
+        or not records
+        or not isinstance(entity_ids, list)
+        or not isinstance(categories, dict)
+        or not isinstance(counts, dict)
+        or not isinstance(type_counts, dict)
+    ):
+        return False
+
+    derived_ids: List[str] = []
+    derived_categories = {name: [] for name in category_names}
+    derived_type_counts: Dict[str, int] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            return False
+        entity_id = record.get("entity_id")
+        type_id = record.get("type_id")
+        category = record.get("category")
+        if (
+            not isinstance(entity_id, str)
+            or not entity_id
+            or not isinstance(type_id, str)
+            or not type_id
+            or category not in derived_categories
+        ):
+            return False
+        derived_ids.append(entity_id)
+        derived_categories[category].append(entity_id)
+        derived_type_counts[type_id] = derived_type_counts.get(type_id, 0) + 1
+
+    if derived_ids != entity_ids or len(derived_ids) != len(set(derived_ids)):
+        return False
+    if categories != derived_categories or type_counts != derived_type_counts:
+        return False
+    derived_counts = {"total": len(records)}
+    derived_counts.update(
+        {name: len(derived_categories[name]) for name in category_names}
+    )
+    if counts != derived_counts:
+        return False
+    return bool(
+        type(result.get("primitives")) is int
+        and result.get("primitives") == derived_counts["vector_primitives"]
+        and type(result.get("images")) is int
+        and result.get("images") == derived_counts["images"]
+    )
+
+
+def _freecad_actual_text_entity_types_verified(
+    delivery: Any,
+    entity_types: Any,
+    result: Any,
+) -> bool:
+    """Reconcile reported FreeCAD text buckets to exact terminal deliveries."""
+
+    if not isinstance(delivery, dict) or delivery.get("verified") is not True:
+        return False
+    if not isinstance(entity_types, dict) or not isinstance(result, dict):
+        return False
+
+    bucket_by_type = {
+        "labels": "native_label",
+        "text": "native_text",
+        "3d_text": "native_3d_text",
+        "glyphs": "outline_curve_or_mesh",
+        "geometry": "raw_geometry_edges",
+        "raster": "raster_text_patch",
+    }
+    expected_buckets = {bucket: 0 for bucket in TEXT_ENTITY_DELIVERED_BUCKETS}
+    terminal_types: List[str] = []
+    terminals = delivery.get("terminal_attempts")
+    if not isinstance(terminals, list) or not terminals:
+        return False
+
+    for terminal in terminals:
+        if not isinstance(terminal, dict) or terminal.get("outcome") != "verified":
+            return False
+        final_type = (
+            str(terminal.get("final_type") or "")
+            .strip()
+            .lower()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+        bucket = bucket_by_type.get(final_type)
+        if bucket is None:
+            return False
+
+        reported_count = terminal.get("delivery_count")
+        if type(reported_count) is int and reported_count > 0:
+            terminal_count = reported_count
+        else:
+            delivery_ids = terminal.get("delivery_entity_ids")
+            if delivery_ids is None:
+                delivery_ids = terminal.get("created_entity_ids")
+            if not isinstance(delivery_ids, list) or not delivery_ids:
+                return False
+            terminal_count = len(delivery_ids)
+        expected_buckets[bucket] += terminal_count
+        terminal_types.append(final_type)
+
+    unique_types = sorted(set(terminal_types))
+    expected_entity_type = (
+        unique_types[0] if len(unique_types) == 1 else "mixed"
+    )
+    expected_total = sum(expected_buckets.values())
+    expected_structural = expected_total - expected_buckets["raster_text_patch"]
+
+    actual_type = (
+        str(entity_types.get("entity_type") or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+    if actual_type != expected_entity_type:
+        return False
+    if type(entity_types.get("count")) is not int or entity_types.get("count") != expected_total:
+        return False
+    for bucket, expected_count in expected_buckets.items():
+        if (
+            bucket not in entity_types
+            or type(entity_types.get(bucket)) is not int
+            or entity_types.get(bucket) != expected_count
+        ):
+            return False
+    return bool(
+        type(result.get("text_entities")) is int
+        and result.get("text_entities") == expected_structural
+    )
+
+
 def build_import_contract_ready(report: "ImportReport") -> Dict[str, Any]:
     """Aggregate report-contract readiness for app/Report Doctor gates."""
 
@@ -506,9 +776,9 @@ def build_import_contract_ready(report: "ImportReport") -> Dict[str, Any]:
     open_failure = extra.get("open_failure")
     has_stamp = bool(str(meta.get("build_stamp") or "").strip())
     has_crosscheck = "scale_crosscheck" in extra
-    text_count = int(result.get("text_entities") or 0)
-    has_entity_types = "actual_text_entity_types" in extra
-    text_ok = text_count <= 0 or has_entity_types
+    host_app = str((report.host or {}).get("app") or "").strip().lower()
+    entity_types = extra.get("actual_text_entity_types")
+    has_entity_types = isinstance(entity_types, dict)
     status = str(extra.get("result_status") or result.get("status") or "success").lower()
     terminal_failure = extra.get("terminal_failure")
     result_succeeded = status not in {
@@ -519,25 +789,52 @@ def build_import_contract_ready(report: "ImportReport") -> Dict[str, Any]:
         "pending",
         "pending_export",
     } and terminal_failure is None
-    source_spans = int(extra.get("text_source_spans") or 0)
     import_text_enabled = extra.get("import_text") is not False
     delivery = extra.get("text_representation_delivery")
+    text_ok = bool(not import_text_enabled or has_entity_types)
     text_delivery_ok = (
         not import_text_enabled
-        or source_spans <= 0
         or (
             isinstance(delivery, dict)
-            and (
-                delivery.get("required") is False
-                or delivery.get("verified") is True
-            )
+            and delivery.get("required") is True
+            and delivery.get("verified") is True
         )
     )
+    representation_contract_ok = "representation_contract_violation" not in extra
+
+    inventory = extra.get("actual_host_object_inventory")
+    save_reopen = extra.get("save_reopen_inventory")
+    if host_app == "freecad":
+        inventory_ok = _freecad_host_inventory_verified(inventory, result)
+        save_reopen_ok = _freecad_save_reopen_inventory_verified(
+            inventory,
+            save_reopen,
+        )
+        text_ok = bool(
+            not import_text_enabled
+            or _freecad_actual_text_entity_types_verified(
+                delivery,
+                entity_types,
+                result,
+            )
+        )
+        delivery_inventory_binding_ok = bool(
+            not import_text_enabled
+            or _freecad_delivery_inventory_binding_verified(delivery, inventory)
+        )
+    else:
+        inventory_ok = True
+        save_reopen_ok = True
+        delivery_inventory_binding_ok = True
     ready = (
         has_stamp
         and has_crosscheck
         and text_ok
         and text_delivery_ok
+        and representation_contract_ok
+        and inventory_ok
+        and save_reopen_ok
+        and delivery_inventory_binding_ok
         and result_succeeded
         and open_failure is None
     )
@@ -549,6 +846,10 @@ def build_import_contract_ready(report: "ImportReport") -> Dict[str, Any]:
             "scale_crosscheck": has_crosscheck,
             "actual_text_entity_types": text_ok,
             "text_delivery": text_delivery_ok,
+            "representation_contract": representation_contract_ok,
+            "host_object_inventory": inventory_ok,
+            "save_reopen_inventory": save_reopen_ok,
+            "delivery_inventory_binding": delivery_inventory_binding_ok,
             "result_succeeded": result_succeeded,
             # Compatibility spelling retained for existing Report Doctor clients.
             "successful_result": result_succeeded,

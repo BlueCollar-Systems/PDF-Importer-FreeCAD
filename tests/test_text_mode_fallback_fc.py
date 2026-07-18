@@ -178,8 +178,8 @@ def test_report_never_fabricates_fallback_to_hide_unexplained_mode_divergence(tm
     assert "text" not in report["fallback"]
     violation = report["extra"]["representation_contract_violation"]
     assert violation["requested_type"] == "3d_text"
-    assert violation["delivered_type"] == "labels"
-    assert violation["reason"] == "unproven_representation_substitution"
+    assert violation["reason"] == "invalid_item_bound_representation_delivery"
+    assert violation["invalid_reasons"] == ["no_item_bound_delivery_attempts"]
 
 
 def test_report_includes_exact_attempt_ledger_and_proven_fallback(tmp_path):

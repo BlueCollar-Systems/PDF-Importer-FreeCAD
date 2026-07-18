@@ -133,7 +133,7 @@ class TestActualTextEntityTypes(unittest.TestCase):
             }
             _assert_contract_shape(verification_payload, schema)
 
-    def test_no_text_mode_does_not_emit_actual_entity_payload(self) -> None:
+    def test_no_text_mode_emits_explicit_empty_entity_and_attempt_payloads(self) -> None:
         with tempfile.TemporaryDirectory(prefix="fc_no_text_entity_report_") as tmp:
             tmp_path = Path(tmp)
             pdf_path = tmp_path / "sample.pdf"
@@ -153,7 +153,11 @@ class TestActualTextEntityTypes(unittest.TestCase):
             )
 
             report = json.loads(report_path.read_text(encoding="utf-8"))
-            self.assertNotIn("actual_text_entity_types", report["extra"])
+            self.assertEqual(report["extra"]["actual_text_entity_types"]["count"], 0)
+            self.assertEqual(report["extra"]["actual_text_entity_types"]["entity_type"], "none")
+            self.assertEqual(report["extra"]["text_delivery_attempts"], [])
+            self.assertFalse(report["extra"]["text_representation_delivery"]["required"])
+            self.assertTrue(report["extra"]["text_representation_delivery"]["verified"])
 
 
 if __name__ == "__main__":

@@ -681,6 +681,259 @@ def _model3d_report_payload(opts: ImportOptions) -> Dict[str, Any]:
     return payload
 
 
+def _build_text_representation_delivery(
+    opts: ImportOptions,
+    attempts: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Summarize the item-bound attempt ledger without inventing success."""
+
+    def normalize_type(value: Any) -> str:
+        raw = str(value or "").strip().lower()
+        if raw in {"", "none", "off", "disabled"}:
+            return "none" if raw else ""
+        try:
+            return _normalize_requested_text_type(raw)
+        except (TypeError, ValueError):
+            return ""
+
+    requested_raw = str(getattr(opts, "text_mode", "") or "none").strip().lower()
+    requested = normalize_type(requested_raw)
+    required = bool(getattr(opts, "import_text", False) and requested != "none")
+    raw_attempts = list(attempts or [])
+    normalized_attempts = [
+        dict(attempt) for attempt in raw_attempts if isinstance(attempt, dict)
+    ]
+    source_ids: List[str] = []
+    attempts_by_source: Dict[str, List[Dict[str, Any]]] = {}
+    invalid_reasons: List[str] = []
+
+    if len(normalized_attempts) != len(raw_attempts):
+        invalid_reasons.append("malformed_delivery_attempt")
+
+    if required and not requested:
+        invalid_reasons.append("requested_type_unsupported")
+
+    for index, attempt in enumerate(normalized_attempts):
+        source_id = str(attempt.get("source_item_id") or "").strip()
+        if not source_id:
+            invalid_reasons.append("attempt_%d_missing_source_item_id" % index)
+            continue
+        if source_id not in source_ids:
+            source_ids.append(source_id)
+        attempts_by_source.setdefault(source_id, []).append(attempt)
+
+    fallback_events = [
+        dict(event)
+        for event in (getattr(opts, "text_mode_fallbacks", []) or [])
+        if isinstance(event, dict)
+    ]
+    final_types: Dict[str, str] = {}
+    terminal_attempts: List[Dict[str, Any]] = []
+    for source_id in source_ids:
+        source_attempts = attempts_by_source[source_id]
+        terminal = source_attempts[-1]
+        terminal_attempts.append(dict(terminal))
+        attempted_sequence = [
+            normalize_type(attempt.get("attempted_type"))
+            for attempt in source_attempts
+        ]
+        requested_sequence = [
+            normalize_type(attempt.get("requested_type"))
+            for attempt in source_attempts
+        ]
+        if any(value != requested for value in requested_sequence):
+            invalid_reasons.append("%s_requested_type_drift" % source_id)
+        ladder = list(TEXT_ITEM_FALLBACK_LADDERS.get(requested, ()))
+        if (
+            not ladder
+            or any(not attempted_type for attempted_type in attempted_sequence)
+            or attempted_sequence != ladder[: len(attempted_sequence)]
+        ):
+            invalid_reasons.append("%s_non_adjacent_or_repeated_ladder" % source_id)
+
+        for local_index, prior in enumerate(source_attempts[:-1]):
+            prior_proof = prior.get("proof")
+            prior_attempted = attempted_sequence[local_index]
+            created_ids = prior.get("created_entity_ids")
+            removed_ids = prior.get("removed_entity_ids")
+            if str(prior.get("outcome") or "").strip().lower() != "proven_impossible":
+                invalid_reasons.append(
+                    "%s_attempt_%d_not_proven_impossible" % (source_id, local_index)
+                )
+            if prior.get("cleanup_complete") is not True:
+                invalid_reasons.append(
+                    "%s_attempt_%d_cleanup_unverified" % (source_id, local_index)
+                )
+            if prior.get("final_type") is not None:
+                invalid_reasons.append(
+                    "%s_attempt_%d_impossible_final_type_present"
+                    % (source_id, local_index)
+                )
+            if (
+                not isinstance(created_ids, list)
+                or not isinstance(removed_ids, list)
+                or any(
+                    not isinstance(entity_id, str)
+                    or not entity_id
+                    or entity_id != entity_id.strip()
+                    for entity_id in list(created_ids or []) + list(removed_ids or [])
+                )
+                or len(created_ids or []) != len(set(created_ids or []))
+                or len(removed_ids or []) != len(set(removed_ids or []))
+            ):
+                invalid_reasons.append(
+                    "%s_attempt_%d_cleanup_ids_invalid" % (source_id, local_index)
+                )
+            elif set(created_ids) != set(removed_ids):
+                invalid_reasons.append(
+                    "%s_attempt_%d_cleanup_entity_mismatch" % (source_id, local_index)
+                )
+            if (
+                not isinstance(prior_proof, dict)
+                or prior_proof.get("item_specific_proven_impossible") is not True
+                or str(prior_proof.get("source_item_id") or "") != source_id
+                or normalize_type(prior_proof.get("requested_type")) != requested
+                or normalize_type(prior_proof.get("attempted_type")) != prior_attempted
+                or prior_proof.get("cleanup_complete") is not True
+                or prior_proof.get("created_entity_ids") != created_ids
+                or prior_proof.get("removed_entity_ids") != removed_ids
+                or not str(prior.get("reason_code") or "").strip()
+                or prior_proof.get("reason_code") != prior.get("reason_code")
+                or not isinstance(prior_proof.get("evidence"), dict)
+                or not prior_proof.get("evidence")
+                or not isinstance(prior_proof.get("attempted_source_results"), list)
+                or not prior_proof.get("attempted_source_results")
+                or prior_proof.get("attempted_sources_complete") is not True
+            ):
+                invalid_reasons.append(
+                    "%s_attempt_%d_proof_invalid" % (source_id, local_index)
+                )
+
+        outcome = str(terminal.get("outcome") or "").strip().lower()
+        final_type = normalize_type(
+            terminal.get("final_type") or terminal.get("attempted_type")
+        )
+        terminal_attempted = normalize_type(terminal.get("attempted_type"))
+        final_types[source_id] = final_type
+        if outcome != "verified":
+            invalid_reasons.append("%s_terminal_outcome_%s" % (source_id, outcome or "missing"))
+        if terminal.get("cleanup_complete") is not True:
+            invalid_reasons.append("%s_cleanup_unverified" % source_id)
+        if not isinstance(terminal.get("evidence"), dict) or not terminal.get("evidence"):
+            invalid_reasons.append("%s_host_evidence_missing" % source_id)
+        if not final_type or final_type == "none":
+            invalid_reasons.append("%s_final_type_missing" % source_id)
+        if not terminal_attempted or final_type != terminal_attempted:
+            invalid_reasons.append("%s_terminal_type_drift" % source_id)
+
+        created_ids = terminal.get("created_entity_ids")
+        removed_ids = terminal.get("removed_entity_ids", [])
+        delivery_ids = terminal.get("delivery_entity_ids")
+        if delivery_ids is None:
+            delivery_ids = created_ids
+        support_ids = terminal.get("support_entity_ids", [])
+        terminal_id_lists = (created_ids, removed_ids, delivery_ids, support_ids)
+        if (
+            any(not isinstance(values, list) for values in terminal_id_lists)
+            or any(
+                not isinstance(entity_id, str)
+                or not entity_id
+                or entity_id != entity_id.strip()
+                for values in terminal_id_lists
+                for entity_id in (values if isinstance(values, list) else [])
+            )
+            or any(
+                len(values) != len(set(values))
+                for values in terminal_id_lists
+                if isinstance(values, list)
+            )
+        ):
+            invalid_reasons.append("%s_terminal_entity_ids_invalid" % source_id)
+        else:
+            created_set = set(created_ids)
+            removed_set = set(removed_ids)
+            delivery_set = set(delivery_ids)
+            support_set = set(support_ids)
+            if (
+                not created_set
+                or not delivery_set
+                or not removed_set.issubset(created_set)
+                or not delivery_set.issubset(created_set)
+                or not support_set.issubset(created_set)
+                or delivery_set.intersection(support_set)
+                or delivery_set.union(support_set) != created_set
+                or delivery_set.intersection(removed_set)
+            ):
+                invalid_reasons.append("%s_terminal_ownership_invalid" % source_id)
+
+        expected_proof_chain = [
+            prior.get("proof") for prior in source_attempts[:-1]
+        ]
+        terminal_attempted_types = terminal.get("attempted_types")
+        terminal_proof_chain = terminal.get("proof_chain")
+        if len(source_attempts) > 1 and (
+            terminal_attempted_types != attempted_sequence
+            or terminal_proof_chain != expected_proof_chain
+        ):
+            invalid_reasons.append("%s_terminal_proof_chain_invalid" % source_id)
+        elif terminal_attempted_types is not None and (
+            terminal_attempted_types != attempted_sequence
+        ):
+            invalid_reasons.append("%s_terminal_attempted_types_invalid" % source_id)
+        if final_type and final_type != requested:
+            expected_transitions = [
+                {"from": left, "to": right}
+                for left, right in zip(attempted_sequence, attempted_sequence[1:])
+            ]
+            expected_created_ids = [
+                entity_id
+                for prior in source_attempts[:-1]
+                for entity_id in list(prior.get("created_entity_ids") or [])
+            ]
+            expected_removed_ids = [
+                entity_id
+                for prior in source_attempts[:-1]
+                for entity_id in list(prior.get("removed_entity_ids") or [])
+            ]
+            fallback_verified = any(
+                normalize_type(event.get("requested")) == requested
+                and normalize_type(event.get("delivered")) == final_type
+                and source_id in list(event.get("source_item_ids") or [])
+                and type(event.get("count")) is int
+                and event.get("count") > 0
+                and isinstance(event.get("proof"), dict)
+                and event["proof"].get("item_specific_proven_impossible") is True
+                and str(event["proof"].get("source_item_id") or "") == source_id
+                and normalize_type(event["proof"].get("requested_type")) == requested
+                and event["proof"].get("attempted_types") == attempted_sequence
+                and event["proof"].get("proof_chain") == expected_proof_chain
+                and event["proof"].get("transition_chain") == expected_transitions
+                and event["proof"].get("created_entity_ids") == expected_created_ids
+                and event["proof"].get("removed_entity_ids") == expected_removed_ids
+                and event["proof"].get("cleanup_complete") is True
+                and isinstance(event["proof"].get("evidence"), dict)
+                and bool(event["proof"].get("evidence"))
+                for event in fallback_events
+            )
+            if not fallback_verified:
+                invalid_reasons.append("%s_fallback_proof_missing" % source_id)
+
+    if required and not source_ids:
+        invalid_reasons.append("no_item_bound_delivery_attempts")
+
+    verified = bool(not required or (source_ids and not invalid_reasons))
+    return {
+        "required": required,
+        "requested_type": requested,
+        "attempt_count": len(normalized_attempts),
+        "source_item_ids": source_ids,
+        "terminal_attempts": terminal_attempts,
+        "final_types": final_types,
+        "invalid_reasons": list(dict.fromkeys(invalid_reasons)),
+        "verified": verified,
+    }
+
+
 def write_import_report(
     *,
     pdf_path: str,
@@ -690,6 +943,7 @@ def write_import_report(
     total_pages: int,
     primitive_count: int = 0,
     text_count: int = 0,
+    image_count: int = 0,
     layer_count: int = 0,
     elapsed_ms: float = 0.0,
     fallback_used: bool = False,
@@ -731,13 +985,25 @@ def write_import_report(
             examples=list(entity_info.get("examples") or []),
             delivered_counts=delivered_counts or None,
         )
+    else:
+        extra["actual_text_entity_types"] = build_actual_text_entity_types(
+            host_app="freecad",
+            text_mode=str(opts.text_mode or "none"),
+            count=0,
+            font_rendered=False,
+            examples=[],
+            delivered_counts=delivered_counts,
+        )
 
     text_attempts = [
         dict(attempt)
         for attempt in (getattr(opts, "text_delivery_attempts", []) or [])
     ]
-    if text_attempts:
-        extra["text_delivery_attempts"] = text_attempts
+    extra["text_delivery_attempts"] = text_attempts
+    extra["text_representation_delivery"] = _build_text_representation_delivery(
+        opts,
+        text_attempts,
+    )
 
     font_stage_failures = [
         dict(failure)
@@ -762,39 +1028,16 @@ def write_import_report(
         )
         extra["text_mode_fallbacks"] = text_fallback_events
 
-    requested_mode = str(opts.text_mode or "").strip().lower()
-    requested_mode = {"label": "labels", "text3d": "3d_text", "outlines": "glyphs"}.get(
-        requested_mode, requested_mode
-    )
-    entity_dict = extra.get("actual_text_entity_types")
-    delivered_mode = ""
-    delivered_count = 0
-    if isinstance(entity_dict, dict):
-        delivered_mode = str(entity_dict.get("entity_type") or "").strip().lower()
-        delivered_mode = {
-            "label": "labels",
-            "text3d": "3d_text",
-            "outlines": "glyphs",
-        }.get(delivered_mode, delivered_mode)
-        delivered_count = int(entity_dict.get("count") or 0)
-    proven_pair = bool(
-        text_fallback
-        and str(text_fallback.get("requested") or "").strip().lower() == requested_mode
-        and str(text_fallback.get("delivered") or "").strip().lower() == delivered_mode
-    )
+    delivery_summary = extra["text_representation_delivery"]
+    extra.pop("representation_contract_violation", None)
     if (
-        requested_mode
-        and requested_mode != "none"
-        and delivered_mode
-        and delivered_count > 0
-        and requested_mode != delivered_mode
-        and not proven_pair
+        delivery_summary.get("required") is True
+        and delivery_summary.get("verified") is not True
     ):
         extra["representation_contract_violation"] = {
-            "requested_type": requested_mode,
-            "delivered_type": delivered_mode,
-            "delivered_count": delivered_count,
-            "reason": "unproven_representation_substitution",
+            "requested_type": delivery_summary.get("requested_type"),
+            "reason": "invalid_item_bound_representation_delivery",
+            "invalid_reasons": list(delivery_summary.get("invalid_reasons") or []),
         }
     if skips:
         extra["shapestring_skips"] = skips
@@ -819,6 +1062,7 @@ def write_import_report(
         pages=int(pages_imported),
         primitive_count=primitive_count,
         text_count=text_count,
+        image_count=image_count,
         layer_count=layer_count,
         elapsed_ms=elapsed_ms,
         fallback_used=fallback_used,
@@ -3083,6 +3327,55 @@ def _record_text_mode_fallback(
     )
 
 
+def _record_explicit_page_raster_delivery(
+    opts: ImportOptions,
+    *,
+    page_num: int,
+    raster_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Record one directly requested, verified full-page Raster delivery."""
+
+    requested = _normalize_requested_text_type(str(getattr(opts, "text_mode", "") or ""))
+    if requested != "raster" or not bool(getattr(opts, "import_text", False)):
+        raise ValueError("explicit page Raster delivery was not requested")
+    page_number = int(page_num)
+    if page_number < 1 or not isinstance(raster_result, dict):
+        raise ValueError("explicit page Raster context is invalid")
+    if raster_result.get("outcome", "verified") != "verified":
+        raise ValueError("explicit page Raster was not verified")
+    raster_ids = _validated_entity_ids(
+        raster_result.get("created_entity_ids"),
+        field_name="raster_result.created_entity_ids",
+        allow_empty=False,
+    )
+    raster_evidence = dict(raster_result.get("evidence") or {})
+    if not raster_evidence:
+        raise ValueError("verified page Raster evidence is required")
+    source_item_id = "p%d:page" % page_number
+    attempt = {
+        "source_item_id": source_item_id,
+        "requested_type": "raster",
+        "attempted_type": "raster",
+        "final_type": "raster",
+        "outcome": "verified",
+        "created_entity_ids": list(raster_ids),
+        "removed_entity_ids": [],
+        "cleanup_complete": True,
+        "evidence": raster_evidence,
+    }
+    _append_text_item_attempt(opts, attempt)
+    _record_text_delivery(opts, "raster_text_patch", len(raster_ids))
+    return {
+        "entity_type": "raster",
+        "count": len(raster_ids),
+        "source_item_count": 1,
+        "source_item_ids": [source_item_id],
+        "font_rendered": False,
+        "examples": [],
+        "attempts": [dict(attempt)],
+    }
+
+
 def _record_no_source_text_page_fallback(
     opts: ImportOptions,
     *,
@@ -3093,6 +3386,12 @@ def _record_no_source_text_page_fallback(
 ) -> Dict[str, Any]:
     """Record a finite page-bound ladder when canonical source text is absent."""
     requested = _normalize_requested_text_type(str(getattr(opts, "text_mode", "") or ""))
+    if requested == "raster":
+        return _record_explicit_page_raster_delivery(
+            opts,
+            page_num=page_num,
+            raster_result=raster_result,
+        )
     page_number = int(page_num)
     source_item_id = "p%d:page" % page_number
     digest = str(pdf_sha256 or "").strip().lower()
@@ -3491,6 +3790,10 @@ def _aggregate_text_item_fallback_proof(
         ],
         "cleanup_complete": True,
         "proof_chain": proof_chain,
+        "transition_chain": [
+            {"from": left, "to": right}
+            for left, right in zip(attempted_types, attempted_types[1:])
+        ],
     }
     for proof in proof_chain:
         if proof.get("font_identity"):
@@ -3700,10 +4003,8 @@ def _write_terminal_representation_failure_report(
         pages_imported=int(pages_imported),
         total_pages=int(total_pages),
         primitive_count=0,
-        text_count=sum(
-            int(value or 0)
-            for value in (getattr(opts, "text_delivered_counts", {}) or {}).values()
-        ),
+        text_count=_structural_text_delivery_count(opts),
+        image_count=0,
         elapsed_ms=float(elapsed_ms),
         fallback_used=fallback_used,
         fallback_reason=fallback_reason,
@@ -3719,6 +4020,316 @@ def _document_objects(doc) -> List[Any]:
         return list(getattr(doc, "Objects", []) or [])
     except (AttributeError, RuntimeError, TypeError):
         return []
+
+
+def _post_baseline_document_objects(
+    objects: List[Any],
+    baseline_object_ids: set,
+    baseline_object_names: set,
+) -> List[Any]:
+    """Return only objects new by both runtime identity and stable FreeCAD name."""
+
+    ids = set(baseline_object_ids or set())
+    names = set(baseline_object_names or set())
+    return [
+        host_obj
+        for host_obj in list(objects or [])
+        if id(host_obj) not in ids and _host_object_id(host_obj) not in names
+    ]
+
+
+_STRUCTURAL_TEXT_REPRESENTATIONS = {"labels", "text", "3d_text", "glyphs", "geometry"}
+
+
+def _host_object_type_id(obj) -> str:
+    try:
+        return str(getattr(obj, "TypeId", "") or "")
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return ""
+
+
+def _host_object_representation(obj) -> str:
+    try:
+        return str(getattr(obj, "PDFRepresentation", "") or "").strip().lower()
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return ""
+
+
+def _host_object_source_item_id(obj) -> str:
+    try:
+        return str(getattr(obj, "PDFSourceItemId", "") or "")
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return ""
+
+
+def _is_host_container(obj, type_id: str) -> bool:
+    if type_id.startswith("App::DocumentObjectGroup"):
+        return True
+    try:
+        derived = getattr(obj, "isDerivedFrom", None)
+        return bool(callable(derived) and derived("App::DocumentObjectGroup"))
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _has_nonempty_host_geometry(obj, type_id: str) -> bool:
+    if not type_id.startswith(("Part::", "PartDesign::", "Sketcher::")):
+        return False
+    try:
+        shape = getattr(obj, "Shape", None)
+        if shape is not None:
+            is_null = getattr(shape, "isNull", None)
+            return not bool(is_null()) if callable(is_null) else True
+        geometry_count = getattr(obj, "GeometryCount", None)
+        if geometry_count is not None:
+            return int(geometry_count) > 0
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+    return False
+
+
+def _host_object_category(obj, type_id: str, representation: str) -> str:
+    if _is_host_container(obj, type_id):
+        return "containers"
+    if type_id.startswith("Image::"):
+        return "images"
+    if representation in _STRUCTURAL_TEXT_REPRESENTATIONS:
+        return "text_representation_objects"
+    if _has_nonempty_host_geometry(obj, type_id):
+        return "vector_primitives"
+    return "unclassified"
+
+
+def _build_host_object_inventory(objects: List[Any]) -> Dict[str, Any]:
+    """Inventory actual FreeCAD objects without treating containers as geometry."""
+
+    categories: Dict[str, List[str]] = {
+        "containers": [],
+        "images": [],
+        "vector_primitives": [],
+        "text_representation_objects": [],
+        "unclassified": [],
+    }
+    records: List[Dict[str, str]] = []
+    type_counts: Dict[str, int] = {}
+    entity_ids: List[str] = []
+    for host_obj in list(objects or []):
+        entity_id = _host_object_id(host_obj)
+        type_id = _host_object_type_id(host_obj)
+        representation = _host_object_representation(host_obj)
+        source_item_id = _host_object_source_item_id(host_obj)
+        category = _host_object_category(host_obj, type_id, representation)
+        records.append(
+            {
+                "entity_id": entity_id,
+                "type_id": type_id,
+                "representation": representation,
+                "source_item_id": source_item_id,
+                "category": category,
+            }
+        )
+        entity_ids.append(entity_id)
+        categories[category].append(entity_id)
+        type_counts[type_id] = int(type_counts.get(type_id, 0)) + 1
+
+    unique_nonempty_ids = bool(
+        records and len(entity_ids) == len(set(entity_ids)) and all(entity_ids)
+    )
+    counts = {"total": len(records)}
+    counts.update({key: len(value) for key, value in categories.items()})
+    return {
+        "schema": "bcs.freecad_host_object_inventory/1.0",
+        "verified": unique_nonempty_ids,
+        "entity_ids": entity_ids,
+        "type_counts": type_counts,
+        "counts": counts,
+        "categories": categories,
+        "objects": records,
+    }
+
+
+def _crosscheck_host_object_inventory(
+    expected_inventory: Dict[str, Any],
+    actual_objects: List[Any],
+) -> Dict[str, Any]:
+    """Cross-check saved/reopened identities, types, representations, and counts."""
+
+    expected_records = [
+        dict(record)
+        for record in (expected_inventory.get("objects") or [])
+        if isinstance(record, dict)
+    ]
+    expected_ids = [str(record.get("entity_id") or "") for record in expected_records]
+    actual_by_id: Dict[str, Any] = {}
+    duplicate_actual_ids: List[str] = []
+    for host_obj in list(actual_objects or []):
+        entity_id = _host_object_id(host_obj)
+        if entity_id in actual_by_id:
+            duplicate_actual_ids.append(entity_id)
+        actual_by_id[entity_id] = host_obj
+
+    expected_id_set = set(expected_ids)
+    unexpected = [
+        entity_id for entity_id in actual_by_id if entity_id not in expected_id_set
+    ]
+
+    missing: List[str] = []
+    mismatches: List[Dict[str, str]] = []
+    matched_objects: List[Any] = []
+    for expected in expected_records:
+        entity_id = str(expected.get("entity_id") or "")
+        actual = actual_by_id.get(entity_id)
+        if actual is None:
+            missing.append(entity_id)
+            continue
+        matched_objects.append(actual)
+        actual_type = _host_object_type_id(actual)
+        actual_representation = _host_object_representation(actual)
+        expected_type = str(expected.get("type_id") or "")
+        expected_representation = str(expected.get("representation") or "")
+        actual_source_id = _host_object_source_item_id(actual)
+        expected_source_id = str(expected.get("source_item_id") or "")
+        if (
+            actual_type != expected_type
+            or actual_representation != expected_representation
+            or actual_source_id != expected_source_id
+        ):
+            mismatch = {
+                "entity_id": entity_id,
+                "expected_type_id": expected_type,
+                "actual_type_id": actual_type,
+                "expected_representation": expected_representation,
+                "actual_representation": actual_representation,
+            }
+            if actual_source_id != expected_source_id:
+                mismatch["expected_source_item_id"] = expected_source_id
+                mismatch["actual_source_item_id"] = actual_source_id
+            mismatches.append(mismatch)
+
+    actual_inventory = _build_host_object_inventory(list(actual_objects or []))
+    expected_counts = dict(expected_inventory.get("counts") or {})
+    actual_counts = dict(actual_inventory.get("counts") or {})
+    counts_match = expected_counts == actual_counts
+    verified = bool(
+        expected_inventory.get("verified") is True
+        and not missing
+        and not mismatches
+        and not duplicate_actual_ids
+        and not unexpected
+        and actual_inventory.get("verified") is True
+        and set(actual_inventory.get("entity_ids") or []) == expected_id_set
+        and counts_match
+    )
+    return {
+        "required": True,
+        "method": "document_object_identity_type_crosscheck",
+        "verified": verified,
+        "expected_entity_ids": expected_ids,
+        "missing_entity_ids": missing,
+        "duplicate_actual_entity_ids": list(dict.fromkeys(duplicate_actual_ids)),
+        "unexpected_entity_ids": unexpected,
+        "mismatched_entities": mismatches,
+        "expected_counts": expected_counts,
+        "actual_counts": actual_counts,
+        "counts_match": counts_match,
+    }
+
+
+def _save_reopen_host_object_inventory(
+    fc_doc,
+    inventory: Dict[str, Any],
+    baseline_entity_names: Optional[set] = None,
+) -> Dict[str, Any]:
+    """Save a temporary FCStd copy, reopen it, and verify imported host objects."""
+
+    failure = {
+        "required": True,
+        "method": "temporary_fcstd_save_copy_reopen",
+        "verified": False,
+        "expected_entity_ids": list(inventory.get("entity_ids") or []),
+        "missing_entity_ids": [],
+        "duplicate_actual_entity_ids": [],
+        "unexpected_entity_ids": [],
+        "mismatched_entities": [],
+        "expected_counts": dict(inventory.get("counts") or {}),
+        "actual_counts": {},
+        "counts_match": False,
+    }
+    if FreeCAD is None:
+        failure["error"] = "freecad_runtime_unavailable"
+        return failure
+    save_copy = getattr(fc_doc, "saveCopy", None)
+    if not callable(save_copy):
+        failure["error"] = "document_save_copy_unavailable"
+        return failure
+
+    descriptor, temp_path = tempfile.mkstemp(prefix="bcs_pdf_inventory_", suffix=".FCStd")
+    os.close(descriptor)
+    try:
+        os.remove(temp_path)
+    except OSError:
+        pass
+    reopened = None
+    original_name = str(getattr(fc_doc, "Name", "") or "")
+    try:
+        save_result = save_copy(temp_path)
+        if save_result is False or not Path(temp_path).is_file():
+            raise RuntimeError("temporary FCStd saveCopy did not create a file")
+        open_document = getattr(FreeCAD, "openDocument", None)
+        if not callable(open_document):
+            raise RuntimeError("FreeCAD.openDocument is unavailable")
+        try:
+            reopened = open_document(temp_path, True)
+        except TypeError:
+            reopened = open_document(temp_path)
+        reopened_objects = _document_objects(reopened)
+        ignored_names = set(baseline_entity_names or set())
+        if ignored_names:
+            reopened_objects = [
+                host_obj
+                for host_obj in reopened_objects
+                if _host_object_id(host_obj) not in ignored_names
+            ]
+        result = _crosscheck_host_object_inventory(inventory, reopened_objects)
+        result["method"] = "temporary_fcstd_save_copy_reopen"
+        return result
+    except (OSError, RuntimeError, TypeError, ValueError, AttributeError) as exc:
+        failure["error"] = "%s: %s" % (exc.__class__.__name__, exc)
+        return failure
+    finally:
+        if reopened is not None:
+            reopened_name = str(getattr(reopened, "Name", "") or "")
+            close_document = getattr(FreeCAD, "closeDocument", None)
+            if reopened_name and callable(close_document):
+                try:
+                    close_document(reopened_name)
+                except (RuntimeError, TypeError, ValueError, AttributeError):
+                    pass
+        if original_name:
+            set_active = getattr(FreeCAD, "setActiveDocument", None)
+            if callable(set_active):
+                try:
+                    set_active(original_name)
+                except (RuntimeError, TypeError, ValueError, AttributeError):
+                    pass
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+
+
+def _structural_text_delivery_count(
+    opts: ImportOptions,
+    fallback_count: int = 0,
+) -> int:
+    delivered = getattr(opts, "text_delivered_counts", {}) or {}
+    if isinstance(delivered, dict) and delivered:
+        return sum(
+            max(0, int(value or 0))
+            for bucket, value in delivered.items()
+            if str(bucket) != "raster_text_patch"
+        )
+    return max(0, int(fallback_count or 0))
 
 
 def _text_host_document(shape_string, text_group):
@@ -7209,12 +7820,23 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 f"{opts.text_mode} text representation"
             )
         else:
+            text_entity_info = None
+            if (
+                bool(getattr(opts, "import_text", False))
+                and str(getattr(opts, "text_mode", "") or "").strip().lower()
+                == "raster"
+            ):
+                text_entity_info = _record_explicit_page_raster_delivery(
+                    opts,
+                    page_num=int(page_num),
+                    raster_result=full_page_raster_result,
+                )
             if progress:
                 progress.setValue(100)
                 progress.close()
             fc_doc.recompute()
             _msg(f"Page {page_num}: imported as raster image")
-            return top_group, None
+            return top_group, text_entity_info
 
     # ── Hybrid mode: preserve structural vectors and genuine source images ──
     if effective_mode == "hybrid":
@@ -8071,7 +8693,6 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     fc_doc = _ensure_doc()
     t_import_start = time.perf_counter()
     _reset_import_run_state(opts)
-    obj_count_before = len(fc_doc.Objects)
     baseline_objects = _document_objects(fc_doc)
     baseline_object_ids = {id(host_obj) for host_obj in baseline_objects}
     baseline_object_names = {_host_object_id(host_obj) for host_obj in baseline_objects}
@@ -8339,17 +8960,33 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                 except (ImportError, RuntimeError, TypeError, ValueError) as e:
                     if opts.verbose:
                         _warn(f"Semantic member generation skipped: {e}")
-        
+
+        imported_objects = _post_baseline_document_objects(
+            _document_objects(fc_doc),
+            baseline_object_ids,
+            baseline_object_names,
+        )
+        host_inventory = _build_host_object_inventory(imported_objects)
+        opts._report_extra["actual_host_object_inventory"] = host_inventory
+        opts._report_extra["save_reopen_inventory"] = _save_reopen_host_object_inventory(
+            fc_doc,
+            host_inventory,
+            baseline_object_names,
+        )
+        inventory_counts = dict(host_inventory.get("counts") or {})
+
         write_import_report(
             pdf_path=pdf_path,
             output_path=report_path,
             opts=opts,
             pages_imported=imported_count,
             total_pages=total_pages,
-            primitive_count=max(0, len(fc_doc.Objects) - obj_count_before),
-            text_count=int(
-                (all_text_entity_info or {}).get("count", 0) or 0
+            primitive_count=int(inventory_counts.get("vector_primitives") or 0),
+            text_count=_structural_text_delivery_count(
+                opts,
+                int((all_text_entity_info or {}).get("count", 0) or 0),
             ),
+            image_count=int(inventory_counts.get("images") or 0),
             elapsed_ms=elapsed_ms,
             fallback_used=fallback_used,
             fallback_reason=fallback_reason,

@@ -8,10 +8,78 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 MOD_ROOT = REPO_ROOT / "PDFVectorImporter"
 sys.path.insert(0, str(MOD_ROOT))
 
-from pdfcadcore.import_report import build_human_summary, build_import_report  # noqa: E402
+from pdfcadcore.import_report import (  # noqa: E402
+    build_actual_text_entity_types,
+    build_human_summary,
+    build_import_report,
+)
 
 
 class TestImportReportHumanSummary(unittest.TestCase):
+    @staticmethod
+    def _inventory(vector_count: int, text_ids=()):
+        records = [
+            {
+                "entity_id": "Vector%03d" % index,
+                "type_id": "Part::Feature",
+                "representation": "",
+                "source_item_id": "",
+                "category": "vector_primitives",
+            }
+            for index in range(vector_count)
+        ]
+        records.extend(
+            {
+                "entity_id": entity_id,
+                "type_id": "App::FeaturePython",
+                "representation": "labels",
+                "source_item_id": "p1:text:0",
+                "category": "text_representation_objects",
+            }
+            for entity_id in text_ids
+        )
+        entity_ids = [record["entity_id"] for record in records]
+        category_names = (
+            "containers",
+            "images",
+            "vector_primitives",
+            "text_representation_objects",
+            "unclassified",
+        )
+        categories = {
+            name: [
+                record["entity_id"]
+                for record in records
+                if record["category"] == name
+            ]
+            for name in category_names
+        }
+        counts = {"total": len(records)}
+        counts.update({name: len(categories[name]) for name in category_names})
+        type_counts = {"Part::Feature": vector_count}
+        if text_ids:
+            type_counts["App::FeaturePython"] = len(text_ids)
+        inventory = {
+            "verified": True,
+            "entity_ids": entity_ids,
+            "type_counts": type_counts,
+            "counts": counts,
+            "categories": categories,
+            "objects": records,
+        }
+        save_reopen = {
+            "verified": True,
+            "expected_entity_ids": entity_ids,
+            "missing_entity_ids": [],
+            "duplicate_actual_entity_ids": [],
+            "unexpected_entity_ids": [],
+            "mismatched_entities": [],
+            "expected_counts": counts,
+            "actual_counts": counts,
+            "counts_match": True,
+        }
+        return inventory, save_reopen
+
     def test_build_import_report_attaches_human_summary(self) -> None:
         report = build_import_report(
             host_app="freecad",
@@ -81,6 +149,9 @@ class TestImportReportHumanSummary(unittest.TestCase):
         self.assertIn("Scale note:", summary)
 
     def test_import_contract_ready_aggregate(self) -> None:
+        inventory, save_reopen = self._inventory(
+            40, ("Label001", "Label002")
+        )
         report = build_import_report(
             host_app="freecad",
             importer_version="4.0.60",
@@ -91,11 +162,26 @@ class TestImportReportHumanSummary(unittest.TestCase):
             text_count=2,
             text_mode="labels",
             extra={
-                "actual_text_entity_types": {
-                    "entity_type": "labels",
-                    "count": 2,
-                    "native_label": 2,
+                "actual_text_entity_types": build_actual_text_entity_types(
+                    host_app="freecad",
+                    text_mode="labels",
+                    delivered_counts={"native_label": 2},
+                ),
+                "text_representation_delivery": {
+                    "required": True,
+                    "verified": True,
+                    "terminal_attempts": [
+                        {
+                            "source_item_id": "p1:text:0",
+                            "attempted_type": "labels",
+                            "final_type": "labels",
+                            "outcome": "verified",
+                            "delivery_entity_ids": ["Label001", "Label002"],
+                        }
+                    ],
                 },
+                "actual_host_object_inventory": inventory,
+                "save_reopen_inventory": save_reopen,
                 "resolved_scale": {
                     "factor": 48.0,
                     "notation": '1/4" = 1\'-0"',
@@ -111,6 +197,9 @@ class TestImportReportHumanSummary(unittest.TestCase):
         self.assertTrue(ready["checks"]["build_stamp"])
         self.assertTrue(ready["checks"]["scale_crosscheck"])
         self.assertTrue(ready["checks"]["actual_text_entity_types"])
+        self.assertTrue(ready["checks"]["host_object_inventory"])
+        self.assertTrue(ready["checks"]["save_reopen_inventory"])
+        self.assertTrue(ready["checks"]["delivery_inventory_binding"])
         self.assertTrue(ready["checks"]["no_open_failure"])
 
     def test_import_contract_ready_fails_when_text_entities_unverified(self) -> None:
@@ -131,6 +220,7 @@ class TestImportReportHumanSummary(unittest.TestCase):
         self.assertFalse(ready["checks"]["actual_text_entity_types"])
 
     def test_import_contract_ready_ignores_source_spans_when_text_is_disabled(self) -> None:
+        inventory, save_reopen = self._inventory(40)
         report = build_import_report(
             host_app="freecad",
             importer_version="4.0.70",
@@ -141,6 +231,10 @@ class TestImportReportHumanSummary(unittest.TestCase):
             import_text=False,
             text_mode="none",
             text_source_spans=7,
+            extra={
+                "actual_host_object_inventory": inventory,
+                "save_reopen_inventory": save_reopen,
+            },
         )
 
         ready = report.extra.get("import_contract_ready")

@@ -51,6 +51,61 @@ def _canonical_item(requested_type: str = "labels") -> dict:
     }
 
 
+def _synthetic_whitespace_source(requested_type: str) -> tuple[dict, dict]:
+    span = {
+        "font": "Siwa-Regular",
+        "size": 7.0,
+        "bbox": (10.0, 20.0, 16.0, 30.0),
+        "origin": (10.0, 27.0),
+        "color": 0,
+        "chars": [
+            {
+                "origin": (10.0 + index * 2.0, 27.0),
+                "bbox": (10.0 + index * 2.0, 20.0, 12.0 + index * 2.0, 30.0),
+                "c": " ",
+                "synthetic": True,
+            }
+            for index in range(3)
+        ],
+    }
+    raw_tdict = {
+        "blocks": [
+            {
+                "type": 0,
+                "lines": [{"dir": (1.0, 0.0), "spans": [span]}],
+            }
+        ]
+    }
+    item = list(
+        core._iter_text_source_items(
+            raw_tdict,
+            1,
+            "a" * 64,
+            requested_type,
+        )
+    )[0]
+    return item, raw_tdict
+
+
+class _SyntheticWhitespacePage:
+    def get_texttrace(self):
+        return []
+
+    def get_fonts(self, full=True):
+        assert full is True
+        return []
+
+
+def _physically_bind_whitespace_item(requested_type: str) -> dict:
+    item, raw_tdict = _synthetic_whitespace_source(requested_type)
+    [bound] = core._bind_page_text_source_ink_evidence(
+        _SyntheticWhitespacePage(),
+        raw_tdict,
+        [item],
+    )
+    return bound
+
+
 def test_production_page_import_has_only_canonical_text_entrypoint():
     tree = ast.parse(inspect.getsource(core._import_pdf_page_inner))
     called_names = {
@@ -66,6 +121,14 @@ def test_production_page_import_has_only_canonical_text_entrypoint():
         "_render_requested_svg_text",
         "_preprocess_text_blocks",
     })
+
+
+def test_legacy_text_helpers_cannot_reintroduce_whitespace_drop_roadblock():
+    for helper in (
+        core._render_text_spans_exact_labels,
+        core._render_text_spans_3d,
+    ):
+        assert "source_text.isspace()" not in inspect.getsource(helper)
 
 
 def test_atomic_raster_publication_survives_concurrent_same_key_writers(tmp_path):
@@ -531,6 +594,45 @@ def test_canonical_geometry_counts_serialized_raw_edges_not_container_objects(
     assert opts.text_delivered_counts == {"raw_geometry_edges": 17}
 
 
+def test_rawdict_whitespace_span_is_a_canonical_exact_source_item():
+    item, _raw_tdict = _synthetic_whitespace_source("text")
+
+    assert item["source_item_id"] == "p1:b0:l0:s0"
+    assert item["text"] == "   "
+    assert item["span"]["text"] == "   "
+    assert [char["c"] for char in item["span"]["chars"]] == [" ", " ", " "]
+
+
+def test_synthetic_raw_characters_are_bound_as_physical_zero_ink_evidence():
+    item = _physically_bind_whitespace_item("text")
+
+    evidence = item["source_ink_evidence"]
+    assert evidence["classification"] == "zero_visible_ink"
+    assert evidence["all_characters_physically_resolved"] is True
+    assert evidence["source_text"] == "   "
+    assert evidence["source_item_id"] == item["source_item_id"]
+    assert [record["authority"] for record in evidence["characters"]] == [
+        "pymupdf_rawdict_synthetic_character",
+        "pymupdf_rawdict_synthetic_character",
+        "pymupdf_rawdict_synthetic_character",
+    ]
+
+
+def test_non_synthetic_whitespace_without_physical_trace_is_not_called_zero_ink():
+    item, raw_tdict = _synthetic_whitespace_source("text")
+    for char in raw_tdict["blocks"][0]["lines"][0]["spans"][0]["chars"]:
+        char["synthetic"] = False
+    item = list(core._iter_text_source_items(raw_tdict, 1, "a" * 64, "text"))[0]
+
+    [bound] = core._bind_page_text_source_ink_evidence(
+        _SyntheticWhitespacePage(),
+        raw_tdict,
+        [item],
+    )
+
+    assert "source_ink_evidence" not in bound
+
+
 @pytest.mark.parametrize(
     ("attempted_type", "expected_proxy_type", "text_property"),
     [
@@ -601,6 +703,202 @@ def test_native_item_delivery_rereads_live_text_transform_style_and_metadata(
         result["evidence"]["rotation_deg"],
         abs_tol=1e-7,
     )
+
+
+@pytest.mark.parametrize("attempted_type", ["text", "labels"])
+def test_native_whitespace_delivery_preserves_exact_content_with_physical_zero_ink(
+    monkeypatch, attempted_type
+):
+    document, group = _install_native_host(monkeypatch)
+    item = _physically_bind_whitespace_item(attempted_type)
+
+    result = core._deliver_text_item_native(
+        item,
+        attempted_type,
+        core.ImportOptions(
+            text_mode=attempted_type,
+            import_text=True,
+            scale_to_mm=False,
+            user_scale=1.0,
+        ),
+        text_group=group,
+        page_h=100.0,
+        scale=1.0,
+    )
+
+    host = document.getObject(result["created_entity_ids"][0])
+    assert list(host.Text) == ["   "]
+    if attempted_type == "labels":
+        assert list(host.CustomText) == ["   "]
+    assert host.PDFRepresentation == attempted_type
+    assert host.PDFSourceInkClassification == "zero_visible_ink"
+    assert len(host.PDFSourceInkEvidenceSHA256) == 64
+    assert result["final_type"] == attempted_type
+    assert result["evidence"]["source_ink_evidence"]["classification"] == (
+        "zero_visible_ink"
+    )
+
+
+@pytest.mark.parametrize("attempted_type", ["text", "labels"])
+def test_native_whitespace_without_physical_authority_is_terminal_and_clean(
+    monkeypatch, attempted_type
+):
+    document, group = _install_native_host(monkeypatch)
+    item = _canonical_item(attempted_type)
+    item["text"] = item["span"]["text"] = "   "
+
+    with pytest.raises(core.TextRepresentationFailure) as raised:
+        core._deliver_text_item_native(
+            item,
+            attempted_type,
+            core.ImportOptions(text_mode=attempted_type, import_text=True),
+            text_group=group,
+            page_h=100.0,
+            scale=1.0,
+        )
+
+    assert raised.value.attempt["reason"] == "source_ink_authority_missing"
+    assert document.Objects == []
+
+
+class _EmptyShape:
+    Vertexes = []
+    Edges = []
+    Faces = []
+    Solids = []
+    Volume = 0.0
+
+    @staticmethod
+    def isNull():
+        return True
+
+
+class _FreeCADNullShape(_EmptyShape):
+    @property
+    def Volume(self):
+        raise RuntimeError("shape is invalid")
+
+
+def test_zero_ink_evidence_accepts_freecad_null_shape_without_volume() -> None:
+    evidence = core._zero_visible_ink_shape_evidence(_FreeCADNullShape())
+
+    assert evidence["zero_visible_ink_verified"] is True
+    assert evidence["shape_is_null"] is True
+    assert evidence["volume"] == 0.0
+    assert evidence["volume_authority"] == "null_shape_has_no_evaluable_volume"
+
+
+def test_zero_ink_3d_text_persists_exact_shapestring_without_fabricated_solid(
+    monkeypatch,
+):
+    document, group = _install_native_host(monkeypatch)
+    item = _physically_bind_whitespace_item("3d_text")
+    font_path = "C:/fonts/exact-source.ttf"
+    source_result = {
+        "source": "embedded_font",
+        "outcome": "found",
+        "font_identity": item["font_identity"],
+        "pdf_sha256": item["pdf_sha256"],
+        "page_number": item["page_number"],
+        "staging_complete": True,
+        "path": font_path,
+    }
+    monkeypatch.setattr(
+        core,
+        "_resolve_shapestring_font_path_with_evidence",
+        lambda *_args, **_kwargs: (font_path, [source_result]),
+    )
+
+    def make_empty_shapestring(_doc, source_text, exact_font_path):
+        host = document.addObject("Part::Part2DObjectPython", "ShapeString")
+        host.String = source_text
+        host.FontFile = exact_font_path
+        host.Shape = _EmptyShape()
+        return host
+
+    monkeypatch.setattr(core, "_make_shapestring_host", make_empty_shapestring)
+
+    result = core._deliver_text_item_3d(
+        item,
+        "3d_text",
+        core.ImportOptions(text_mode="3d_text", import_text=True),
+        text_group=group,
+        page_h=100.0,
+        scale=1.0,
+    )
+
+    assert result["outcome"] == "verified"
+    assert result["final_type"] == "3d_text"
+    assert result["delivery_entity_ids"] == result["created_entity_ids"]
+    assert result["support_entity_ids"] == []
+    assert result["evidence"]["zero_visible_ink_verified"] is True
+    host = document.getObject(result["delivery_entity_ids"][0])
+    assert host.String == "   "
+    assert host.FontFile == font_path
+    assert host.PDFRepresentation == "3d_text"
+    assert host.PDFSourceInkClassification == "zero_visible_ink"
+    assert document.Objects == [host]
+
+
+@pytest.mark.parametrize("attempted_type", ["glyphs", "geometry"])
+def test_zero_ink_svg_mode_persists_empty_requested_entity_from_physical_authority(
+    monkeypatch, attempted_type
+):
+    from PDFVectorImporter.src import PDFSvgTextRenderer as renderer
+
+    document, group = _install_native_host(monkeypatch)
+    item = _physically_bind_whitespace_item(attempted_type)
+    monkeypatch.setattr(core, "Part", SimpleNamespace(Shape=_EmptyShape))
+    monkeypatch.setattr(
+        renderer,
+        "render_text",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a physically zero-ink source item must not fabricate SVG outlines"
+        ),
+    )
+
+    result = core._deliver_text_item_svg(
+        item,
+        attempted_type,
+        core.ImportOptions(text_mode=attempted_type, import_text=True),
+        pdf_path="fixture.pdf",
+        page_h=100.0,
+        page_w=100.0,
+        scale=1.0,
+        fc_doc=document,
+        parent_group=group,
+        render_cache={},
+    )
+
+    assert result["outcome"] == "verified"
+    assert result["final_type"] == attempted_type
+    assert result["delivery_count"] == 1
+    assert result["evidence"]["zero_visible_ink_verified"] is True
+    host = document.getObject(result["delivery_entity_ids"][0])
+    assert host.TypeId == "Part::Feature"
+    assert host.PDFRepresentation == attempted_type
+    assert host.PDFSourceInkClassification == "zero_visible_ink"
+    assert host.Shape.isNull() is True
+
+
+def test_page_without_source_text_cannot_fabricate_item_fallback_or_raster():
+    opts = core.ImportOptions(import_mode="auto", import_text=True, text_mode="labels")
+
+    with pytest.raises(ValueError, match="without a canonical source item"):
+        core._record_no_source_text_page_fallback(
+            opts,
+            page_num=1,
+            pdf_sha256="a" * 64,
+            raw_tdict={"blocks": [{"type": 1}]},
+            raster_result={
+                "created_entity_ids": ["PageRaster001"],
+                "evidence": {"host_entity_type": "Image::ImagePlane"},
+            },
+        )
+
+    assert opts.text_delivery_attempts == []
+    assert opts.text_mode_fallbacks == []
+    assert opts.text_delivered_counts == {}
 
 
 @pytest.mark.parametrize("attempted_type", ["text", "labels"])

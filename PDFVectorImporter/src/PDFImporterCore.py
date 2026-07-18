@@ -22,6 +22,7 @@ import sys
 import tempfile
 import time
 import traceback
+from io import BytesIO
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -2289,7 +2290,7 @@ def _render_text_spans_exact_labels(
 
             for span_index, span in enumerate(spans):
                 source_text = str(span.get("text", "") or "")
-                if not source_text or source_text.isspace():
+                if not source_text:
                     continue
                 from pdfcadcore.text_scale import effective_span_font_size_pt
 
@@ -3208,6 +3209,357 @@ def _finite_source_tuple(value: Any, length: int, field_name: str) -> Tuple[floa
     return tuple(numbers)
 
 
+def _raw_span_text(source_span: Dict[str, Any]) -> str:
+    """Return exact span text from either PyMuPDF dict or rawdict data."""
+    if "text" in source_span:
+        source_text = source_span.get("text")
+        if not isinstance(source_text, str):
+            raise ValueError("text span content must be a string")
+        return source_text
+    chars = source_span.get("chars", [])
+    if not isinstance(chars, list):
+        raise ValueError("raw text span chars must be a list")
+    text_parts: List[str] = []
+    for char_index, char in enumerate(chars):
+        if not isinstance(char, dict):
+            raise ValueError("raw text character must be a dictionary")
+        value = char.get("c", "")
+        if not isinstance(value, str):
+            raise ValueError(
+                "raw text character %d content must be a string" % char_index
+            )
+        text_parts.append(value)
+    return "".join(text_parts)
+
+
+def _source_ink_evidence_digest(evidence: Dict[str, Any]) -> str:
+    payload = dict(evidence or {})
+    payload.pop("evidence_sha256", None)
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def _trace_font_key(value: Any) -> str:
+    return _canonical_font_identity(str(value or ""))["normalized_key"]
+
+
+def _bind_page_text_source_ink_evidence(
+    page,
+    raw_tdict: Dict[str, Any],
+    items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Bind source items to physical PDF paint evidence without Unicode guesses.
+
+    PyMuPDF rawdict marks synthesized characters that have no PDF text-paint
+    operator. Non-synthetic characters are matched by codepoint, font and
+    origin to get_texttrace glyph ids, then inspected in the exact embedded
+    font program with FontTools. An unresolved character yields no authority.
+    """
+    if not isinstance(raw_tdict, dict) or not isinstance(items, list):
+        raise ValueError("source ink binding context is invalid")
+    bound_items = copy.deepcopy(items)
+    blocks = raw_tdict.get("blocks", [])
+    if not isinstance(blocks, list):
+        return bound_items
+
+    try:
+        traces = list(page.get_texttrace() or [])
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        traces = []
+    trace_chars: List[Dict[str, Any]] = []
+    for trace_index, trace in enumerate(traces):
+        if not isinstance(trace, dict):
+            continue
+        trace_font = str(trace.get("font", "") or "")
+        try:
+            trace_type = int(trace.get("type", 0) or 0)
+            opacity = float(trace.get("opacity", 1.0))
+        except (TypeError, ValueError):
+            continue
+        for trace_char_index, record in enumerate(trace.get("chars") or ()):
+            try:
+                codepoint = int(record[0])
+                glyph_id = int(record[1])
+                origin = _finite_source_tuple(record[2], 2, "trace.origin")
+            except (IndexError, TypeError, ValueError):
+                continue
+            trace_chars.append(
+                {
+                    "trace_index": trace_index,
+                    "trace_char_index": trace_char_index,
+                    "codepoint": codepoint,
+                    "glyph_id": glyph_id,
+                    "origin": origin,
+                    "font": trace_font,
+                    "font_key": _trace_font_key(trace_font),
+                    "trace_type": trace_type,
+                    "opacity": opacity,
+                }
+            )
+
+    catalog = None
+    font_cache: Dict[str, Any] = {}
+    claimed_trace_chars: set = set()
+
+    def exact_glyph_record(
+        raw_char: Dict[str, Any],
+        source_font: str,
+    ) -> Optional[Dict[str, Any]]:
+        nonlocal catalog
+        value = raw_char.get("c")
+        if not isinstance(value, str) or len(value) != 1:
+            return None
+        try:
+            raw_origin = _finite_source_tuple(raw_char.get("origin"), 2, "char.origin")
+        except ValueError:
+            return None
+        font_key = _trace_font_key(source_font)
+        candidates = []
+        for index, candidate in enumerate(trace_chars):
+            if index in claimed_trace_chars:
+                continue
+            if (
+                candidate["codepoint"] != ord(value)
+                or candidate["font_key"] != font_key
+            ):
+                continue
+            distance = math.hypot(
+                candidate["origin"][0] - raw_origin[0],
+                candidate["origin"][1] - raw_origin[1],
+            )
+            if distance <= 0.05:
+                candidates.append((distance, index, candidate))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda entry: (entry[0], entry[1]))
+        if len(candidates) > 1 and math.isclose(
+            candidates[0][0], candidates[1][0], abs_tol=1e-9
+        ):
+            return None
+        _distance, trace_char_id, trace_record = candidates[0]
+
+        if trace_record["trace_type"] == 3 or trace_record["opacity"] <= 0.0:
+            claimed_trace_chars.add(trace_char_id)
+            return {
+                "authority": "pymupdf_texttrace_nonpainting_render_mode",
+                "character": value,
+                "synthetic": False,
+                "glyph_id": trace_record["glyph_id"],
+                "trace_type": trace_record["trace_type"],
+                "opacity": trace_record["opacity"],
+                "zero_visible_ink": True,
+                "physically_resolved": True,
+            }
+
+        if catalog is None:
+            try:
+                from pdfcadcore.embedded_fonts import EmbeddedFontCatalog
+
+                page_number = int(bound_items[0].get("page_number", 1)) if bound_items else 1
+                catalog = EmbeddedFontCatalog.from_page(page, page_number)
+            except (ImportError, RuntimeError, TypeError, ValueError):
+                catalog = False
+        if catalog is False:
+            return None
+        asset = catalog.for_span(trace_record["font"])
+        if asset is None:
+            asset = catalog.for_span(source_font)
+        if asset is None:
+            return None
+        font = font_cache.get(asset.usable_sha256)
+        if font is None:
+            try:
+                from fontTools.ttLib import TTFont
+
+                font = TTFont(BytesIO(asset.usable_bytes), lazy=False)
+                font_cache[asset.usable_sha256] = font
+            except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+                return None
+        try:
+            from fontTools.pens.boundsPen import BoundsPen
+
+            glyph_order = font.getGlyphOrder()
+            glyph_id = int(trace_record["glyph_id"])
+            if glyph_id < 0 or glyph_id >= len(glyph_order):
+                return None
+            glyph_name = glyph_order[glyph_id]
+            glyph_set = font.getGlyphSet()
+            pen = BoundsPen(glyph_set)
+            glyph_set[glyph_name].draw(pen)
+            bounds = None if pen.bounds is None else tuple(float(v) for v in pen.bounds)
+        except (AttributeError, IndexError, KeyError, RuntimeError, TypeError, ValueError):
+            return None
+        claimed_trace_chars.add(trace_char_id)
+        return {
+            "authority": "exact_pdf_font_glyph_bounds",
+            "character": value,
+            "synthetic": False,
+            "glyph_id": glyph_id,
+            "glyph_name": glyph_name,
+            "glyph_bounds": bounds,
+            "source_font_sha256": asset.source_sha256,
+            "usable_font_sha256": asset.usable_sha256,
+            "trace_type": trace_record["trace_type"],
+            "opacity": trace_record["opacity"],
+            "zero_visible_ink": bounds is None,
+            "physically_resolved": True,
+        }
+
+    try:
+        for item in bound_items:
+            # Whitespace is only a candidate for physical inspection. Unicode
+            # never decides the result: raw/trace/font evidence below must still
+            # resolve every character as visibly inked or physically empty.
+            source_text = item.get("text") if isinstance(item, dict) else None
+            if not isinstance(source_text, str) or not source_text.isspace():
+                continue
+            try:
+                block = blocks[item["block_index"]]
+                line = block["lines"][item["line_index"]]
+                raw_span = line["spans"][item["span_index"]]
+            except (IndexError, KeyError, TypeError):
+                continue
+            raw_chars = raw_span.get("chars", [])
+            if not isinstance(raw_chars, list) or not raw_chars:
+                continue
+            if _raw_span_text(raw_span) != item.get("text"):
+                continue
+            source_font = str(raw_span.get("font", "") or "")
+            character_evidence: List[Dict[str, Any]] = []
+            resolved = True
+            for source_index, raw_char in enumerate(raw_chars):
+                if not isinstance(raw_char, dict):
+                    resolved = False
+                    break
+                value = raw_char.get("c")
+                if not isinstance(value, str) or not value:
+                    resolved = False
+                    break
+                if raw_char.get("synthetic") is True:
+                    record = {
+                        "authority": "pymupdf_rawdict_synthetic_character",
+                        "character": value,
+                        "synthetic": True,
+                        "zero_visible_ink": True,
+                        "physically_resolved": True,
+                    }
+                else:
+                    record = exact_glyph_record(raw_char, source_font)
+                    if record is None:
+                        resolved = False
+                        break
+                record["source_index"] = source_index
+                character_evidence.append(record)
+            if not resolved or "".join(
+                record["character"] for record in character_evidence
+            ) != item.get("text"):
+                continue
+            zero_visible_ink = all(
+                record["zero_visible_ink"] for record in character_evidence
+            )
+            evidence = {
+                "schema": "pdf_source_ink_evidence_v1",
+                "authority": "pymupdf_rawdict_texttrace_exact_font",
+                "pdf_sha256": item["pdf_sha256"],
+                "page_number": item["page_number"],
+                "source_item_id": item["source_item_id"],
+                "source_text": item["text"],
+                "source_text_sha256": hashlib.sha256(
+                    item["text"].encode("utf-8")
+                ).hexdigest(),
+                "font_identity": copy.deepcopy(item["font_identity"]),
+                "classification": (
+                    "zero_visible_ink" if zero_visible_ink else "visible_ink"
+                ),
+                "all_characters_physically_resolved": True,
+                "characters": character_evidence,
+            }
+            evidence["evidence_sha256"] = _source_ink_evidence_digest(evidence)
+            item["source_ink_evidence"] = evidence
+    finally:
+        for font in font_cache.values():
+            try:
+                font.close()
+            except (AttributeError, RuntimeError):
+                pass
+    return bound_items
+
+
+def _validated_source_ink_evidence(item: Dict[str, Any]) -> Dict[str, Any]:
+    evidence = item.get("source_ink_evidence") if isinstance(item, dict) else None
+    if not isinstance(evidence, dict):
+        raise ValueError("source ink evidence is unavailable")
+    characters = evidence.get("characters")
+    source_text = item.get("text")
+    if (
+        evidence.get("schema") != "pdf_source_ink_evidence_v1"
+        or evidence.get("authority") != "pymupdf_rawdict_texttrace_exact_font"
+        or evidence.get("pdf_sha256") != item.get("pdf_sha256")
+        or evidence.get("page_number") != item.get("page_number")
+        or evidence.get("source_item_id") != item.get("source_item_id")
+        or evidence.get("source_text") != source_text
+        or evidence.get("font_identity") != item.get("font_identity")
+        or evidence.get("source_text_sha256")
+        != hashlib.sha256(str(source_text).encode("utf-8")).hexdigest()
+        or evidence.get("all_characters_physically_resolved") is not True
+        or not isinstance(characters, list)
+        or not characters
+        or "".join(
+            record.get("character", "") if isinstance(record, dict) else ""
+            for record in characters
+        ) != source_text
+        or any(
+            not isinstance(record, dict)
+            or record.get("physically_resolved") is not True
+            or type(record.get("zero_visible_ink")) is not bool
+            or record.get("authority") not in {
+                "pymupdf_rawdict_synthetic_character",
+                "pymupdf_texttrace_nonpainting_render_mode",
+                "exact_pdf_font_glyph_bounds",
+            }
+            for record in characters
+        )
+        or evidence.get("classification")
+        not in {"zero_visible_ink", "visible_ink"}
+        or (
+            evidence.get("classification") == "zero_visible_ink"
+            and not all(record["zero_visible_ink"] for record in characters)
+        )
+        or (
+            evidence.get("classification") == "visible_ink"
+            and all(record["zero_visible_ink"] for record in characters)
+        )
+        or evidence.get("evidence_sha256") != _source_ink_evidence_digest(evidence)
+    ):
+        raise ValueError("source ink evidence is not physically source-bound")
+    return copy.deepcopy(evidence)
+
+
+def _persist_source_ink_evidence(host_obj, evidence: Dict[str, Any]) -> None:
+    digest = str(evidence.get("evidence_sha256") or "")
+    classification = str(evidence.get("classification") or "")
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None or classification not in {
+        "zero_visible_ink",
+        "visible_ink",
+    }:
+        raise ValueError("source ink evidence cannot be persisted")
+    properties = set(getattr(host_obj, "PropertiesList", []) or [])
+    add_property = getattr(host_obj, "addProperty", None)
+    for name, value in (
+        ("PDFSourceInkClassification", classification),
+        ("PDFSourceInkEvidenceSHA256", digest),
+    ):
+        if name not in properties and callable(add_property):
+            add_property("App::PropertyString", name, "PDF Import")
+            properties.add(name)
+        setattr(host_obj, name, value)
+
+
 def _iter_text_source_items(
     tdict: dict,
     page_num: int,
@@ -3246,10 +3598,8 @@ def _iter_text_source_items(
             for span_index, source_span in enumerate(spans):
                 if not isinstance(source_span, dict):
                     raise ValueError("text span must be a dictionary")
-                source_text = source_span.get("text", "")
-                if not isinstance(source_text, str):
-                    raise ValueError("text span content must be a string")
-                if not source_text or source_text.isspace():
+                source_text = _raw_span_text(source_span)
+                if not source_text:
                     continue
 
                 source_font = source_span.get("font", "")
@@ -3273,6 +3623,10 @@ def _iter_text_source_items(
                 span = _plain_text_source_value(source_span, "span")
                 if type(span) is not dict:
                     raise ValueError("canonical span must be a plain dictionary")
+                # rawdict stores characters instead of the convenience `text`
+                # field. Delivery code receives one uniform exact span without
+                # trimming leading, trailing, or all-whitespace content.
+                span["text"] = source_text
 
                 yield {
                     "importer_identity": FREECAD_TEXT_IMPORTER_IDENTITY,
@@ -3624,218 +3978,24 @@ def _record_no_source_text_page_fallback(
     raw_tdict: Dict[str, Any],
     raster_result: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Record a finite page-bound ladder when canonical source text is absent."""
-    requested = _normalize_requested_text_type(str(getattr(opts, "text_mode", "") or ""))
-    if requested == "raster":
-        return _record_explicit_page_raster_delivery(
-            opts,
-            page_num=page_num,
-            raster_result=raster_result,
-        )
-    page_number = page_num
-    digest = pdf_sha256.strip().lower() if isinstance(pdf_sha256, str) else ""
-    if (
-        type(page_number) is not int
-        or page_number < 1
-        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
-        or not isinstance(raw_tdict, dict)
-        or not isinstance(raster_result, dict)
-        or raster_result.get("outcome", "verified") != "verified"
-    ):
-        raise ValueError("no-source page fallback context is invalid")
-    source_item_id = "p%d:page" % page_number
-    try:
-        canonical_source_items = list(
-            _iter_text_source_items(raw_tdict, page_number, digest, requested)
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError("no-source page fallback source text is invalid") from exc
-    if canonical_source_items:
-        raise ValueError("no-source page fallback found canonical source text")
-    raster_ids = _validated_entity_ids(
-        raster_result.get("created_entity_ids"),
-        field_name="raster_result.created_entity_ids",
-        allow_empty=False,
+    """Record only a directly requested page Raster when no text item exists.
+
+    A page is not a canonical text item. Without an item there is no lawful
+    item-specific impossibility proof, so non-Raster modes must not manufacture
+    a fallback ladder or claim a page raster as delivered text.
+    """
+    requested = _normalize_requested_text_type(
+        str(getattr(opts, "text_mode", "") or "")
     )
-    raster_evidence = dict(raster_result.get("evidence") or {})
-    if not raster_evidence:
-        raise ValueError("verified page raster evidence is required")
-
-    blocks = list(raw_tdict.get("blocks") or [])
-    source_observation = {
-        "text_dictionary_present": True,
-        "canonical_source_item_count": 0,
-        "raw_text_block_count": sum(
-            1 for block in blocks if isinstance(block, dict) and block.get("type") == 0
-        ),
-        "source_inspection_reused": True,
-        "visible_source_text_found": False,
-    }
-    ladder = list(TEXT_ITEM_FALLBACK_LADDERS[requested])
-    attempted_types: List[str] = []
-    proof_chain: List[Dict[str, Any]] = []
-    attempts: List[Dict[str, Any]] = []
-
-    attempt_ledger = getattr(opts, "text_delivery_attempts", None)
-    fallback_ledger = getattr(opts, "text_mode_fallbacks", None)
-    delivery_counts = getattr(opts, "text_delivered_counts", None)
-    if (
-        not isinstance(attempt_ledger, list)
-        or not isinstance(fallback_ledger, list)
-        or not isinstance(delivery_counts, dict)
-    ):
-        raise ValueError("no-source text fallback ledgers are unavailable")
-    prior_attempts = copy.deepcopy(attempt_ledger)
-    prior_fallbacks = copy.deepcopy(fallback_ledger)
-    prior_delivery_counts = copy.deepcopy(delivery_counts)
-    staged_opts = copy.copy(opts)
-    staged_opts.text_delivery_attempts = copy.deepcopy(prior_attempts)
-    staged_opts.text_mode_fallbacks = copy.deepcopy(prior_fallbacks)
-    staged_opts.text_delivered_counts = copy.deepcopy(prior_delivery_counts)
-
-    try:
-        for index, attempted_type in enumerate(ladder):
-            attempted_types.append(attempted_type)
-            if attempted_type == "raster":
-                break
-            following_type = ladder[index + 1]
-            proof = {
-                "item_specific_proven_impossible": True,
-                "importer_identity": FREECAD_TEXT_IMPORTER_IDENTITY,
-                "pdf_sha256": digest,
-                "page_number": page_number,
-                "source_item_id": source_item_id,
-                "requested_type": requested,
-                "attempted_type": attempted_type,
-                "reason_code": "no_source_text_items",
-                "evidence": dict(source_observation),
-                "attempted_types": list(attempted_types),
-                "attempted_source_results": [
-                    {
-                        "source": "pymupdf_text_dictionary",
-                        "outcome": "not_found",
-                        "importer_identity": FREECAD_TEXT_IMPORTER_IDENTITY,
-                        "pdf_sha256": digest,
-                        "page_number": page_number,
-                        "source_item_id": source_item_id,
-                        "source_item_ids": [],
-                        "canonical_source_item_count": 0,
-                        "visible_source_text_found": False,
-                    }
-                ],
-                "attempted_sources_complete": True,
-                "created_entity_ids": [],
-                "removed_entity_ids": [],
-                "cleanup_complete": True,
-            }
-            attempt = {
-                "source_item_id": source_item_id,
-                "requested_type": requested,
-                "attempted_type": attempted_type,
-                "final_type": None,
-                "outcome": "proven_impossible",
-                "reason": "no_source_text_items",
-                "reason_code": "no_source_text_items",
-                "transition_from": attempted_type,
-                "transition_to": following_type,
-                "created_entity_ids": [],
-                "removed_entity_ids": [],
-                "cleanup_complete": True,
-                "proof": proof,
-            }
-            _append_text_item_attempt(staged_opts, attempt)
-            attempts.append(attempt)
-            proof_chain.append(proof)
-
-        verified_attempt = {
-            "source_item_id": source_item_id,
-            "requested_type": requested,
-            "attempted_type": "raster",
-            "final_type": "raster",
-            "outcome": "verified",
-            "reason": (
-                "explicit requested page Raster"
-                if requested == "raster"
-                else "verified page Raster after finite no-source-text proof chain"
-            ),
-            "created_entity_ids": list(raster_ids),
-            "delivery_entity_ids": list(raster_ids),
-            "support_entity_ids": [],
-            "removed_entity_ids": [],
-            "cleanup_complete": True,
-            "delivery_count": len(raster_ids),
-            "attempted_types": list(attempted_types),
-            "proof_chain": [dict(proof) for proof in proof_chain],
-            "evidence": raster_evidence,
-        }
-        _append_text_item_attempt(staged_opts, verified_attempt)
-        attempts.append(verified_attempt)
-
-        if requested != "raster":
-            fallback_proof = {
-                "item_specific_proven_impossible": True,
-                "importer_identity": FREECAD_TEXT_IMPORTER_IDENTITY,
-                "pdf_sha256": digest,
-                "page_number": page_number,
-                "source_item_id": source_item_id,
-                "requested_type": requested,
-                "attempted_type": ladder[-2],
-                "reason_code": "no_source_text_items",
-                "evidence": dict(source_observation),
-                "attempted_types": list(attempted_types),
-                "attempted_source_results": [
-                    {
-                        "source": "pymupdf_text_dictionary",
-                        "outcome": "not_found",
-                        "importer_identity": FREECAD_TEXT_IMPORTER_IDENTITY,
-                        "pdf_sha256": digest,
-                        "page_number": page_number,
-                        "source_item_id": source_item_id,
-                        "source_item_ids": [],
-                        "canonical_source_item_count": 0,
-                        "visible_source_text_found": False,
-                    }
-                ],
-                "attempted_sources_complete": True,
-                "created_entity_ids": [],
-                "removed_entity_ids": [],
-                "cleanup_complete": True,
-                "proof_chain": [dict(proof) for proof in proof_chain],
-                "transition_chain": [
-                    {"from": left, "to": right}
-                    for left, right in zip(ladder, ladder[1:], strict=False)
-                ],
-            }
-            _record_text_mode_fallback(
-                staged_opts,
-                requested=requested,
-                delivered="raster",
-                reason="proof_gated:%s:no_source_text_items" % requested,
-                count=1,
-                source_item_id=source_item_id,
-                proof=fallback_proof,
-            )
-
-        _record_text_delivery(staged_opts, "raster_text_patch", len(raster_ids))
-        attempt_ledger[:] = copy.deepcopy(staged_opts.text_delivery_attempts)
-        fallback_ledger[:] = copy.deepcopy(staged_opts.text_mode_fallbacks)
-        delivery_counts.clear()
-        delivery_counts.update(copy.deepcopy(staged_opts.text_delivered_counts))
-    except Exception:
-        attempt_ledger[:] = prior_attempts
-        fallback_ledger[:] = prior_fallbacks
-        delivery_counts.clear()
-        delivery_counts.update(prior_delivery_counts)
-        raise
-    return {
-        "entity_type": "raster",
-        "count": len(raster_ids),
-        "source_item_count": 0,
-        "source_item_ids": [source_item_id],
-        "font_rendered": False,
-        "examples": [],
-        "attempts": attempts,
-    }
+    if requested != "raster":
+        raise ValueError(
+            "text representation fallback is impossible without a canonical source item"
+        )
+    return _record_explicit_page_raster_delivery(
+        opts,
+        page_num=page_num,
+        raster_result=raster_result,
+    )
 
 
 class TextRepresentationFailure(RuntimeError):
@@ -4718,6 +4878,11 @@ def _host_shape_content_snapshot(obj, type_id: str) -> Dict[str, Any]:
         shape = None
 
     if shape is not None:
+        try:
+            is_null = getattr(shape, "isNull", None)
+            shape_is_null = bool(is_null()) if callable(is_null) else None
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            shape_is_null = None
         for property_name in (
             "Vertexes",
             "Edges",
@@ -4760,6 +4925,7 @@ def _host_shape_content_snapshot(obj, type_id: str) -> Dict[str, Any]:
                 if number is not None:
                     bounds[property_name.lower()] = number
     else:
+        shape_is_null = None
         try:
             geometry_count = obj.GeometryCount
             if type(geometry_count) is int and geometry_count >= 0:
@@ -4790,6 +4956,7 @@ def _host_shape_content_snapshot(obj, type_id: str) -> Dict[str, Any]:
         ).hexdigest()
     return {
         "shape_nonempty": bool(shape_nonempty),
+        "shape_is_null": shape_is_null,
         "shape_structure_verified": bool(
             shape_nonempty and meaningful_topology and shape_digest
         ),
@@ -4867,6 +5034,16 @@ def _host_object_content_snapshot(
     """Capture persisted content that metadata-only delivery cannot imitate."""
 
     content: Dict[str, Any] = {}
+    for property_name, content_name in (
+        ("PDFSourceInkClassification", "source_ink_classification"),
+        ("PDFSourceInkEvidenceSHA256", "source_ink_evidence_sha256"),
+    ):
+        try:
+            value = str(getattr(obj, property_name, "") or "")
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            value = ""
+        if value:
+            content[content_name] = value
     if type_id.startswith(("Part::", "PartDesign::", "Sketcher::")):
         content.update(_host_shape_content_snapshot(obj, type_id))
     if representation in {"labels", "text"}:
@@ -4903,6 +5080,11 @@ def _host_object_content_snapshot(
         except (AttributeError, RuntimeError, TypeError, ValueError):
             base = None
         content["base_entity_id"] = _host_object_id(base) if base is not None else ""
+    if representation in {"glyphs", "geometry"}:
+        try:
+            content["source_text"] = str(obj.PDFSourceText)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            content["source_text"] = ""
     if representation == "raster" or type_id.startswith("Image::"):
         try:
             image_file = str(getattr(obj, "ImageFile", "") or "")
@@ -5346,6 +5528,48 @@ def _shape_baseline_extent(shape, angle_deg: float) -> Optional[float]:
         return None
 
 
+def _zero_visible_ink_shape_evidence(shape) -> Dict[str, Any]:
+    """Reread an evaluated host shape and certify that it contains no ink."""
+    if shape is None:
+        raise ValueError("evaluated host shape is unavailable")
+    try:
+        counts = {
+            "vertex_count": len(list(getattr(shape, "Vertexes", []) or [])),
+            "edge_count": len(list(getattr(shape, "Edges", []) or [])),
+            "face_count": len(list(getattr(shape, "Faces", []) or [])),
+            "solid_count": len(list(getattr(shape, "Solids", []) or [])),
+        }
+        is_null = bool(getattr(shape, "isNull", lambda: False)())
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("evaluated host shape could not be inspected") from exc
+    try:
+        volume = float(getattr(shape, "Volume", 0.0) or 0.0)
+        volume_authority = "evaluated_shape_volume"
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        if not is_null or any(counts.values()):
+            raise ValueError("evaluated host shape volume could not be inspected") from exc
+        # FreeCAD's real Part.Shape() reports isNull()==True and zero topology,
+        # but its Volume property raises "shape is invalid".  Nullness plus
+        # independently reread zero topology is the physical host authority;
+        # treating its unavailable volume as zero avoids rejecting a genuinely
+        # empty requested representation.
+        volume = 0.0
+        volume_authority = "null_shape_has_no_evaluable_volume"
+    if (
+        any(counts.values())
+        or not math.isfinite(volume)
+        or abs(volume) > 1e-12
+    ):
+        raise ValueError("evaluated host shape contains visible geometry")
+    return {
+        **counts,
+        "volume": volume,
+        "volume_authority": volume_authority,
+        "shape_is_null": is_null,
+        "zero_visible_ink_verified": True,
+    }
+
+
 def _annotate_text_host_object(obj, source_item_id: str, representation: str) -> None:
     """Persist stable source identity and requested representation on a host object."""
     properties = set(getattr(obj, "PropertiesList", []) or [])
@@ -5708,6 +5932,7 @@ def _deliver_text_item_native(
         bound_item = {}
     source_item_id = str(bound_item.get("source_item_id") or "")
     requested_type = bound_item.get("requested_type")
+    source_ink_evidence: Optional[Dict[str, Any]] = None
     doc = _text_host_document(None, text_group)
     baseline_objects: set = set()
     owned: List[Any] = []
@@ -5783,7 +6008,6 @@ def _deliver_text_item_native(
             or re.fullmatch(r"[0-9a-f]{64}", pdf_sha256) is None
             or not isinstance(source_text, str)
             or not source_text
-            or source_text.isspace()
             or not isinstance(span, dict)
             or span.get("text") != source_text
             or bbox != _finite_source_tuple(span.get("bbox"), 4, "span.bbox")
@@ -5810,6 +6034,25 @@ def _deliver_text_item_native(
         fail(
             "invalid_native_text_source_item",
             {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+        )
+
+    if "source_ink_evidence" in bound_item:
+        try:
+            source_ink_evidence = _validated_source_ink_evidence(bound_item)
+        except ValueError as exc:
+            fail(
+                "invalid_source_ink_authority",
+                {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+            )
+    if source_text.isspace() and source_ink_evidence is None:
+        fail(
+            "source_ink_authority_missing",
+            {
+                "source_text_sha256": hashlib.sha256(
+                    source_text.encode("utf-8")
+                ).hexdigest(),
+                "required_authority": "physical_pdf_character_evidence",
+            },
         )
 
     try:
@@ -5870,6 +6113,8 @@ def _deliver_text_item_native(
         owned.append(host_obj)
         text_group.addObject(host_obj)
         _annotate_text_host_object(host_obj, source_item_id, attempted_type)
+        if source_ink_evidence is not None:
+            _persist_source_ink_evidence(host_obj, source_ink_evidence)
 
         normalized_font = _normalize_pdf_font_name(span.get("font", ""))
         source_color = _span_source_color(span)
@@ -5936,6 +6181,12 @@ def _deliver_text_item_native(
         metadata_color = str(getattr(host_obj, "PDFTextColorRGB", "") or "")
         metadata_visibility = getattr(host_obj, "PDFTextVisibility", None)
         label_marker_absent = False
+        actual_ink_classification = str(
+            getattr(host_obj, "PDFSourceInkClassification", "") or ""
+        )
+        actual_ink_digest = str(
+            getattr(host_obj, "PDFSourceInkEvidenceSHA256", "") or ""
+        )
         if view is None:
             actual_font_size = metadata_font_size
             actual_fonts = [metadata_font_name]
@@ -6032,6 +6283,15 @@ def _deliver_text_item_native(
             or metadata_justification != "Left"
             or metadata_color != color_metadata
             or metadata_visibility is not True
+            or (
+                source_ink_evidence is not None
+                and (
+                    actual_ink_classification
+                    != source_ink_evidence["classification"]
+                    or actual_ink_digest
+                    != source_ink_evidence["evidence_sha256"]
+                )
+            )
             or not color_verified
             or (view is not None and not view_style_verified)
             or (
@@ -6063,6 +6323,11 @@ def _deliver_text_item_native(
         "style_verification": style_verification,
         "view_style_verified": bool(view_style_verified),
     }
+    if source_ink_evidence is not None:
+        delivery_evidence["source_ink_evidence"] = copy.deepcopy(
+            source_ink_evidence
+        )
+        delivery_evidence["source_ink_evidence_persisted"] = True
     if attempted_type == "labels":
         delivery_evidence.update(
             {
@@ -6441,6 +6706,7 @@ def _deliver_text_item_3d(
     creation_started = False
     ownership_collection_failed = False
     ownership_collection_error = ""
+    source_ink_evidence: Optional[Dict[str, Any]] = None
 
     def add_owned(obj) -> None:
         if obj is not None and baseline_valid and id(obj) in baseline_objects:
@@ -6603,11 +6869,10 @@ def _deliver_text_item_3d(
             )
             or source_item_id != expected_source_id
             or not isinstance(pdf_sha256, str)
-            or re.fullmatch(r"[0-9a-f]{64}", pdf_sha256) is None
-            or not isinstance(source_text, str)
-            or not source_text
-            or source_text.isspace()
-            or not isinstance(font_identity, dict)
+                or re.fullmatch(r"[0-9a-f]{64}", pdf_sha256) is None
+                or not isinstance(source_text, str)
+                or not source_text
+                or not isinstance(font_identity, dict)
             or not isinstance(span, dict)
             or span.get("text") != source_text
         ):
@@ -6643,6 +6908,25 @@ def _deliver_text_item_3d(
         terminal_failure(
             "invalid_3d_text_source_item",
             {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+        )
+
+    if "source_ink_evidence" in bound_item:
+        try:
+            source_ink_evidence = _validated_source_ink_evidence(bound_item)
+        except ValueError as exc:
+            terminal_failure(
+                "invalid_source_ink_authority",
+                {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+            )
+    if source_text.isspace() and source_ink_evidence is None:
+        terminal_failure(
+            "source_ink_authority_missing",
+            {
+                "source_text_sha256": hashlib.sha256(
+                    source_text.encode("utf-8")
+                ).hexdigest(),
+                "required_authority": "physical_pdf_character_evidence",
+            },
         )
 
     try:
@@ -6846,6 +7130,101 @@ def _deliver_text_item_3d(
         depth = max(font_size_fc * 0.12, 0.05)
         source_color = _span_source_color(span)
         normalized_font = _normalize_pdf_font_name(source_font)
+
+        if (
+            source_ink_evidence is not None
+            and source_ink_evidence["classification"] == "zero_visible_ink"
+        ):
+            stage = "zero_ink_shapestring_configuration"
+            shape_string.Size = float(font_size_fc)
+            try:
+                shape_string.ScaleToSize = False
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                pass
+            try:
+                shape_string.MakeFace = False
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                pass
+            _annotate_text_host_object(shape_string, source_item_id, "3d_text")
+            _persist_text_style_metadata(
+                shape_string,
+                font_name=normalized_font,
+                font_size=font_size_fc,
+                source_color=source_color,
+            )
+            _persist_source_ink_evidence(shape_string, source_ink_evidence)
+            _apply_text_color(shape_string, source_color)
+            text_group.addObject(shape_string)
+            doc.recompute()
+            collection_error = collect_owned()
+            if collection_error:
+                raise RuntimeError(
+                    "owned object collection failed: %s" % collection_error
+                )
+            created_ids, ids_complete = owned_ids()
+            entity_id = _host_object_id(shape_string)
+            live_objects = list(getattr(doc, "Objects", []) or [])
+            verified_anchor_xyz = _host_anchor_xyz(shape_string)
+            verified_rotation_deg = _host_text_rotation_deg(shape_string)
+            expected_anchor_xyz = (float(pos.x), float(pos.y), float(pos.z))
+            shape_evidence = _zero_visible_ink_shape_evidence(
+                getattr(shape_string, "Shape", None)
+            )
+            if (
+                not ids_complete
+                or created_ids != [entity_id]
+                or not any(candidate is shape_string for candidate in live_objects)
+                or getattr(shape_string, "String", None) != source_text
+                or str(getattr(shape_string, "FontFile", "") or "") != font_path
+                or getattr(shape_string, "PDFSourceItemId", None) != source_item_id
+                or getattr(shape_string, "PDFRepresentation", None) != "3d_text"
+                or getattr(shape_string, "PDFSourceInkClassification", None)
+                != "zero_visible_ink"
+                or getattr(shape_string, "PDFSourceInkEvidenceSHA256", None)
+                != source_ink_evidence["evidence_sha256"]
+                or verified_anchor_xyz is None
+                or any(
+                    abs(verified_anchor_xyz[index] - expected_anchor_xyz[index])
+                    > 1e-7
+                    for index in range(3)
+                )
+                or verified_rotation_deg is None
+                or not _rotation_matches(verified_rotation_deg, host_rotation_deg)
+            ):
+                raise RuntimeError(
+                    "zero-ink 3D Text host evidence could not be verified"
+                )
+            return {
+                "source_item_id": source_item_id,
+                "requested_type": requested_type,
+                "attempted_type": "3d_text",
+                "final_type": "3d_text",
+                "outcome": "verified",
+                "created_entity_ids": [entity_id],
+                "delivery_entity_ids": [entity_id],
+                "support_entity_ids": [],
+                "removed_entity_ids": [],
+                "cleanup_complete": True,
+                "delivery_count": 1,
+                "evidence": {
+                    "source_text": source_text,
+                    "source_text_preserved": True,
+                    "source_item_id": source_item_id,
+                    "source_item_id_verified": True,
+                    "entity_type": str(
+                        getattr(shape_string, "TypeId", "") or ""
+                    ),
+                    "rotation_deg": float(verified_rotation_deg),
+                    "verified_anchor_xyz": tuple(verified_anchor_xyz),
+                    "font_path": font_path,
+                    "font_source_result": font_source_result,
+                    "nominal_height": float(font_size_fc),
+                    "source_color": source_color,
+                    "source_ink_evidence": copy.deepcopy(source_ink_evidence),
+                    "source_ink_evidence_persisted": True,
+                    **shape_evidence,
+                },
+            }
 
         def _configure_item_host(host_obj):
             # P1 ordering: every custom property write happens BEFORE the host
@@ -7121,7 +7500,7 @@ def _render_text_spans_3d(
 
             for span_index, span in enumerate(spans):
                 source_text = str(span.get("text", "") or "")
-                if not source_text or source_text.isspace():
+                if not source_text:
                     continue
                 source_item_id = "p%d:b%d:l%d:s%d" % (
                     page_num, block_index, line_index, span_index
@@ -7445,6 +7824,7 @@ def _deliver_text_item_svg(
         bound_item = {}
     source_item_id = str(bound_item.get("source_item_id") or "")
     requested_type = bound_item.get("requested_type")
+    source_ink_evidence: Optional[Dict[str, Any]] = None
 
     def raise_attempt(
         reason: str,
@@ -7509,7 +7889,6 @@ def _deliver_text_item_svg(
             or re.fullmatch(r"[0-9a-f]{64}", pdf_sha256) is None
             or not isinstance(source_text, str)
             or not source_text
-            or source_text.isspace()
             or not isinstance(span, dict)
             or span.get("text") != source_text
             or requested_type not in TEXT_ITEM_FALLBACK_LADDERS
@@ -7535,6 +7914,25 @@ def _deliver_text_item_svg(
         raise_attempt(
             "invalid_svg_text_source_item",
             {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+        )
+
+    if "source_ink_evidence" in bound_item:
+        try:
+            source_ink_evidence = _validated_source_ink_evidence(bound_item)
+        except ValueError as exc:
+            raise_attempt(
+                "invalid_source_ink_authority",
+                {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+            )
+    if source_text.isspace() and source_ink_evidence is None:
+        raise_attempt(
+            "source_ink_authority_missing",
+            {
+                "source_text_sha256": hashlib.sha256(
+                    source_text.encode("utf-8")
+                ).hexdigest(),
+                "required_authority": "physical_pdf_character_evidence",
+            },
         )
 
     try:
@@ -7674,6 +8072,88 @@ def _deliver_text_item_svg(
             attempt=impossible_attempt,
             proof=proof,
         )
+
+    if (
+        source_ink_evidence is not None
+        and source_ink_evidence["classification"] == "zero_visible_ink"
+    ):
+        try:
+            if Part is None or not callable(getattr(Part, "Shape", None)):
+                raise RuntimeError("FreeCAD empty Part shape factory is unavailable")
+            host_obj = fc_doc.addObject(
+                "Part::Feature",
+                "PDF_Empty_Glyph" if attempted_type == "glyphs" else "PDF_Empty_Geometry",
+            )
+            if host_obj is None or id(host_obj) in baseline_object_ids:
+                raise RuntimeError("zero-ink host factory returned no new object")
+            host_obj.Shape = Part.Shape()
+            _annotate_text_host_object(host_obj, source_item_id, attempted_type)
+            _persist_source_ink_evidence(host_obj, source_ink_evidence)
+            properties = set(getattr(host_obj, "PropertiesList", []) or [])
+            add_property = getattr(host_obj, "addProperty", None)
+            if "PDFSourceText" not in properties and callable(add_property):
+                add_property("App::PropertyString", "PDFSourceText", "PDF Import")
+            host_obj.PDFSourceText = source_text
+            parent_group.addObject(host_obj)
+            fc_doc.recompute()
+
+            entity_id = _host_object_id(host_obj)
+            live_objects = list(getattr(fc_doc, "Objects", []) or [])
+            new_objects = [
+                candidate
+                for candidate in live_objects
+                if id(candidate) not in baseline_object_ids
+            ]
+            shape_evidence = _zero_visible_ink_shape_evidence(
+                getattr(host_obj, "Shape", None)
+            )
+            if (
+                new_objects != [host_obj]
+                or not entity_id
+                or fc_doc.getObject(entity_id) is not host_obj
+                or str(getattr(host_obj, "TypeId", "") or "") != "Part::Feature"
+                or getattr(host_obj, "PDFSourceItemId", None) != source_item_id
+                or getattr(host_obj, "PDFRepresentation", None) != attempted_type
+                or getattr(host_obj, "PDFSourceText", None) != source_text
+                or getattr(host_obj, "PDFSourceInkClassification", None)
+                != "zero_visible_ink"
+                or getattr(host_obj, "PDFSourceInkEvidenceSHA256", None)
+                != source_ink_evidence["evidence_sha256"]
+            ):
+                raise RuntimeError(
+                    "zero-ink requested representation could not be verified"
+                )
+        except Exception as exc:
+            fail_after_render(
+                "zero_ink_requested_representation_failed",
+                {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+            )
+        evidence = {
+            "source_text": source_text,
+            "source_text_preserved": True,
+            "source_item_id": source_item_id,
+            "source_item_id_verified": True,
+            "host_entity_type": "Part::Feature",
+            "source_ink_evidence": copy.deepcopy(source_ink_evidence),
+            "source_ink_evidence_persisted": True,
+            "raw_edge_count": 0,
+            "glyph_count": 0,
+            **shape_evidence,
+        }
+        return {
+            "source_item_id": source_item_id,
+            "requested_type": requested_type,
+            "attempted_type": attempted_type,
+            "final_type": attempted_type,
+            "outcome": "verified",
+            "created_entity_ids": [entity_id],
+            "delivery_entity_ids": [entity_id],
+            "support_entity_ids": [],
+            "removed_entity_ids": [],
+            "cleanup_complete": True,
+            "delivery_count": 1,
+            "evidence": evidence,
+        }
 
     try:
         from PDFVectorImporter.src.PDFSvgTextRenderer import (
@@ -7840,6 +8320,7 @@ def _render_canonical_text_items(
     items = list(
         _iter_text_source_items(source_dict, int(page_num), pdf_sha256, requested)
     )
+    items = _bind_page_text_source_ink_evidence(page, source_dict, items)
 
     font_stage_complete = False
     svg_render_cache: Dict[str, Any] = {
@@ -9279,7 +9760,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             return top_group, None
         text_group = _make_group(top_group or fc_doc, "Text", fc_doc)
         try:
-            raw_tdict = page.get_text("dict")
+            raw_tdict = page.get_text("rawdict")
         except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
             attempt = {
                 "source_item_id": "p%d:page" % int(page_num),
@@ -9319,7 +9800,10 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             pdf_sha256=pdf_sha256,
             raw_tdict=raw_tdict,
         )
-        if int(text_entity_info.get("source_item_count", 0) or 0) <= 0:
+        if (
+            int(text_entity_info.get("source_item_count", 0) or 0) <= 0
+            and _normalize_requested_text_type(str(opts.text_mode or "")) == "raster"
+        ):
             if full_page_raster_result is None:
                 full_page_raster_result = _import_page_as_raster(
                     pdf_doc,

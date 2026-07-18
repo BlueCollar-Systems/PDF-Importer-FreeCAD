@@ -710,11 +710,26 @@ def test_source_items_preserve_original_identity_and_transform():
             {
                 "type": 0,
                 "lines": [
-                    {"dir": (1, 0), "spans": [{"text": "   "}]},
+                    {
+                        "dir": (1, 0),
+                        "spans": [{
+                            "text": "   ",
+                            "font": "Siwa-Regular",
+                            "size": 9.5,
+                            "origin": (10, 15),
+                            "bbox": (10, 6, 18, 18),
+                        }],
+                    },
                     {
                         "dir": (0, 1),
                         "spans": [
-                            {"text": "\t"},
+                            {
+                                "text": "\t",
+                                "font": "Siwa-Regular",
+                                "size": 9.5,
+                                "origin": (12, 20),
+                                "bbox": (11, 10, 16, 22),
+                            },
                             source_span,
                         ],
                     },
@@ -727,8 +742,13 @@ def test_source_items_preserve_original_identity_and_transform():
         tdict, 2, "A" * 64, " 3D Text "
     ))
 
-    assert len(items) == 1
-    item = items[0]
+    assert [item["text"] for item in items] == ["   ", "\t", " ITEM "]
+    assert [item["source_item_id"] for item in items] == [
+        "p2:b1:l0:s0",
+        "p2:b1:l1:s0",
+        "p2:b1:l1:s1",
+    ]
+    item = items[2]
     assert item["importer_identity"] == core.FREECAD_TEXT_IMPORTER_IDENTITY
     assert item["pdf_sha256"] == "a" * 64
     assert item["page_number"] == 2

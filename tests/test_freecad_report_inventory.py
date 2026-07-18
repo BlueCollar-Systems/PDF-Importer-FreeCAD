@@ -36,6 +36,9 @@ class HostObject:
         string=None,
         base=None,
         view_style_verified: bool = False,
+        source_ink_classification: str = "",
+        source_ink_digest: str = "",
+        source_text_property=None,
     ) -> None:
         self.Name = name
         self.TypeId = type_id
@@ -64,6 +67,12 @@ class HostObject:
                     "Justification": "Left",
                 },
             )()
+        if source_ink_classification:
+            self.PDFSourceInkClassification = source_ink_classification
+        if source_ink_digest:
+            self.PDFSourceInkEvidenceSHA256 = source_ink_digest
+        if source_text_property is not None:
+            self.PDFSourceText = source_text_property
         if type_id.startswith("Part::"):
             self.Shape = Shape(shape_nonempty)
 
@@ -105,6 +114,37 @@ class Shape:
 
     def isNull(self) -> bool:
         return not self._nonempty
+
+
+def _zero_ink_source_evidence(
+    source_item_id: str,
+    source_text: str = "   ",
+) -> dict:
+    evidence = {
+        "schema": "pdf_source_ink_evidence_v1",
+        "authority": "pymupdf_rawdict_texttrace_exact_font",
+        "pdf_sha256": "a" * 64,
+        "page_number": 1,
+        "source_item_id": source_item_id,
+        "source_text": source_text,
+        "source_text_sha256": hashlib.sha256(source_text.encode("utf-8")).hexdigest(),
+        "font_identity": {"normalized_key": "testfont"},
+        "classification": "zero_visible_ink",
+        "all_characters_physically_resolved": True,
+        "characters": [
+            {
+                "authority": "pymupdf_rawdict_synthetic_character",
+                "character": character,
+                "synthetic": True,
+                "zero_visible_ink": True,
+                "physically_resolved": True,
+                "source_index": index,
+            }
+            for index, character in enumerate(source_text)
+        ],
+    }
+    evidence["evidence_sha256"] = core._source_ink_evidence_digest(evidence)
+    return evidence
 
 
 def _aws_objects(image_file: str = "aws-page-1.png"):
@@ -935,7 +975,7 @@ def test_no_source_fallback_rejects_visible_canonical_text() -> None:
         ]
     }
 
-    with pytest.raises(ValueError, match="source text"):
+    with pytest.raises(ValueError, match="canonical source item"):
         core._record_no_source_text_page_fallback(
             opts,
             page_num=1,
@@ -2637,5 +2677,179 @@ def test_legitimate_3d_text_delivery_with_support_objects_remains_ready(
     ready = json.loads(report_path.read_text(encoding="utf-8"))["extra"][
         "import_contract_ready"
     ]
+    assert ready["checks"]["delivery_inventory_binding"] is True
+    assert ready["ready"] is True
+
+
+def test_zero_ink_inventory_binds_exact_source_text_and_physical_evidence() -> None:
+    source_id = "p1:b0:l0:s0"
+    source_text = "   "
+    evidence = _zero_ink_source_evidence(source_id, source_text)
+    before = HostObject(
+        "EmptyGeometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id=source_id,
+        shape_nonempty=False,
+        source_ink_classification="zero_visible_ink",
+        source_ink_digest=evidence["evidence_sha256"],
+        source_text_property=source_text,
+    )
+    inventory = core._build_host_object_inventory([before])
+    content = inventory["objects"][0]["content"]
+
+    assert content["source_text"] == source_text
+    assert content["source_ink_classification"] == "zero_visible_ink"
+    assert content["source_ink_evidence_sha256"] == evidence["evidence_sha256"]
+
+    after = HostObject(
+        "EmptyGeometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id=source_id,
+        shape_nonempty=False,
+        source_ink_classification="zero_visible_ink",
+        source_ink_digest="f" * 64,
+        source_text_property=source_text,
+    )
+    assert core._crosscheck_host_object_inventory(inventory, [after])["verified"] is False
+
+
+def test_synthetic_source_character_cannot_be_relabelled_as_visible_ink() -> None:
+    source_id = "p1:b0:l0:s0"
+    source_text = " "
+    evidence = _zero_ink_source_evidence(source_id, source_text)
+    evidence["classification"] = "visible_ink"
+    evidence["characters"][0]["zero_visible_ink"] = False
+    evidence["evidence_sha256"] = core._source_ink_evidence_digest(evidence)
+
+    assert report_contract._freecad_source_ink_evidence_verified(
+        evidence,
+        source_id,
+        source_text,
+    ) is False
+
+
+@pytest.mark.parametrize("representation", ["labels", "text", "3d_text", "glyphs", "geometry"])
+def test_physically_zero_ink_requested_representation_is_report_ready(
+    tmp_path,
+    representation: str,
+) -> None:
+    source_id = "p1:b0:l0:s0"
+    source_text = "   "
+    source_evidence = _zero_ink_source_evidence(source_id, source_text)
+    digest = source_evidence["evidence_sha256"]
+    entity_id = {
+        "labels": "Label001",
+        "text": "Text001",
+        "3d_text": "ShapeString001",
+        "glyphs": "EmptyGlyph001",
+        "geometry": "EmptyGeometry001",
+    }[representation]
+    type_id = {
+        "labels": "App::FeaturePython",
+        "text": "App::FeaturePython",
+        "3d_text": "Part::Part2DObjectPython",
+        "glyphs": "Part::Feature",
+        "geometry": "Part::Feature",
+    }[representation]
+    terminal_evidence = {
+        "source_text": source_text,
+        "source_text_preserved": True,
+        "source_ink_evidence": source_evidence,
+        "source_ink_evidence_persisted": True,
+    }
+    if representation in {"labels", "text"}:
+        terminal_evidence.update(
+            {
+                "host_entity_type": type_id,
+                "host_proxy_type": "Label" if representation == "labels" else "Text",
+                "view_style_verified": True,
+            }
+        )
+        if representation == "labels":
+            terminal_evidence["label_marker_absent"] = True
+    else:
+        terminal_evidence.update(
+            {
+                "vertex_count": 0,
+                "edge_count": 0,
+                "face_count": 0,
+                "solid_count": 0,
+                "volume": 0.0,
+                "shape_is_null": True,
+                "zero_visible_ink_verified": True,
+            }
+        )
+
+    opts = core.ImportOptions(
+        import_mode="vector",
+        import_text=True,
+        text_mode=representation,
+    )
+    opts.text_delivery_attempts.append(
+        {
+            "source_item_id": source_id,
+            "requested_type": representation,
+            "attempted_type": representation,
+            "final_type": representation,
+            "outcome": "verified",
+            "created_entity_ids": [entity_id],
+            "delivery_entity_ids": [entity_id],
+            "support_entity_ids": [],
+            "removed_entity_ids": [],
+            "cleanup_complete": True,
+            "delivery_count": 1,
+            "evidence": terminal_evidence,
+        }
+    )
+    opts.text_delivered_counts[
+        {
+            "labels": "native_label",
+            "text": "native_text",
+            "3d_text": "native_3d_text",
+            "glyphs": "outline_curve_or_mesh",
+            "geometry": "raw_geometry_edges",
+        }[representation]
+    ] = 1
+    host_object = HostObject(
+        entity_id,
+        type_id,
+        representation=representation,
+        source_item_id=source_id,
+        shape_nonempty=False,
+        proxy_type=(
+            "Label" if representation == "labels" else "Text" if representation == "text" else ""
+        ),
+        text=[source_text] if representation in {"labels", "text"} else None,
+        custom_text=[source_text] if representation == "labels" else None,
+        string=source_text if representation == "3d_text" else None,
+        view_style_verified=representation in {"labels", "text"},
+        source_ink_classification="zero_visible_ink",
+        source_ink_digest=digest,
+        source_text_property=(
+            source_text if representation in {"glyphs", "geometry"} else None
+        ),
+    )
+    _attach_inventory(
+        opts,
+        [HostObject("PDF_Page_1", "App::DocumentObjectGroup"), host_object],
+    )
+    report_path = tmp_path / (representation + "-zero-ink.json")
+
+    core.write_import_report(
+        pdf_path=str(tmp_path / "drawing.pdf"),
+        output_path=str(report_path),
+        opts=opts,
+        pages_imported=1,
+        total_pages=1,
+        text_count=1,
+    )
+
+    ready = json.loads(report_path.read_text(encoding="utf-8"))["extra"][
+        "import_contract_ready"
+    ]
+    assert ready["checks"]["host_object_inventory"] is True
+    assert ready["checks"]["save_reopen_inventory"] is True
     assert ready["checks"]["delivery_inventory_binding"] is True
     assert ready["ready"] is True

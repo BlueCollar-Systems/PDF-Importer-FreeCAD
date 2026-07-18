@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import json
 import sys
 from pathlib import Path
@@ -261,7 +260,7 @@ def test_failed_fast_text_probe_with_canonical_text_never_places_masking_raster(
         def get_text(self, kind):
             if kind == "blocks":
                 raise RuntimeError("synthetic fast probe failure")
-            if kind == "dict":
+            if kind == "rawdict":
                 return raw_tdict
             raise AssertionError("unexpected text extraction kind: %s" % kind)
 
@@ -323,93 +322,46 @@ def test_failed_fast_text_probe_with_canonical_text_never_places_masking_raster(
 
 
 @pytest.mark.parametrize("mode", ["labels", "text", "3d_text", "glyphs", "geometry"])
-def test_image_only_page_records_adjacent_proof_gated_raster_fallback(mode):
+def test_page_without_source_item_rejects_fabricated_raster_fallback(mode):
     opts = core.ImportOptions(import_mode="auto", import_text=True, text_mode=mode)
-    raster_result = {
-        "created_entity_ids": ["PageRaster001"],
-        "evidence": {
-            "host_entity_type": "Image::ImagePlane",
-            "save_reopen_identity_verified": True,
-        },
-    }
-
-    info = core._record_no_source_text_page_fallback(
-        opts,
-        page_num=1,
-        pdf_sha256="a" * 64,
-        raw_tdict={"blocks": [{"type": 1}]},
-        raster_result=raster_result,
-    )
-
-    ladder = list(core.TEXT_ITEM_FALLBACK_LADDERS[mode])
-    assert opts.text_mode == mode
-    assert [attempt["attempted_type"] for attempt in opts.text_delivery_attempts] == ladder
-    assert all(
-        attempt["source_item_id"] == "p1:page"
-        and attempt["requested_type"] == mode
-        for attempt in opts.text_delivery_attempts
-    )
-    impossible = opts.text_delivery_attempts[:-1]
-    assert impossible
-    assert all(attempt["outcome"] == "proven_impossible" for attempt in impossible)
-    assert all(attempt["reason_code"] == "no_source_text_items" for attempt in impossible)
-    assert all(attempt["cleanup_complete"] is True for attempt in impossible)
-    assert all(attempt["created_entity_ids"] == [] for attempt in impossible)
-    assert all(attempt["removed_entity_ids"] == [] for attempt in impossible)
-    assert all(
-        attempt["proof"]["item_specific_proven_impossible"] is True
-        and attempt["proof"]["source_item_id"] == "p1:page"
-        and attempt["proof"]["attempted_type"] == attempt["attempted_type"]
-        for attempt in impossible
-    )
-    assert list(zip(ladder, ladder[1:], strict=False)) == [
-        (attempted, following)
-        for attempted, following in zip(
-            [attempt["attempted_type"] for attempt in opts.text_delivery_attempts],
-            [attempt["attempted_type"] for attempt in opts.text_delivery_attempts][1:],
-            strict=False,
-        )
-    ]
-    final = opts.text_delivery_attempts[-1]
-    assert final["outcome"] == "verified"
-    assert final["final_type"] == "raster"
-    assert final["created_entity_ids"] == ["PageRaster001"]
-    assert info["entity_type"] == "raster"
-    assert info["count"] == 1
-    assert info["source_item_ids"] == ["p1:page"]
-    assert opts.text_mode_fallbacks[-1]["requested"] == mode
-    assert opts.text_mode_fallbacks[-1]["delivered"] == "raster"
-    assert opts.text_mode_fallbacks[-1]["proof"]["attempted_types"] == ladder
-
-
-def test_no_source_fallback_restores_exact_prior_state_when_third_attempt_append_fails(
-    monkeypatch,
-):
-    opts = core.ImportOptions(import_mode="auto", import_text=True, text_mode="labels")
-    opts.text_delivery_attempts.append({"prior": "attempt"})
-    opts.text_mode_fallbacks.append({"prior": "fallback"})
-    opts.text_delivered_counts["prior"] = 7
     attempts_ref = opts.text_delivery_attempts
     fallbacks_ref = opts.text_mode_fallbacks
     counts_ref = opts.text_delivered_counts
-    before = (
-        copy.deepcopy(attempts_ref),
-        copy.deepcopy(fallbacks_ref),
-        copy.deepcopy(counts_ref),
-    )
-    original_append = core._append_text_item_attempt
-    calls = 0
 
-    def fail_after_third_append(target_opts, attempt):
-        nonlocal calls
-        calls += 1
-        original_append(target_opts, attempt)
-        if calls == 3:
-            raise RuntimeError("synthetic third append failure")
+    with pytest.raises(ValueError, match="without a canonical source item"):
+        core._record_no_source_text_page_fallback(
+            opts,
+            page_num=1,
+            pdf_sha256="a" * 64,
+            raw_tdict={"blocks": [{"type": 1}]},
+            raster_result={
+                "created_entity_ids": ["PageRaster001"],
+                "evidence": {
+                    "host_entity_type": "Image::ImagePlane",
+                    "save_reopen_identity_verified": True,
+                },
+            },
+        )
 
-    monkeypatch.setattr(core, "_append_text_item_attempt", fail_after_third_append)
+    assert opts.text_mode == mode
+    assert opts.text_delivery_attempts is attempts_ref
+    assert opts.text_mode_fallbacks is fallbacks_ref
+    assert opts.text_delivered_counts is counts_ref
+    assert attempts_ref == []
+    assert fallbacks_ref == []
+    assert counts_ref == {}
 
-    with pytest.raises(RuntimeError, match="synthetic third append failure"):
+
+def test_no_source_rejection_never_invokes_attempt_or_fallback_ledgers(monkeypatch):
+    opts = core.ImportOptions(import_mode="auto", import_text=True, text_mode="labels")
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("a page without a source item cannot enter a fallback ledger")
+
+    monkeypatch.setattr(core, "_append_text_item_attempt", forbidden)
+    monkeypatch.setattr(core, "_record_text_mode_fallback", forbidden)
+
+    with pytest.raises(ValueError, match="without a canonical source item"):
         core._record_no_source_text_page_fallback(
             opts,
             page_num=1,
@@ -421,52 +373,9 @@ def test_no_source_fallback_restores_exact_prior_state_when_third_attempt_append
             },
         )
 
-    assert calls == 3
-    assert opts.text_delivery_attempts is attempts_ref
-    assert opts.text_mode_fallbacks is fallbacks_ref
-    assert opts.text_delivered_counts is counts_ref
-    assert (attempts_ref, fallbacks_ref, counts_ref) == before
-
-
-def test_no_source_fallback_restores_exact_prior_state_when_fallback_record_fails(
-    monkeypatch,
-):
-    opts = core.ImportOptions(import_mode="auto", import_text=True, text_mode="labels")
-    opts.text_delivery_attempts.append({"prior": "attempt"})
-    opts.text_mode_fallbacks.append({"prior": "fallback"})
-    opts.text_delivered_counts["prior"] = 7
-    attempts_ref = opts.text_delivery_attempts
-    fallbacks_ref = opts.text_mode_fallbacks
-    counts_ref = opts.text_delivered_counts
-    before = (
-        copy.deepcopy(attempts_ref),
-        copy.deepcopy(fallbacks_ref),
-        copy.deepcopy(counts_ref),
-    )
-
-    def fail_fallback_record(*_args, **_kwargs):
-        raise RuntimeError("synthetic fallback ledger failure")
-
-    monkeypatch.setattr(core, "_record_text_mode_fallback", fail_fallback_record)
-
-    with pytest.raises(RuntimeError, match="synthetic fallback ledger failure"):
-        core._record_no_source_text_page_fallback(
-            opts,
-            page_num=1,
-            pdf_sha256="d" * 64,
-            raw_tdict={"blocks": [{"type": 1}]},
-            raster_result={
-                "created_entity_ids": ["PageRaster004"],
-                "evidence": {"host_entity_type": "Image::ImagePlane"},
-            },
-        )
-
-    assert opts.text_delivery_attempts is attempts_ref
-    assert opts.text_mode_fallbacks is fallbacks_ref
-    assert opts.text_delivered_counts is counts_ref
-    assert (attempts_ref, fallbacks_ref, counts_ref) == before
-
-
+    assert opts.text_delivery_attempts == []
+    assert opts.text_mode_fallbacks == []
+    assert opts.text_delivered_counts == {}
 def test_public_page_import_rolls_back_post_baseline_objects_and_reports_truth(
     monkeypatch,
 ):

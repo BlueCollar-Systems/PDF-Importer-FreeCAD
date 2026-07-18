@@ -1046,6 +1046,13 @@ def _freecad_host_content_comparison(
 
     if not isinstance(left, dict) or not isinstance(right, dict):
         return {"verified": False, "certificate": None}
+    left_zero_ink = _freecad_zero_ink_shape_snapshot_verified(left)
+    right_zero_ink = _freecad_zero_ink_shape_snapshot_verified(right)
+    if left_zero_ink or right_zero_ink:
+        return {
+            "verified": bool(left_zero_ink and right_zero_ink and left == right),
+            "certificate": None,
+        }
     left_public = left.get("shape_fingerprint_geometry")
     right_public = right.get("shape_fingerprint_geometry")
     if left_public is None and right_public is None:
@@ -1167,6 +1174,15 @@ def _freecad_host_record_equivalent(
     right_content = right.get("content")
     if not isinstance(left_content, dict) or not isinstance(right_content, dict):
         return False
+    left_zero_ink = _freecad_zero_ink_shape_snapshot_verified(left_content)
+    right_zero_ink = _freecad_zero_ink_shape_snapshot_verified(right_content)
+    if left_zero_ink or right_zero_ink:
+        return bool(
+            certificate is None
+            and left_zero_ink
+            and right_zero_ink
+            and left_content == right_content
+        )
     left_geometry = left_content.get("shape_fingerprint_geometry")
     right_geometry = right_content.get("shape_fingerprint_geometry")
     if left_geometry is None and right_geometry is None:
@@ -1217,6 +1233,207 @@ def _freecad_shape_fingerprint_verified(content: Any) -> bool:
     if "edges" in topology and topology.get("edges") != edge_count:
         return False
     return True
+
+
+def _freecad_zero_ink_shape_snapshot_verified(content: Any) -> bool:
+    """Validate the persisted empty host shape used for physical zero ink."""
+
+    if not isinstance(content, dict):
+        return False
+    topology = content.get("shape_topology_counts")
+    metrics = content.get("shape_metrics")
+    geometry = content.get("shape_fingerprint_geometry")
+    digest = content.get("source_ink_evidence_sha256")
+    return bool(
+        content.get("source_ink_classification") == "zero_visible_ink"
+        and isinstance(digest, str)
+        and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+        and content.get("shape_nonempty") is False
+        and type(content.get("shape_is_null")) is bool
+        and content.get("shape_structure_verified") is False
+        and isinstance(topology, dict)
+        and topology
+        and all(type(count) is int and count == 0 for count in topology.values())
+        and isinstance(metrics, dict)
+        and all(
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(float(value))
+            and abs(float(value)) <= 1e-12
+            for value in metrics.values()
+        )
+        and content.get("shape_digest") == ""
+        and content.get("shape_fingerprint_schema")
+        == _FREECAD_SHAPE_FINGERPRINT_SCHEMA
+        and content.get("shape_fingerprint_quantum")
+        == _FREECAD_SHAPE_FINGERPRINT_QUANTUM
+        and content.get("shape_fingerprint_vertex_count") == 0
+        and content.get("shape_fingerprint_edge_count") == 0
+        and content.get("shape_fingerprint_sampled_edge_count") == 0
+        and content.get("shape_fingerprint_verified") is False
+        and isinstance(geometry, dict)
+        and geometry.get("schema") == _FREECAD_SHAPE_GEOMETRY_SCHEMA
+        and geometry.get("tolerance") == _FREECAD_SHAPE_FINGERPRINT_QUANTUM
+        and isinstance(geometry.get("sample_digest"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", geometry.get("sample_digest")) is not None
+        and geometry.get("vertex_count") == 0
+        and geometry.get("edge_count") == 0
+        and geometry.get("sampled_point_count") == 0
+    )
+
+
+def _freecad_source_ink_evidence_verified(
+    evidence: Any,
+    source_item_id: str,
+    source_text: str,
+) -> bool:
+    """Revalidate the sealed source/font proof; Unicode is not ink authority."""
+
+    if not isinstance(evidence, dict) or not isinstance(source_text, str):
+        return False
+    characters = evidence.get("characters")
+    classification = evidence.get("classification")
+    digest = evidence.get("evidence_sha256")
+    if (
+        evidence.get("schema") != "pdf_source_ink_evidence_v1"
+        or evidence.get("authority") != "pymupdf_rawdict_texttrace_exact_font"
+        or not isinstance(evidence.get("pdf_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", evidence.get("pdf_sha256")) is None
+        or type(evidence.get("page_number")) is not int
+        or evidence.get("page_number") <= 0
+        or evidence.get("source_item_id") != source_item_id
+        or evidence.get("source_text") != source_text
+        or evidence.get("source_text_sha256")
+        != hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+        or not isinstance(evidence.get("font_identity"), dict)
+        or not evidence.get("font_identity")
+        or classification not in {"zero_visible_ink", "visible_ink"}
+        or evidence.get("all_characters_physically_resolved") is not True
+        or not isinstance(characters, list)
+        or not characters
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+    ):
+        return False
+
+    resolved_text: List[str] = []
+    zero_flags: List[bool] = []
+    for index, record in enumerate(characters):
+        if not isinstance(record, dict):
+            return False
+        character = record.get("character")
+        authority = record.get("authority")
+        if (
+            not isinstance(character, str)
+            or not character
+            or record.get("source_index") != index
+            or record.get("physically_resolved") is not True
+            or type(record.get("zero_visible_ink")) is not bool
+            or authority
+            not in {
+                "pymupdf_rawdict_synthetic_character",
+                "pymupdf_texttrace_nonpainting_render_mode",
+                "exact_pdf_font_glyph_bounds",
+            }
+        ):
+            return False
+        if authority == "pymupdf_rawdict_synthetic_character":
+            if (
+                record.get("synthetic") is not True
+                or record.get("zero_visible_ink") is not True
+            ):
+                return False
+        elif authority == "pymupdf_texttrace_nonpainting_render_mode":
+            opacity = record.get("opacity")
+            if (
+                record.get("synthetic") is not False
+                or record.get("zero_visible_ink") is not True
+                or type(record.get("glyph_id")) is not int
+                or isinstance(opacity, bool)
+                or not isinstance(opacity, (int, float))
+                or not math.isfinite(float(opacity))
+                or (record.get("trace_type") != 3 and float(opacity) > 0.0)
+            ):
+                return False
+        else:
+            bounds = record.get("glyph_bounds")
+            opacity = record.get("opacity")
+            for hash_name in ("source_font_sha256", "usable_font_sha256"):
+                value = record.get(hash_name)
+                if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                    return False
+            if (
+                record.get("synthetic") is not False
+                or type(record.get("glyph_id")) is not int
+                or record.get("glyph_id") < 0
+                or not isinstance(record.get("glyph_name"), str)
+                or not record.get("glyph_name")
+                or type(record.get("trace_type")) is not int
+                or record.get("trace_type") == 3
+                or isinstance(opacity, bool)
+                or not isinstance(opacity, (int, float))
+                or not math.isfinite(float(opacity))
+                or float(opacity) <= 0.0
+                or (
+                    bounds is not None
+                    and (
+                        not isinstance(bounds, (list, tuple))
+                        or len(bounds) != 4
+                        or any(
+                            isinstance(value, bool)
+                            or not isinstance(value, (int, float))
+                            or not math.isfinite(float(value))
+                            for value in bounds
+                        )
+                    )
+                )
+                or record.get("zero_visible_ink") != (bounds is None)
+            ):
+                return False
+        resolved_text.append(character)
+        zero_flags.append(record["zero_visible_ink"])
+
+    digest_payload = dict(evidence)
+    digest_payload.pop("evidence_sha256", None)
+    expected_digest = hashlib.sha256(
+        json.dumps(
+            digest_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return bool(
+        "".join(resolved_text) == source_text
+        and (
+            (classification == "zero_visible_ink" and all(zero_flags))
+            or (classification == "visible_ink" and not all(zero_flags))
+        )
+        and digest == expected_digest
+    )
+
+
+def _freecad_source_ink_inventory_binding_verified(
+    terminal_evidence: Any,
+    content: Any,
+    source_item_id: str,
+    source_text: str,
+) -> bool:
+    if not isinstance(terminal_evidence, dict) or not isinstance(content, dict):
+        return False
+    source_evidence = terminal_evidence.get("source_ink_evidence")
+    return bool(
+        terminal_evidence.get("source_ink_evidence_persisted") is True
+        and _freecad_source_ink_evidence_verified(
+            source_evidence,
+            source_item_id,
+            source_text,
+        )
+        and content.get("source_ink_classification")
+        == source_evidence.get("classification")
+        and content.get("source_ink_evidence_sha256")
+        == source_evidence.get("evidence_sha256")
+    )
 
 
 def _freecad_delivery_inventory_binding_verified(
@@ -1318,6 +1535,21 @@ def _freecad_delivery_inventory_binding_verified(
             or not evidence
         ):
             return False
+        source_text = evidence.get("source_text")
+        source_ink_evidence = evidence.get("source_ink_evidence")
+        source_ink_verified = False
+        if source_ink_evidence is not None:
+            if not isinstance(source_text, str) or not _freecad_source_ink_evidence_verified(
+                source_ink_evidence,
+                source_item_id,
+                source_text,
+            ):
+                return False
+            source_ink_verified = True
+        zero_ink_terminal = bool(
+            source_ink_verified
+            and source_ink_evidence.get("classification") == "zero_visible_ink"
+        )
 
         id_lists = (created_ids, delivery_ids, support_ids, terminal_removed_ids)
         if any(
@@ -1374,13 +1606,20 @@ def _freecad_delivery_inventory_binding_verified(
                 record.get("parent_source_item_id") or ""
             )
             if final_type in {"glyphs", "geometry"}:
-                child_source_ids = evidence.get("child_source_item_ids")
-                if (
-                    not isinstance(child_source_ids, list)
-                    or record_source_id not in child_source_ids
-                    or record_parent_source_id != source_item_id
-                ):
-                    return False
+                if zero_ink_terminal:
+                    if (
+                        record_source_id != source_item_id
+                        or record_parent_source_id != ""
+                    ):
+                        return False
+                else:
+                    child_source_ids = evidence.get("child_source_item_ids")
+                    if (
+                        not isinstance(child_source_ids, list)
+                        or record_source_id not in child_source_ids
+                        or record_parent_source_id != source_item_id
+                    ):
+                        return False
             elif (
                 record_source_id != source_item_id
                 or record_parent_source_id != ""
@@ -1413,7 +1652,6 @@ def _freecad_delivery_inventory_binding_verified(
                 if category != "text_representation_objects":
                     return False
                 if final_type in {"labels", "text"}:
-                    source_text = evidence.get("source_text")
                     expected_proxy = "Label" if final_type == "labels" else "Text"
                     if (
                         type_id != "App::FeaturePython"
@@ -1429,15 +1667,41 @@ def _freecad_delivery_inventory_binding_verified(
                         )
                         or not isinstance(content.get("view_style"), dict)
                         or content["view_style"].get("view_present") is not True
+                        or (
+                            source_ink_evidence is not None
+                            and not _freecad_source_ink_inventory_binding_verified(
+                                evidence,
+                                content,
+                                source_item_id,
+                                source_text,
+                            )
+                        )
                     ):
                         return False
-                if final_type in {"3d_text", "glyphs", "geometry"} and (
-                    not type_id.startswith(("Part::", "PartDesign::", "Sketcher::"))
-                    or not meaningful_shape_content(content)
-                ):
-                    return False
+                if final_type in {"3d_text", "glyphs", "geometry"}:
+                    if not type_id.startswith(("Part::", "PartDesign::", "Sketcher::")):
+                        return False
+                    if zero_ink_terminal:
+                        exact_source_content = (
+                            content.get("string") == [source_text]
+                            if final_type == "3d_text"
+                            else content.get("source_text") == source_text
+                        )
+                        if (
+                            not exact_source_content
+                            or not _freecad_zero_ink_shape_snapshot_verified(content)
+                            or not _freecad_source_ink_inventory_binding_verified(
+                                evidence,
+                                content,
+                                source_item_id,
+                                source_text,
+                            )
+                        ):
+                            return False
+                    elif not meaningful_shape_content(content):
+                        return False
 
-        if final_type in {"glyphs", "geometry"}:
+        if final_type in {"glyphs", "geometry"} and not zero_ink_terminal:
             child_source_ids = evidence.get("child_source_item_ids")
             if (
                 not isinstance(child_source_ids, list)
@@ -1457,11 +1721,77 @@ def _freecad_delivery_inventory_binding_verified(
                 != set(child_source_ids)
             ):
                 return False
+        if final_type in {"glyphs", "geometry"} and zero_ink_terminal:
+            zero_content = (
+                live_records[delivery_ids[0]].get("content") or {}
+                if len(delivery_ids) == 1 and delivery_ids[0] in live_records
+                else {}
+            )
+            if (
+                len(delivery_ids) != 1
+                or support_ids
+                or not isinstance(source_text, str)
+                or not source_text
+                or evidence.get("source_text_preserved") is not True
+                or any(
+                    evidence.get(count_name) != 0
+                    for count_name in (
+                        "vertex_count",
+                        "edge_count",
+                        "face_count",
+                        "solid_count",
+                    )
+                )
+                or isinstance(evidence.get("volume"), bool)
+                or not isinstance(evidence.get("volume"), (int, float))
+                or not math.isfinite(float(evidence.get("volume")))
+                or abs(float(evidence.get("volume"))) > 1e-12
+                or type(evidence.get("shape_is_null")) is not bool
+                or evidence.get("shape_is_null") != zero_content.get("shape_is_null")
+                or evidence.get("zero_visible_ink_verified") is not True
+            ):
+                return False
 
         if final_type == "3d_text":
-            source_text = evidence.get("source_text")
             delivery_records = [live_records[entity_id] for entity_id in delivery_ids]
             support_records = [live_records[entity_id] for entity_id in support_ids]
+            if zero_ink_terminal:
+                zero_record = delivery_records[0] if len(delivery_records) == 1 else {}
+                zero_content = zero_record.get("content") or {}
+                if (
+                    len(delivery_records) != 1
+                    or support_records
+                    or not isinstance(source_text, str)
+                    or not source_text
+                    or evidence.get("source_text_preserved") is not True
+                    or zero_content.get("string") != [source_text]
+                    or not _freecad_zero_ink_shape_snapshot_verified(zero_content)
+                    or not _freecad_source_ink_inventory_binding_verified(
+                        evidence,
+                        zero_content,
+                        source_item_id,
+                        source_text,
+                    )
+                    or any(
+                        evidence.get(count_name) != 0
+                        for count_name in (
+                            "vertex_count",
+                            "edge_count",
+                            "face_count",
+                            "solid_count",
+                        )
+                    )
+                    or isinstance(evidence.get("volume"), bool)
+                    or not isinstance(evidence.get("volume"), (int, float))
+                    or not math.isfinite(float(evidence.get("volume")))
+                    or abs(float(evidence.get("volume"))) > 1e-12
+                    or type(evidence.get("shape_is_null")) is not bool
+                    or evidence.get("shape_is_null")
+                    != zero_content.get("shape_is_null")
+                    or evidence.get("zero_visible_ink_verified") is not True
+                ):
+                    return False
+                continue
             if (
                 len(delivery_records) != 1
                 or len(support_records) < 2
@@ -1575,6 +1905,7 @@ def _freecad_save_reopen_inventory_verified(
         for entity_id, record in expected_by_id.items()
         if isinstance(record.get("content"), dict)
         and record["content"].get("shape_fingerprint_geometry") is not None
+        and not _freecad_zero_ink_shape_snapshot_verified(record["content"])
     }
     objects_match = bool(
         len(expected_by_id) == len(expected_objects)
@@ -1689,20 +2020,34 @@ def _freecad_host_inventory_verified(inventory: Any, result: Any) -> bool:
         ):
             return False
         if representation in {"3d_text", "glyphs", "geometry"}:
-            topology = content.get("shape_topology_counts")
-            if (
-                content.get("shape_nonempty") is not True
-                or content.get("shape_structure_verified") is not True
-                or not isinstance(topology, dict)
-                or not any(
-                    type(count) is int and count > 0 for count in topology.values()
+            zero_ink_shape = _freecad_zero_ink_shape_snapshot_verified(content)
+            if zero_ink_shape:
+                exact_source_present = (
+                    isinstance(content.get("string"), list)
+                    and len(content.get("string")) == 1
+                    and isinstance(content["string"][0], str)
+                    and bool(content["string"][0])
+                    if representation == "3d_text"
+                    else isinstance(content.get("source_text"), str)
+                    and bool(content.get("source_text"))
                 )
-                or not isinstance(content.get("shape_digest"), str)
-                or re.fullmatch(r"[0-9a-f]{64}", content.get("shape_digest"))
-                is None
-                or not _freecad_shape_fingerprint_verified(content)
-            ):
-                return False
+                if not exact_source_present:
+                    return False
+            else:
+                topology = content.get("shape_topology_counts")
+                if (
+                    content.get("shape_nonempty") is not True
+                    or content.get("shape_structure_verified") is not True
+                    or not isinstance(topology, dict)
+                    or not any(
+                        type(count) is int and count > 0 for count in topology.values()
+                    )
+                    or not isinstance(content.get("shape_digest"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", content.get("shape_digest"))
+                    is None
+                    or not _freecad_shape_fingerprint_verified(content)
+                ):
+                    return False
         derived_ids.append(entity_id)
         derived_categories[category].append(entity_id)
         derived_type_counts[type_id] = derived_type_counts.get(type_id, 0) + 1

@@ -46,6 +46,7 @@ class TestImportReportHumanSummary(unittest.TestCase):
                     "justification": "Left",
                     "color_rgb": "0,0,0",
                     "font_size": 10.0,
+                    "view_style": {"view_present": True},
                 },
             }
             for entity_id in text_ids
@@ -195,6 +196,14 @@ class TestImportReportHumanSummary(unittest.TestCase):
                             "delivery_entity_ids": ["Label001", "Label002"],
                             "support_entity_ids": [],
                             "removed_entity_ids": [],
+                            "evidence": {
+                                "host_entity_type": "App::FeaturePython",
+                                "host_proxy_type": "Label",
+                                "source_text": "LABEL",
+                                "source_text_preserved": True,
+                                "view_style_verified": True,
+                                "label_marker_absent": True,
+                            },
                         }
                     ],
                 },

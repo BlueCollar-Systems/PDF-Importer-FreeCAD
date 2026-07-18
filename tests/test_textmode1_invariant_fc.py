@@ -36,6 +36,7 @@ def _report(tmp_path, requested, delivered, count):
         evidence = {
             "host_entity_type": "App::FeaturePython",
             "host_proxy_type": "Label",
+            "source_text": "LABEL",
             "source_text_preserved": True,
             "view_style_verified": True,
             "label_marker_absent": True,

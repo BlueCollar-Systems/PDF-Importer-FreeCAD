@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 import functools
 import hashlib
+import json
 import math
 from contextlib import contextmanager
 import os
@@ -750,6 +751,34 @@ def _build_text_representation_delivery(
                 and result.get("source_item_id") != source_item_id
             ):
                 return "proof_source_result_item_id_invalid"
+        if proof.get("reason_code") == "no_source_text_items":
+            evidence = proof.get("evidence")
+            if (
+                not isinstance(evidence, dict)
+                or evidence.get("text_dictionary_present") is not True
+                or type(evidence.get("canonical_source_item_count")) is not int
+                or evidence.get("canonical_source_item_count") != 0
+                or evidence.get("visible_source_text_found") is not False
+                or proof.get("attempted_sources_complete") is not True
+                or len(attempted_source_results) != 1
+            ):
+                return "proof_no_source_evidence_invalid"
+            result = attempted_source_results[0]
+            if (
+                result.get("source") != "pymupdf_text_dictionary"
+                or result.get("outcome") != "not_found"
+                or result.get("importer_identity")
+                != FREECAD_TEXT_IMPORTER_IDENTITY
+                or result.get("pdf_sha256") != digest
+                or type(result.get("page_number")) is not int
+                or result.get("page_number") != page_number
+                or result.get("source_item_id") != source_item_id
+                or result.get("source_item_ids") != []
+                or type(result.get("canonical_source_item_count")) is not int
+                or result.get("canonical_source_item_count") != 0
+                or result.get("visible_source_text_found") is not False
+            ):
+                return "proof_no_source_result_invalid"
         return ""
 
     requested_raw = str(getattr(opts, "text_mode", "") or "none").strip().lower()
@@ -796,7 +825,23 @@ def _build_text_representation_delivery(
     final_types: Dict[str, str] = {}
     terminal_attempts: List[Dict[str, Any]] = []
     removed_entity_ids: List[str] = []
+    entity_identity_owners: Dict[str, str] = {}
     matched_fallback_event_indexes = set()
+
+    def claim_entity_identities(source_id: str, entity_ids: Any) -> None:
+        if not isinstance(entity_ids, list):
+            return
+        for entity_id in entity_ids:
+            if not isinstance(entity_id, str) or not entity_id:
+                continue
+            prior_owner = entity_identity_owners.get(entity_id)
+            if prior_owner is None:
+                entity_identity_owners[entity_id] = source_id
+            elif prior_owner != source_id:
+                invalid_reasons.append(
+                    "%s_entity_identity_shared_with_%s" % (source_id, prior_owner)
+                )
+
     for source_id in source_ids:
         source_attempts = attempts_by_source[source_id]
         terminal = source_attempts[-1]
@@ -858,6 +903,8 @@ def _build_text_representation_delivery(
                 )
             if isinstance(removed_ids, list):
                 removed_entity_ids.extend(removed_ids)
+            claim_entity_identities(source_id, created_ids)
+            claim_entity_identities(source_id, removed_ids)
             if (
                 not isinstance(prior_proof, dict)
                 or prior_proof.get("item_specific_proven_impossible") is not True
@@ -907,16 +954,24 @@ def _build_text_representation_delivery(
             invalid_reasons.append("%s_cleanup_unverified" % source_id)
         if not isinstance(terminal.get("evidence"), dict) or not terminal.get("evidence"):
             invalid_reasons.append("%s_host_evidence_missing" % source_id)
-        elif final_type == "labels":
-            label_evidence = terminal["evidence"]
+        elif final_type in {"labels", "text"}:
+            native_evidence = terminal["evidence"]
+            expected_proxy_type = "Label" if final_type == "labels" else "Text"
             if (
-                label_evidence.get("host_entity_type") != "App::FeaturePython"
-                or label_evidence.get("host_proxy_type") != "Label"
-                or label_evidence.get("source_text_preserved") is not True
-                or label_evidence.get("view_style_verified") is not True
-                or label_evidence.get("label_marker_absent") is not True
+                native_evidence.get("host_entity_type") != "App::FeaturePython"
+                or native_evidence.get("host_proxy_type") != expected_proxy_type
+                or not isinstance(native_evidence.get("source_text"), str)
+                or not native_evidence.get("source_text")
+                or native_evidence.get("source_text_preserved") is not True
+                or native_evidence.get("view_style_verified") is not True
+                or (
+                    final_type == "labels"
+                    and native_evidence.get("label_marker_absent") is not True
+                )
             ):
-                invalid_reasons.append("%s_label_visual_evidence_unverified" % source_id)
+                invalid_reasons.append(
+                    "%s_%s_visual_evidence_unverified" % (source_id, final_type)
+                )
         if not final_type or final_type == "none":
             invalid_reasons.append("%s_final_type_missing" % source_id)
         if not terminal_attempted or final_type != terminal_attempted:
@@ -951,6 +1006,8 @@ def _build_text_representation_delivery(
             delivery_set = set(delivery_ids)
             support_set = set(support_ids)
             removed_entity_ids.extend(removed_ids)
+            claim_entity_identities(source_id, created_ids)
+            claim_entity_identities(source_id, removed_ids)
             if (
                 not created_set
                 or not delivery_set
@@ -1081,7 +1138,11 @@ def write_import_report(
 ) -> str:
     """Emit bcs.import_report/1.1 JSON for one import run."""
     from pdfcadcore.fitz_loader import sample_process_mb
-    from pdfcadcore.import_report import build_actual_text_entity_types, build_import_report
+    from pdfcadcore.import_report import (
+        TEXT_ENTITY_DELIVERED_BUCKETS,
+        build_actual_text_entity_types,
+        build_import_report,
+    )
 
     phases = dict(getattr(opts, "phase_timings_ms", {}) or {})
     if elapsed_ms > 0 and "total_ms" not in phases:
@@ -1111,6 +1172,7 @@ def write_import_report(
         and all(
             isinstance(bucket, str)
             and bool(bucket)
+            and bucket in TEXT_ENTITY_DELIVERED_BUCKETS
             and type(value) is int
             and value >= 0
             for bucket, value in raw_delivered_count_items
@@ -1119,7 +1181,9 @@ def write_import_report(
     delivered_counts = {
         bucket: value
         for bucket, value in raw_delivered_count_items
-        if isinstance(bucket, str) and type(value) is int and value > 0
+        if bucket in TEXT_ENTITY_DELIVERED_BUCKETS
+        and type(value) is int
+        and value > 0
     }
     entity_info = extra.get("actual_text_entity_types")
     if isinstance(entity_info, dict):
@@ -3632,8 +3696,13 @@ def _record_no_source_text_page_fallback(
                     {
                         "source": "pymupdf_text_dictionary",
                         "outcome": "not_found",
+                        "importer_identity": FREECAD_TEXT_IMPORTER_IDENTITY,
                         "pdf_sha256": digest,
                         "page_number": page_number,
+                        "source_item_id": source_item_id,
+                        "source_item_ids": [],
+                        "canonical_source_item_count": 0,
+                        "visible_source_text_found": False,
                     }
                 ],
                 "attempted_sources_complete": True,
@@ -3700,8 +3769,13 @@ def _record_no_source_text_page_fallback(
                     {
                         "source": "pymupdf_text_dictionary",
                         "outcome": "not_found",
+                        "importer_identity": FREECAD_TEXT_IMPORTER_IDENTITY,
                         "pdf_sha256": digest,
                         "page_number": page_number,
+                        "source_item_id": source_item_id,
+                        "source_item_ids": [],
+                        "canonical_source_item_count": 0,
+                        "visible_source_text_found": False,
                     }
                 ],
                 "attempted_sources_complete": True,
@@ -4257,11 +4331,11 @@ def _host_object_text_values(obj, property_name: str) -> List[str]:
 
 
 def _host_image_content_snapshot(image_file: str) -> Dict[str, Any]:
-    """Identify a persisted image by stable name and bytes, not cache directory."""
+    """Identify a persisted image by readable bytes, independent of cache pathname."""
 
     raw_path = str(image_file or "")
     snapshot: Dict[str, Any] = {
-        "image_file": Path(raw_path).name if raw_path else "",
+        "image_file": "persisted" if raw_path else "",
         "image_sha256": "",
         "image_bytes": 0,
     }
@@ -4283,6 +4357,146 @@ def _host_image_content_snapshot(image_file: str) -> Dict[str, Any]:
     return snapshot
 
 
+def _finite_host_number(value: Any) -> Optional[str]:
+    """Return a stable finite numeric token suitable for save/reopen equality."""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError, RuntimeError, AttributeError):
+        return None
+    return format(number, ".12g") if math.isfinite(number) else None
+
+
+def _host_shape_content_snapshot(obj, type_id: str) -> Dict[str, Any]:
+    """Capture meaningful persisted topology and geometry, not just non-nullness."""
+
+    shape_nonempty = _has_nonempty_host_geometry(obj, type_id)
+    topology_counts: Dict[str, int] = {}
+    metrics: Dict[str, str] = {}
+    bounds: Dict[str, str] = {}
+    try:
+        shape = getattr(obj, "Shape", None)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        shape = None
+
+    if shape is not None:
+        for property_name in (
+            "Vertexes",
+            "Edges",
+            "Wires",
+            "Faces",
+            "Shells",
+            "Solids",
+            "CompSolids",
+            "Compounds",
+        ):
+            try:
+                collection = getattr(shape, property_name)
+                topology_counts[property_name.lower()] = len(collection)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                continue
+        for property_name in ("Length", "Area", "Volume"):
+            try:
+                token = _finite_host_number(getattr(shape, property_name))
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                token = None
+            if token is not None:
+                metrics[property_name.lower()] = token
+        try:
+            bound_box = shape.BoundBox
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            bound_box = None
+        if bound_box is not None:
+            for property_name in (
+                "XMin",
+                "YMin",
+                "ZMin",
+                "XMax",
+                "YMax",
+                "ZMax",
+            ):
+                try:
+                    token = _finite_host_number(getattr(bound_box, property_name))
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    token = None
+                if token is not None:
+                    bounds[property_name.lower()] = token
+    else:
+        try:
+            geometry_count = obj.GeometryCount
+            if type(geometry_count) is int and geometry_count >= 0:
+                topology_counts["geometry_count"] = geometry_count
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+
+    meaningful_topology = any(
+        type(count) is int and count > 0 for count in topology_counts.values()
+    )
+    digest_payload = {
+        "topology_counts": topology_counts,
+        "metrics": metrics,
+        "bounds": bounds,
+    }
+    shape_digest = ""
+    if shape_nonempty and meaningful_topology:
+        shape_digest = hashlib.sha256(
+            json.dumps(
+                digest_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    return {
+        "shape_nonempty": bool(shape_nonempty),
+        "shape_structure_verified": bool(
+            shape_nonempty and meaningful_topology and shape_digest
+        ),
+        "shape_topology_counts": topology_counts,
+        "shape_metrics": metrics,
+        "shape_bounds": bounds,
+        "shape_digest": shape_digest,
+    }
+
+
+def _host_view_style_snapshot(obj) -> Dict[str, Any]:
+    """Capture the real GUI view-provider style when the host exposes one."""
+
+    try:
+        view = getattr(obj, "ViewObject", None)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        view = None
+    snapshot: Dict[str, Any] = {"view_present": view is not None}
+    if view is None:
+        return snapshot
+    for property_name in ("FontName", "Font", "Justification"):
+        try:
+            if hasattr(view, property_name):
+                snapshot[property_name.lower()] = str(
+                    getattr(view, property_name) or ""
+                )
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            continue
+    try:
+        if hasattr(view, "FontSize"):
+            token = _finite_host_number(view.FontSize)
+            snapshot["font_size"] = token
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+    colors: Dict[str, List[str]] = {}
+    for property_name in ("TextColor", "ShapeColor", "LineColor", "PointColor"):
+        try:
+            value = getattr(view, property_name)
+            channels = list(value)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            continue
+        normalized = [_finite_host_number(channel) for channel in channels[:4]]
+        if normalized and all(channel is not None for channel in normalized):
+            colors[property_name.lower()] = [str(channel) for channel in normalized]
+    if colors:
+        snapshot["colors"] = colors
+    return snapshot
+
+
 def _host_object_content_snapshot(
     obj,
     type_id: str,
@@ -4292,8 +4506,8 @@ def _host_object_content_snapshot(
 
     content: Dict[str, Any] = {}
     if type_id.startswith(("Part::", "PartDesign::", "Sketcher::")):
-        content["shape_nonempty"] = _has_nonempty_host_geometry(obj, type_id)
-    if representation == "labels":
+        content.update(_host_shape_content_snapshot(obj, type_id))
+    if representation in {"labels", "text"}:
         try:
             proxy_type = str(getattr(getattr(obj, "Proxy", None), "Type", "") or "")
         except (AttributeError, RuntimeError, TypeError, ValueError):
@@ -4302,25 +4516,54 @@ def _host_object_content_snapshot(
             {
                 "proxy_type": proxy_type,
                 "text": _host_object_text_values(obj, "Text"),
-                "custom_text": _host_object_text_values(obj, "CustomText"),
+                "custom_text": (
+                    _host_object_text_values(obj, "CustomText")
+                    if representation == "labels"
+                    else []
+                ),
                 "font_name": str(getattr(obj, "PDFTextFontName", "") or ""),
                 "justification": str(
                     getattr(obj, "PDFTextJustification", "") or ""
                 ),
                 "color_rgb": str(getattr(obj, "PDFTextColorRGB", "") or ""),
+                "view_style": _host_view_style_snapshot(obj),
             }
         )
         try:
-            font_size = float(getattr(obj, "PDFTextFontSize"))
+            font_size = float(obj.PDFTextFontSize)
             content["font_size"] = font_size if math.isfinite(font_size) else None
         except (AttributeError, RuntimeError, TypeError, ValueError):
             content["font_size"] = None
+    if representation == "3d_text":
+        content["string"] = _host_object_text_values(obj, "String")
+        try:
+            base = getattr(obj, "Base", None)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            base = None
+        content["base_entity_id"] = _host_object_id(base) if base is not None else ""
     if representation == "raster" or type_id.startswith("Image::"):
         try:
             image_file = str(getattr(obj, "ImageFile", "") or "")
         except (AttributeError, RuntimeError, TypeError, ValueError):
             image_file = ""
-        content.update(_host_image_content_snapshot(image_file))
+        image_snapshot = _host_image_content_snapshot(image_file)
+        if image_snapshot.get("image_bytes", 0) <= 0:
+            try:
+                included_file = str(getattr(obj, "PDFRasterFile", "") or "")
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                included_file = ""
+            included_snapshot = _host_image_content_snapshot(included_file)
+            if included_snapshot.get("image_bytes", 0) > 0:
+                image_snapshot = included_snapshot
+        content.update(image_snapshot)
+        for property_name, content_name in (
+            ("PDFSourceSHA256", "pdf_source_sha256"),
+            ("PDFRasterSHA256", "declared_raster_sha256"),
+        ):
+            try:
+                content[content_name] = str(getattr(obj, property_name, "") or "")
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                content[content_name] = ""
     return content
 
 

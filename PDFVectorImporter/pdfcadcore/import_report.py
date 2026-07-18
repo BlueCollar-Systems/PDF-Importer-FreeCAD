@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -535,19 +536,47 @@ def _freecad_delivery_inventory_binding_verified(
     ):
         return False
 
-    all_live_ids: set[str] = set()
-
-    for terminal in terminals:
-        if not isinstance(terminal, dict) or terminal.get("outcome") != "verified":
-            return False
-        source_item_id = str(terminal.get("source_item_id") or "").strip()
-        final_type = (
-            str(terminal.get("final_type") or "")
+    def normalize_representation(value: Any) -> str:
+        return (
+            str(value or "")
             .strip()
             .lower()
             .replace("-", "_")
             .replace(" ", "_")
         )
+
+    def meaningful_shape_content(content: Dict[str, Any]) -> bool:
+        topology = content.get("shape_topology_counts")
+        digest = content.get("shape_digest")
+        return bool(
+            content.get("shape_nonempty") is True
+            and content.get("shape_structure_verified") is True
+            and isinstance(topology, dict)
+            and any(type(count) is int and count > 0 for count in topology.values())
+            and isinstance(digest, str)
+            and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+        )
+
+    representation_ids = {
+        entity_id
+        for entity_id, record in records_by_id.items()
+        if (
+            normalize_representation(record.get("representation"))
+            in {"labels", "text", "3d_text", "glyphs", "geometry", "raster"}
+            or bool(str(record.get("source_item_id") or ""))
+            or bool(str(record.get("parent_source_item_id") or ""))
+            or (record.get("content") or {}).get("proxy_type") in {"Label", "Text"}
+        )
+    }
+    all_live_ids: set[str] = set()
+    all_terminal_removed_ids: set[str] = set()
+
+    for terminal in terminals:
+        if not isinstance(terminal, dict) or terminal.get("outcome") != "verified":
+            return False
+        source_item_id = str(terminal.get("source_item_id") or "").strip()
+        final_type = normalize_representation(terminal.get("final_type"))
+        evidence = terminal.get("evidence")
         created_ids = terminal.get("created_entity_ids")
         delivery_ids = terminal.get("delivery_entity_ids")
         if delivery_ids is None:
@@ -562,6 +591,8 @@ def _freecad_delivery_inventory_binding_verified(
             or not delivery_ids
             or not isinstance(support_ids, list)
             or not isinstance(terminal_removed_ids, list)
+            or not isinstance(evidence, dict)
+            or not evidence
         ):
             return False
 
@@ -587,9 +618,12 @@ def _freecad_delivery_inventory_binding_verified(
             or delivery_set.intersection(support_set)
             or delivery_set.union(support_set) != live_set
             or all_live_ids.intersection(live_set)
+            or all_terminal_removed_ids.intersection(terminal_removed_set)
+            or live_set.intersection(set(removed_entity_ids))
         ):
             return False
         all_live_ids.update(live_set)
+        all_terminal_removed_ids.update(terminal_removed_set)
 
         reported_delivery_count = terminal.get("delivery_count")
         if "delivery_count" in terminal and (
@@ -602,24 +636,31 @@ def _freecad_delivery_inventory_binding_verified(
         ):
             return False
 
+        live_records: Dict[str, Dict[str, Any]] = {}
         for raw_entity_id in list(delivery_ids) + list(support_ids):
             entity_id = str(raw_entity_id or "").strip()
             record = records_by_id.get(entity_id)
             if record is None:
                 return False
-            representation = (
-                str(record.get("representation") or "")
-                .strip()
-                .lower()
-                .replace("-", "_")
-                .replace(" ", "_")
-            )
+            live_records[entity_id] = record
+            representation = normalize_representation(record.get("representation"))
             if representation != final_type:
                 return False
-            if (
-                str(record.get("source_item_id") or "") != source_item_id
-                and str(record.get("parent_source_item_id") or "")
-                != source_item_id
+            record_source_id = str(record.get("source_item_id") or "")
+            record_parent_source_id = str(
+                record.get("parent_source_item_id") or ""
+            )
+            if final_type in {"glyphs", "geometry"}:
+                child_source_ids = evidence.get("child_source_item_ids")
+                if (
+                    not isinstance(child_source_ids, list)
+                    or record_source_id not in child_source_ids
+                    or record_parent_source_id != source_item_id
+                ):
+                    return False
+            elif (
+                record_source_id != source_item_id
+                or record_parent_source_id != ""
             ):
                 return False
             category = str(record.get("category") or "")
@@ -633,26 +674,116 @@ def _freecad_delivery_inventory_binding_verified(
                     or not type_id.startswith("Image::")
                     or not isinstance(content.get("image_file"), str)
                     or not content.get("image_file")
+                    or type(content.get("image_bytes")) is not int
+                    or content.get("image_bytes") <= 0
+                    or not isinstance(content.get("image_sha256"), str)
+                    or re.fullmatch(
+                        r"[0-9a-f]{64}", content.get("image_sha256")
+                    )
+                    is None
+                    or evidence.get("raster_content_verified") is not True
+                    or evidence.get("source_asset_sha256")
+                    != content.get("image_sha256")
                 ):
                     return False
             else:
                 if category != "text_representation_objects":
                     return False
-                if final_type == "labels" and (
-                    type_id != "App::FeaturePython"
-                    or content.get("proxy_type") != "Label"
-                    or not isinstance(content.get("text"), list)
-                    or not content.get("text")
-                    or content.get("custom_text") != content.get("text")
-                ):
-                    return False
+                if final_type in {"labels", "text"}:
+                    source_text = evidence.get("source_text")
+                    expected_proxy = "Label" if final_type == "labels" else "Text"
+                    if (
+                        type_id != "App::FeaturePython"
+                        or not isinstance(source_text, str)
+                        or not source_text
+                        or evidence.get("source_text_preserved") is not True
+                        or evidence.get("view_style_verified") is not True
+                        or content.get("proxy_type") != expected_proxy
+                        or content.get("text") != [source_text]
+                        or (
+                            final_type == "labels"
+                            and content.get("custom_text") != [source_text]
+                        )
+                        or not isinstance(content.get("view_style"), dict)
+                        or content["view_style"].get("view_present") is not True
+                    ):
+                        return False
                 if final_type in {"3d_text", "glyphs", "geometry"} and (
                     not type_id.startswith(("Part::", "PartDesign::", "Sketcher::"))
-                    or content.get("shape_nonempty") is not True
+                    or not meaningful_shape_content(content)
                 ):
                     return False
 
-    return True
+        if final_type in {"glyphs", "geometry"}:
+            child_source_ids = evidence.get("child_source_item_ids")
+            if (
+                not isinstance(child_source_ids, list)
+                or not child_source_ids
+                or any(
+                    not isinstance(child_id, str)
+                    or not child_id
+                    or child_id != child_id.strip()
+                    for child_id in child_source_ids
+                )
+                or len(child_source_ids) != len(set(child_source_ids))
+                or len(child_source_ids) != len(live_set)
+                or {
+                    str(record.get("source_item_id") or "")
+                    for record in live_records.values()
+                }
+                != set(child_source_ids)
+            ):
+                return False
+
+        if final_type == "3d_text":
+            source_text = evidence.get("source_text")
+            delivery_records = [live_records[entity_id] for entity_id in delivery_ids]
+            support_records = [live_records[entity_id] for entity_id in support_ids]
+            if (
+                len(delivery_records) != 1
+                or len(support_records) < 2
+                or not isinstance(source_text, str)
+                or not source_text
+                or evidence.get("source_text_preserved") is not True
+                or type(evidence.get("solid_count")) is not int
+                or evidence.get("solid_count") <= 0
+                or isinstance(evidence.get("volume"), bool)
+                or not isinstance(evidence.get("volume"), (int, float))
+                or not math.isfinite(float(evidence.get("volume")))
+                or float(evidence.get("volume")) <= 0.0
+            ):
+                return False
+            extrusion_record = delivery_records[0]
+            extrusion_content = extrusion_record.get("content") or {}
+            if (
+                extrusion_record.get("type_id") != "Part::Extrusion"
+                or extrusion_content.get("base_entity_id") not in support_set
+            ):
+                return False
+            shape_string_records = [
+                record
+                for record in support_records
+                if record.get("entity_id") != extrusion_content.get("base_entity_id")
+                and str(record.get("type_id") or "").startswith(
+                    ("Part::", "PartDesign::")
+                )
+                and (record.get("content") or {}).get("string") == [source_text]
+            ]
+            calibrated_support_records = [
+                record
+                for record in support_records
+                if record.get("entity_id") == extrusion_content.get("base_entity_id")
+                and str(record.get("type_id") or "").startswith(
+                    ("Part::", "PartDesign::")
+                )
+            ]
+            if len(shape_string_records) != 1 or len(calibrated_support_records) != 1:
+                return False
+
+    return bool(
+        all_live_ids == representation_ids
+        and all_terminal_removed_ids.issubset(set(removed_entity_ids))
+    )
 
 
 def _freecad_save_reopen_inventory_verified(
@@ -760,6 +891,11 @@ def _freecad_host_inventory_verified(inventory: Any, result: Any) -> bool:
             category != "images"
             or not type_id.startswith("Image::")
             or not isinstance(content.get("image_file"), str)
+            or not content.get("image_file")
+            or type(content.get("image_bytes")) is not int
+            or content.get("image_bytes") <= 0
+            or not isinstance(content.get("image_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", content.get("image_sha256")) is None
         ):
             return False
         if representation in {"labels", "text", "3d_text", "glyphs", "geometry"} and (
@@ -781,6 +917,20 @@ def _freecad_host_inventory_verified(inventory: Any, result: Any) -> bool:
             type(content.get("shape_nonempty")) is not bool
         ):
             return False
+        if representation in {"3d_text", "glyphs", "geometry"}:
+            topology = content.get("shape_topology_counts")
+            if (
+                content.get("shape_nonempty") is not True
+                or content.get("shape_structure_verified") is not True
+                or not isinstance(topology, dict)
+                or not any(
+                    type(count) is int and count > 0 for count in topology.values()
+                )
+                or not isinstance(content.get("shape_digest"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", content.get("shape_digest"))
+                is None
+            ):
+                return False
         derived_ids.append(entity_id)
         derived_categories[category].append(entity_id)
         derived_type_counts[type_id] = derived_type_counts.get(type_id, 0) + 1

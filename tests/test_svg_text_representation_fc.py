@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sys
 import re
 from pathlib import Path
@@ -54,6 +55,15 @@ DUPLICATE_BBOX_SVG = """
   <use href="#glyph-1" x="15" y="20" />
   <use href="#glyph-1" x="10" y="20" />
   <use href="#glyph-1" x="15" y="20" />
+</svg>
+"""
+
+THREE_TIED_VISIBLE_GLYPHS_SVG = """
+<svg width="100" height="100" viewBox="0 0 100 100">
+  <defs><path id="glyph-visible" d="M 0 0 L 3 0 L 3 5 Z" /></defs>
+  <use href="#glyph-visible" x="10" y="20" />
+  <use href="#glyph-visible" x="15" y="20" />
+  <use href="#glyph-visible" x="20" y="20" />
 </svg>
 """
 
@@ -224,6 +234,66 @@ def _install_renderer(monkeypatch):
     )
 
 
+def _attach_visible_source_ink(item):
+    source_sha = "1" * 64
+    usable_sha = "2" * 64
+    binding = {
+        "asset_id": "sha256:" + usable_sha,
+        "source_xref": 1,
+        "source_font_sha256": source_sha,
+        "usable_font_sha256": usable_sha,
+        "base_font_name": item["font_identity"]["raw_name"],
+        "span_font_name": item["font_identity"]["raw_name"],
+        "source_format": "ttf",
+        "usable_format": "ttf",
+        "source_origin": "test_exact_font",
+    }
+    characters = [
+        {
+            "authority": "exact_pdf_font_glyph_bounds",
+            "character": character,
+            "synthetic": False,
+            "glyph_id": index + 1,
+            "glyph_name": "glyph%05d" % (index + 1),
+            "glyph_bounds": (0.0, 0.0, 500.0, 700.0),
+            "advance_width": 600.0,
+            "layout_only_zero_ink": False,
+            "font_asset_binding": dict(binding),
+            "source_font_sha256": source_sha,
+            "usable_font_sha256": usable_sha,
+            "trace_type": 0,
+            "opacity": 1.0,
+            "zero_visible_ink": False,
+            "physically_resolved": True,
+            "source_index": index,
+        }
+        for index, character in enumerate(item["text"])
+    ]
+    evidence = {
+        "schema": "pdf_source_ink_evidence_v1",
+        "authority": "pymupdf_rawdict_texttrace_exact_font",
+        "pdf_sha256": item["pdf_sha256"],
+        "page_number": item["page_number"],
+        "source_item_id": item["source_item_id"],
+        "source_text": item["text"],
+        "source_text_sha256": hashlib.sha256(
+            item["text"].encode("utf-8")
+        ).hexdigest(),
+        "font_identity": dict(item["font_identity"]),
+        "classification": "visible_ink",
+        "zero_ink_characters_layout_only": False,
+        "all_characters_physically_resolved": True,
+        "font_asset_bindings": [dict(binding)],
+        "glyph_id_sequence": [record["glyph_id"] for record in characters],
+        "characters": characters,
+    }
+    evidence["evidence_sha256"] = core._source_ink_evidence_digest(evidence)
+    item["source_ink_evidence"] = evidence
+    item["source_font_asset_bindings"] = [dict(binding)]
+    item["source_glyph_id_sequence"] = list(evidence["glyph_id_sequence"])
+    return item
+
+
 def _source_item(*, bbox, requested_type="glyphs", source_item_id="p1:b0:l0:s0"):
     match = re.fullmatch(r"p(\d+):b(\d+):l(\d+):s(\d+)", source_item_id)
     assert match is not None
@@ -231,7 +301,7 @@ def _source_item(*, bbox, requested_type="glyphs", source_item_id="p1:b0:l0:s0")
         int(value) for value in match.groups()
     )
     span = {"text": "TEXT", "bbox": tuple(bbox)}
-    return {
+    item = {
         "importer_identity": "bluecollarsystems.freecad.pdf_vector_importer",
         "pdf_sha256": "a" * 64,
         "page_number": page_number,
@@ -239,11 +309,13 @@ def _source_item(*, bbox, requested_type="glyphs", source_item_id="p1:b0:l0:s0")
         "requested_type": requested_type,
         "bbox": tuple(bbox),
         "text": "TEXT",
+        "font_identity": {"raw_name": "TestFont", "normalized_key": "testfont"},
         "span": span,
         "block_index": block_index,
         "line_index": line_index,
         "span_index": span_index,
     }
+    return _attach_visible_source_ink(item)
 
 
 def test_nonempty_unparseable_svg_placement_is_never_silently_dropped(monkeypatch):
@@ -432,6 +504,82 @@ def test_global_assignment_is_stable_when_identical_items_are_rendered_out_of_or
         second_item["source_item_id"]: [2, 3],
     }
     assert cache["claimed_placement_indices"] == {0, 1, 2, 3}
+
+
+def _assert_exact_text_length_controls_tied_visible_glyph_assignment(
+    monkeypatch,
+    second_text,
+):
+    _install_renderer(monkeypatch)
+    monkeypatch.setattr(
+        renderer,
+        "_render_svg_with_pymupdf",
+        lambda *_args: THREE_TIED_VISIBLE_GLYPHS_SVG,
+    )
+    first_item = _source_item(
+        bbox=(8.0, 18.0, 25.0, 27.0),
+        source_item_id="p1:b0:l0:s0",
+    )
+    second_item = _source_item(
+        bbox=(8.0, 18.0, 25.0, 27.0),
+        source_item_id="p1:b0:l1:s0",
+    )
+    first_item["text"] = first_item["span"]["text"] = "A"
+    second_item["text"] = second_item["span"]["text"] = second_text
+    _attach_visible_source_ink(first_item)
+    _attach_visible_source_ink(second_item)
+    manifest = [
+        {
+            "source_order": order,
+            "source_item_id": item["source_item_id"],
+            "page_number": item["page_number"],
+            "pdf_sha256": item["pdf_sha256"],
+            "bbox": item["bbox"],
+            "text": item["text"],
+        }
+        for order, item in enumerate((first_item, second_item))
+    ]
+    doc = FakeDocument()
+    group = FakeGroup()
+    cache = {"source_item_manifest": manifest}
+
+    first = renderer.render_text(
+        "fixture.pdf",
+        1,
+        100.0,
+        1.0,
+        page_w=100.0,
+        fc_doc=doc,
+        parent_group=group,
+        representation="glyphs",
+        source_item=first_item,
+        requested_representation="glyphs",
+        render_cache=cache,
+    )
+    second = renderer.render_text(
+        "fixture.pdf",
+        1,
+        100.0,
+        1.0,
+        page_w=100.0,
+        fc_doc=doc,
+        parent_group=group,
+        representation="glyphs",
+        source_item=second_item,
+        requested_representation="glyphs",
+        render_cache=cache,
+    )
+
+    assert first["item_filter"]["matched_placement_indices"] == [0]
+    assert second["item_filter"]["matched_placement_indices"] == [1, 2]
+
+
+def test_contoured_all_whitespace_glyphs_use_exact_source_length(monkeypatch):
+    _assert_exact_text_length_controls_tied_visible_glyph_assignment(monkeypatch, "  ")
+
+
+def test_mixed_visible_and_space_span_uses_exact_source_length(monkeypatch):
+    _assert_exact_text_length_controls_tied_visible_glyph_assignment(monkeypatch, "A ")
 
 
 def test_glyphs_create_one_verified_host_entity_per_placed_glyph(monkeypatch):
@@ -627,6 +775,7 @@ def test_real_rotated_page_item_filters_never_cross_relabel(tmp_path, monkeypatc
         item = _source_item(bbox=bbox, source_item_id=source_item_id)
         item["text"] = text
         item["span"] = {"text": text, "bbox": bbox}
+        _attach_visible_source_ink(item)
         items.append(item)
 
     monkeypatch.setattr(renderer, "FreeCAD", FakeFreeCAD)

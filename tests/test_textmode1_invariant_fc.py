@@ -322,60 +322,75 @@ def test_failed_fast_text_probe_with_canonical_text_never_places_masking_raster(
 
 
 @pytest.mark.parametrize("mode", ["labels", "text", "3d_text", "glyphs", "geometry"])
-def test_page_without_source_item_rejects_fabricated_raster_fallback(mode):
+def test_page_without_source_item_uses_page_scoped_visual_fallback(mode):
     opts = core.ImportOptions(import_mode="auto", import_text=True, text_mode=mode)
     attempts_ref = opts.text_delivery_attempts
     fallbacks_ref = opts.text_mode_fallbacks
     counts_ref = opts.text_delivered_counts
 
-    with pytest.raises(ValueError, match="without a canonical source item"):
-        core._record_no_source_text_page_fallback(
-            opts,
-            page_num=1,
-            pdf_sha256="a" * 64,
-            raw_tdict={"blocks": [{"type": 1}]},
-            raster_result={
-                "created_entity_ids": ["PageRaster001"],
-                "evidence": {
-                    "host_entity_type": "Image::ImagePlane",
-                    "save_reopen_identity_verified": True,
-                },
+    info = core._record_no_source_text_page_fallback(
+        opts,
+        page_num=1,
+        pdf_sha256="a" * 64,
+        raw_tdict={"blocks": [{"type": 1}]},
+        raster_result={
+            "outcome": "verified",
+            "created_entity_ids": ["PageRaster001"],
+            "evidence": {
+                "host_entity_type": "Image::ImagePlane",
+                "pdf_sha256": "a" * 64,
+                "source_asset_sha256": "f" * 64,
+                "raster_content_verified": True,
+                "raster_file_included": True,
             },
-        )
+        },
+    )
 
     assert opts.text_mode == mode
     assert opts.text_delivery_attempts is attempts_ref
     assert opts.text_mode_fallbacks is fallbacks_ref
     assert opts.text_delivered_counts is counts_ref
-    assert attempts_ref == []
-    assert fallbacks_ref == []
-    assert counts_ref == {}
+    assert info["source_item_count"] == 0
+    assert attempts_ref[-1]["final_type"] == "raster"
+    assert all(
+        attempt["proof"]["page_specific_proven_impossible"] is True
+        for attempt in attempts_ref[:-1]
+    )
+    assert len(fallbacks_ref) == 1
+    assert counts_ref == {"raster_text_patch": 1}
 
 
-def test_no_source_rejection_never_invokes_attempt_or_fallback_ledgers(monkeypatch):
+def test_no_source_page_fallback_rolls_back_all_ledgers_on_write_failure(monkeypatch):
     opts = core.ImportOptions(import_mode="auto", import_text=True, text_mode="labels")
 
-    def forbidden(*_args, **_kwargs):
-        pytest.fail("a page without a source item cannot enter a fallback ledger")
+    def fail_attempt(*_args, **_kwargs):
+        raise RuntimeError("ledger write failed")
 
-    monkeypatch.setattr(core, "_append_text_item_attempt", forbidden)
-    monkeypatch.setattr(core, "_record_text_mode_fallback", forbidden)
+    monkeypatch.setattr(core, "_append_text_item_attempt", fail_attempt)
 
-    with pytest.raises(ValueError, match="without a canonical source item"):
+    with pytest.raises(RuntimeError, match="ledger write failed"):
         core._record_no_source_text_page_fallback(
             opts,
             page_num=1,
             pdf_sha256="c" * 64,
             raw_tdict={"blocks": [{"type": 1}]},
             raster_result={
+                "outcome": "verified",
                 "created_entity_ids": ["PageRaster003"],
-                "evidence": {"host_entity_type": "Image::ImagePlane"},
+                "evidence": {
+                    "host_entity_type": "Image::ImagePlane",
+                    "pdf_sha256": "c" * 64,
+                    "source_asset_sha256": "f" * 64,
+                    "raster_content_verified": True,
+                    "raster_file_included": True,
+                },
             },
         )
 
     assert opts.text_delivery_attempts == []
     assert opts.text_mode_fallbacks == []
     assert opts.text_delivered_counts == {}
+    assert opts.page_visual_source_observations == {}
 def test_public_page_import_rolls_back_post_baseline_objects_and_reports_truth(
     monkeypatch,
 ):

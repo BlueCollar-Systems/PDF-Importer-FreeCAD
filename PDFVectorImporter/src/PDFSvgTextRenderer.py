@@ -314,9 +314,9 @@ def _bbox_intersection_area(
     )
 
 
-def _visible_text_units(value: str) -> int:
-    """Estimate visible glyph demand without treating whitespace as ink."""
-    return max(1, sum(1 for character in str(value or "") if not character.isspace()))
+def _source_text_units(value: str) -> int:
+    """Return exact source character demand without Unicode paint guesses."""
+    return len(value) if isinstance(value, str) else 0
 
 
 def _allocate_tied_placements(
@@ -436,7 +436,6 @@ def _build_global_placement_assignments(
             or raw_entry.get("pdf_sha256") != pdf_sha256
             or not isinstance(source_text, str)
             or not source_text
-            or source_text.isspace()
             or not isinstance(raw_bbox, tuple)
             or len(source_bbox) != 4
             or not all(math.isfinite(value) for value in source_bbox)
@@ -476,7 +475,7 @@ def _build_global_placement_assignments(
     assignments = {entry["source_item_id"]: [] for entry in normalized}
     assigned_counts = {entry["source_item_id"]: 0 for entry in normalized}
     source_units = {
-        entry["source_item_id"]: _visible_text_units(entry["text"])
+        entry["source_item_id"]: _source_text_units(entry["text"])
         for entry in normalized
     }
     host_bboxes = {

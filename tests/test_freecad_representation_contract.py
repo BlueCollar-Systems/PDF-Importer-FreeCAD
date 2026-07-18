@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import math
 import copy
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -298,7 +299,7 @@ def _canonical_3d_item(
 
     span = _span(text)
     span["font"] = font
-    return {
+    item = {
         "importer_identity": core.FREECAD_TEXT_IMPORTER_IDENTITY,
         "pdf_sha256": "a" * 64,
         "page_number": page_number,
@@ -318,6 +319,61 @@ def _canonical_3d_item(
         "line_index": 0,
         "span_index": span_index,
     }
+    source_sha = "1" * 64
+    usable_sha = "2" * 64
+    binding = {
+        "asset_id": "sha256:" + usable_sha,
+        "source_xref": 1,
+        "source_font_sha256": source_sha,
+        "usable_font_sha256": usable_sha,
+        "base_font_name": item["font_identity"]["raw_name"],
+        "span_font_name": item["font_identity"]["raw_name"],
+        "source_format": "ttf",
+        "usable_format": "ttf",
+        "source_origin": "test_exact_font",
+    }
+    characters = [
+        {
+            "authority": "exact_pdf_font_glyph_bounds",
+            "character": character,
+            "synthetic": False,
+            "glyph_id": index + 1,
+            "glyph_name": "glyph%05d" % (index + 1),
+            "glyph_bounds": (0.0, 0.0, 500.0, 700.0),
+            "advance_width": 600.0,
+            "layout_only_zero_ink": False,
+            "font_asset_binding": dict(binding),
+            "source_font_sha256": source_sha,
+            "usable_font_sha256": usable_sha,
+            "trace_type": 0,
+            "opacity": 1.0,
+            "zero_visible_ink": False,
+            "physically_resolved": True,
+            "source_index": index,
+        }
+        for index, character in enumerate(item["text"])
+    ]
+    evidence = {
+        "schema": "pdf_source_ink_evidence_v1",
+        "authority": "pymupdf_rawdict_texttrace_exact_font",
+        "pdf_sha256": item["pdf_sha256"],
+        "page_number": item["page_number"],
+        "source_item_id": item["source_item_id"],
+        "source_text": item["text"],
+        "source_text_sha256": hashlib.sha256(item["text"].encode("utf-8")).hexdigest(),
+        "font_identity": dict(item["font_identity"]),
+        "classification": "visible_ink",
+        "zero_ink_characters_layout_only": False,
+        "all_characters_physically_resolved": True,
+        "font_asset_bindings": [dict(binding)],
+        "glyph_id_sequence": [record["glyph_id"] for record in characters],
+        "characters": characters,
+    }
+    evidence["evidence_sha256"] = core._source_ink_evidence_digest(evidence)
+    item["source_ink_evidence"] = evidence
+    item["source_font_asset_bindings"] = [dict(binding)]
+    item["source_glyph_id_sequence"] = list(evidence["glyph_id_sequence"])
+    return item
 
 
 def _found_font_resolution(item, path="C:/fonts/arial.ttf"):
@@ -443,6 +499,22 @@ def test_3d_text_preserves_source_whitespace_and_rotation_even_in_quantity_colum
     assert draft.calls[0][0] == " 1 "
     support = next(obj for obj in document.Objects if obj.TypeId == "Part::Part2DObjectPython")
     assert support.Placement.Rotation.angle == pytest.approx(-90.0)
+
+
+def test_legacy_3d_helper_never_drops_exact_all_space_span(monkeypatch):
+    _document, draft, group = _install_host(monkeypatch)
+    opts = core.ImportOptions(text_mode="3d_text")
+
+    count = core._render_text_spans_3d(
+        _tdict("   "),
+        group,
+        100.0,
+        opts,
+        1.0,
+    )
+
+    assert count == 1
+    assert draft.calls[0][0] == "   "
 
 
 def test_labels_preserve_source_rotation_and_text_even_in_quantity_column(monkeypatch):
@@ -1337,7 +1409,24 @@ def test_verified_item_3d_result_has_complete_ids_and_evidence(monkeypatch):
     assert evidence["verified_advance"] == pytest.approx(evidence["target_advance"])
     assert evidence["font_path"] == resolution[0]
     assert evidence["font_source_result"] == resolution[1][0]
+    assert evidence["source_ink_evidence"] == item["source_ink_evidence"]
+    assert evidence["source_ink_evidence_persisted"] is True
+    assert evidence["source_pdf_sha256"] == item["pdf_sha256"]
+    assert evidence["source_page_number"] == item["page_number"]
+    assert evidence["source_font_identity"] == item["font_identity"]
+    assert evidence["source_font_asset_bindings"] == item[
+        "source_font_asset_bindings"
+    ]
+    assert evidence["source_glyph_id_sequence"] == item[
+        "source_glyph_id_sequence"
+    ]
     support, calibrated, extrusion = document.Objects
+    for host in (support, calibrated, extrusion):
+        assert host.PDFSourceInkClassification == "visible_ink"
+        assert (
+            host.PDFSourceInkEvidenceSHA256
+            == item["source_ink_evidence"]["evidence_sha256"]
+        )
     assert support.ViewObject.Visibility is False
     assert calibrated.ViewObject.Visibility is False
     assert calibrated.Placement.Base.x == pytest.approx(support.Placement.Base.x)

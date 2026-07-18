@@ -312,6 +312,33 @@ def count_doc_objects(doc) -> dict:
     return out
 
 
+def _build_import_options(core, cfg_obj, pages):
+    """Map the canonical shared config onto FreeCAD's host option names."""
+
+    return core.ImportOptions(
+        pages=pages,
+        scale_to_mm=True,
+        user_scale=1.0,
+        flip_y=True,
+        join_tol=float(cfg_obj.join_tol),
+        curve_step_mm=float(cfg_obj.curve_step_mm),
+        make_faces=bool(cfg_obj.make_faces),
+        import_text=bool(cfg_obj.import_text),
+        text_mode=str(cfg_obj.text_mode),
+        strict_text_fidelity=bool(cfg_obj.strict_text_fidelity),
+        hatch_mode=str(cfg_obj.hatch_mode),
+        group_by_color=bool(cfg_obj.group_by_color),
+        assign_linewidth=bool(cfg_obj.assign_lineweight),
+        map_dashes=bool(cfg_obj.map_dashes),
+        detect_arcs=bool(cfg_obj.detect_arcs),
+        ignore_images=bool(cfg_obj.ignore_images),
+        raster_fallback=bool(cfg_obj.raster_fallback),
+        import_mode=str(cfg_obj.import_mode),
+        create_top_group=True,
+        verbose=False,
+    )
+
+
 def main() -> int:
     payload_path = os.environ.get("BC_PDF_QA_PAYLOAD", "").strip()
     if not payload_path:
@@ -376,28 +403,7 @@ def main() -> int:
                 f"Attempts: {cfg_errors}"
             )
         cfg_obj = getattr(ImportConfig, mode_name)()
-        opts = core.ImportOptions(
-            pages=pages,
-            scale_to_mm=True,
-            user_scale=1.0,
-            flip_y=True,
-            join_tol=float(cfg_obj.join_tol),
-            curve_step_mm=float(cfg_obj.curve_step_mm),
-            make_faces=bool(cfg_obj.make_faces),
-            import_text=bool(cfg_obj.import_text),
-            text_mode=str(cfg_obj.text_mode),
-            strict_text_fidelity=bool(cfg_obj.strict_text_fidelity),
-            hatch_mode=str(cfg_obj.hatch_mode),
-            group_by_color=bool(cfg_obj.group_by_color),
-            assign_linewidth=bool(cfg_obj.assign_linewidth),
-            map_dashes=bool(cfg_obj.map_dashes),
-            detect_arcs=bool(cfg_obj.detect_arcs),
-            ignore_images=bool(cfg_obj.ignore_images),
-            raster_fallback=bool(cfg_obj.raster_fallback),
-            import_mode=str(cfg_obj.import_mode),
-            create_top_group=True,
-            verbose=False,
-        )
+        opts = _build_import_options(core, cfg_obj, pages)
 
         doc = FreeCAD.ActiveDocument or FreeCAD.newDocument("BC_QA")
         before = count_doc_objects(doc)

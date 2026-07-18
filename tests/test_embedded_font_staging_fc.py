@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import sys
 from pathlib import Path
@@ -55,7 +56,7 @@ def _proof_item(font="Siwa-Regular", *, pdf_sha256=PDF_SHA_A, page_number=1):
         "origin": (10.0, 50.0),
         "bbox": (10.0, 40.0, 40.0, 52.0),
     }
-    return {
+    item = {
         "importer_identity": core.FREECAD_TEXT_IMPORTER_IDENTITY,
         "pdf_sha256": pdf_sha256,
         "page_number": page_number,
@@ -75,6 +76,63 @@ def _proof_item(font="Siwa-Regular", *, pdf_sha256=PDF_SHA_A, page_number=1):
         "line_index": 0,
         "span_index": 0,
     }
+    source_sha = "1" * 64
+    usable_sha = "2" * 64
+    binding = {
+        "asset_id": "sha256:" + usable_sha,
+        "source_xref": 1,
+        "source_font_sha256": source_sha,
+        "usable_font_sha256": usable_sha,
+        "base_font_name": font,
+        "span_font_name": font,
+        "source_format": "ttf",
+        "usable_format": "ttf",
+        "source_origin": "test_exact_font",
+    }
+    characters = [
+        {
+            "authority": "exact_pdf_font_glyph_bounds",
+            "character": character,
+            "synthetic": False,
+            "glyph_id": index + 1,
+            "glyph_name": "glyph%05d" % (index + 1),
+            "glyph_bounds": (0.0, 0.0, 500.0, 700.0),
+            "advance_width": 600.0,
+            "layout_only_zero_ink": False,
+            "font_asset_binding": dict(binding),
+            "source_font_sha256": source_sha,
+            "usable_font_sha256": usable_sha,
+            "trace_type": 0,
+            "opacity": 1.0,
+            "zero_visible_ink": False,
+            "physically_resolved": True,
+            "source_index": index,
+        }
+        for index, character in enumerate(item["text"])
+    ]
+    evidence = {
+        "schema": "pdf_source_ink_evidence_v1",
+        "authority": "pymupdf_rawdict_texttrace_exact_font",
+        "pdf_sha256": item["pdf_sha256"],
+        "page_number": item["page_number"],
+        "source_item_id": item["source_item_id"],
+        "source_text": item["text"],
+        "source_text_sha256": hashlib.sha256(
+            item["text"].encode("utf-8")
+        ).hexdigest(),
+        "font_identity": dict(item["font_identity"]),
+        "classification": "visible_ink",
+        "zero_ink_characters_layout_only": False,
+        "all_characters_physically_resolved": True,
+        "font_asset_bindings": [dict(binding)],
+        "glyph_id_sequence": [record["glyph_id"] for record in characters],
+        "characters": characters,
+    }
+    evidence["evidence_sha256"] = core._source_ink_evidence_digest(evidence)
+    item["source_ink_evidence"] = evidence
+    item["source_font_asset_bindings"] = [dict(binding)]
+    item["source_glyph_id_sequence"] = list(evidence["glyph_id_sequence"])
+    return item
 
 
 def _raw_cff_fixture() -> bytes:

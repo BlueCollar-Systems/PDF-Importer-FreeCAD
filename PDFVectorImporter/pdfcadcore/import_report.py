@@ -1286,130 +1286,26 @@ def _freecad_source_ink_evidence_verified(
     evidence: Any,
     source_item_id: str,
     source_text: str,
+    *,
+    expected_pdf_sha256: str,
+    expected_page_number: int,
+    expected_font_identity: Dict[str, Any],
+    expected_font_asset_bindings: List[Dict[str, Any]],
+    expected_glyph_id_sequence: List[Optional[int]],
 ) -> bool:
-    """Revalidate the sealed source/font proof; Unicode is not ink authority."""
+    """Revalidate one sealed proof against independent report/source identity."""
 
-    if not isinstance(evidence, dict) or not isinstance(source_text, str):
-        return False
-    characters = evidence.get("characters")
-    classification = evidence.get("classification")
-    digest = evidence.get("evidence_sha256")
-    if (
-        evidence.get("schema") != "pdf_source_ink_evidence_v1"
-        or evidence.get("authority") != "pymupdf_rawdict_texttrace_exact_font"
-        or not isinstance(evidence.get("pdf_sha256"), str)
-        or re.fullmatch(r"[0-9a-f]{64}", evidence.get("pdf_sha256")) is None
-        or type(evidence.get("page_number")) is not int
-        or evidence.get("page_number") <= 0
-        or evidence.get("source_item_id") != source_item_id
-        or evidence.get("source_text") != source_text
-        or evidence.get("source_text_sha256")
-        != hashlib.sha256(source_text.encode("utf-8")).hexdigest()
-        or not isinstance(evidence.get("font_identity"), dict)
-        or not evidence.get("font_identity")
-        or classification not in {"zero_visible_ink", "visible_ink"}
-        or evidence.get("all_characters_physically_resolved") is not True
-        or not isinstance(characters, list)
-        or not characters
-        or not isinstance(digest, str)
-        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
-    ):
-        return False
+    from .source_ink import source_ink_evidence_verified
 
-    resolved_text: List[str] = []
-    zero_flags: List[bool] = []
-    for index, record in enumerate(characters):
-        if not isinstance(record, dict):
-            return False
-        character = record.get("character")
-        authority = record.get("authority")
-        if (
-            not isinstance(character, str)
-            or not character
-            or record.get("source_index") != index
-            or record.get("physically_resolved") is not True
-            or type(record.get("zero_visible_ink")) is not bool
-            or authority
-            not in {
-                "pymupdf_rawdict_synthetic_character",
-                "pymupdf_texttrace_nonpainting_render_mode",
-                "exact_pdf_font_glyph_bounds",
-            }
-        ):
-            return False
-        if authority == "pymupdf_rawdict_synthetic_character":
-            if (
-                record.get("synthetic") is not True
-                or record.get("zero_visible_ink") is not True
-            ):
-                return False
-        elif authority == "pymupdf_texttrace_nonpainting_render_mode":
-            opacity = record.get("opacity")
-            if (
-                record.get("synthetic") is not False
-                or record.get("zero_visible_ink") is not True
-                or type(record.get("glyph_id")) is not int
-                or isinstance(opacity, bool)
-                or not isinstance(opacity, (int, float))
-                or not math.isfinite(float(opacity))
-                or (record.get("trace_type") != 3 and float(opacity) > 0.0)
-            ):
-                return False
-        else:
-            bounds = record.get("glyph_bounds")
-            opacity = record.get("opacity")
-            for hash_name in ("source_font_sha256", "usable_font_sha256"):
-                value = record.get(hash_name)
-                if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
-                    return False
-            if (
-                record.get("synthetic") is not False
-                or type(record.get("glyph_id")) is not int
-                or record.get("glyph_id") < 0
-                or not isinstance(record.get("glyph_name"), str)
-                or not record.get("glyph_name")
-                or type(record.get("trace_type")) is not int
-                or record.get("trace_type") == 3
-                or isinstance(opacity, bool)
-                or not isinstance(opacity, (int, float))
-                or not math.isfinite(float(opacity))
-                or float(opacity) <= 0.0
-                or (
-                    bounds is not None
-                    and (
-                        not isinstance(bounds, (list, tuple))
-                        or len(bounds) != 4
-                        or any(
-                            isinstance(value, bool)
-                            or not isinstance(value, (int, float))
-                            or not math.isfinite(float(value))
-                            for value in bounds
-                        )
-                    )
-                )
-                or record.get("zero_visible_ink") != (bounds is None)
-            ):
-                return False
-        resolved_text.append(character)
-        zero_flags.append(record["zero_visible_ink"])
-
-    digest_payload = dict(evidence)
-    digest_payload.pop("evidence_sha256", None)
-    expected_digest = hashlib.sha256(
-        json.dumps(
-            digest_payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
-    return bool(
-        "".join(resolved_text) == source_text
-        and (
-            (classification == "zero_visible_ink" and all(zero_flags))
-            or (classification == "visible_ink" and not all(zero_flags))
-        )
-        and digest == expected_digest
+    return source_ink_evidence_verified(
+        evidence,
+        expected_pdf_sha256=expected_pdf_sha256,
+        expected_page_number=expected_page_number,
+        expected_source_item_id=source_item_id,
+        expected_source_text=source_text,
+        expected_font_identity=expected_font_identity,
+        expected_font_asset_bindings=expected_font_asset_bindings,
+        expected_glyph_id_sequence=expected_glyph_id_sequence,
     )
 
 
@@ -1418,6 +1314,12 @@ def _freecad_source_ink_inventory_binding_verified(
     content: Any,
     source_item_id: str,
     source_text: str,
+    *,
+    expected_pdf_sha256: str,
+    expected_page_number: int,
+    expected_font_identity: Dict[str, Any],
+    expected_font_asset_bindings: List[Dict[str, Any]],
+    expected_glyph_id_sequence: List[Optional[int]],
 ) -> bool:
     if not isinstance(terminal_evidence, dict) or not isinstance(content, dict):
         return False
@@ -1428,6 +1330,11 @@ def _freecad_source_ink_inventory_binding_verified(
             source_evidence,
             source_item_id,
             source_text,
+            expected_pdf_sha256=expected_pdf_sha256,
+            expected_page_number=expected_page_number,
+            expected_font_identity=expected_font_identity,
+            expected_font_asset_bindings=expected_font_asset_bindings,
+            expected_glyph_id_sequence=expected_glyph_id_sequence,
         )
         and content.get("source_ink_classification")
         == source_evidence.get("classification")
@@ -1439,10 +1346,14 @@ def _freecad_source_ink_inventory_binding_verified(
 def _freecad_delivery_inventory_binding_verified(
     delivery: Any,
     inventory: Any,
+    expected_pdf_sha256: Optional[str],
 ) -> bool:
     """Bind each terminal text delivery to its exact persisted host object."""
 
-    if not isinstance(delivery, dict) or delivery.get("verified") is not True:
+    if (
+        not isinstance(delivery, dict)
+        or delivery.get("verified") is not True
+    ):
         return False
     if not isinstance(inventory, dict) or inventory.get("verified") is not True:
         return False
@@ -1539,10 +1450,33 @@ def _freecad_delivery_inventory_binding_verified(
         source_ink_evidence = evidence.get("source_ink_evidence")
         source_ink_verified = False
         if source_ink_evidence is not None:
-            if not isinstance(source_text, str) or not _freecad_source_ink_evidence_verified(
-                source_ink_evidence,
-                source_item_id,
-                source_text,
+            page_match = re.fullmatch(r"p([1-9][0-9]*):b[0-9]+:l[0-9]+:s[0-9]+", source_item_id)
+            expected_page_number = int(page_match.group(1)) if page_match else None
+            expected_font_identity = evidence.get("source_font_identity")
+            expected_font_asset_bindings = evidence.get(
+                "source_font_asset_bindings"
+            )
+            expected_glyph_id_sequence = evidence.get("source_glyph_id_sequence")
+            if (
+                not isinstance(source_text, str)
+                or expected_page_number is None
+                or not isinstance(expected_pdf_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", expected_pdf_sha256) is None
+                or evidence.get("source_pdf_sha256") != expected_pdf_sha256
+                or evidence.get("source_page_number") != expected_page_number
+                or not isinstance(expected_font_identity, dict)
+                or not isinstance(expected_font_asset_bindings, list)
+                or not isinstance(expected_glyph_id_sequence, list)
+                or not _freecad_source_ink_evidence_verified(
+                    source_ink_evidence,
+                    source_item_id,
+                    source_text,
+                    expected_pdf_sha256=expected_pdf_sha256,
+                    expected_page_number=expected_page_number,
+                    expected_font_identity=expected_font_identity,
+                    expected_font_asset_bindings=expected_font_asset_bindings,
+                    expected_glyph_id_sequence=expected_glyph_id_sequence,
+                )
             ):
                 return False
             source_ink_verified = True
@@ -1550,6 +1484,44 @@ def _freecad_delivery_inventory_binding_verified(
             source_ink_verified
             and source_ink_evidence.get("classification") == "zero_visible_ink"
         )
+        page_scope_match = re.fullmatch(r"p([1-9][0-9]*):page", source_item_id)
+        if page_scope_match is not None:
+            requested_type = normalize_representation(terminal.get("requested_type"))
+            page_number = int(page_scope_match.group(1))
+            if (
+                final_type != "raster"
+                or not isinstance(expected_pdf_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", expected_pdf_sha256) is None
+                or evidence.get("pdf_sha256") != expected_pdf_sha256
+            ):
+                return False
+            if requested_type != "raster":
+                from .page_visual import page_visual_fallback_proof_verified
+
+                page_proof = evidence.get("page_visual_fallback_proof")
+                raw_dictionary_sha256 = evidence.get(
+                    "page_visual_raw_text_dictionary_sha256"
+                )
+                attempted_type = normalize_representation(
+                    page_proof.get("attempted_type")
+                    if isinstance(page_proof, dict)
+                    else ""
+                )
+                if (
+                    evidence.get("source_pdf_sha256") != expected_pdf_sha256
+                    or evidence.get("source_page_number") != page_number
+                    or evidence.get("page_visual_scope_id") != source_item_id
+                    or not page_visual_fallback_proof_verified(
+                        page_proof,
+                        expected_pdf_sha256=expected_pdf_sha256,
+                        expected_page_number=page_number,
+                        expected_source_scope_id=source_item_id,
+                        expected_requested_type=requested_type,
+                        expected_attempted_type=attempted_type,
+                        expected_raw_text_dictionary_sha256=raw_dictionary_sha256,
+                    )
+                ):
+                    return False
 
         id_lists = (created_ids, delivery_ids, support_ids, terminal_removed_ids)
         if any(
@@ -1630,6 +1602,18 @@ def _freecad_delivery_inventory_binding_verified(
             content = record.get("content")
             if not isinstance(content, dict):
                 return False
+            if source_ink_verified and not _freecad_source_ink_inventory_binding_verified(
+                evidence,
+                content,
+                source_item_id,
+                source_text,
+                expected_pdf_sha256=expected_pdf_sha256,
+                expected_page_number=expected_page_number,
+                expected_font_identity=expected_font_identity,
+                expected_font_asset_bindings=expected_font_asset_bindings,
+                expected_glyph_id_sequence=expected_glyph_id_sequence,
+            ):
+                return False
             if final_type == "raster":
                 if (
                     category != "images"
@@ -1646,6 +1630,15 @@ def _freecad_delivery_inventory_binding_verified(
                     or evidence.get("raster_content_verified") is not True
                     or evidence.get("source_asset_sha256")
                     != content.get("image_sha256")
+                    or (
+                        page_scope_match is not None
+                        and (
+                            content.get("pdf_source_sha256")
+                            != expected_pdf_sha256
+                            or content.get("declared_raster_sha256")
+                            != content.get("image_sha256")
+                        )
+                    )
                 ):
                     return False
             else:
@@ -1668,12 +1661,25 @@ def _freecad_delivery_inventory_binding_verified(
                         or not isinstance(content.get("view_style"), dict)
                         or content["view_style"].get("view_present") is not True
                         or (
+                            zero_ink_terminal
+                            and (
+                                evidence.get("physical_visibility") is not False
+                                or content.get("text_visibility") is not False
+                                or content["view_style"].get("visibility") is not False
+                            )
+                        )
+                        or (
                             source_ink_evidence is not None
                             and not _freecad_source_ink_inventory_binding_verified(
                                 evidence,
                                 content,
                                 source_item_id,
                                 source_text,
+                                expected_pdf_sha256=expected_pdf_sha256,
+                                expected_page_number=expected_page_number,
+                                expected_font_identity=expected_font_identity,
+                                expected_font_asset_bindings=expected_font_asset_bindings,
+                                expected_glyph_id_sequence=expected_glyph_id_sequence,
                             )
                         )
                     ):
@@ -1689,12 +1695,24 @@ def _freecad_delivery_inventory_binding_verified(
                         )
                         if (
                             not exact_source_content
+                            or (
+                                final_type == "3d_text"
+                                and (
+                                    evidence.get("physical_visibility") is not False
+                                    or content.get("text_visibility") is not False
+                                )
+                            )
                             or not _freecad_zero_ink_shape_snapshot_verified(content)
                             or not _freecad_source_ink_inventory_binding_verified(
                                 evidence,
                                 content,
                                 source_item_id,
                                 source_text,
+                                expected_pdf_sha256=expected_pdf_sha256,
+                                expected_page_number=expected_page_number,
+                                expected_font_identity=expected_font_identity,
+                                expected_font_asset_bindings=expected_font_asset_bindings,
+                                expected_glyph_id_sequence=expected_glyph_id_sequence,
                             )
                         ):
                             return False
@@ -1771,6 +1789,11 @@ def _freecad_delivery_inventory_binding_verified(
                         zero_content,
                         source_item_id,
                         source_text,
+                        expected_pdf_sha256=expected_pdf_sha256,
+                        expected_page_number=expected_page_number,
+                        expected_font_identity=expected_font_identity,
+                        expected_font_asset_bindings=expected_font_asset_bindings,
+                        expected_glyph_id_sequence=expected_glyph_id_sequence,
                     )
                     or any(
                         evidence.get(count_name) != 0
@@ -2219,7 +2242,11 @@ def build_import_contract_ready(report: "ImportReport") -> Dict[str, Any]:
         )
         delivery_inventory_binding_ok = bool(
             not import_text_enabled
-            or _freecad_delivery_inventory_binding_verified(delivery, inventory)
+            or _freecad_delivery_inventory_binding_verified(
+                delivery,
+                inventory,
+                str((report.input or {}).get("sha256") or "").strip().lower(),
+            )
         )
     else:
         inventory_ok = True

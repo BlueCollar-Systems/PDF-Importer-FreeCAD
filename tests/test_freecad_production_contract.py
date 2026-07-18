@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import concurrent.futures
+import hashlib
 import importlib.util
 import inspect
 import math
@@ -23,6 +24,64 @@ for path in (str(REPO_ROOT), str(SRC_DIR), str(MOD_ROOT)):
 import PDFImporterCore as core  # noqa: E402
 
 
+def _attach_visible_source_ink(item: dict) -> dict:
+    source_sha = "1" * 64
+    usable_sha = "2" * 64
+    binding = {
+        "asset_id": "sha256:" + usable_sha,
+        "source_xref": 1,
+        "source_font_sha256": source_sha,
+        "usable_font_sha256": usable_sha,
+        "base_font_name": item["font_identity"]["raw_name"],
+        "span_font_name": item["font_identity"]["raw_name"],
+        "source_format": "ttf",
+        "usable_format": "ttf",
+        "source_origin": "test_exact_font",
+    }
+    characters = [
+        {
+            "authority": "exact_pdf_font_glyph_bounds",
+            "character": character,
+            "synthetic": False,
+            "glyph_id": index + 1,
+            "glyph_name": "glyph%05d" % (index + 1),
+            "glyph_bounds": (0.0, 0.0, 500.0, 700.0),
+            "advance_width": 600.0,
+            "layout_only_zero_ink": False,
+            "font_asset_binding": dict(binding),
+            "source_font_sha256": source_sha,
+            "usable_font_sha256": usable_sha,
+            "trace_type": 0,
+            "opacity": 1.0,
+            "zero_visible_ink": False,
+            "physically_resolved": True,
+            "source_index": index,
+        }
+        for index, character in enumerate(item["text"])
+    ]
+    evidence = {
+        "schema": "pdf_source_ink_evidence_v1",
+        "authority": "pymupdf_rawdict_texttrace_exact_font",
+        "pdf_sha256": item["pdf_sha256"],
+        "page_number": item["page_number"],
+        "source_item_id": item["source_item_id"],
+        "source_text": item["text"],
+        "source_text_sha256": hashlib.sha256(item["text"].encode("utf-8")).hexdigest(),
+        "font_identity": dict(item["font_identity"]),
+        "classification": "visible_ink",
+        "zero_ink_characters_layout_only": False,
+        "all_characters_physically_resolved": True,
+        "font_asset_bindings": [dict(binding)],
+        "glyph_id_sequence": [record["glyph_id"] for record in characters],
+        "characters": characters,
+    }
+    evidence["evidence_sha256"] = core._source_ink_evidence_digest(evidence)
+    item["source_ink_evidence"] = evidence
+    item["source_font_asset_bindings"] = [dict(binding)]
+    item["source_glyph_id_sequence"] = list(evidence["glyph_id_sequence"])
+    return item
+
+
 def _canonical_item(requested_type: str = "labels") -> dict:
     span = {
         "text": "A",
@@ -32,7 +91,7 @@ def _canonical_item(requested_type: str = "labels") -> dict:
         "origin": (10.0, 30.0),
         "color": 0,
     }
-    return {
+    item = {
         "importer_identity": core.FREECAD_TEXT_IMPORTER_IDENTITY,
         "pdf_sha256": "a" * 64,
         "page_number": 1,
@@ -49,6 +108,7 @@ def _canonical_item(requested_type: str = "labels") -> dict:
         "line_index": 0,
         "span_index": 0,
     }
+    return _attach_visible_source_ink(item)
 
 
 def _synthetic_whitespace_source(requested_type: str) -> tuple[dict, dict]:
@@ -128,7 +188,9 @@ def test_legacy_text_helpers_cannot_reintroduce_whitespace_drop_roadblock():
         core._render_text_spans_exact_labels,
         core._render_text_spans_3d,
     ):
-        assert "source_text.isspace()" not in inspect.getsource(helper)
+        source = inspect.getsource(helper)
+        assert ".isspace()" not in source
+        assert "non-whitespace" not in source
 
 
 def test_atomic_raster_publication_survives_concurrent_same_key_writers(tmp_path):
@@ -444,6 +506,90 @@ def test_svg_item_deliverer_emits_valid_typed_impossibility_for_closed_reason(
         "glyphs",
         raised.value.proof,
     )["cleanup_complete"] is True
+
+
+@pytest.mark.parametrize(
+    ("attempted_type", "child_suffix"),
+    [("glyphs", ":g0"), ("geometry", ":geometry")],
+)
+def test_visible_svg_delivery_persists_physical_source_ink_on_every_host(
+    monkeypatch,
+    attempted_type,
+    child_suffix,
+):
+    from PDFVectorImporter.src import PDFSvgTextRenderer as renderer
+
+    document, group = _install_native_host(monkeypatch)
+    item = _canonical_item(attempted_type)
+    child_source_id = item["source_item_id"] + child_suffix
+
+    def verified_item_render(*_args, **_kwargs):
+        host = document.addObject("Part::Feature", "PDF_SVG_Text")
+        core._annotate_text_host_object(host, child_source_id, attempted_type)
+        host.addProperty(
+            "App::PropertyString", "PDFParentSourceItemId", "PDF Import"
+        )
+        host.PDFParentSourceItemId = item["source_item_id"]
+        group.addObject(host)
+        evidence = {
+            "source_item_bbox": item["bbox"],
+            "matched_placement_indices": [0],
+            "child_source_item_ids": [child_source_id],
+        }
+        return {
+            "outcome": "verified",
+            "entity_type": attempted_type,
+            "source_item_id": item["source_item_id"],
+            "entities": 1,
+            "glyphs": 1 if attempted_type == "glyphs" else 0,
+            "raw_edges": 1 if attempted_type == "geometry" else 0,
+            "created_entity_ids": [host.Name],
+            "item_filter": {"matched_placement_indices": [0]},
+            "delivery_attempts": [
+                {
+                    "source_item_id": item["source_item_id"],
+                    "requested_type": attempted_type,
+                    "attempted_type": attempted_type,
+                    "final_type": attempted_type,
+                    "outcome": "verified",
+                    "created_entity_ids": [host.Name],
+                    "delivery_entity_ids": [host.Name],
+                    "support_entity_ids": [],
+                    "removed_entity_ids": [],
+                    "cleanup_complete": True,
+                    "delivery_count": 1,
+                    "evidence": evidence,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(renderer, "render_text", verified_item_render)
+
+    result = core._deliver_text_item_svg(
+        item,
+        attempted_type,
+        core.ImportOptions(text_mode=attempted_type, import_text=True),
+        pdf_path="fixture.pdf",
+        page_h=100.0,
+        page_w=100.0,
+        scale=1.0,
+        fc_doc=document,
+        parent_group=group,
+        render_cache={},
+    )
+
+    assert result["outcome"] == "verified"
+    assert result["delivery_count"] == 1
+    assert result["evidence"]["source_ink_evidence"] == item[
+        "source_ink_evidence"
+    ]
+    assert result["evidence"]["source_ink_evidence_persisted"] is True
+    host = document.getObject(result["delivery_entity_ids"][0])
+    assert host.PDFSourceInkClassification == "visible_ink"
+    assert (
+        host.PDFSourceInkEvidenceSHA256
+        == item["source_ink_evidence"]["evidence_sha256"]
+    )
 
 
 def test_canonical_page_orchestrator_preserves_original_source_identity(monkeypatch):
@@ -788,35 +934,26 @@ def test_zero_ink_evidence_accepts_freecad_null_shape_without_volume() -> None:
     assert evidence["volume_authority"] == "null_shape_has_no_evaluable_volume"
 
 
-def test_zero_ink_3d_text_persists_exact_shapestring_without_fabricated_solid(
+def test_zero_ink_3d_text_persists_exact_text_on_physically_empty_3d_host(
     monkeypatch,
 ):
     document, group = _install_native_host(monkeypatch)
     item = _physically_bind_whitespace_item("3d_text")
-    font_path = "C:/fonts/exact-source.ttf"
-    source_result = {
-        "source": "embedded_font",
-        "outcome": "found",
-        "font_identity": item["font_identity"],
-        "pdf_sha256": item["pdf_sha256"],
-        "page_number": item["page_number"],
-        "staging_complete": True,
-        "path": font_path,
-    }
+    monkeypatch.setattr(core, "Part", SimpleNamespace(Shape=_EmptyShape))
     monkeypatch.setattr(
         core,
         "_resolve_shapestring_font_path_with_evidence",
-        lambda *_args, **_kwargs: (font_path, [source_result]),
+        lambda *_args, **_kwargs: pytest.fail(
+            "zero-ink 3D text must not instantiate a visible ShapeString"
+        ),
     )
-
-    def make_empty_shapestring(_doc, source_text, exact_font_path):
-        host = document.addObject("Part::Part2DObjectPython", "ShapeString")
-        host.String = source_text
-        host.FontFile = exact_font_path
-        host.Shape = _EmptyShape()
-        return host
-
-    monkeypatch.setattr(core, "_make_shapestring_host", make_empty_shapestring)
+    monkeypatch.setattr(
+        core,
+        "_make_shapestring_host",
+        lambda *_args, **_kwargs: pytest.fail(
+            "zero-ink 3D text must not instantiate a visible ShapeString"
+        ),
+    )
 
     result = core._deliver_text_item_3d(
         item,
@@ -834,7 +971,9 @@ def test_zero_ink_3d_text_persists_exact_shapestring_without_fabricated_solid(
     assert result["evidence"]["zero_visible_ink_verified"] is True
     host = document.getObject(result["delivery_entity_ids"][0])
     assert host.String == "   "
-    assert host.FontFile == font_path
+    assert host.TypeId == "Part::Feature"
+    assert host.Shape.isNull() is True
+    assert host.PDFTextVisibility is False
     assert host.PDFRepresentation == "3d_text"
     assert host.PDFSourceInkClassification == "zero_visible_ink"
     assert document.Objects == [host]
@@ -879,26 +1018,6 @@ def test_zero_ink_svg_mode_persists_empty_requested_entity_from_physical_authori
     assert host.PDFRepresentation == attempted_type
     assert host.PDFSourceInkClassification == "zero_visible_ink"
     assert host.Shape.isNull() is True
-
-
-def test_page_without_source_text_cannot_fabricate_item_fallback_or_raster():
-    opts = core.ImportOptions(import_mode="auto", import_text=True, text_mode="labels")
-
-    with pytest.raises(ValueError, match="without a canonical source item"):
-        core._record_no_source_text_page_fallback(
-            opts,
-            page_num=1,
-            pdf_sha256="a" * 64,
-            raw_tdict={"blocks": [{"type": 1}]},
-            raster_result={
-                "created_entity_ids": ["PageRaster001"],
-                "evidence": {"host_entity_type": "Image::ImagePlane"},
-            },
-        )
-
-    assert opts.text_delivery_attempts == []
-    assert opts.text_mode_fallbacks == []
-    assert opts.text_delivered_counts == {}
 
 
 @pytest.mark.parametrize("attempted_type", ["text", "labels"])
@@ -1068,6 +1187,15 @@ def test_item_raster_delivery_is_persistent_verified_and_source_bound(
     assert host.PDFSourceSHA256 == item["pdf_sha256"]
     assert host.PDFRasterSHA256 == result["evidence"]["source_asset_sha256"]
     assert result["evidence"]["raster_content_verified"] is True
+    assert result["evidence"]["source_ink_evidence"] == item[
+        "source_ink_evidence"
+    ]
+    assert result["evidence"]["source_ink_evidence_persisted"] is True
+    assert host.PDFSourceInkClassification == "visible_ink"
+    assert (
+        host.PDFSourceInkEvidenceSHA256
+        == item["source_ink_evidence"]["evidence_sha256"]
+    )
     assert host.XSize == pytest.approx(item["bbox"][2] - item["bbox"][0])
     assert host.YSize == pytest.approx(item["bbox"][3] - item["bbox"][1])
 

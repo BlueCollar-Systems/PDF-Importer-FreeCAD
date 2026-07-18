@@ -17,6 +17,7 @@ for path in (REPO_ROOT / "PDFVectorImporter" / "src", REPO_ROOT / "PDFVectorImpo
 
 import PDFImporterCore as core  # noqa: E402
 from pdfcadcore import import_report as report_contract  # noqa: E402
+from pdfcadcore.fitz_loader import import_fitz  # noqa: E402
 
 
 class HostObject:
@@ -39,6 +40,9 @@ class HostObject:
         source_ink_classification: str = "",
         source_ink_digest: str = "",
         source_text_property=None,
+        text_visibility=None,
+        pdf_source_sha256: str = "",
+        declared_raster_sha256: str = "",
     ) -> None:
         self.Name = name
         self.TypeId = type_id
@@ -65,6 +69,7 @@ class HostObject:
                     "FontName": "Arial",
                     "FontSize": 10.0,
                     "Justification": "Left",
+                    "Visibility": False if text_visibility is False else True,
                 },
             )()
         if source_ink_classification:
@@ -73,6 +78,12 @@ class HostObject:
             self.PDFSourceInkEvidenceSHA256 = source_ink_digest
         if source_text_property is not None:
             self.PDFSourceText = source_text_property
+        if type(text_visibility) is bool:
+            self.PDFTextVisibility = text_visibility
+        if pdf_source_sha256:
+            self.PDFSourceSHA256 = pdf_source_sha256
+        if declared_raster_sha256:
+            self.PDFRasterSHA256 = declared_raster_sha256
         if type_id.startswith("Part::"):
             self.Shape = Shape(shape_nonempty)
 
@@ -119,24 +130,31 @@ class Shape:
 def _zero_ink_source_evidence(
     source_item_id: str,
     source_text: str = "   ",
+    pdf_sha256: str = "a" * 64,
 ) -> dict:
     evidence = {
         "schema": "pdf_source_ink_evidence_v1",
         "authority": "pymupdf_rawdict_texttrace_exact_font",
-        "pdf_sha256": "a" * 64,
+        "pdf_sha256": pdf_sha256,
         "page_number": 1,
         "source_item_id": source_item_id,
         "source_text": source_text,
         "source_text_sha256": hashlib.sha256(source_text.encode("utf-8")).hexdigest(),
-        "font_identity": {"normalized_key": "testfont"},
+        "font_identity": {"raw_name": "TestFont", "normalized_key": "testfont"},
         "classification": "zero_visible_ink",
+        "zero_ink_characters_layout_only": True,
         "all_characters_physically_resolved": True,
+        "font_asset_bindings": [],
+        "glyph_id_sequence": [None for _character in source_text],
         "characters": [
             {
                 "authority": "pymupdf_rawdict_synthetic_character",
                 "character": character,
                 "synthetic": True,
+                "glyph_id": None,
+                "font_asset_binding": None,
                 "zero_visible_ink": True,
+                "layout_only_zero_ink": True,
                 "physically_resolved": True,
                 "source_index": index,
             }
@@ -147,7 +165,23 @@ def _zero_ink_source_evidence(
     return evidence
 
 
-def _aws_objects(image_file: str = "aws-page-1.png"):
+def _write_minimal_pdf(path: Path) -> None:
+    fitz = import_fitz()
+    document = fitz.open()
+    document.new_page()
+    document.save(str(path))
+    document.close()
+
+
+def _aws_objects(
+    image_file: str = "aws-page-1.png",
+    pdf_sha256: str = "a" * 64,
+):
+    raster_sha256 = (
+        hashlib.sha256(Path(image_file).read_bytes()).hexdigest()
+        if image_file and Path(image_file).is_file()
+        else "f" * 64
+    )
     return [
         HostObject("PDF_Page_1", "App::DocumentObjectGroup"),
         HostObject(
@@ -156,131 +190,40 @@ def _aws_objects(image_file: str = "aws-page-1.png"):
             representation="raster",
             source_item_id="p1:page",
             image_file=image_file,
+            pdf_source_sha256=pdf_sha256,
+            declared_raster_sha256=raster_sha256,
         ),
     ]
 
 
-def _aws_fallback_opts(raster_path: str = "") -> core.ImportOptions:
+def _aws_fallback_opts(
+    raster_path: str = "",
+    pdf_sha256: str = "a" * 64,
+) -> core.ImportOptions:
     opts = core.ImportOptions(import_mode="auto", import_text=True, text_mode="labels")
-    source_id = "p1:page"
-    pdf_sha256 = "a" * 64
-    proofs = []
-    ladder = list(core.TEXT_ITEM_FALLBACK_LADDERS["labels"])
-    for index, attempted_type in enumerate(ladder[:-1]):
-        proof = {
-            "item_specific_proven_impossible": True,
-            "importer_identity": core.FREECAD_TEXT_IMPORTER_IDENTITY,
-            "pdf_sha256": pdf_sha256,
-            "page_number": 1,
-            "source_item_id": source_id,
-            "requested_type": "labels",
-            "attempted_type": attempted_type,
-            "reason_code": "no_source_text_items",
-            "evidence": {
-                "text_dictionary_present": True,
-                "canonical_source_item_count": 0,
-                "visible_source_text_found": False,
-            },
-            "attempted_types": ladder[: index + 1],
-            "attempted_source_results": [
-                {
-                    "source": "pymupdf_text_dictionary",
-                    "outcome": "not_found",
-                    "importer_identity": core.FREECAD_TEXT_IMPORTER_IDENTITY,
-                    "pdf_sha256": pdf_sha256,
-                    "page_number": 1,
-                    "source_item_id": source_id,
-                    "source_item_ids": [],
-                    "canonical_source_item_count": 0,
-                    "visible_source_text_found": False,
-                }
-            ],
-            "attempted_sources_complete": True,
-            "created_entity_ids": [],
-            "removed_entity_ids": [],
-            "cleanup_complete": True,
-        }
-        proofs.append(proof)
-        opts.text_delivery_attempts.append(
-            {
-                "source_item_id": source_id,
-                "requested_type": "labels",
-                "attempted_type": attempted_type,
-                "final_type": None,
-                "outcome": "proven_impossible",
-                "reason_code": "no_source_text_items",
-                "created_entity_ids": [],
-                "removed_entity_ids": [],
-                "cleanup_complete": True,
-                "proof": proof,
-            }
-        )
-    opts.text_delivery_attempts.append(
-        {
-            "source_item_id": source_id,
-            "requested_type": "labels",
-            "attempted_type": "raster",
-            "final_type": "raster",
+    opts._pdf_sha256 = pdf_sha256
+    raster_sha256 = (
+        hashlib.sha256(Path(raster_path).read_bytes()).hexdigest()
+        if raster_path and Path(raster_path).is_file()
+        else "f" * 64
+    )
+    core._record_no_source_text_page_fallback(
+        opts,
+        page_num=1,
+        pdf_sha256=pdf_sha256,
+        raw_tdict={"blocks": [{"type": 1, "bbox": (0.0, 0.0, 100.0, 100.0)}]},
+        raster_result={
             "outcome": "verified",
             "created_entity_ids": ["PageRaster001"],
-            "delivery_entity_ids": ["PageRaster001"],
-            "support_entity_ids": [],
-            "removed_entity_ids": [],
-            "cleanup_complete": True,
-            "attempted_types": ladder,
-            "proof_chain": proofs,
             "evidence": {
                 "host_entity_type": "Image::ImagePlane",
-                **(
-                    {
-                        "source_asset_sha256": hashlib.sha256(
-                            Path(raster_path).read_bytes()
-                        ).hexdigest(),
-                        "raster_content_verified": True,
-                    }
-                    if raster_path and Path(raster_path).is_file()
-                    else {}
-                ),
+                "pdf_sha256": pdf_sha256,
+                "source_asset_sha256": raster_sha256,
+                "raster_content_verified": True,
+                "raster_file_included": True,
             },
-        }
-    )
-    fallback_proof = {
-        "item_specific_proven_impossible": True,
-        "importer_identity": core.FREECAD_TEXT_IMPORTER_IDENTITY,
-        "pdf_sha256": pdf_sha256,
-        "page_number": 1,
-        "source_item_id": source_id,
-        "requested_type": "labels",
-        "attempted_type": ladder[-2],
-        "reason_code": "no_source_text_items",
-        "evidence": {
-            "text_dictionary_present": True,
-            "canonical_source_item_count": 0,
-            "visible_source_text_found": False,
         },
-        "attempted_types": ladder,
-        "attempted_source_results": proofs[0]["attempted_source_results"],
-        "attempted_sources_complete": True,
-        "created_entity_ids": [],
-        "removed_entity_ids": [],
-        "cleanup_complete": True,
-        "proof_chain": proofs,
-        "transition_chain": [
-            {"from": left, "to": right}
-            for left, right in zip(ladder, ladder[1:], strict=False)
-        ],
-    }
-    opts.text_mode_fallbacks.append(
-        {
-            "requested": "labels",
-            "delivered": "raster",
-            "reason": "no_source_text_items",
-            "count": 1,
-            "source_item_ids": [source_id],
-            "proof": fallback_proof,
-        }
     )
-    opts.text_delivered_counts["raster_text_patch"] = 1
     return opts
 
 
@@ -433,8 +376,11 @@ def test_saved_inventory_crosscheck_rejects_type_or_representation_drift() -> No
 def test_aws_image_only_fallback_report_is_truthful_and_ready(tmp_path) -> None:
     raster_path = tmp_path / "aws-page-1.png"
     raster_path.write_bytes(b"real persisted AWS raster bytes")
-    objects = _aws_objects(str(raster_path))
-    opts = _aws_fallback_opts(str(raster_path))
+    pdf_path = tmp_path / "AWSWeldSymbolchart.pdf"
+    _write_minimal_pdf(pdf_path)
+    pdf_sha256 = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+    objects = _aws_objects(str(raster_path), pdf_sha256)
+    opts = _aws_fallback_opts(str(raster_path), pdf_sha256)
     inventory = core._build_host_object_inventory(objects)
     opts._report_extra = {
         "actual_host_object_inventory": inventory,
@@ -446,7 +392,7 @@ def test_aws_image_only_fallback_report_is_truthful_and_ready(tmp_path) -> None:
     report_path = tmp_path / "aws.import_report.json"
 
     core.write_import_report(
-        pdf_path=str(tmp_path / "AWSWeldSymbolchart.pdf"),
+        pdf_path=str(pdf_path),
         output_path=str(report_path),
         opts=opts,
         pages_imported=1,
@@ -975,7 +921,7 @@ def test_no_source_fallback_rejects_visible_canonical_text() -> None:
         ]
     }
 
-    with pytest.raises(ValueError, match="canonical source item"):
+    with pytest.raises(ValueError, match="canonical source"):
         core._record_no_source_text_page_fallback(
             opts,
             page_num=1,
@@ -2727,6 +2673,11 @@ def test_synthetic_source_character_cannot_be_relabelled_as_visible_ink() -> Non
         evidence,
         source_id,
         source_text,
+        expected_pdf_sha256=evidence["pdf_sha256"],
+        expected_page_number=evidence["page_number"],
+        expected_font_identity=evidence["font_identity"],
+        expected_font_asset_bindings=evidence["font_asset_bindings"],
+        expected_glyph_id_sequence=evidence["glyph_id_sequence"],
     ) is False
 
 
@@ -2737,7 +2688,13 @@ def test_physically_zero_ink_requested_representation_is_report_ready(
 ) -> None:
     source_id = "p1:b0:l0:s0"
     source_text = "   "
-    source_evidence = _zero_ink_source_evidence(source_id, source_text)
+    pdf_path = tmp_path / "drawing.pdf"
+    _write_minimal_pdf(pdf_path)
+    source_evidence = _zero_ink_source_evidence(
+        source_id,
+        source_text,
+        hashlib.sha256(pdf_path.read_bytes()).hexdigest(),
+    )
     digest = source_evidence["evidence_sha256"]
     entity_id = {
         "labels": "Label001",
@@ -2758,6 +2715,12 @@ def test_physically_zero_ink_requested_representation_is_report_ready(
         "source_text_preserved": True,
         "source_ink_evidence": source_evidence,
         "source_ink_evidence_persisted": True,
+        "source_pdf_sha256": source_evidence["pdf_sha256"],
+        "source_page_number": source_evidence["page_number"],
+        "source_font_identity": source_evidence["font_identity"],
+        "source_font_asset_bindings": source_evidence["font_asset_bindings"],
+            "source_glyph_id_sequence": source_evidence["glyph_id_sequence"],
+            "physical_visibility": False,
     }
     if representation in {"labels", "text"}:
         terminal_evidence.update(
@@ -2825,6 +2788,9 @@ def test_physically_zero_ink_requested_representation_is_report_ready(
         custom_text=[source_text] if representation == "labels" else None,
         string=source_text if representation == "3d_text" else None,
         view_style_verified=representation in {"labels", "text"},
+        text_visibility=(
+            False if representation in {"labels", "text", "3d_text"} else None
+        ),
         source_ink_classification="zero_visible_ink",
         source_ink_digest=digest,
         source_text_property=(
@@ -2838,7 +2804,7 @@ def test_physically_zero_ink_requested_representation_is_report_ready(
     report_path = tmp_path / (representation + "-zero-ink.json")
 
     core.write_import_report(
-        pdf_path=str(tmp_path / "drawing.pdf"),
+        pdf_path=str(pdf_path),
         output_path=str(report_path),
         opts=opts,
         pages_imported=1,

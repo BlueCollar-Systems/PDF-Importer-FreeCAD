@@ -4367,6 +4367,173 @@ def _finite_host_number(value: Any) -> Optional[str]:
     return format(number, ".12g") if math.isfinite(number) else None
 
 
+_SHAPE_FINGERPRINT_QUANTUM = 1e-7
+_SHAPE_FINGERPRINT_EDGE_SAMPLES = 7
+
+
+def _quantized_shape_number(value: Any) -> Optional[int]:
+    """Quantize a finite OCCT value beyond normal save/reopen roundoff."""
+
+    try:
+        number = float(value)
+        scaled = number / _SHAPE_FINGERPRINT_QUANTUM
+    except (TypeError, ValueError, RuntimeError, AttributeError, OverflowError):
+        return None
+    if not math.isfinite(number) or not math.isfinite(scaled):
+        return None
+    return int(round(scaled))
+
+
+def _stable_shape_number(value: Any) -> Optional[str]:
+    """Return a readable token backed by the canonical shape quantum."""
+
+    units = _quantized_shape_number(value)
+    if units is None:
+        return None
+    quantized = float(units) * _SHAPE_FINGERPRINT_QUANTUM
+    if quantized == 0.0:
+        quantized = 0.0
+    return format(quantized, ".12g")
+
+
+def _host_point_token(point: Any) -> Optional[Tuple[int, int, int]]:
+    """Read a FreeCAD vector-like point into a tolerance-stable tuple."""
+
+    coordinates: List[int] = []
+    for lower_name, upper_name in (("x", "X"), ("y", "Y"), ("z", "Z")):
+        try:
+            value = getattr(point, lower_name)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            try:
+                value = getattr(point, upper_name)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                return None
+        token = _quantized_shape_number(value)
+        if token is None:
+            return None
+        coordinates.append(token)
+    return coordinates[0], coordinates[1], coordinates[2]
+
+
+def _canonical_point_path(
+    points: List[Tuple[int, int, int]],
+) -> Tuple[bool, Tuple[Tuple[int, int, int], ...]]:
+    """Canonicalize edge orientation and a closed edge's possible seam."""
+
+    if not points:
+        return False, ()
+    sequence = tuple(points)
+    closed = len(sequence) > 2 and sequence[0] == sequence[-1]
+    if closed:
+        sequence = sequence[:-1]
+        if not sequence:
+            return True, ()
+        candidates = []
+        for oriented in (sequence, tuple(reversed(sequence))):
+            candidates.extend(
+                oriented[index:] + oriented[:index]
+                for index in range(len(oriented))
+            )
+        return True, min(candidates)
+    return False, min(sequence, tuple(reversed(sequence)))
+
+
+def _host_edge_fingerprint(edge: Any) -> Tuple[Any, ...]:
+    """Fingerprint an edge without trusting volatile BREP serialization."""
+
+    try:
+        curve = getattr(edge, "Curve", None)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        curve = None
+    curve_type = type(curve).__name__ if curve is not None else ""
+    try:
+        length_token = _quantized_shape_number(edge.Length)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        length_token = None
+
+    sampled_points: List[Any] = []
+    try:
+        discretize = getattr(edge, "discretize", None)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        discretize = None
+    if callable(discretize):
+        try:
+            sampled_points = list(
+                discretize(Number=_SHAPE_FINGERPRINT_EDGE_SAMPLES) or []
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            sampled_points = []
+    if not sampled_points:
+        try:
+            sampled_points = [
+                vertex.Point
+                for vertex in list(getattr(edge, "Vertexes", []) or [])
+            ]
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            sampled_points = []
+
+    point_tokens = [
+        token
+        for token in (_host_point_token(point) for point in sampled_points)
+        if token is not None
+    ]
+    closed, canonical_path = _canonical_point_path(point_tokens)
+    return (
+        curve_type,
+        length_token if length_token is not None else "",
+        1 if closed else 0,
+        canonical_path,
+    )
+
+
+def _host_shape_geometry_fingerprint(shape: Any) -> Dict[str, Any]:
+    """Build an order-independent, tolerance-aware geometry fingerprint."""
+
+    try:
+        vertices = list(getattr(shape, "Vertexes", []) or [])
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        vertices = []
+    vertex_tokens = []
+    invalid_vertex_count = 0
+    for vertex in vertices:
+        try:
+            point = vertex.Point
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            invalid_vertex_count += 1
+            continue
+        token = _host_point_token(point)
+        if token is None:
+            invalid_vertex_count += 1
+        else:
+            vertex_tokens.append(token)
+    vertex_tokens.sort()
+
+    try:
+        edges = list(getattr(shape, "Edges", []) or [])
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        edges = []
+    edge_tokens = [_host_edge_fingerprint(edge) for edge in edges]
+    edge_tokens.sort(
+        key=lambda token: json.dumps(
+            token,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    sampled_edge_count = sum(1 for token in edge_tokens if token[-1])
+    return {
+        "schema": "bcs.freecad_shape_fingerprint/1.0",
+        "quantum": format(_SHAPE_FINGERPRINT_QUANTUM, ".12g"),
+        "vertices": vertex_tokens,
+        "edges": edge_tokens,
+        "vertex_count": len(vertices),
+        "invalid_vertex_count": invalid_vertex_count,
+        "edge_count": len(edges),
+        "sampled_edge_count": sampled_edge_count,
+        "canonical_geometry_present": bool(vertex_tokens or sampled_edge_count),
+    }
+
+
 def _host_shape_content_snapshot(obj, type_id: str) -> Dict[str, Any]:
     """Capture meaningful persisted topology and geometry, not just non-nullness."""
 
@@ -4397,7 +4564,7 @@ def _host_shape_content_snapshot(obj, type_id: str) -> Dict[str, Any]:
                 continue
         for property_name in ("Length", "Area", "Volume"):
             try:
-                token = _finite_host_number(getattr(shape, property_name))
+                token = _stable_shape_number(getattr(shape, property_name))
             except (AttributeError, RuntimeError, TypeError, ValueError):
                 token = None
             if token is not None:
@@ -4416,7 +4583,7 @@ def _host_shape_content_snapshot(obj, type_id: str) -> Dict[str, Any]:
                 "ZMax",
             ):
                 try:
-                    token = _finite_host_number(getattr(bound_box, property_name))
+                    token = _stable_shape_number(getattr(bound_box, property_name))
                 except (AttributeError, RuntimeError, TypeError, ValueError):
                     token = None
                 if token is not None:
@@ -4432,10 +4599,14 @@ def _host_shape_content_snapshot(obj, type_id: str) -> Dict[str, Any]:
     meaningful_topology = any(
         type(count) is int and count > 0 for count in topology_counts.values()
     )
+    geometry_fingerprint = (
+        _host_shape_geometry_fingerprint(shape) if shape is not None else {}
+    )
     digest_payload = {
         "topology_counts": topology_counts,
         "metrics": metrics,
         "bounds": bounds,
+        "geometry": geometry_fingerprint,
     }
     shape_digest = ""
     if shape_nonempty and meaningful_topology:
@@ -4455,6 +4626,19 @@ def _host_shape_content_snapshot(obj, type_id: str) -> Dict[str, Any]:
         "shape_metrics": metrics,
         "shape_bounds": bounds,
         "shape_digest": shape_digest,
+        "shape_fingerprint_schema": geometry_fingerprint.get("schema", ""),
+        "shape_fingerprint_quantum": geometry_fingerprint.get("quantum", ""),
+        "shape_fingerprint_vertex_count": geometry_fingerprint.get(
+            "vertex_count", 0
+        ),
+        "shape_fingerprint_edge_count": geometry_fingerprint.get("edge_count", 0),
+        "shape_fingerprint_sampled_edge_count": geometry_fingerprint.get(
+            "sampled_edge_count", 0
+        ),
+        "shape_fingerprint_verified": bool(
+            geometry_fingerprint.get("canonical_geometry_present")
+            and geometry_fingerprint.get("invalid_vertex_count") == 0
+        ),
     }
 
 

@@ -16,6 +16,7 @@ for path in (REPO_ROOT / "PDFVectorImporter" / "src", REPO_ROOT / "PDFVectorImpo
         sys.path.insert(0, str(path))
 
 import PDFImporterCore as core  # noqa: E402
+from pdfcadcore import import_report as report_contract  # noqa: E402
 
 
 class HostObject:
@@ -72,10 +73,35 @@ class HostObject:
         )
 
 
+class ShapePoint:
+    def __init__(self, x: float, y: float, z: float = 0.0) -> None:
+        self.x = x
+        self.y = y
+        self.z = z
+
+
+class ShapeVertex:
+    def __init__(self, x: float, y: float, z: float = 0.0) -> None:
+        self.Point = ShapePoint(x, y, z)
+
+
+class ShapeEdge:
+    Length = 1.0
+
+    def __init__(self) -> None:
+        self.Vertexes = [ShapeVertex(0.0, 0.0), ShapeVertex(1.0, 0.0)]
+
+    def discretize(self, **_kwargs):
+        return [ShapePoint(0.0, 0.0), ShapePoint(1.0, 0.0)]
+
+
 class Shape:
     def __init__(self, nonempty: bool) -> None:
         self._nonempty = nonempty
-        self.Edges = [object()] if nonempty else []
+        self.Vertexes = (
+            [ShapeVertex(0.0, 0.0), ShapeVertex(1.0, 0.0)] if nonempty else []
+        )
+        self.Edges = [ShapeEdge()] if nonempty else []
 
     def isNull(self) -> bool:
         return not self._nonempty
@@ -1576,6 +1602,182 @@ def test_reopen_crosscheck_rejects_nonempty_shape_topology_drift() -> None:
     assert crosscheck["mismatched_entities"]
 
 
+def test_report_rejects_structural_shape_without_verified_fingerprint() -> None:
+    """A valid-looking summary digest cannot replace canonical geometry proof."""
+
+    glyph = HostObject(
+        "Glyph001",
+        "Part::Feature",
+        representation="glyphs",
+        source_item_id="p1:b0:l0:s0:g0",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    inventory = core._build_host_object_inventory([glyph])
+    content = inventory["objects"][0]["content"]
+    content["shape_fingerprint_verified"] = False
+    content["shape_fingerprint_schema"] = ""
+
+    verified = report_contract._freecad_host_inventory_verified(
+        inventory,
+        {"primitives": 0, "images": 0},
+    )
+
+    assert verified is False
+
+
+def test_reopen_crosscheck_rejects_geometry_drift_with_equal_summary_counts() -> None:
+    """Equal counts and bounds cannot certify different persisted contours."""
+
+    before = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    after = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+
+    def vertex(x, y, z=0.0):
+        return type("Vertex", (), {"Point": type("Point", (), {"x": x, "y": y, "z": z})()})()
+
+    before.Shape.Vertexes = [
+        vertex(0.0, 0.0),
+        vertex(1.0, 0.0),
+        vertex(1.0, 1.0),
+        vertex(0.0, 1.0),
+    ]
+    after.Shape.Vertexes = [
+        vertex(0.0, 0.0),
+        vertex(1.0, 0.0),
+        vertex(1.0, 1.0),
+        vertex(0.25, 1.0),
+    ]
+    before.Shape.Edges = [object(), object(), object(), object()]
+    after.Shape.Edges = [object(), object(), object(), object()]
+    bound_box = type(
+        "BoundBox",
+        (),
+        {
+            "XMin": 0.0,
+            "YMin": 0.0,
+            "ZMin": 0.0,
+            "XMax": 1.0,
+            "YMax": 1.0,
+            "ZMax": 0.0,
+        },
+    )
+    before.Shape.BoundBox = bound_box
+    after.Shape.BoundBox = bound_box
+    expected = core._build_host_object_inventory([before])
+
+    crosscheck = core._crosscheck_host_object_inventory(expected, [after])
+
+    assert crosscheck["verified"] is False
+
+
+def test_reopen_crosscheck_rejects_curve_drift_with_equal_endpoints() -> None:
+    """A changed curve interior cannot hide behind stable endpoint summaries."""
+
+    before = HostObject(
+        "Glyph001",
+        "Part::Feature",
+        representation="glyphs",
+        source_item_id="p1:b0:l0:s0:g0",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    after = HostObject(
+        "Glyph001",
+        "Part::Feature",
+        representation="glyphs",
+        source_item_id="p1:b0:l0:s0:g0",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+
+    def point(x, y, z=0.0):
+        return type("Point", (), {"x": x, "y": y, "z": z})()
+
+    def vertex(x, y, z=0.0):
+        return type("Vertex", (), {"Point": point(x, y, z)})()
+
+    class SampledEdge:
+        Length = 1.25
+
+        def __init__(self, samples):
+            self._samples = list(samples)
+            self.Vertexes = [vertex(0.0, 0.0), vertex(1.0, 0.0)]
+
+        def discretize(self, **_kwargs):
+            return [point(x, y) for x, y in self._samples]
+
+    before.Shape.Vertexes = [vertex(0.0, 0.0), vertex(1.0, 0.0)]
+    after.Shape.Vertexes = [vertex(0.0, 0.0), vertex(1.0, 0.0)]
+    before.Shape.Edges = [
+        SampledEdge([(0.0, 0.0), (0.5, 0.25), (1.0, 0.0)])
+    ]
+    after.Shape.Edges = [
+        SampledEdge([(0.0, 0.0), (0.5, -0.25), (1.0, 0.0)])
+    ]
+    bound_box = type(
+        "BoundBox",
+        (),
+        {
+            "XMin": 0.0,
+            "YMin": -1.0,
+            "ZMin": 0.0,
+            "XMax": 1.0,
+            "YMax": 1.0,
+            "ZMax": 0.0,
+        },
+    )()
+    before.Shape.BoundBox = bound_box
+    after.Shape.BoundBox = bound_box
+    expected = core._build_host_object_inventory([before])
+
+    crosscheck = core._crosscheck_host_object_inventory(expected, [after])
+
+    assert crosscheck["verified"] is False
+
+
+def test_reopen_crosscheck_tolerates_vertex_and_edge_enumeration_order() -> None:
+    """Host enumeration order is not persisted geometry identity."""
+
+    before = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    after = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+
+    def vertex(x, y, z=0.0):
+        return type("Vertex", (), {"Point": type("Point", (), {"x": x, "y": y, "z": z})()})()
+
+    first = [vertex(0.0, 0.0), vertex(1.0, 0.0), vertex(0.0, 1.0)]
+    second = list(reversed(first))
+    before.Shape.Vertexes = first
+    after.Shape.Vertexes = second
+    before.Shape.Edges = [object(), object()]
+    after.Shape.Edges = list(reversed(before.Shape.Edges))
+    expected = core._build_host_object_inventory([before])
+
+    crosscheck = core._crosscheck_host_object_inventory(expected, [after])
+
+    assert crosscheck["verified"] is True
+
+
 def test_reopen_crosscheck_uses_stable_topology_not_volatile_brep_bytes() -> None:
     """OCCT may reserialize an identical dynamic shape with different BREP bytes."""
 
@@ -1595,6 +1797,58 @@ def test_reopen_crosscheck_uses_stable_topology_not_volatile_brep_bytes() -> Non
     )
     before.Shape.exportBrepToString = lambda: "volatile serialization A"
     after.Shape.exportBrepToString = lambda: "volatile serialization B"
+    expected = core._build_host_object_inventory([before])
+
+    crosscheck = core._crosscheck_host_object_inventory(expected, [after])
+
+    assert crosscheck["verified"] is True
+
+
+def test_reopen_crosscheck_tolerates_real_freecad_bound_box_roundoff() -> None:
+    """A legitimate OCCT save/reopen must survive sub-nanometre bbox noise.
+
+    FreeCAD 1.1.1 reproduced these exact values for a persisted native 3D Text
+    ShapeString.  Its topology counts and shape metrics were unchanged.
+    """
+
+    before = HostObject(
+        "ShapeString001",
+        "Part::Part2DObjectPython",
+        representation="3d_text",
+        source_item_id="p1:text:0",
+        string="3D",
+    )
+    after = HostObject(
+        "ShapeString001",
+        "Part::Part2DObjectPython",
+        representation="3d_text",
+        source_item_id="p1:text:0",
+        string="3D",
+    )
+    before.Shape.BoundBox = type(
+        "BoundBox",
+        (),
+        {
+            "XMin": 9.99999999474e-08,
+            "YMin": -0.163057324841,
+            "ZMin": 0.0,
+            "XMax": 15.4343950045,
+            "YMax": 9.40297239915,
+            "ZMax": 0.0,
+        },
+    )()
+    after.Shape.BoundBox = type(
+        "BoundBox",
+        (),
+        {
+            "XMin": 9.99999996143e-08,
+            "YMin": -0.163057324841,
+            "ZMin": 0.0,
+            "XMax": 15.4343950045,
+            "YMax": 9.40297239915,
+            "ZMax": 0.0,
+        },
+    )()
     expected = core._build_host_object_inventory([before])
 
     crosscheck = core._crosscheck_host_object_inventory(expected, [after])

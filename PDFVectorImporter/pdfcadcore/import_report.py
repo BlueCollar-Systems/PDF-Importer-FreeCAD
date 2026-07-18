@@ -497,6 +497,43 @@ def build_model_3d_extra(
     }
 
 
+_FREECAD_SHAPE_FINGERPRINT_SCHEMA = "bcs.freecad_shape_fingerprint/1.0"
+_FREECAD_SHAPE_FINGERPRINT_QUANTUM = "1e-07"
+
+
+def _freecad_shape_fingerprint_verified(content: Any) -> bool:
+    """Validate the canonical geometry proof carried by a host snapshot."""
+
+    if not isinstance(content, dict):
+        return False
+    topology = content.get("shape_topology_counts")
+    vertex_count = content.get("shape_fingerprint_vertex_count")
+    edge_count = content.get("shape_fingerprint_edge_count")
+    sampled_edge_count = content.get("shape_fingerprint_sampled_edge_count")
+    if (
+        content.get("shape_fingerprint_verified") is not True
+        or content.get("shape_fingerprint_schema")
+        != _FREECAD_SHAPE_FINGERPRINT_SCHEMA
+        or content.get("shape_fingerprint_quantum")
+        != _FREECAD_SHAPE_FINGERPRINT_QUANTUM
+        or not isinstance(topology, dict)
+        or type(vertex_count) is not int
+        or vertex_count < 0
+        or type(edge_count) is not int
+        or edge_count < 0
+        or type(sampled_edge_count) is not int
+        or sampled_edge_count < 0
+        or sampled_edge_count > edge_count
+        or vertex_count + sampled_edge_count <= 0
+    ):
+        return False
+    if "vertexes" in topology and topology.get("vertexes") != vertex_count:
+        return False
+    if "edges" in topology and topology.get("edges") != edge_count:
+        return False
+    return True
+
+
 def _freecad_delivery_inventory_binding_verified(
     delivery: Any,
     inventory: Any,
@@ -555,6 +592,7 @@ def _freecad_delivery_inventory_binding_verified(
             and any(type(count) is int and count > 0 for count in topology.values())
             and isinstance(digest, str)
             and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+            and _freecad_shape_fingerprint_verified(content)
         )
 
     representation_ids = {
@@ -929,6 +967,7 @@ def _freecad_host_inventory_verified(inventory: Any, result: Any) -> bool:
                 or not isinstance(content.get("shape_digest"), str)
                 or re.fullmatch(r"[0-9a-f]{64}", content.get("shape_digest"))
                 is None
+                or not _freecad_shape_fingerprint_verified(content)
             ):
                 return False
         derived_ids.append(entity_id)

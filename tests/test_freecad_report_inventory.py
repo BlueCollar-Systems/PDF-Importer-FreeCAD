@@ -1956,6 +1956,336 @@ def test_structural_shape_fingerprint_rejects_an_unsampled_edge() -> None:
     assert content["shape_fingerprint_verified"] is False
 
 
+def test_structural_shape_fingerprint_rejects_a_one_point_edge_sample() -> None:
+    """One point cannot observe a claimed nonzero-length edge."""
+
+    class OnePointEdge:
+        Length = 1.0
+        Vertexes = [ShapeVertex(0.0, 0.0), ShapeVertex(1.0, 0.0)]
+
+        def discretize(self, **_kwargs):
+            return [ShapePoint(0.0, 0.0)]
+
+    glyph = HostObject(
+        "Glyph001",
+        "Part::Feature",
+        representation="glyphs",
+        source_item_id="p1:b0:l0:s0:g0",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    glyph.Shape.Edges = [OnePointEdge()]
+
+    content = core._build_host_object_inventory([glyph])["objects"][0]["content"]
+
+    assert content["shape_fingerprint_sampled_edge_count"] == 0
+    assert content["shape_fingerprint_verified"] is False
+
+
+def test_structural_shape_fingerprint_allows_a_one_point_degenerate_edge() -> None:
+    """A single point completely observes an actually zero-length edge."""
+
+    class OnePointDegenerateEdge:
+        Length = 0.0
+        Vertexes = [ShapeVertex(0.0, 0.0)]
+
+        def discretize(self, **_kwargs):
+            return [ShapePoint(0.0, 0.0)]
+
+    glyph = HostObject(
+        "Glyph001",
+        "Part::Feature",
+        representation="glyphs",
+        source_item_id="p1:b0:l0:s0:g0",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    glyph.Shape.Vertexes = [ShapeVertex(0.0, 0.0)]
+    glyph.Shape.Edges = [OnePointDegenerateEdge()]
+
+    content = core._build_host_object_inventory([glyph])["objects"][0]["content"]
+
+    assert content["shape_fingerprint_sampled_edge_count"] == 1
+    assert content["shape_fingerprint_verified"] is True
+
+
+def test_reopen_crosscheck_does_not_treat_an_open_near_loop_as_cyclic() -> None:
+    """Near-coincident raw endpoints do not override explicit open topology."""
+
+    class ExplicitlyOpenEdge:
+        Length = 2.0
+
+        def __init__(self, x_coordinates) -> None:
+            self._x_coordinates = x_coordinates
+            self.Vertexes = [
+                ShapeVertex(x_coordinates[0], 0.0),
+                ShapeVertex(x_coordinates[-1], 0.0),
+            ]
+
+        def isClosed(self) -> bool:
+            return False
+
+        def discretize(self, **_kwargs):
+            return [ShapePoint(x, 0.0) for x in self._x_coordinates]
+
+    before = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+    )
+    after = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+    )
+    before.Shape.Edges = [ExplicitlyOpenEdge((0.0, 4e-8, 1.0, 8e-8))]
+    after.Shape.Edges = [ExplicitlyOpenEdge((4e-8, 1.0, 8e-8, 0.0))]
+    expected = core._build_host_object_inventory([before])
+
+    crosscheck = core._crosscheck_host_object_inventory(expected, [after])
+
+    assert crosscheck["verified"] is False
+
+
+def test_reopen_crosscheck_honors_authoritative_closed_edge_topology() -> None:
+    """A closed topological edge may persist with a different sampling seam."""
+
+    class ExplicitlyClosedEdge:
+        Length = 3.0
+
+        def __init__(self, x_coordinates) -> None:
+            self._x_coordinates = x_coordinates
+
+        def isClosed(self) -> bool:
+            return True
+
+        def discretize(self, **_kwargs):
+            return [ShapePoint(x, 0.0) for x in self._x_coordinates]
+
+    before = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+    )
+    after = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+    )
+    before.Shape.Edges = [ExplicitlyClosedEdge((0.0, 1.0, 2.0))]
+    after.Shape.Edges = [ExplicitlyClosedEdge((1.0, 2.0, 0.0))]
+    expected = core._build_host_object_inventory([before])
+
+    crosscheck = core._crosscheck_host_object_inventory(expected, [after])
+
+    assert crosscheck["verified"] is True
+
+
+def test_shape_metric_comparison_uses_raw_continuous_tolerance() -> None:
+    """Pre-rounded metrics must not hide a delta above the advertised tolerance."""
+
+    before = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+    )
+    after = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+    )
+    before.Shape.Area = 0.51e-7
+    after.Shape.Area = 2.49e-7
+    expected = core._build_host_object_inventory([before])
+
+    crosscheck = core._crosscheck_host_object_inventory(expected, [after])
+
+    assert after.Shape.Area - before.Shape.Area > 1e-7
+    assert crosscheck["verified"] is False
+
+
+def test_shape_bound_comparison_uses_raw_continuous_tolerance() -> None:
+    """Bounds use the same one-time absolute comparison as shape metrics."""
+
+    before = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+    )
+    after = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+    )
+    before.Shape.BoundBox = type("BoundBox", (), {"XMin": 0.51e-7})()
+    after.Shape.BoundBox = type("BoundBox", (), {"XMin": 2.49e-7})()
+    expected = core._build_host_object_inventory([before])
+
+    crosscheck = core._crosscheck_host_object_inventory(expected, [after])
+
+    assert after.Shape.BoundBox.XMin - before.Shape.BoundBox.XMin > 1e-7
+    assert crosscheck["verified"] is False
+
+
+def test_public_shape_certificate_rejects_a_tampered_shape_digest() -> None:
+    """A declared content digest remains part of the certificate's integrity."""
+
+    before = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+    )
+    after = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+    )
+    private_expected = core._build_host_object_inventory([before])
+    public_expected = core._public_report_value(private_expected)
+    public_crosscheck = core._public_report_value(
+        core._crosscheck_host_object_inventory(private_expected, [after])
+    )
+    assert report_contract._freecad_save_reopen_inventory_verified(
+        public_expected, public_crosscheck
+    ) is True
+
+    tampered = json.loads(json.dumps(public_crosscheck))
+    content = tampered["actual_objects"][0]["content"]
+    content["shape_digest"] = "f" * 64
+
+    assert report_contract._freecad_save_reopen_inventory_verified(
+        public_expected, tampered
+    ) is False
+
+
+def test_public_shape_certificate_binds_both_retained_content_records() -> None:
+    """The public certificate is independently checkable from retained evidence."""
+
+    before = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+    )
+    after = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+    )
+    private_expected = core._build_host_object_inventory([before])
+    public_expected = core._public_report_value(private_expected)
+    public_crosscheck = core._public_report_value(
+        core._crosscheck_host_object_inventory(private_expected, [after])
+    )
+    certificate = public_crosscheck["geometry_comparisons"][0]
+    expected_content = public_expected["objects"][0]["content"]
+    actual_content = public_crosscheck["actual_objects"][0]["content"]
+
+    def content_digest(content) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                content,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+
+    assert certificate["expected_content_digest"] == content_digest(
+        expected_content
+    )
+    assert certificate["actual_content_digest"] == content_digest(actual_content)
+
+
+def test_unordered_alignment_does_not_fail_at_python_recursion_depth() -> None:
+    """Ambiguous one-to-one shape matching must not recurse once per entity."""
+
+    item_count = sys.getrecursionlimit() + 5
+    items = list(range(item_count))
+
+    def adjacent(left_index, right_index) -> bool:
+        if left_index == item_count - 1:
+            return right_index in (0, item_count - 1)
+        return right_index in (left_index, left_index + 1)
+
+    alignment = report_contract._freecad_unordered_alignment(
+        items, items, adjacent
+    )
+
+    assert alignment is not None
+    assert len(alignment) == item_count
+
+
+def test_unordered_alignment_has_a_linear_fast_path_for_aligned_ambiguity() -> None:
+    """Already aligned ambiguous input must not materialize every possible pair."""
+
+    item_count = sys.getrecursionlimit() + 5
+    items = list(range(item_count))
+    predicate_calls = 0
+
+    def ambiguous(_left_index, _right_index) -> bool:
+        nonlocal predicate_calls
+        predicate_calls += 1
+        return True
+
+    alignment = report_contract._freecad_unordered_alignment(
+        items, items, ambiguous
+    )
+
+    assert alignment is not None
+    assert len(alignment) == item_count
+    assert predicate_calls <= item_count * 2
+
+
+def test_unordered_alignment_repairs_a_greedy_choice_without_recursion() -> None:
+    """The bounded fallback still finds a perfect one-to-one assignment."""
+
+    def compatible(left_index, right_index) -> bool:
+        if left_index == 0:
+            return right_index in (0, 1)
+        return right_index == 0
+
+    alignment = report_contract._freecad_unordered_alignment(
+        [0, 1], [0, 1], compatible
+    )
+
+    assert alignment == {0: 1, 1: 0}
+
+
+def test_unordered_alignment_enforces_its_pair_budget_during_the_fast_path(
+    monkeypatch,
+) -> None:
+    """A late greedy failure cannot spend beyond the fallback pair budget."""
+
+    monkeypatch.setattr(
+        report_contract,
+        "_FREECAD_UNORDERED_FALLBACK_PAIR_LIMIT",
+        4,
+    )
+    predicate_calls = 0
+
+    def compatible(left_index, right_index) -> bool:
+        nonlocal predicate_calls
+        predicate_calls += 1
+        return (left_index, right_index) in {(0, 2), (1, 3)}
+
+    alignment = report_contract._freecad_unordered_alignment(
+        [0, 1, 2, 3], [0, 1, 2, 3], compatible
+    )
+
+    assert alignment is None
+    assert predicate_calls <= 4
+
+
 def test_tolerated_shape_roundoff_emits_a_bound_public_certificate() -> None:
     """Raw samples stay transient while the report binds both observations."""
 

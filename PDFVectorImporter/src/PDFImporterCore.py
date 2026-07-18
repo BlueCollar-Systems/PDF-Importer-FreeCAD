@@ -4418,18 +4418,6 @@ def _raw_shape_number(value: Any) -> Optional[float]:
     return 0.0 if number == 0.0 else number
 
 
-def _stable_shape_number(value: Any) -> Optional[str]:
-    """Return a readable token backed by the canonical shape quantum."""
-
-    units = _quantized_shape_number(value)
-    if units is None:
-        return None
-    quantized = float(units) * _SHAPE_FINGERPRINT_QUANTUM
-    if quantized == 0.0:
-        quantized = 0.0
-    return format(quantized, ".12g")
-
-
 def _host_point_token(point: Any) -> Optional[Tuple[int, int, int]]:
     """Read a FreeCAD vector-like point into a tolerance-stable tuple."""
 
@@ -4470,25 +4458,82 @@ def _host_point_sample(point: Any) -> Optional[List[float]]:
 
 def _canonical_point_path(
     points: List[Tuple[int, int, int]],
-) -> Tuple[bool, Tuple[Tuple[int, int, int], ...]]:
+    *,
+    closed: bool,
+) -> Tuple[Tuple[int, int, int], ...]:
     """Canonicalize edge orientation and a closed edge's possible seam."""
 
     if not points:
-        return False, ()
+        return ()
     sequence = tuple(points)
-    closed = len(sequence) > 2 and sequence[0] == sequence[-1]
     if closed:
-        sequence = sequence[:-1]
+        if len(sequence) > 1 and sequence[0] == sequence[-1]:
+            sequence = sequence[:-1]
         if not sequence:
-            return True, ()
+            return ()
         candidates = []
         for oriented in (sequence, tuple(reversed(sequence))):
             candidates.extend(
                 oriented[index:] + oriented[:index]
                 for index in range(len(oriented))
             )
-        return True, min(candidates)
-    return False, min(sequence, tuple(reversed(sequence)))
+        return min(candidates)
+    return min(sequence, tuple(reversed(sequence)))
+
+
+def _host_edge_closed_state(
+    edge: Any,
+    point_samples: List[List[float]],
+) -> Tuple[bool, bool]:
+    """Read topological closure before using sample proximity as a fallback."""
+
+    try:
+        is_closed = getattr(edge, "isClosed", None)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        is_closed = None
+    if callable(is_closed):
+        try:
+            authoritative = is_closed()
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            authoritative = None
+        if type(authoritative) is bool:
+            return authoritative, True
+
+    try:
+        vertices = list(edge.Vertexes)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        vertices = []
+    if len(vertices) == 1:
+        return True, True
+    if len(vertices) >= 2:
+        first_vertex = vertices[0]
+        last_vertex = vertices[-1]
+        for method_name in ("isSame", "isEqual"):
+            try:
+                compare = getattr(first_vertex, method_name, None)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                compare = None
+            if callable(compare):
+                try:
+                    topologically_equal = compare(last_vertex)
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    continue
+                if type(topologically_equal) is bool:
+                    return topologically_equal, True
+        return first_vertex is last_vertex, True
+
+    return (
+        bool(
+            len(point_samples) > 2
+            and all(
+                abs(first - last) <= _SHAPE_FINGERPRINT_QUANTUM
+                for first, last in zip(
+                    point_samples[0], point_samples[-1], strict=True
+                )
+            )
+        ),
+        False,
+    )
 
 
 def _host_edge_fingerprint(
@@ -4546,16 +4591,13 @@ def _host_edge_fingerprint(
         samples_valid
         and len(point_tokens) == len(sampled_points)
         and raw_length is not None
+        and raw_length >= 0.0
+        and (raw_length == 0.0 or len(point_tokens) >= 2)
     )
-    closed, canonical_path = _canonical_point_path(point_tokens)
-    sample_closed = bool(
-        len(point_samples) > 2
-        and all(
-            abs(first - last) <= _SHAPE_FINGERPRINT_QUANTUM
-            for first, last in zip(
-                point_samples[0], point_samples[-1], strict=True
-            )
-        )
+    closed, closure_authoritative = _host_edge_closed_state(edge, point_samples)
+    canonical_path = _canonical_point_path(
+        point_tokens,
+        closed=closed,
     )
     return (
         (
@@ -4567,7 +4609,8 @@ def _host_edge_fingerprint(
         {
             "curve_type": curve_type,
             "length": raw_length,
-            "closed": sample_closed,
+            "closed": closed,
+            "closure_authoritative": closure_authoritative,
             "points": point_samples,
         },
         samples_valid,
@@ -4667,8 +4710,8 @@ def _host_shape_content_snapshot(obj, type_id: str) -> Dict[str, Any]:
 
     shape_nonempty = _has_nonempty_host_geometry(obj, type_id)
     topology_counts: Dict[str, int] = {}
-    metrics: Dict[str, str] = {}
-    bounds: Dict[str, str] = {}
+    metrics: Dict[str, float] = {}
+    bounds: Dict[str, float] = {}
     try:
         shape = getattr(obj, "Shape", None)
     except (AttributeError, RuntimeError, TypeError, ValueError):
@@ -4692,11 +4735,11 @@ def _host_shape_content_snapshot(obj, type_id: str) -> Dict[str, Any]:
                 continue
         for property_name in ("Length", "Area", "Volume"):
             try:
-                token = _stable_shape_number(getattr(shape, property_name))
+                number = _raw_shape_number(getattr(shape, property_name))
             except (AttributeError, RuntimeError, TypeError, ValueError):
-                token = None
-            if token is not None:
-                metrics[property_name.lower()] = token
+                number = None
+            if number is not None:
+                metrics[property_name.lower()] = number
         try:
             bound_box = shape.BoundBox
         except (AttributeError, RuntimeError, TypeError, ValueError):
@@ -4711,11 +4754,11 @@ def _host_shape_content_snapshot(obj, type_id: str) -> Dict[str, Any]:
                 "ZMax",
             ):
                 try:
-                    token = _stable_shape_number(getattr(bound_box, property_name))
+                    number = _raw_shape_number(getattr(bound_box, property_name))
                 except (AttributeError, RuntimeError, TypeError, ValueError):
-                    token = None
-                if token is not None:
-                    bounds[property_name.lower()] = token
+                    number = None
+                if number is not None:
+                    bounds[property_name.lower()] = number
     else:
         try:
             geometry_count = obj.GeometryCount

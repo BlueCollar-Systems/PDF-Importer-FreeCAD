@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
@@ -502,7 +503,8 @@ _FREECAD_SHAPE_FINGERPRINT_QUANTUM = "1e-07"
 _FREECAD_SHAPE_FINGERPRINT_TOLERANCE = 1e-7
 _FREECAD_RAW_SHAPE_GEOMETRY_SCHEMA = "bcs.freecad_raw_shape_geometry/1.0"
 _FREECAD_SHAPE_GEOMETRY_SCHEMA = "bcs.freecad_shape_geometry_digest/1.0"
-_FREECAD_SHAPE_COMPARISON_SCHEMA = "bcs.freecad_shape_persistence_comparison/1.0"
+_FREECAD_SHAPE_COMPARISON_SCHEMA = "bcs.freecad_shape_persistence_comparison/1.1"
+_FREECAD_UNORDERED_FALLBACK_PAIR_LIMIT = 4_000_000
 
 
 def _freecad_finite_number(value: Any) -> Optional[float]:
@@ -543,36 +545,151 @@ def _freecad_points_close(left: Any, right: Any) -> bool:
 
 
 def _freecad_unordered_alignment(left: Any, right: Any, predicate):
-    """Return a one-to-one right-index alignment or None."""
+    """Return a deterministic, stack-safe one-to-one alignment or None.
+
+    The aligned fast path is linear for the normal already-sorted inventory.
+    A failed greedy choice falls back to iterative layered maximum matching,
+    with every predicate pair evaluated at most once and a fixed pair budget.
+    """
 
     if not isinstance(left, list) or not isinstance(right, list) or len(left) != len(right):
         return None
-    adjacency = [
-        [right_index for right_index, right_item in enumerate(right) if predicate(left_item, right_item)]
-        for left_item in left
-    ]
+    item_count = len(left)
+    if item_count == 0:
+        return {}
+
+    class _PairBudgetExceededError(RuntimeError):
+        pass
+
+    compatibility_cache: Dict[tuple[int, int], bool] = {}
+    pair_budget = max(item_count, _FREECAD_UNORDERED_FALLBACK_PAIR_LIMIT)
+
+    def compatible(left_index: int, right_index: int) -> bool:
+        key = (left_index, right_index)
+        if key not in compatibility_cache:
+            if len(compatibility_cache) >= pair_budget:
+                raise _PairBudgetExceededError
+            compatibility_cache[key] = bool(
+                predicate(left[left_index], right[right_index])
+            )
+        return compatibility_cache[key]
+
+    available_right = bytearray([1]) * item_count
+    fast_alignment: Dict[int, int] = {}
+    try:
+        for left_index in range(item_count):
+            for offset in range(item_count):
+                right_index = (left_index + offset) % item_count
+                if available_right[right_index] and compatible(
+                    left_index, right_index
+                ):
+                    fast_alignment[left_index] = right_index
+                    available_right[right_index] = 0
+                    break
+            else:
+                break
+    except _PairBudgetExceededError:
+        return None
+    if len(fast_alignment) == item_count:
+        return fast_alignment
+
+    if item_count > _FREECAD_UNORDERED_FALLBACK_PAIR_LIMIT // item_count:
+        return None
+    adjacency = []
+    try:
+        for left_index in range(item_count):
+            candidates = [
+                (left_index + offset) % item_count
+                for offset in range(item_count)
+                if compatible(left_index, (left_index + offset) % item_count)
+            ]
+            adjacency.append(candidates)
+    except _PairBudgetExceededError:
+        return None
     if any(not candidates for candidates in adjacency):
         return None
-    order = sorted(range(len(left)), key=lambda index: len(adjacency[index]))
-    matched_left_by_right: Dict[int, int] = {}
 
-    def augment(left_index: int, visited: set[int]) -> bool:
-        for right_index in adjacency[left_index]:
-            if right_index in visited:
+    unmatched = -1
+    matched_right_by_left = [unmatched] * item_count
+    matched_left_by_right = [unmatched] * item_count
+    matched_count = 0
+    infinity = item_count + 1
+
+    while matched_count < item_count:
+        distances = [infinity] * item_count
+        queue = deque()
+        for left_index in range(item_count):
+            if matched_right_by_left[left_index] == unmatched:
+                distances[left_index] = 0
+                queue.append(left_index)
+
+        shortest_path = infinity
+        while queue:
+            left_index = queue.popleft()
+            if distances[left_index] >= shortest_path:
                 continue
-            visited.add(right_index)
-            previous = matched_left_by_right.get(right_index)
-            if previous is None or augment(previous, visited):
-                matched_left_by_right[right_index] = left_index
-                return True
-        return False
+            for right_index in adjacency[left_index]:
+                paired_left = matched_left_by_right[right_index]
+                if paired_left == unmatched:
+                    shortest_path = distances[left_index] + 1
+                elif distances[paired_left] == infinity:
+                    distances[paired_left] = distances[left_index] + 1
+                    queue.append(paired_left)
+        if shortest_path == infinity:
+            break
 
-    if not all(augment(left_index, set()) for left_index in order):
+        next_candidate = [0] * item_count
+        phase_matches = 0
+        for root_left in range(item_count):
+            if (
+                matched_right_by_left[root_left] != unmatched
+                or distances[root_left] != 0
+            ):
+                continue
+            left_path = [root_left]
+            right_path: List[int] = []
+            augmented = False
+            while left_path:
+                left_index = left_path[-1]
+                advanced = False
+                while next_candidate[left_index] < len(adjacency[left_index]):
+                    right_index = adjacency[left_index][next_candidate[left_index]]
+                    next_candidate[left_index] += 1
+                    paired_left = matched_left_by_right[right_index]
+                    if paired_left == unmatched:
+                        if distances[left_index] + 1 != shortest_path:
+                            continue
+                        complete_right_path = right_path + [right_index]
+                        for path_left, path_right in zip(
+                            left_path,
+                            complete_right_path,
+                            strict=True,
+                        ):
+                            matched_right_by_left[path_left] = path_right
+                            matched_left_by_right[path_right] = path_left
+                        augmented = True
+                        break
+                    if distances[paired_left] == distances[left_index] + 1:
+                        left_path.append(paired_left)
+                        right_path.append(right_index)
+                        advanced = True
+                        break
+                if augmented:
+                    phase_matches += 1
+                    break
+                if advanced:
+                    continue
+                distances[left_index] = infinity
+                left_path.pop()
+                if right_path and len(right_path) >= len(left_path):
+                    right_path.pop()
+        if phase_matches == 0:
+            break
+        matched_count += phase_matches
+
+    if matched_count != item_count:
         return None
-    return {
-        left_index: right_index
-        for right_index, left_index in matched_left_by_right.items()
-    }
+    return dict(enumerate(matched_right_by_left))
 
 
 def _freecad_unordered_match(left: Any, right: Any, predicate) -> bool:
@@ -581,7 +698,12 @@ def _freecad_unordered_match(left: Any, right: Any, predicate) -> bool:
     return _freecad_unordered_alignment(left, right, predicate) is not None
 
 
-def _freecad_path_close(left: Any, right: Any, closed: bool) -> bool:
+def _freecad_path_close(
+    left: Any,
+    right: Any,
+    closed: bool,
+    closure_authoritative: bool = False,
+) -> bool:
     if not isinstance(left, list) or not isinstance(right, list) or len(left) != len(right):
         return False
     if not left:
@@ -594,7 +716,16 @@ def _freecad_path_close(left: Any, right: Any, closed: bool) -> bool:
         )
 
     if not closed:
-        return linear_match(left, right) or linear_match(left, list(reversed(right)))
+        matched = linear_match(left, right) or linear_match(
+            left, list(reversed(right))
+        )
+        if not matched or not closure_authoritative or len(left) <= 2:
+            return matched
+        for oriented in (right, list(reversed(right))):
+            for offset in range(1, len(oriented)):
+                if linear_match(left, oriented[offset:] + oriented[:offset]):
+                    return False
+        return True
 
     left_cycle = list(left)
     right_cycle = list(right)
@@ -620,6 +751,10 @@ def _freecad_edge_close(left: Any, right: Any) -> bool:
         or type(left.get("closed")) is not bool
         or type(right.get("closed")) is not bool
         or left.get("closed") != right.get("closed")
+        or type(left.get("closure_authoritative")) is not bool
+        or type(right.get("closure_authoritative")) is not bool
+        or left.get("closure_authoritative")
+        != right.get("closure_authoritative")
     ):
         return False
     left_length = _freecad_finite_number(left.get("length"))
@@ -629,7 +764,10 @@ def _freecad_edge_close(left: Any, right: Any) -> bool:
     if abs(left_length - right_length) > _FREECAD_SHAPE_FINGERPRINT_TOLERANCE:
         return False
     return _freecad_path_close(
-        left.get("points"), right.get("points"), bool(left.get("closed"))
+        left.get("points"),
+        right.get("points"),
+        bool(left.get("closed")),
+        bool(left.get("closure_authoritative")),
     )
 
 
@@ -646,8 +784,20 @@ def _freecad_point_delta(left: Any, right: Any) -> Optional[float]:
     )
 
 
-def _freecad_path_delta(left: Any, right: Any, closed: bool) -> Optional[float]:
+def _freecad_path_delta(
+    left: Any,
+    right: Any,
+    closed: bool,
+    closure_authoritative: bool = False,
+) -> Optional[float]:
     if not isinstance(left, list) or not isinstance(right, list) or len(left) != len(right):
+        return None
+    if not _freecad_path_close(
+        left,
+        right,
+        closed,
+        closure_authoritative,
+    ):
         return None
 
     def linear_delta(first: List[Any], second: List[Any]) -> Optional[float]:
@@ -689,7 +839,10 @@ def _freecad_edge_delta(left: Any, right: Any) -> Optional[float]:
     left_length = _freecad_finite_number(left.get("length"))
     right_length = _freecad_finite_number(right.get("length"))
     path_delta = _freecad_path_delta(
-        left.get("points"), right.get("points"), bool(left.get("closed"))
+        left.get("points"),
+        right.get("points"),
+        bool(left.get("closed")),
+        bool(left.get("closure_authoritative")),
     )
     if left_length is None or right_length is None or path_delta is None:
         return None
@@ -857,6 +1010,33 @@ def _freecad_shape_comparison_digest(certificate: Dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def _freecad_public_shape_content_digest(content: Any) -> Optional[str]:
+    """Digest retained public content for internal consistency verification.
+
+    This unkeyed checksum makes independent report-field tampering observable.
+    It is not an authenticity claim: coordinated rewriting remains possible
+    without a trusted external signature or other anchor.
+    """
+
+    if not isinstance(content, dict):
+        return None
+    public_content = {
+        key: value
+        for key, value in content.items()
+        if key != "_shape_comparison_geometry"
+    }
+    try:
+        payload = json.dumps(
+            public_content,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _freecad_host_content_comparison(
     left: Any,
     right: Any,
@@ -874,6 +1054,8 @@ def _freecad_host_content_comparison(
     right_raw = right.get("_shape_comparison_geometry")
     left_raw_digest = _freecad_raw_shape_digest(left_raw)
     right_raw_digest = _freecad_raw_shape_digest(right_raw)
+    left_content_digest = _freecad_public_shape_content_digest(left)
+    right_content_digest = _freecad_public_shape_content_digest(right)
     left_sampled_point_count = (
         sum(len(edge.get("points", [])) for edge in left_raw.get("edges", []))
         if isinstance(left_raw, dict)
@@ -895,6 +1077,8 @@ def _freecad_host_content_comparison(
         or right_public.get("edge_count") != len(right_raw.get("edges", []))
         or left_public.get("sampled_point_count") != left_sampled_point_count
         or right_public.get("sampled_point_count") != right_sampled_point_count
+        or left_content_digest is None
+        or right_content_digest is None
         or not _freecad_shape_content_static_fields_match(left, right)
     ):
         return {"verified": False, "certificate": None}
@@ -908,6 +1092,8 @@ def _freecad_host_content_comparison(
         "entity_id": str(entity_id or ""),
         "expected_sample_digest": left_raw_digest,
         "actual_sample_digest": right_raw_digest,
+        "expected_content_digest": left_content_digest,
+        "actual_content_digest": right_content_digest,
         "vertex_count": left_public.get("vertex_count"),
         "edge_count": left_public.get("edge_count"),
         "sampled_point_count": left_sampled_point_count,
@@ -934,6 +1120,8 @@ def _freecad_shape_comparison_certificate_valid(
         return False
     left_geometry = left.get("shape_fingerprint_geometry")
     right_geometry = right.get("shape_fingerprint_geometry")
+    left_content_digest = _freecad_public_shape_content_digest(left)
+    right_content_digest = _freecad_public_shape_content_digest(right)
     max_delta = _freecad_finite_number(certificate.get("max_delta"))
     comparison_digest = certificate.get("comparison_digest")
     return bool(
@@ -946,6 +1134,8 @@ def _freecad_shape_comparison_certificate_valid(
         == left_geometry.get("sample_digest")
         and certificate.get("actual_sample_digest")
         == right_geometry.get("sample_digest")
+        and certificate.get("expected_content_digest") == left_content_digest
+        and certificate.get("actual_content_digest") == right_content_digest
         and certificate.get("vertex_count") == left_geometry.get("vertex_count")
         and certificate.get("vertex_count") == right_geometry.get("vertex_count")
         and certificate.get("edge_count") == left_geometry.get("edge_count")

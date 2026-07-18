@@ -19,6 +19,27 @@ import PDFImporterCore as core  # noqa: E402
 from PDFVectorImporter.src import PDFSvgTextRenderer as renderer  # noqa: E402
 
 
+def test_readme_documents_six_distinct_modes_and_exact_controller_ladders():
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    display = {
+        "text": "Text",
+        "labels": "Labels",
+        "3d_text": "3D Text",
+        "glyphs": "Glyphs",
+        "geometry": "Geometry",
+        "raster": "Raster",
+    }
+
+    for mode in display.values():
+        assert f"| **{mode}** |" in readme
+    for requested, ladder in core.TEXT_ITEM_FALLBACK_LADDERS.items():
+        rendered = " → ".join(display[rung] for rung in ladder)
+        assert f"| **{display[requested]}** | {rendered} |" in readme
+
+    assert "always achievable" not in readme.lower()
+    assert "terminal verified attempt" in readme.lower()
+
+
 def _report(tmp_path, requested, delivered, count):
     opts = core.ImportOptions(text_mode=requested)
     bucket_by_type = {

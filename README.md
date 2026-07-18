@@ -27,7 +27,7 @@ assets, generation scripts, checksums, license, and notes.
 |----------|-----------|
 | PDF Parsing | PyMuPDF-powered vector extraction with full path, text, and image support |
 | Import Modes | Auto (default), Vector, Raster, Hybrid — every mode targets maximum fidelity (BCS-ARCH-001) |
-| Text Rendering | 3D Text (default visual-parity path), Labels, Glyphs, Geometry — orthogonal to mode |
+| Text Rendering | Text, Labels, 3D Text (default visual-parity path), Glyphs, Geometry, Raster — six distinct requests orthogonal to page mode |
 | Arc Reconstruction | Kasa algebraic circle fit converts polyline segments back to true arcs |
 | Layer Support | OCG layers (PDF Optional Content Groups) map to FreeCAD groups |
 | Color Grouping | Geometry automatically organized by stroke/fill color |
@@ -164,10 +164,12 @@ types, not in quality tier.
 
 | Option | Result |
 |--------|--------|
+| **Text** | FreeCAD-native flat editable text objects |
 | **Labels** | FreeCAD-native text objects, editable as text |
 | **3D Text** | Extruded geometric text (Draft ShapeString) |
 | **Glyphs** | Per-character vector glyphs |
 | **Geometry** | Text converted to non-editable geometry |
+| **Raster** | One source-bound raster patch per PDF text item |
 
 Plus a separate **Import text** toggle to skip text entirely.
 Glyphs and Geometry prefer Poppler/pdftocairo SVG output when available, then fall back to bundled PyMuPDF SVG paths.
@@ -185,15 +187,18 @@ with the attempted types, exact created/removed host IDs, cleanup result, and
 the evidence that proved the requested type impossible. It is never silent.
 (Owner directive 2026-07-13.)
 
-Authorized order after item-specific proof (left rung first):
+Controller attempt order (requested rung first). Each later rung begins only
+after affirmative item-specific impossibility proof and exact cleanup for the
+preceding rung:
 
-| Requested | Ladder |
+| Requested | Exact finite attempt order |
 |-----------|--------|
-| **3D Text** | Glyphs → Geometry → Labels → Raster |
-| **Glyphs** | Geometry → 3D Text → Labels → Raster |
-| **Geometry** | Glyphs → 3D Text → Labels → Raster |
-| **Labels** | 3D Text → Glyphs → Geometry → Raster |
-| **Raster** | terminal — always achievable |
+| **Text** | Text → Labels → 3D Text → Glyphs → Geometry → Raster |
+| **Labels** | Labels → Text → 3D Text → Glyphs → Geometry → Raster |
+| **3D Text** | 3D Text → Glyphs → Geometry → Text → Labels → Raster |
+| **Glyphs** | Glyphs → Geometry → 3D Text → Text → Labels → Raster |
+| **Geometry** | Geometry → Glyphs → 3D Text → Text → Labels → Raster |
+| **Raster** | Raster |
 
 Notes:
 - **Glyphs and Geometry are distinct deliverables.** Glyphs preserve one
@@ -206,6 +211,9 @@ Notes:
 - Automatic raster classification may add a raster background, but it does not
   discard an explicitly requested text representation. Explicit Raster remains
   raster-only.
+- Raster is the terminal verified attempt, not a guaranteed success label. If
+  its source-bound pixels, placement, host entity, or persistence cannot be
+  verified, the item is reported as failed.
 - The invariant is "requested type delivered and verified, or an exact failed
   attempt is reported and the transaction stops, or a proof-gated per-item
   fallback is reported." It is locked by

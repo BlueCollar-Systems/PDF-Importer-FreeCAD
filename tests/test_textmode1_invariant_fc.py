@@ -31,6 +31,15 @@ def _report(tmp_path, requested, delivered, count):
         "raster": "raster_text_patch",
     }
     entity_ids = ["Delivered%03d" % index for index in range(count)]
+    evidence = {"host_entity_type": "Part::Feature"}
+    if delivered == "labels":
+        evidence = {
+            "host_entity_type": "App::FeaturePython",
+            "host_proxy_type": "Label",
+            "source_text_preserved": True,
+            "view_style_verified": True,
+            "label_marker_absent": True,
+        }
     opts.text_delivery_attempts.append(
         {
             "source_item_id": "p1:text:0",
@@ -45,7 +54,7 @@ def _report(tmp_path, requested, delivered, count):
             "cleanup_complete": True,
             "attempted_types": [delivered],
             "proof_chain": [],
-            "evidence": {"host_entity_type": "Part::Feature"},
+            "evidence": evidence,
         }
     )
     opts.text_delivered_counts[bucket_by_type[delivered]] = count
@@ -662,8 +671,11 @@ def test_explicit_requested_raster_live_branch_records_verified_delivery(monkeyp
             "final_type": "raster",
             "outcome": "verified",
             "created_entity_ids": ["PageRaster001"],
+            "delivery_entity_ids": ["PageRaster001"],
+            "support_entity_ids": [],
             "removed_entity_ids": [],
             "cleanup_complete": True,
+            "delivery_count": 1,
             "evidence": raster_result["evidence"],
         }
     ]

@@ -556,6 +556,9 @@ def test_native_item_delivery_rereads_live_text_transform_style_and_metadata(
     assert host.PDFTextColorRGB == "0.2,0.4,0.6"
     assert result["evidence"]["style_verification"] == "gui_view_and_app_metadata"
     assert result["evidence"]["view_style_verified"] is True
+    if attempted_type == "labels":
+        assert result["evidence"]["label_marker_absent"] is False
+        assert result["evidence"]["label_marker_verification"] == "pending"
     assert core._host_anchor_xyz(host) == pytest.approx(
         result["evidence"]["expected_anchor_xyz"]
     )
@@ -605,6 +608,9 @@ def test_native_item_delivery_headless_rereads_honest_app_style_metadata(
     assert result["outcome"] == "verified"
     assert result["evidence"]["style_verification"] == "headless_app_metadata"
     assert result["evidence"]["view_style_verified"] is False
+    if attempted_type == "labels":
+        assert result["evidence"]["label_marker_absent"] is False
+        assert result["evidence"]["label_marker_verification"] == "pending"
 
 
 def test_rotated_native_text_remains_text_with_verified_persistent_placement(

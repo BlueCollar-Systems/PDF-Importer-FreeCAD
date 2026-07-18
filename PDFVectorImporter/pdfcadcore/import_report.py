@@ -521,29 +521,88 @@ def _freecad_delivery_inventory_binding_verified(
             return False
         records_by_id[entity_id] = record
 
+    removed_entity_ids = delivery.get("removed_entity_ids", [])
+    if (
+        not isinstance(removed_entity_ids, list)
+        or any(
+            not isinstance(entity_id, str)
+            or not entity_id
+            or entity_id != entity_id.strip()
+            for entity_id in removed_entity_ids
+        )
+        or len(removed_entity_ids) != len(set(removed_entity_ids))
+        or any(entity_id in records_by_id for entity_id in removed_entity_ids)
+    ):
+        return False
+
+    all_live_ids: set[str] = set()
+
     for terminal in terminals:
         if not isinstance(terminal, dict) or terminal.get("outcome") != "verified":
             return False
         source_item_id = str(terminal.get("source_item_id") or "").strip()
         final_type = (
-            str(terminal.get("final_type") or terminal.get("attempted_type") or "")
+            str(terminal.get("final_type") or "")
             .strip()
             .lower()
             .replace("-", "_")
             .replace(" ", "_")
         )
+        created_ids = terminal.get("created_entity_ids")
         delivery_ids = terminal.get("delivery_entity_ids")
         if delivery_ids is None:
-            delivery_ids = terminal.get("created_entity_ids")
+            delivery_ids = created_ids
+        support_ids = terminal.get("support_entity_ids", [])
+        terminal_removed_ids = terminal.get("removed_entity_ids", [])
         if (
             not source_item_id
             or not final_type
+            or not isinstance(created_ids, list)
             or not isinstance(delivery_ids, list)
             or not delivery_ids
+            or not isinstance(support_ids, list)
+            or not isinstance(terminal_removed_ids, list)
         ):
             return False
 
-        for raw_entity_id in delivery_ids:
+        id_lists = (created_ids, delivery_ids, support_ids, terminal_removed_ids)
+        if any(
+            any(
+                not isinstance(entity_id, str)
+                or not entity_id
+                or entity_id != entity_id.strip()
+                for entity_id in values
+            )
+            or len(values) != len(set(values))
+            for values in id_lists
+        ):
+            return False
+        created_set = set(created_ids)
+        delivery_set = set(delivery_ids)
+        support_set = set(support_ids)
+        terminal_removed_set = set(terminal_removed_ids)
+        live_set = created_set.difference(terminal_removed_set)
+        if (
+            not terminal_removed_set.issubset(created_set)
+            or delivery_set.intersection(support_set)
+            or delivery_set.union(support_set) != live_set
+            or all_live_ids.intersection(live_set)
+        ):
+            return False
+        all_live_ids.update(live_set)
+
+        reported_delivery_count = terminal.get("delivery_count")
+        if "delivery_count" in terminal and (
+            type(reported_delivery_count) is not int
+            or reported_delivery_count <= 0
+            or (
+                final_type != "geometry"
+                and reported_delivery_count != len(delivery_set)
+            )
+        ):
+            return False
+
+        for raw_entity_id in list(delivery_ids) + list(support_ids):
             entity_id = str(raw_entity_id or "").strip()
             record = records_by_id.get(entity_id)
             if record is None:
@@ -557,15 +616,41 @@ def _freecad_delivery_inventory_binding_verified(
             )
             if representation != final_type:
                 return False
-            if str(record.get("source_item_id") or "") != source_item_id:
+            if (
+                str(record.get("source_item_id") or "") != source_item_id
+                and str(record.get("parent_source_item_id") or "")
+                != source_item_id
+            ):
                 return False
             category = str(record.get("category") or "")
             type_id = str(record.get("type_id") or "")
-            if final_type == "raster":
-                if category != "images" or not type_id.startswith("Image::"):
-                    return False
-            elif category != "text_representation_objects":
+            content = record.get("content")
+            if not isinstance(content, dict):
                 return False
+            if final_type == "raster":
+                if (
+                    category != "images"
+                    or not type_id.startswith("Image::")
+                    or not isinstance(content.get("image_file"), str)
+                    or not content.get("image_file")
+                ):
+                    return False
+            else:
+                if category != "text_representation_objects":
+                    return False
+                if final_type == "labels" and (
+                    type_id != "App::FeaturePython"
+                    or content.get("proxy_type") != "Label"
+                    or not isinstance(content.get("text"), list)
+                    or not content.get("text")
+                    or content.get("custom_text") != content.get("text")
+                ):
+                    return False
+                if final_type in {"3d_text", "glyphs", "geometry"} and (
+                    not type_id.startswith(("Part::", "PartDesign::", "Sketcher::"))
+                    or content.get("shape_nonempty") is not True
+                ):
+                    return False
 
     return True
 
@@ -609,6 +694,8 @@ def _freecad_save_reopen_inventory_verified(
         and save_reopen.get("expected_counts") == inventory_counts
         and save_reopen.get("actual_counts") == inventory_counts
         and save_reopen.get("counts_match") is True
+        and save_reopen.get("expected_objects") == inventory_objects
+        and save_reopen.get("actual_objects") == inventory_objects
     )
 
 
@@ -618,6 +705,7 @@ def _freecad_host_inventory_verified(inventory: Any, result: Any) -> bool:
     if (
         not isinstance(inventory, dict)
         or inventory.get("verified") is not True
+        or inventory.get("schema") != "bcs.freecad_host_object_inventory/1.1"
         or not isinstance(result, dict)
     ):
         return False
@@ -652,12 +740,45 @@ def _freecad_host_inventory_verified(inventory: Any, result: Any) -> bool:
         entity_id = record.get("entity_id")
         type_id = record.get("type_id")
         category = record.get("category")
+        representation = record.get("representation")
+        source_item_id = record.get("source_item_id")
+        parent_source_item_id = record.get("parent_source_item_id")
+        content = record.get("content")
         if (
             not isinstance(entity_id, str)
             or not entity_id
             or not isinstance(type_id, str)
             or not type_id
             or category not in derived_categories
+            or not isinstance(representation, str)
+            or not isinstance(source_item_id, str)
+            or not isinstance(parent_source_item_id, str)
+            or not isinstance(content, dict)
+        ):
+            return False
+        if representation == "raster" and (
+            category != "images"
+            or not type_id.startswith("Image::")
+            or not isinstance(content.get("image_file"), str)
+        ):
+            return False
+        if representation in {"labels", "text", "3d_text", "glyphs", "geometry"} and (
+            category != "text_representation_objects"
+        ):
+            return False
+        if category == "containers" and not type_id.startswith(
+            "App::DocumentObjectGroup"
+        ):
+            return False
+        if category == "images" and not type_id.startswith("Image::"):
+            return False
+        if category == "vector_primitives" and (
+            not type_id.startswith(("Part::", "PartDesign::", "Sketcher::"))
+            or content.get("shape_nonempty") is not True
+        ):
+            return False
+        if type_id.startswith(("Part::", "PartDesign::", "Sketcher::")) and (
+            type(content.get("shape_nonempty")) is not bool
         ):
             return False
         derived_ids.append(entity_id)
@@ -722,15 +843,24 @@ def _freecad_actual_text_entity_types_verified(
         if bucket is None:
             return False
 
+        delivery_ids = terminal.get("delivery_entity_ids")
+        if delivery_ids is None:
+            delivery_ids = terminal.get("created_entity_ids")
+        if (
+            not isinstance(delivery_ids, list)
+            or not delivery_ids
+            or any(not isinstance(entity_id, str) or not entity_id for entity_id in delivery_ids)
+            or len(delivery_ids) != len(set(delivery_ids))
+        ):
+            return False
         reported_count = terminal.get("delivery_count")
-        if type(reported_count) is int and reported_count > 0:
+        if "delivery_count" in terminal:
+            if type(reported_count) is not int or reported_count <= 0:
+                return False
+            if final_type != "geometry" and reported_count != len(delivery_ids):
+                return False
             terminal_count = reported_count
         else:
-            delivery_ids = terminal.get("delivery_entity_ids")
-            if delivery_ids is None:
-                delivery_ids = terminal.get("created_entity_ids")
-            if not isinstance(delivery_ids, list) or not delivery_ids:
-                return False
             terminal_count = len(delivery_ids)
         expected_buckets[bucket] += terminal_count
         terminal_types.append(final_type)
@@ -742,6 +872,8 @@ def _freecad_actual_text_entity_types_verified(
     expected_total = sum(expected_buckets.values())
     expected_structural = expected_total - expected_buckets["raster_text_patch"]
 
+    if entity_types.get("delivery_counts_valid") is not True:
+        return False
     actual_type = (
         str(entity_types.get("entity_type") or "")
         .strip()
@@ -1048,6 +1180,7 @@ class TextEntityVerification:
     dxf_text: int = 0
     raster_image: int = 0
     fallback_geometry: int = 0
+    delivery_counts_valid: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

@@ -24,7 +24,9 @@ class TestImportReportHumanSummary(unittest.TestCase):
                 "type_id": "Part::Feature",
                 "representation": "",
                 "source_item_id": "",
+                "parent_source_item_id": "",
                 "category": "vector_primitives",
+                "content": {"shape_nonempty": True},
             }
             for index in range(vector_count)
         ]
@@ -34,7 +36,17 @@ class TestImportReportHumanSummary(unittest.TestCase):
                 "type_id": "App::FeaturePython",
                 "representation": "labels",
                 "source_item_id": "p1:text:0",
+                "parent_source_item_id": "",
                 "category": "text_representation_objects",
+                "content": {
+                    "proxy_type": "Label",
+                    "text": ["LABEL"],
+                    "custom_text": ["LABEL"],
+                    "font_name": "Arial",
+                    "justification": "Left",
+                    "color_rgb": "0,0,0",
+                    "font_size": 10.0,
+                },
             }
             for entity_id in text_ids
         )
@@ -60,6 +72,7 @@ class TestImportReportHumanSummary(unittest.TestCase):
         if text_ids:
             type_counts["App::FeaturePython"] = len(text_ids)
         inventory = {
+            "schema": "bcs.freecad_host_object_inventory/1.1",
             "verified": True,
             "entity_ids": entity_ids,
             "type_counts": type_counts,
@@ -77,6 +90,8 @@ class TestImportReportHumanSummary(unittest.TestCase):
             "expected_counts": counts,
             "actual_counts": counts,
             "counts_match": True,
+            "expected_objects": records,
+            "actual_objects": records,
         }
         return inventory, save_reopen
 
@@ -176,7 +191,10 @@ class TestImportReportHumanSummary(unittest.TestCase):
                             "attempted_type": "labels",
                             "final_type": "labels",
                             "outcome": "verified",
+                            "created_entity_ids": ["Label001", "Label002"],
                             "delivery_entity_ids": ["Label001", "Label002"],
+                            "support_entity_ids": [],
+                            "removed_entity_ids": [],
                         }
                     ],
                 },

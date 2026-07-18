@@ -696,8 +696,67 @@ def _build_text_representation_delivery(
         except (TypeError, ValueError):
             return ""
 
+    def source_page_number(source_item_id: str) -> Optional[int]:
+        match = re.match(r"^p([1-9][0-9]*):", source_item_id)
+        return int(match.group(1)) if match else None
+
+    def proof_authority_error(
+        proof: Any,
+        *,
+        source_item_id: str,
+        requested_type: str,
+        attempted_type: str,
+    ) -> str:
+        """Return why a report proof is not bound to one exact source item."""
+
+        if not isinstance(proof, dict):
+            return "proof_missing"
+        if proof.get("importer_identity") != FREECAD_TEXT_IMPORTER_IDENTITY:
+            return "proof_importer_identity_invalid"
+        digest = proof.get("pdf_sha256")
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            return "proof_pdf_sha256_invalid"
+        page_number = proof.get("page_number")
+        expected_page_number = source_page_number(source_item_id)
+        if (
+            type(page_number) is not int
+            or page_number <= 0
+            or expected_page_number is None
+            or page_number != expected_page_number
+        ):
+            return "proof_page_invalid"
+        if proof.get("source_item_id") != source_item_id:
+            return "proof_source_item_id_invalid"
+        if normalize_type(proof.get("requested_type")) != requested_type:
+            return "proof_requested_type_invalid"
+        if normalize_type(proof.get("attempted_type")) != attempted_type:
+            return "proof_attempted_type_invalid"
+
+        attempted_source_results = proof.get("attempted_source_results")
+        if not isinstance(attempted_source_results, list) or not attempted_source_results:
+            return "proof_source_results_invalid"
+        for result in attempted_source_results:
+            if not isinstance(result, dict):
+                return "proof_source_results_invalid"
+            if "pdf_sha256" in result and result.get("pdf_sha256") != digest:
+                return "proof_source_result_pdf_sha256_invalid"
+            if "page_number" in result and (
+                type(result.get("page_number")) is not int
+                or result.get("page_number") != page_number
+            ):
+                return "proof_source_result_page_invalid"
+            if (
+                "source_item_id" in result
+                and result.get("source_item_id") != source_item_id
+            ):
+                return "proof_source_result_item_id_invalid"
+        return ""
+
     requested_raw = str(getattr(opts, "text_mode", "") or "none").strip().lower()
     requested = normalize_type(requested_raw)
+    expected_pdf_digest = str(getattr(opts, "_pdf_sha256", "") or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", expected_pdf_digest) is None:
+        expected_pdf_digest = ""
     required = bool(getattr(opts, "import_text", False) and requested != "none")
     raw_attempts = list(attempts or [])
     normalized_attempts = [
@@ -714,21 +773,30 @@ def _build_text_representation_delivery(
         invalid_reasons.append("requested_type_unsupported")
 
     for index, attempt in enumerate(normalized_attempts):
-        source_id = str(attempt.get("source_item_id") or "").strip()
-        if not source_id:
+        source_id = attempt.get("source_item_id")
+        if (
+            not isinstance(source_id, str)
+            or not source_id
+            or source_id != source_id.strip()
+        ):
             invalid_reasons.append("attempt_%d_missing_source_item_id" % index)
             continue
         if source_id not in source_ids:
             source_ids.append(source_id)
         attempts_by_source.setdefault(source_id, []).append(attempt)
 
+    raw_fallback_events = list(getattr(opts, "text_mode_fallbacks", []) or [])
     fallback_events = [
         dict(event)
-        for event in (getattr(opts, "text_mode_fallbacks", []) or [])
+        for event in raw_fallback_events
         if isinstance(event, dict)
     ]
+    if len(fallback_events) != len(raw_fallback_events):
+        invalid_reasons.append("malformed_fallback_event")
     final_types: Dict[str, str] = {}
     terminal_attempts: List[Dict[str, Any]] = []
+    removed_entity_ids: List[str] = []
+    matched_fallback_event_indexes = set()
     for source_id in source_ids:
         source_attempts = attempts_by_source[source_id]
         terminal = source_attempts[-1]
@@ -788,6 +856,8 @@ def _build_text_representation_delivery(
                 invalid_reasons.append(
                     "%s_attempt_%d_cleanup_entity_mismatch" % (source_id, local_index)
                 )
+            if isinstance(removed_ids, list):
+                removed_entity_ids.extend(removed_ids)
             if (
                 not isinstance(prior_proof, dict)
                 or prior_proof.get("item_specific_proven_impossible") is not True
@@ -808,11 +878,27 @@ def _build_text_representation_delivery(
                 invalid_reasons.append(
                     "%s_attempt_%d_proof_invalid" % (source_id, local_index)
                 )
+            proof_error = proof_authority_error(
+                prior_proof,
+                source_item_id=source_id,
+                requested_type=requested,
+                attempted_type=prior_attempted,
+            )
+            if proof_error:
+                invalid_reasons.append(
+                    "%s_attempt_%d_%s" % (source_id, local_index, proof_error)
+                )
+            elif (
+                expected_pdf_digest
+                and prior_proof.get("pdf_sha256") != expected_pdf_digest
+            ):
+                invalid_reasons.append(
+                    "%s_attempt_%d_proof_pdf_sha256_mismatch"
+                    % (source_id, local_index)
+                )
 
         outcome = str(terminal.get("outcome") or "").strip().lower()
-        final_type = normalize_type(
-            terminal.get("final_type") or terminal.get("attempted_type")
-        )
+        final_type = normalize_type(terminal.get("final_type"))
         terminal_attempted = normalize_type(terminal.get("attempted_type"))
         final_types[source_id] = final_type
         if outcome != "verified":
@@ -821,6 +907,16 @@ def _build_text_representation_delivery(
             invalid_reasons.append("%s_cleanup_unverified" % source_id)
         if not isinstance(terminal.get("evidence"), dict) or not terminal.get("evidence"):
             invalid_reasons.append("%s_host_evidence_missing" % source_id)
+        elif final_type == "labels":
+            label_evidence = terminal["evidence"]
+            if (
+                label_evidence.get("host_entity_type") != "App::FeaturePython"
+                or label_evidence.get("host_proxy_type") != "Label"
+                or label_evidence.get("source_text_preserved") is not True
+                or label_evidence.get("view_style_verified") is not True
+                or label_evidence.get("label_marker_absent") is not True
+            ):
+                invalid_reasons.append("%s_label_visual_evidence_unverified" % source_id)
         if not final_type or final_type == "none":
             invalid_reasons.append("%s_final_type_missing" % source_id)
         if not terminal_attempted or final_type != terminal_attempted:
@@ -854,17 +950,28 @@ def _build_text_representation_delivery(
             removed_set = set(removed_ids)
             delivery_set = set(delivery_ids)
             support_set = set(support_ids)
+            removed_entity_ids.extend(removed_ids)
             if (
                 not created_set
                 or not delivery_set
                 or not removed_set.issubset(created_set)
-                or not delivery_set.issubset(created_set)
-                or not support_set.issubset(created_set)
+                or not delivery_set.issubset(created_set.difference(removed_set))
+                or not support_set.issubset(created_set.difference(removed_set))
                 or delivery_set.intersection(support_set)
-                or delivery_set.union(support_set) != created_set
-                or delivery_set.intersection(removed_set)
+                or delivery_set.union(support_set)
+                != created_set.difference(removed_set)
             ):
                 invalid_reasons.append("%s_terminal_ownership_invalid" % source_id)
+            reported_delivery_count = terminal.get("delivery_count")
+            if "delivery_count" in terminal and (
+                type(reported_delivery_count) is not int
+                or reported_delivery_count <= 0
+                or (
+                    final_type != "geometry"
+                    and reported_delivery_count != len(delivery_set)
+                )
+            ):
+                invalid_reasons.append("%s_delivery_count_invalid" % source_id)
 
         expected_proof_chain = [
             prior.get("proof") for prior in source_attempts[:-1]
@@ -895,16 +1002,23 @@ def _build_text_representation_delivery(
                 for prior in source_attempts[:-1]
                 for entity_id in list(prior.get("removed_entity_ids") or [])
             ]
-            fallback_verified = any(
-                normalize_type(event.get("requested")) == requested
+            fallback_proof_attempted = (
+                attempted_sequence[-2] if len(attempted_sequence) >= 2 else ""
+            )
+            matching_fallback_event_indexes = [
+                event_index
+                for event_index, event in enumerate(fallback_events)
+                if normalize_type(event.get("requested")) == requested
                 and normalize_type(event.get("delivered")) == final_type
-                and source_id in list(event.get("source_item_ids") or [])
+                and event.get("source_item_ids") == [source_id]
                 and type(event.get("count")) is int
-                and event.get("count") > 0
+                and event.get("count") == 1
                 and isinstance(event.get("proof"), dict)
                 and event["proof"].get("item_specific_proven_impossible") is True
                 and str(event["proof"].get("source_item_id") or "") == source_id
                 and normalize_type(event["proof"].get("requested_type")) == requested
+                and normalize_type(event["proof"].get("attempted_type"))
+                == fallback_proof_attempted
                 and event["proof"].get("attempted_types") == attempted_sequence
                 and event["proof"].get("proof_chain") == expected_proof_chain
                 and event["proof"].get("transition_chain") == expected_transitions
@@ -913,10 +1027,25 @@ def _build_text_representation_delivery(
                 and event["proof"].get("cleanup_complete") is True
                 and isinstance(event["proof"].get("evidence"), dict)
                 and bool(event["proof"].get("evidence"))
-                for event in fallback_events
-            )
+                and not proof_authority_error(
+                    event["proof"],
+                    source_item_id=source_id,
+                    requested_type=requested,
+                    attempted_type=fallback_proof_attempted,
+                )
+                and (
+                    not expected_pdf_digest
+                    or event["proof"].get("pdf_sha256") == expected_pdf_digest
+                )
+            ]
+            fallback_verified = len(matching_fallback_event_indexes) == 1
+            if fallback_verified:
+                matched_fallback_event_indexes.add(matching_fallback_event_indexes[0])
             if not fallback_verified:
                 invalid_reasons.append("%s_fallback_proof_missing" % source_id)
+
+    if len(matched_fallback_event_indexes) != len(fallback_events):
+        invalid_reasons.append("unbound_or_inflated_fallback_event")
 
     if required and not source_ids:
         invalid_reasons.append("no_item_bound_delivery_attempts")
@@ -928,6 +1057,7 @@ def _build_text_representation_delivery(
         "attempt_count": len(normalized_attempts),
         "source_item_ids": source_ids,
         "terminal_attempts": terminal_attempts,
+        "removed_entity_ids": list(dict.fromkeys(removed_entity_ids)),
         "final_types": final_types,
         "invalid_reasons": list(dict.fromkeys(invalid_reasons)),
         "verified": verified,
@@ -970,10 +1100,26 @@ def write_import_report(
     # Add text entity info to extra if available
     if hasattr(opts, '_report_extra') and opts._report_extra:
         extra.update(opts._report_extra)
+    raw_delivered_counts = getattr(opts, "text_delivered_counts", {}) or {}
+    raw_delivered_count_items = (
+        list(raw_delivered_counts.items())
+        if isinstance(raw_delivered_counts, dict)
+        else []
+    )
+    delivered_counts_valid = bool(
+        isinstance(raw_delivered_counts, dict)
+        and all(
+            isinstance(bucket, str)
+            and bool(bucket)
+            and type(value) is int
+            and value >= 0
+            for bucket, value in raw_delivered_count_items
+        )
+    )
     delivered_counts = {
-        str(k): int(v)
-        for k, v in (getattr(opts, "text_delivered_counts", {}) or {}).items()
-        if int(v or 0) > 0
+        bucket: value
+        for bucket, value in raw_delivered_count_items
+        if isinstance(bucket, str) and type(value) is int and value > 0
     }
     entity_info = extra.get("actual_text_entity_types")
     if isinstance(entity_info, dict):
@@ -994,6 +1140,9 @@ def write_import_report(
             examples=[],
             delivered_counts=delivered_counts,
         )
+    extra["actual_text_entity_types"]["delivery_counts_valid"] = (
+        delivered_counts_valid
+    )
 
     text_attempts = [
         dict(attempt)
@@ -1017,14 +1166,16 @@ def write_import_report(
     text_fallback_events = [
         dict(event)
         for event in (getattr(opts, "text_mode_fallbacks", []) or [])
-        if int(event.get("count", 0) or 0) > 0
+        if isinstance(event, dict)
+        and type(event.get("count")) is int
+        and event.get("count") > 0
         and bool((event.get("proof") or {}).get("item_specific_proven_impossible"))
         and bool(event.get("source_item_ids"))
     ]
     text_fallback: Optional[Dict[str, Any]] = None
     if text_fallback_events:
         text_fallback = dict(
-            max(text_fallback_events, key=lambda ev: int(ev.get("count", 0) or 0))
+            max(text_fallback_events, key=lambda ev: ev.get("count", 0))
         )
         extra["text_mode_fallbacks"] = text_fallback_events
 
@@ -3291,7 +3442,8 @@ def _record_text_mode_fallback(
             "requested representation must be item-specifically proven impossible"
         )
     if (
-        int(count or 0) <= 0
+        type(count) is not int
+        or count <= 0
         or not requested
         or not delivered
         or requested == delivered
@@ -3312,7 +3464,10 @@ def _record_text_mode_fallback(
             source_ids = list(event.get("source_item_ids") or [])
             if source_item_id not in source_ids:
                 source_ids.append(source_item_id)
-                event["count"] = int(event.get("count", 0)) + int(count)
+                prior_count = event.get("count")
+                if type(prior_count) is not int or prior_count <= 0:
+                    raise ValueError("existing fallback record count is invalid")
+                event["count"] = prior_count + count
             event["source_item_ids"] = source_ids
             return
     events.append(
@@ -3320,7 +3475,7 @@ def _record_text_mode_fallback(
             "requested": requested,
             "delivered": delivered,
             "reason": reason,
-            "count": int(count),
+            "count": count,
             "source_item_ids": [source_item_id],
             "proof": proof,
         }
@@ -3338,9 +3493,9 @@ def _record_explicit_page_raster_delivery(
     requested = _normalize_requested_text_type(str(getattr(opts, "text_mode", "") or ""))
     if requested != "raster" or not bool(getattr(opts, "import_text", False)):
         raise ValueError("explicit page Raster delivery was not requested")
-    page_number = int(page_num)
-    if page_number < 1 or not isinstance(raster_result, dict):
+    if type(page_num) is not int or page_num < 1 or not isinstance(raster_result, dict):
         raise ValueError("explicit page Raster context is invalid")
+    page_number = page_num
     if raster_result.get("outcome", "verified") != "verified":
         raise ValueError("explicit page Raster was not verified")
     raster_ids = _validated_entity_ids(
@@ -3359,8 +3514,11 @@ def _record_explicit_page_raster_delivery(
         "final_type": "raster",
         "outcome": "verified",
         "created_entity_ids": list(raster_ids),
+        "delivery_entity_ids": list(raster_ids),
+        "support_entity_ids": [],
         "removed_entity_ids": [],
         "cleanup_complete": True,
+        "delivery_count": len(raster_ids),
         "evidence": raster_evidence,
     }
     _append_text_item_attempt(opts, attempt)
@@ -3392,17 +3550,26 @@ def _record_no_source_text_page_fallback(
             page_num=page_num,
             raster_result=raster_result,
         )
-    page_number = int(page_num)
-    source_item_id = "p%d:page" % page_number
-    digest = str(pdf_sha256 or "").strip().lower()
+    page_number = page_num
+    digest = pdf_sha256.strip().lower() if isinstance(pdf_sha256, str) else ""
     if (
-        page_number < 1
+        type(page_number) is not int
+        or page_number < 1
         or re.fullmatch(r"[0-9a-f]{64}", digest) is None
         or not isinstance(raw_tdict, dict)
         or not isinstance(raster_result, dict)
         or raster_result.get("outcome", "verified") != "verified"
     ):
         raise ValueError("no-source page fallback context is invalid")
+    source_item_id = "p%d:page" % page_number
+    try:
+        canonical_source_items = list(
+            _iter_text_source_items(raw_tdict, page_number, digest, requested)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("no-source page fallback source text is invalid") from exc
+    if canonical_source_items:
+        raise ValueError("no-source page fallback found canonical source text")
     raster_ids = _validated_entity_ids(
         raster_result.get("created_entity_ids"),
         field_name="raster_result.created_entity_ids",
@@ -3505,8 +3672,11 @@ def _record_no_source_text_page_fallback(
                 else "verified page Raster after finite no-source-text proof chain"
             ),
             "created_entity_ids": list(raster_ids),
+            "delivery_entity_ids": list(raster_ids),
+            "support_entity_ids": [],
             "removed_entity_ids": [],
             "cleanup_complete": True,
+            "delivery_count": len(raster_ids),
             "attempted_types": list(attempted_types),
             "proof_chain": [dict(proof) for proof in proof_chain],
             "evidence": raster_evidence,
@@ -3522,7 +3692,7 @@ def _record_no_source_text_page_fallback(
                 "page_number": page_number,
                 "source_item_id": source_item_id,
                 "requested_type": requested,
-                "attempted_type": requested,
+                "attempted_type": ladder[-2],
                 "reason_code": "no_source_text_items",
                 "evidence": dict(source_observation),
                 "attempted_types": list(attempted_types),
@@ -3717,16 +3887,17 @@ def _normalize_verified_text_item_result(
     removed_set = set(removed_ids)
     delivery_set = set(delivery_ids)
     support_set = set(support_ids)
+    live_set = created_set.difference(removed_set)
     if not removed_set.issubset(created_set):
         raise ValueError("deliverer result reports removal of an unowned entity")
     if (
-        not delivery_set.issubset(created_set)
-        or not support_set.issubset(created_set)
+        not delivery_set.issubset(live_set)
+        or not support_set.issubset(live_set)
         or delivery_set.intersection(support_set)
-        or delivery_set.union(support_set) != created_set
+        or delivery_set.union(support_set) != live_set
     ):
         raise ValueError("deliverer result delivery/support ownership is invalid")
-    if not created_set.difference(removed_set):
+    if not live_set:
         raise ValueError("deliverer result has no verified final entity")
     if result.get("cleanup_complete") is not True:
         raise ValueError("deliverer result cleanup is unverified")
@@ -4062,6 +4233,97 @@ def _host_object_source_item_id(obj) -> str:
         return ""
 
 
+def _host_object_parent_source_item_id(obj) -> str:
+    try:
+        return str(getattr(obj, "PDFParentSourceItemId", "") or "")
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return ""
+
+
+def _host_object_text_values(obj, property_name: str) -> List[str]:
+    try:
+        value = getattr(obj, property_name)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return []
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    try:
+        return [str(item) for item in list(value)]
+    except (TypeError, ValueError, RuntimeError):
+        text = str(value or "")
+        return [text] if text else []
+
+
+def _host_image_content_snapshot(image_file: str) -> Dict[str, Any]:
+    """Identify a persisted image by stable name and bytes, not cache directory."""
+
+    raw_path = str(image_file or "")
+    snapshot: Dict[str, Any] = {
+        "image_file": Path(raw_path).name if raw_path else "",
+        "image_sha256": "",
+        "image_bytes": 0,
+    }
+    if not raw_path:
+        return snapshot
+    try:
+        path = Path(raw_path)
+        byte_count = path.stat().st_size
+        if byte_count <= 0:
+            return snapshot
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        snapshot["image_sha256"] = digest.hexdigest()
+        snapshot["image_bytes"] = int(byte_count)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        pass
+    return snapshot
+
+
+def _host_object_content_snapshot(
+    obj,
+    type_id: str,
+    representation: str,
+) -> Dict[str, Any]:
+    """Capture persisted content that metadata-only delivery cannot imitate."""
+
+    content: Dict[str, Any] = {}
+    if type_id.startswith(("Part::", "PartDesign::", "Sketcher::")):
+        content["shape_nonempty"] = _has_nonempty_host_geometry(obj, type_id)
+    if representation == "labels":
+        try:
+            proxy_type = str(getattr(getattr(obj, "Proxy", None), "Type", "") or "")
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            proxy_type = ""
+        content.update(
+            {
+                "proxy_type": proxy_type,
+                "text": _host_object_text_values(obj, "Text"),
+                "custom_text": _host_object_text_values(obj, "CustomText"),
+                "font_name": str(getattr(obj, "PDFTextFontName", "") or ""),
+                "justification": str(
+                    getattr(obj, "PDFTextJustification", "") or ""
+                ),
+                "color_rgb": str(getattr(obj, "PDFTextColorRGB", "") or ""),
+            }
+        )
+        try:
+            font_size = float(getattr(obj, "PDFTextFontSize"))
+            content["font_size"] = font_size if math.isfinite(font_size) else None
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            content["font_size"] = None
+    if representation == "raster" or type_id.startswith("Image::"):
+        try:
+            image_file = str(getattr(obj, "ImageFile", "") or "")
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            image_file = ""
+        content.update(_host_image_content_snapshot(image_file))
+    return content
+
+
 def _is_host_container(obj, type_id: str) -> bool:
     if type_id.startswith("App::DocumentObjectGroup"):
         return True
@@ -4110,7 +4372,7 @@ def _build_host_object_inventory(objects: List[Any]) -> Dict[str, Any]:
         "text_representation_objects": [],
         "unclassified": [],
     }
-    records: List[Dict[str, str]] = []
+    records: List[Dict[str, Any]] = []
     type_counts: Dict[str, int] = {}
     entity_ids: List[str] = []
     for host_obj in list(objects or []):
@@ -4118,6 +4380,7 @@ def _build_host_object_inventory(objects: List[Any]) -> Dict[str, Any]:
         type_id = _host_object_type_id(host_obj)
         representation = _host_object_representation(host_obj)
         source_item_id = _host_object_source_item_id(host_obj)
+        parent_source_item_id = _host_object_parent_source_item_id(host_obj)
         category = _host_object_category(host_obj, type_id, representation)
         records.append(
             {
@@ -4125,7 +4388,11 @@ def _build_host_object_inventory(objects: List[Any]) -> Dict[str, Any]:
                 "type_id": type_id,
                 "representation": representation,
                 "source_item_id": source_item_id,
+                "parent_source_item_id": parent_source_item_id,
                 "category": category,
+                "content": _host_object_content_snapshot(
+                    host_obj, type_id, representation
+                ),
             }
         )
         entity_ids.append(entity_id)
@@ -4138,7 +4405,7 @@ def _build_host_object_inventory(objects: List[Any]) -> Dict[str, Any]:
     counts = {"total": len(records)}
     counts.update({key: len(value) for key, value in categories.items()})
     return {
-        "schema": "bcs.freecad_host_object_inventory/1.0",
+        "schema": "bcs.freecad_host_object_inventory/1.1",
         "verified": unique_nonempty_ids,
         "entity_ids": entity_ids,
         "type_counts": type_counts,
@@ -4174,7 +4441,7 @@ def _crosscheck_host_object_inventory(
     ]
 
     missing: List[str] = []
-    mismatches: List[Dict[str, str]] = []
+    mismatches: List[Dict[str, Any]] = []
     matched_objects: List[Any] = []
     for expected in expected_records:
         entity_id = str(expected.get("entity_id") or "")
@@ -4189,10 +4456,17 @@ def _crosscheck_host_object_inventory(
         expected_representation = str(expected.get("representation") or "")
         actual_source_id = _host_object_source_item_id(actual)
         expected_source_id = str(expected.get("source_item_id") or "")
+        actual_parent_source_id = _host_object_parent_source_item_id(actual)
+        expected_parent_source_id = str(expected.get("parent_source_item_id") or "")
+        actual_content = _host_object_content_snapshot(
+            actual, actual_type, actual_representation
+        )
+        expected_content = expected.get("content")
         if (
             actual_type != expected_type
             or actual_representation != expected_representation
             or actual_source_id != expected_source_id
+            or actual_parent_source_id != expected_parent_source_id
         ):
             mismatch = {
                 "entity_id": entity_id,
@@ -4204,7 +4478,18 @@ def _crosscheck_host_object_inventory(
             if actual_source_id != expected_source_id:
                 mismatch["expected_source_item_id"] = expected_source_id
                 mismatch["actual_source_item_id"] = actual_source_id
+            if actual_parent_source_id != expected_parent_source_id:
+                mismatch["expected_parent_source_item_id"] = expected_parent_source_id
+                mismatch["actual_parent_source_item_id"] = actual_parent_source_id
             mismatches.append(mismatch)
+        elif isinstance(expected_content, dict) and actual_content != expected_content:
+            mismatches.append(
+                {
+                    "entity_id": entity_id,
+                    "expected_content": expected_content,
+                    "actual_content": actual_content,
+                }
+            )
 
     actual_inventory = _build_host_object_inventory(list(actual_objects or []))
     expected_counts = dict(expected_inventory.get("counts") or {})
@@ -4232,6 +4517,8 @@ def _crosscheck_host_object_inventory(
         "expected_counts": expected_counts,
         "actual_counts": actual_counts,
         "counts_match": counts_match,
+        "expected_objects": expected_records,
+        "actual_objects": list(actual_inventory.get("objects") or []),
     }
 
 
@@ -4254,6 +4541,8 @@ def _save_reopen_host_object_inventory(
         "expected_counts": dict(inventory.get("counts") or {}),
         "actual_counts": {},
         "counts_match": False,
+        "expected_objects": list(inventory.get("objects") or []),
+        "actual_objects": [],
     }
     if FreeCAD is None:
         failure["error"] = "freecad_runtime_unavailable"
@@ -5111,6 +5400,33 @@ def _deliver_text_item_native(
             {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
         )
 
+    delivery_evidence = {
+        "host_entity_type": str(getattr(host_obj, "TypeId", "") or ""),
+        "host_proxy_type": actual_proxy_type,
+        "source_text": source_text,
+        "source_text_preserved": True,
+        "source_item_id_verified": True,
+        "expected_anchor_xyz": expected_anchor,
+        "verified_anchor_xyz": tuple(actual_anchor),
+        "rotation_deg": float(actual_rotation),
+        "font_name": normalized_font,
+        "font_size": float(actual_font_size),
+        "source_color": source_color,
+        "color_verified": bool(color_verified),
+        "style_verification": style_verification,
+        "view_style_verified": bool(view_style_verified),
+    }
+    if attempted_type == "labels":
+        # A coincident Draft Label leader can still display a visible marker.
+        # Until the reopened GUI proves that marker absent, the report must
+        # remain pending instead of treating placement metadata as appearance.
+        delivery_evidence.update(
+            {
+                "label_marker_absent": False,
+                "label_marker_verification": "pending",
+            }
+        )
+
     return {
         "source_item_id": source_item_id,
         "requested_type": requested_type,
@@ -5118,24 +5434,12 @@ def _deliver_text_item_native(
         "final_type": attempted_type,
         "outcome": "verified",
         "created_entity_ids": [entity_id],
+        "delivery_entity_ids": [entity_id],
+        "support_entity_ids": [],
         "removed_entity_ids": [],
         "cleanup_complete": True,
-        "evidence": {
-            "host_entity_type": str(getattr(host_obj, "TypeId", "") or ""),
-            "host_proxy_type": actual_proxy_type,
-            "source_text": source_text,
-            "source_text_preserved": True,
-            "source_item_id_verified": True,
-            "expected_anchor_xyz": expected_anchor,
-            "verified_anchor_xyz": tuple(actual_anchor),
-            "rotation_deg": float(actual_rotation),
-            "font_name": normalized_font,
-            "font_size": float(actual_font_size),
-            "source_color": source_color,
-            "color_verified": bool(color_verified),
-            "style_verification": style_verification,
-            "view_style_verified": bool(view_style_verified),
-        },
+        "delivery_count": 1,
+        "evidence": delivery_evidence,
     }
 
 

@@ -6,6 +6,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 for path in (REPO_ROOT / "PDFVectorImporter" / "src", REPO_ROOT / "PDFVectorImporter"):
@@ -23,12 +25,26 @@ class HostObject:
         *,
         representation: str = "",
         source_item_id: str = "",
+        parent_source_item_id: str = "",
         shape_nonempty: bool = True,
+        proxy_type: str = "",
+        text=None,
+        custom_text=None,
+        image_file: str = "",
     ) -> None:
         self.Name = name
         self.TypeId = type_id
         self.PDFRepresentation = representation
         self.PDFSourceItemId = source_item_id
+        self.PDFParentSourceItemId = parent_source_item_id
+        if proxy_type:
+            self.Proxy = type("Proxy", (), {"Type": proxy_type})()
+        if text is not None:
+            self.Text = text
+        if custom_text is not None:
+            self.CustomText = custom_text
+        if image_file:
+            self.ImageFile = image_file
         if type_id.startswith("Part::"):
             self.Shape = Shape(shape_nonempty)
 
@@ -41,6 +57,7 @@ class HostObject:
 class Shape:
     def __init__(self, nonempty: bool) -> None:
         self._nonempty = nonempty
+        self.Edges = [object()] if nonempty else []
 
     def isNull(self) -> bool:
         return not self._nonempty
@@ -54,6 +71,7 @@ def _aws_objects():
             "Image::ImagePlane",
             representation="raster",
             source_item_id="p1:page",
+            image_file="aws-page-1.png",
         ),
     ]
 
@@ -173,7 +191,14 @@ def _direct_label_opts(*, delivered_count: bool = True) -> core.ImportOptions:
             "cleanup_complete": True,
             "attempted_types": ["labels"],
             "proof_chain": [],
-            "evidence": {"host_entity_type": "App::FeaturePython"},
+            "evidence": {
+                "host_entity_type": "App::FeaturePython",
+                "host_proxy_type": "Label",
+                "source_text": "LABEL",
+                "source_text_preserved": True,
+                "view_style_verified": True,
+                "label_marker_absent": True,
+            },
         }
     )
     if delivered_count:
@@ -189,6 +214,9 @@ def _label_objects():
             "App::FeaturePython",
             representation="labels",
             source_item_id="p1:text:0",
+            proxy_type="Label",
+            text=["LABEL"],
+            custom_text=["LABEL"],
         ),
     ]
 
@@ -594,3 +622,623 @@ def test_valid_mixed_item_fallback_is_not_a_representation_violation(tmp_path) -
     extra = json.loads(report_path.read_text(encoding="utf-8"))["extra"]
     assert "representation_contract_violation" not in extra
     assert extra["import_contract_ready"]["ready"] is True
+
+
+@pytest.mark.parametrize(
+    ("representation", "child_suffix", "delivery_count", "bucket"),
+    (
+        ("glyphs", ":g0", 1, "outline_curve_or_mesh"),
+        ("geometry", ":geometry", 7, "raw_geometry_edges"),
+    ),
+)
+def test_svg_child_delivery_binds_through_its_persisted_parent_source_id(
+    tmp_path,
+    representation,
+    child_suffix,
+    delivery_count,
+    bucket,
+) -> None:
+    """Legitimate SVG children must not be blocked by their child-level IDs."""
+
+    parent_source_id = "p1:b0:l0:s0"
+    entity_id = "SVGChild001"
+    opts = core.ImportOptions(
+        import_mode="vector",
+        import_text=True,
+        text_mode=representation,
+    )
+    opts.text_delivery_attempts.append(
+        {
+            "source_item_id": parent_source_id,
+            "requested_type": representation,
+            "attempted_type": representation,
+            "final_type": representation,
+            "outcome": "verified",
+            "created_entity_ids": [entity_id],
+            "delivery_entity_ids": [entity_id],
+            "support_entity_ids": [],
+            "removed_entity_ids": [],
+            "cleanup_complete": True,
+            "delivery_count": delivery_count,
+            "evidence": {"child_source_item_ids": [parent_source_id + child_suffix]},
+        }
+    )
+    opts.text_delivered_counts[bucket] = delivery_count
+    objects = [
+        HostObject("PDF_Page_1", "App::DocumentObjectGroup"),
+        HostObject(
+            entity_id,
+            "Part::Feature",
+            representation=representation,
+            source_item_id=parent_source_id + child_suffix,
+            parent_source_item_id=parent_source_id,
+        ),
+    ]
+    _attach_inventory(opts, objects)
+    report_path = tmp_path / (representation + "-child-binding.json")
+
+    core.write_import_report(
+        pdf_path=str(tmp_path / "drawing.pdf"),
+        output_path=str(report_path),
+        opts=opts,
+        pages_imported=1,
+        total_pages=1,
+        text_count=delivery_count,
+    )
+
+    ready = json.loads(report_path.read_text(encoding="utf-8"))["extra"][
+        "import_contract_ready"
+    ]
+    assert ready["checks"]["delivery_inventory_binding"] is True
+    assert ready["ready"] is True
+
+
+def test_ready_rejects_prior_attempt_entity_that_still_exists_after_reopen(
+    tmp_path,
+) -> None:
+    """A removed ID cannot remain in the actual persisted host inventory."""
+
+    opts = _aws_fallback_opts()
+    leaked_id = "LeakedLabel001"
+    first_attempt = opts.text_delivery_attempts[0]
+    first_attempt["created_entity_ids"] = [leaked_id]
+    first_attempt["removed_entity_ids"] = [leaked_id]
+    first_attempt["proof"]["created_entity_ids"] = [leaked_id]
+    first_attempt["proof"]["removed_entity_ids"] = [leaked_id]
+    fallback_proof = opts.text_mode_fallbacks[0]["proof"]
+    fallback_proof["created_entity_ids"] = [leaked_id]
+    fallback_proof["removed_entity_ids"] = [leaked_id]
+    objects = _aws_objects() + [
+        HostObject(
+            leaked_id,
+            "App::FeaturePython",
+            representation="labels",
+            source_item_id="p1:page",
+        )
+    ]
+    _attach_inventory(opts, objects)
+    report_path = tmp_path / "leaked-cleanup-entity.json"
+
+    core.write_import_report(
+        pdf_path=str(tmp_path / "AWSWeldSymbolchart.pdf"),
+        output_path=str(report_path),
+        opts=opts,
+        pages_imported=1,
+        total_pages=1,
+        image_count=1,
+    )
+
+    ready = json.loads(report_path.read_text(encoding="utf-8"))["extra"][
+        "import_contract_ready"
+    ]
+    assert ready["checks"]["delivery_inventory_binding"] is False
+    assert ready["ready"] is False
+
+
+def test_ready_rejects_terminal_count_not_bound_to_delivery_host_ids(tmp_path) -> None:
+    """A logical count cannot certify host entities absent from the inventory."""
+
+    opts = _direct_label_opts()
+    opts.text_delivery_attempts[0]["delivery_count"] = 2
+    opts.text_delivered_counts["native_label"] = 2
+    _attach_inventory(opts, _label_objects())
+    report_path = tmp_path / "inflated-terminal-count.json"
+
+    core.write_import_report(
+        pdf_path=str(tmp_path / "drawing.pdf"),
+        output_path=str(report_path),
+        opts=opts,
+        pages_imported=1,
+        total_pages=1,
+        text_count=2,
+    )
+
+    ready = json.loads(report_path.read_text(encoding="utf-8"))["extra"][
+        "import_contract_ready"
+    ]
+    assert ready["checks"]["actual_text_entity_types"] is False
+    assert ready["ready"] is False
+
+
+@pytest.mark.parametrize("proof_page", (1.5, 2))
+def test_ready_rejects_inexact_page_identity_in_item_fallback_proof(
+    tmp_path,
+    proof_page,
+) -> None:
+    """Proof page identity must be exact and agree with the source item ID."""
+
+    opts = _aws_fallback_opts()
+    for attempt in opts.text_delivery_attempts[:-1]:
+        proof = attempt["proof"]
+        proof["page_number"] = proof_page
+        for source_result in proof["attempted_source_results"]:
+            source_result["page_number"] = proof_page
+    fallback_proof = opts.text_mode_fallbacks[0]["proof"]
+    fallback_proof["page_number"] = proof_page
+    for source_result in fallback_proof["attempted_source_results"]:
+        source_result["page_number"] = proof_page
+    _attach_inventory(opts, _aws_objects())
+    report_path = tmp_path / "fractional-proof-page.json"
+
+    core.write_import_report(
+        pdf_path=str(tmp_path / "AWSWeldSymbolchart.pdf"),
+        output_path=str(report_path),
+        opts=opts,
+        pages_imported=1,
+        total_pages=1,
+        image_count=1,
+    )
+
+    delivery = json.loads(report_path.read_text(encoding="utf-8"))["extra"][
+        "text_representation_delivery"
+    ]
+    assert delivery["verified"] is False
+    assert any("page" in reason for reason in delivery["invalid_reasons"])
+
+
+def test_no_source_fallback_rejects_visible_canonical_text() -> None:
+    """The page helper must derive absence instead of trusting its caller."""
+
+    opts = core.ImportOptions(import_mode="vector", import_text=True, text_mode="labels")
+    raw_tdict = {
+        "blocks": [
+            {
+                "type": 0,
+                "lines": [
+                    {
+                        "dir": (1.0, 0.0),
+                        "spans": [
+                            {
+                                "text": "VISIBLE",
+                                "bbox": (0.0, 0.0, 20.0, 10.0),
+                                "origin": (0.0, 8.0),
+                                "size": 10.0,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+
+    with pytest.raises(ValueError, match="source text"):
+        core._record_no_source_text_page_fallback(
+            opts,
+            page_num=1,
+            pdf_sha256="a" * 64,
+            raw_tdict=raw_tdict,
+            raster_result={
+                "outcome": "verified",
+                "created_entity_ids": ["PageRaster001"],
+                "evidence": {"host_entity_type": "Image::ImagePlane"},
+            },
+        )
+
+
+@pytest.mark.parametrize("page_num", (True, 1.5, "1"))
+def test_explicit_raster_page_identity_is_not_coerced(page_num) -> None:
+    opts = core.ImportOptions(import_mode="raster", import_text=True, text_mode="raster")
+
+    with pytest.raises(ValueError, match="context"):
+        core._record_explicit_page_raster_delivery(
+            opts,
+            page_num=page_num,
+            raster_result={
+                "outcome": "verified",
+                "created_entity_ids": ["PageRaster001"],
+                "evidence": {"host_entity_type": "Image::ImagePlane"},
+            },
+        )
+
+
+def test_reopen_crosscheck_rejects_non_raster_shape_that_became_empty() -> None:
+    """Representation metadata cannot hide lost Glyphs/Geometry/3D geometry."""
+
+    expected = core._build_host_object_inventory(
+        [
+            HostObject(
+                "Geometry001",
+                "Part::Feature",
+                representation="geometry",
+                source_item_id="p1:b0:l0:s0:geometry",
+                parent_source_item_id="p1:b0:l0:s0",
+                shape_nonempty=True,
+            )
+        ]
+    )
+    reopened = [
+        HostObject(
+            "Geometry001",
+            "Part::Feature",
+            representation="geometry",
+            source_item_id="p1:b0:l0:s0:geometry",
+            parent_source_item_id="p1:b0:l0:s0",
+            shape_nonempty=False,
+        )
+    ]
+
+    crosscheck = core._crosscheck_host_object_inventory(expected, reopened)
+
+    assert crosscheck["verified"] is False
+    assert crosscheck["mismatched_entities"]
+
+
+def test_reopen_crosscheck_rejects_label_text_content_drift() -> None:
+    """A reopened Label with the right metadata but wrong text is not delivery."""
+
+    expected = core._build_host_object_inventory(
+        [
+            HostObject(
+                "Label001",
+                "App::FeaturePython",
+                representation="labels",
+                source_item_id="p1:b0:l0:s0",
+                proxy_type="Label",
+                text=["SOURCE"],
+                custom_text=["SOURCE"],
+            )
+        ]
+    )
+    reopened = [
+        HostObject(
+            "Label001",
+            "App::FeaturePython",
+            representation="labels",
+            source_item_id="p1:b0:l0:s0",
+            proxy_type="Label",
+            text=["CHANGED"],
+            custom_text=["CHANGED"],
+        )
+    ]
+
+    crosscheck = core._crosscheck_host_object_inventory(expected, reopened)
+
+    assert crosscheck["verified"] is False
+    assert crosscheck["mismatched_entities"]
+
+
+def test_reopen_crosscheck_rejects_raster_that_lost_its_image_content() -> None:
+    expected = core._build_host_object_inventory(
+        [
+            HostObject(
+                "Raster001",
+                "Image::ImagePlane",
+                representation="raster",
+                source_item_id="p1:page",
+                image_file="page.png",
+            )
+        ]
+    )
+    reopened = [
+        HostObject(
+            "Raster001",
+            "Image::ImagePlane",
+            representation="raster",
+            source_item_id="p1:page",
+        )
+    ]
+
+    crosscheck = core._crosscheck_host_object_inventory(expected, reopened)
+
+    assert crosscheck["verified"] is False
+    assert crosscheck["mismatched_entities"]
+
+
+def test_reopen_crosscheck_accepts_relocated_identical_raster_cache(
+    tmp_path,
+) -> None:
+    """FreeCAD rematerializes embedded image assets under a new cache path."""
+
+    expected_dir = tmp_path / "before"
+    actual_dir = tmp_path / "after"
+    expected_dir.mkdir()
+    actual_dir.mkdir()
+    expected_image = expected_dir / "page-source-p1.png"
+    actual_image = actual_dir / expected_image.name
+    expected_image.write_bytes(b"same persisted raster content")
+    actual_image.write_bytes(expected_image.read_bytes())
+    expected = core._build_host_object_inventory(
+        [
+            HostObject(
+                "Raster001",
+                "Image::ImagePlane",
+                representation="raster",
+                source_item_id="p1:page",
+                image_file=str(expected_image),
+            )
+        ]
+    )
+    reopened = [
+        HostObject(
+            "Raster001",
+            "Image::ImagePlane",
+            representation="raster",
+            source_item_id="p1:page",
+            image_file=str(actual_image),
+        )
+    ]
+
+    crosscheck = core._crosscheck_host_object_inventory(expected, reopened)
+
+    assert crosscheck["verified"] is True
+
+
+def test_ready_rejects_metadata_only_label_without_native_label_content(
+    tmp_path,
+) -> None:
+    opts = _direct_label_opts()
+    ghost_objects = [
+        HostObject("PDF_Page_1", "App::DocumentObjectGroup"),
+        HostObject(
+            "Label001",
+            "App::FeaturePython",
+            representation="labels",
+            source_item_id="p1:text:0",
+        ),
+    ]
+    _attach_inventory(opts, ghost_objects)
+    report_path = tmp_path / "metadata-only-label.json"
+
+    core.write_import_report(
+        pdf_path=str(tmp_path / "drawing.pdf"),
+        output_path=str(report_path),
+        opts=opts,
+        pages_imported=1,
+        total_pages=1,
+        text_count=1,
+    )
+
+    ready = json.loads(report_path.read_text(encoding="utf-8"))["extra"][
+        "import_contract_ready"
+    ]
+    assert ready["checks"]["delivery_inventory_binding"] is False
+    assert ready["ready"] is False
+
+
+def test_ready_rejects_headless_label_visual_evidence_as_final(tmp_path) -> None:
+    """Headless metadata is pending evidence, not visual verification."""
+
+    opts = _direct_label_opts()
+    terminal_evidence = opts.text_delivery_attempts[0]["evidence"]
+    terminal_evidence["view_style_verified"] = False
+    terminal_evidence["label_marker_absent"] = False
+    terminal_evidence["style_verification"] = "headless_app_metadata"
+    _attach_inventory(opts, _label_objects())
+    report_path = tmp_path / "headless-label-style.json"
+
+    core.write_import_report(
+        pdf_path=str(tmp_path / "drawing.pdf"),
+        output_path=str(report_path),
+        opts=opts,
+        pages_imported=1,
+        total_pages=1,
+        text_count=1,
+    )
+
+    ready = json.loads(report_path.read_text(encoding="utf-8"))["extra"][
+        "import_contract_ready"
+    ]
+    assert ready["checks"]["text_delivery"] is False
+    assert ready["ready"] is False
+
+
+def test_ready_rejects_fallback_event_with_unbound_items_or_inflated_count(
+    tmp_path,
+) -> None:
+    """One valid item proof cannot authorize extra items or deliveries."""
+
+    opts = _aws_fallback_opts()
+    event = opts.text_mode_fallbacks[0]
+    event["source_item_ids"] = ["p1:page", "p2:ghost"]
+    event["count"] = 99
+    _attach_inventory(opts, _aws_objects())
+    report_path = tmp_path / "inflated-fallback-event.json"
+
+    core.write_import_report(
+        pdf_path=str(tmp_path / "AWSWeldSymbolchart.pdf"),
+        output_path=str(report_path),
+        opts=opts,
+        pages_imported=1,
+        total_pages=1,
+        image_count=1,
+    )
+
+    extra = json.loads(report_path.read_text(encoding="utf-8"))["extra"]
+    assert extra["text_representation_delivery"]["verified"] is False
+    assert extra["import_contract_ready"]["ready"] is False
+
+
+def test_ready_rejects_delivery_whose_live_support_objects_are_absent(
+    tmp_path,
+) -> None:
+    """3D Text support ownership must bind to reopened objects too."""
+
+    source_item_id = "p1:b0:l0:s0"
+    opts = core.ImportOptions(
+        import_mode="vector",
+        import_text=True,
+        text_mode="3d_text",
+    )
+    opts.text_delivery_attempts.append(
+        {
+            "source_item_id": source_item_id,
+            "requested_type": "3d_text",
+            "attempted_type": "3d_text",
+            "final_type": "3d_text",
+            "outcome": "verified",
+            "created_entity_ids": ["ShapeString001", "ScaleSupport001", "Extrusion001"],
+            "delivery_entity_ids": ["Extrusion001"],
+            "support_entity_ids": ["ShapeString001", "ScaleSupport001"],
+            "removed_entity_ids": [],
+            "cleanup_complete": True,
+            "evidence": {
+                "source_text": "3D",
+                "source_text_preserved": True,
+                "solid_count": 1,
+                "volume": 1.0,
+                "view_style_verified": True,
+            },
+        }
+    )
+    opts.text_delivered_counts["native_3d_text"] = 1
+    reopened_objects = [
+        HostObject("PDF_Page_1", "App::DocumentObjectGroup"),
+        HostObject(
+            "Extrusion001",
+            "Part::Extrusion",
+            representation="3d_text",
+            source_item_id=source_item_id,
+        ),
+    ]
+    _attach_inventory(opts, reopened_objects)
+    report_path = tmp_path / "missing-3d-support.json"
+
+    core.write_import_report(
+        pdf_path=str(tmp_path / "drawing.pdf"),
+        output_path=str(report_path),
+        opts=opts,
+        pages_imported=1,
+        total_pages=1,
+        text_count=1,
+    )
+
+    ready = json.loads(report_path.read_text(encoding="utf-8"))["extra"][
+        "import_contract_ready"
+    ]
+    assert ready["checks"]["delivery_inventory_binding"] is False
+    assert ready["ready"] is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("pdf_sha256", "b" * 64),
+        ("importer_identity", "different.importer"),
+    ),
+)
+def test_ready_rejects_item_proof_bound_to_other_source_authority(
+    tmp_path,
+    field,
+    value,
+) -> None:
+    opts = _aws_fallback_opts()
+    for attempt in opts.text_delivery_attempts[:-1]:
+        attempt["proof"][field] = value
+    opts.text_mode_fallbacks[0]["proof"][field] = value
+    _attach_inventory(opts, _aws_objects())
+    report_path = tmp_path / ("wrong-proof-" + field + ".json")
+
+    core.write_import_report(
+        pdf_path=str(tmp_path / "AWSWeldSymbolchart.pdf"),
+        output_path=str(report_path),
+        opts=opts,
+        pages_imported=1,
+        total_pages=1,
+        image_count=1,
+    )
+
+    extra = json.loads(report_path.read_text(encoding="utf-8"))["extra"]
+    assert extra["text_representation_delivery"]["verified"] is False
+    assert extra["import_contract_ready"]["ready"] is False
+
+
+def test_ready_does_not_truncate_fractional_delivered_count(tmp_path) -> None:
+    opts = _direct_label_opts()
+    opts.text_delivered_counts["native_label"] = 1.5
+    _attach_inventory(opts, _label_objects())
+    report_path = tmp_path / "fractional-delivered-count.json"
+
+    core.write_import_report(
+        pdf_path=str(tmp_path / "drawing.pdf"),
+        output_path=str(report_path),
+        opts=opts,
+        pages_imported=1,
+        total_pages=1,
+        text_count=1,
+    )
+
+    ready = json.loads(report_path.read_text(encoding="utf-8"))["extra"][
+        "import_contract_ready"
+    ]
+    assert ready["checks"]["actual_text_entity_types"] is False
+    assert ready["ready"] is False
+
+
+@pytest.mark.parametrize("count", (True, 1.5, "1"))
+def test_fallback_record_count_is_not_coerced(count) -> None:
+    opts = core.ImportOptions(import_mode="vector", import_text=True, text_mode="labels")
+
+    with pytest.raises(ValueError, match="count"):
+        core._record_text_mode_fallback(
+            opts,
+            requested="labels",
+            delivered="text",
+            reason="proof_gated:labels:native_label_unavailable",
+            count=count,
+            source_item_id="p1:b0:l0:s0",
+            proof={
+                "item_specific_proven_impossible": True,
+                "evidence": {"native_label_available": False},
+                "attempted_types": ["labels", "text"],
+            },
+        )
+
+
+def test_terminal_delivery_must_explicitly_preserve_final_representation() -> None:
+    opts = _direct_label_opts()
+    opts.text_delivery_attempts[0].pop("final_type")
+
+    delivery = core._build_text_representation_delivery(
+        opts,
+        opts.text_delivery_attempts,
+    )
+
+    assert delivery["verified"] is False
+    assert any("final_type" in reason for reason in delivery["invalid_reasons"])
+
+
+@pytest.mark.parametrize("source_item_id", (True, 1, 1.5))
+def test_terminal_source_item_identity_is_not_coerced(
+    tmp_path,
+    source_item_id,
+) -> None:
+    opts = _direct_label_opts()
+    opts.text_delivery_attempts[0]["source_item_id"] = source_item_id
+    objects = _label_objects()
+    objects[-1].PDFSourceItemId = str(source_item_id).lower() if source_item_id is True else str(source_item_id)
+    _attach_inventory(opts, objects)
+    report_path = tmp_path / "numeric-source-item-id.json"
+
+    core.write_import_report(
+        pdf_path=str(tmp_path / "drawing.pdf"),
+        output_path=str(report_path),
+        opts=opts,
+        pages_imported=1,
+        total_pages=1,
+        text_count=1,
+    )
+
+    delivery = json.loads(report_path.read_text(encoding="utf-8"))["extra"][
+        "text_representation_delivery"
+    ]
+    assert delivery["verified"] is False

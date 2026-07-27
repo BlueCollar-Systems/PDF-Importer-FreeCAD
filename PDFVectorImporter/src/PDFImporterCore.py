@@ -3439,6 +3439,95 @@ def _run_text_item_fallback_ladder(
     raise TextRepresentationFailure("Text item fallback ladder exhausted", failed)
 
 
+def _build_text_size_crosschecks(opts: ImportOptions) -> Dict[str, Any]:
+    """P1-5 (SU parity): declared-vs-achieved 3D Text size telemetry blocks.
+
+    Width: per delivered native 3D Text span, the achieved/declared
+    baseline-advance ratio from the same measurements the importer already
+    verified against the 3% tolerance (evidence ``verified_advance`` over
+    ``target_advance``/``source_advance``). Height: faithful nominal target
+    heights (PDF text matrix -> FC mm); the per-axis width calibration never
+    rescales the height axis (exactly 1.0), mirroring SketchUp's
+    ``text_height_crosscheck``/``text_width_crosscheck`` report blocks.
+    Returns only the blocks that have data (empty dict on raster-only or
+    text-free imports).
+    """
+    ledger = getattr(opts, "text_delivery_attempts", None)
+    entries = ledger if isinstance(ledger, list) else []
+    width_ratios: List[float] = []
+    height_samples: List[float] = []
+    out_of_tolerance = 0
+    failed_attempts = 0
+    for attempt in entries:
+        if not isinstance(attempt, dict):
+            continue
+        if str(attempt.get("attempted_type") or "") != "3d_text":
+            continue
+        if str(attempt.get("outcome") or "") != "verified":
+            failed_attempts += 1
+            continue
+        evidence = attempt.get("evidence")
+        evidence = evidence if isinstance(evidence, dict) else {}
+        declared = evidence.get("target_advance", evidence.get("source_advance"))
+        achieved = evidence.get("verified_advance")
+        try:
+            declared_f = float(declared)
+            achieved_f = float(achieved)
+        except (TypeError, ValueError):
+            declared_f = achieved_f = float("nan")
+        if (
+            math.isfinite(declared_f)
+            and declared_f > 0.0
+            and math.isfinite(achieved_f)
+            and achieved_f > 0.0
+        ):
+            width_ratios.append(achieved_f / declared_f)
+            if abs(achieved_f - declared_f) > max(0.05, declared_f * 0.03):
+                out_of_tolerance += 1
+        try:
+            nominal_f = float(evidence.get("nominal_height"))
+        except (TypeError, ValueError):
+            nominal_f = float("nan")
+        if math.isfinite(nominal_f) and nominal_f > 0.0:
+            height_samples.append(nominal_f)
+
+    blocks: Dict[str, Any] = {}
+    if width_ratios or failed_attempts:
+        ratios = sorted(width_ratios)
+        blocks["text_width_crosscheck"] = {
+            "sample_count": len(ratios),
+            "min_factor": round(ratios[0], 5) if ratios else 0.0,
+            "median_factor": round(ratios[len(ratios) // 2], 5) if ratios else 0.0,
+            "max_factor": round(ratios[-1], 5) if ratios else 0.0,
+            "policy": "verified_over_declared_baseline_advance",
+            "out_of_tolerance_count": out_of_tolerance,
+            "failed_attempt_count": failed_attempts,
+            "note": (
+                "Achieved/declared baseline-advance ratios for delivered "
+                "native 3D Text spans (per-axis X calibration; the height "
+                "axis is never rescaled). Every delivered span already "
+                "passed the importer's max(0.05mm, 3%) advance verification, "
+                "so out_of_tolerance_count > 0 indicates a verification bug."
+            ),
+        }
+    if height_samples:
+        heights = sorted(height_samples)
+        blocks["text_height_crosscheck"] = {
+            "sample_count": len(heights),
+            "min_mm": round(heights[0], 5),
+            "median_mm": round(heights[len(heights) // 2], 5),
+            "max_mm": round(heights[-1], 5),
+            "policy": "nominal_pdf_text_matrix_height_mm",
+            "note": (
+                "Faithful nominal PDF target heights (text-matrix pt -> mm "
+                "x scale) for delivered native 3D Text spans. The width "
+                "calibration scales the baseline axis only; the height axis "
+                "factor is always exactly 1.0."
+            ),
+        }
+    return blocks
+
+
 def _write_terminal_representation_failure_report(
     *,
     pdf_path: str,
@@ -8081,6 +8170,8 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             opts._report_extra = {}
         if all_text_entity_info:
             opts._report_extra['actual_text_entity_types'] = all_text_entity_info
+        # P1-5 (SU parity): declared-vs-achieved text size telemetry.
+        opts._report_extra.update(_build_text_size_crosschecks(opts))
         opts._report_extra["result_status"] = "success"
         opts._report_extra.pop("terminal_failure", None)
 

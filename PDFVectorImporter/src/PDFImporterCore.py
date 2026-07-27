@@ -484,6 +484,8 @@ class ImportOptions:
     auto_reason: Optional[str] = None
     raster_page_count: int = 0
     raster_fallback_reasons: List[str] = field(default_factory=list)
+    # Per-image ImagePlanes placed this run (hybrid dedupe report honesty).
+    image_plane_count: int = 0
     import_report_path: Optional[str] = None
     # ShapeString telemetry. A renderer failure is reported as a failed attempt;
     # it does not authorize changing the requested representation.
@@ -784,6 +786,7 @@ def write_import_report(
         pages=int(pages_imported),
         primitive_count=primitive_count,
         text_count=text_count,
+        image_count=int(getattr(opts, "image_plane_count", 0) or 0),
         layer_count=layer_count,
         elapsed_ms=elapsed_ms,
         fallback_used=fallback_used,
@@ -6509,6 +6512,207 @@ def _cap_raster_dpi(page, requested_dpi: int):
     return capped, budget, capped != dpi
 
 
+def _adaptive_patch_dpi(page, opts: ImportOptions, clip) -> int:
+    """DPI for a per-image patch: page-adaptive default, clip-budget capped."""
+    dpi = int(getattr(opts, "raster_dpi", 200) or 200)
+    if not getattr(opts, "raster_dpi_user_set", False):
+        w_cm = page.rect.width * MM_PER_PT / 10.0
+        h_cm = page.rect.height * MM_PER_PT / 10.0
+        area_cm2 = w_cm * h_cm
+        if area_cm2 > 2000:
+            dpi = 150
+        elif area_cm2 > 700:
+            dpi = 300
+    dpi = max(72, dpi)
+    clip_area_pt2 = max(1.0, float(clip.width) * float(clip.height))
+    budget = _raster_pixel_budget()
+    pixels = clip_area_pt2 * ((dpi / 72.0) ** 2)
+    if pixels > budget:
+        dpi = max(72, int(math.floor(math.sqrt(budget / clip_area_pt2) * 72.0)))
+    return dpi
+
+
+def _images_only_page_copy(pdf_doc, page):
+    """Return (tmp_doc, tmp_page): a single-page copy holding ONLY image content.
+
+    Text and vector line-art are redacted out of the copy so per-image patch
+    renders never duplicate content that hybrid mode delivers natively
+    (R-C dedupe). The caller must close tmp_doc.
+    """
+    tmp_doc = fitz.open()
+    tmp_doc.insert_pdf(pdf_doc, from_page=page.number, to_page=page.number)
+    tmp_page = tmp_doc[0]
+    tmp_page.add_redact_annot(tmp_page.rect)
+    try:
+        tmp_page.apply_redactions(
+            images=fitz.PDF_REDACT_IMAGE_NONE,
+            graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED,
+            text=fitz.PDF_REDACT_TEXT_REMOVE,
+        )
+    except TypeError:
+        # Older PyMuPDF without graphics/text kwargs still removes text.
+        tmp_page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+    return tmp_doc, tmp_page
+
+
+def _import_embedded_images_as_planes(pdf_doc, page, page_num: int,
+                                      page_h: float, opts: ImportOptions,
+                                      scale: float, parent, fc_doc) -> int:
+    """Place one verified ImagePlane per embedded image instance.
+
+    Hybrid dedupe (R-C): instead of one full-page ``get_pixmap`` underlay
+    that rasterizes text + linework + images (double-render), each embedded
+    image block is rendered on its own — from an images-only copy of the
+    page, so rotated/sheared/masked placements keep their exact page
+    appearance — and placed at its bbox. Native vectors and native text
+    render everything else, so nothing is drawn twice.
+
+    Image::ImagePlane renders CENTERED on its Placement (verified in the
+    live FreeCAD GUI viewport, 2026-07-27), so each plane is anchored at
+    its block's model-space center. Returns the number of planes placed.
+    """
+    try:
+        infos = page.get_image_info(xrefs=True) or []
+    except (RuntimeError, ValueError, TypeError) as exc:
+        _warn(f"Page {page_num}: embedded image inventory failed: {exc}")
+        return 0
+    instances = []
+    for info in infos:
+        bbox = info.get("bbox")
+        if not bbox:
+            continue
+        rect = fitz.Rect(bbox) & page.rect
+        if rect.is_empty or rect.width <= 0.5 or rect.height <= 0.5:
+            continue
+        instances.append((rect, int(info.get("xref") or 0)))
+    if not instances:
+        return 0
+
+    digest = str(getattr(opts, "_pdf_sha256", "") or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        digest = hashlib.sha256(
+            ("page=%d|w=%.9g|h=%.9g|n=%d" % (
+                page_num, float(page.rect.width), float(page.rect.height),
+                len(instances),
+            )).encode("utf-8")
+        ).hexdigest()
+    asset_dir = _raster_asset_dir()
+    asset_dir.mkdir(parents=True, exist_ok=True)
+
+    tmp_doc = None
+    render_page = page
+    patches_include_page_ink = False
+    try:
+        try:
+            tmp_doc, render_page = _images_only_page_copy(pdf_doc, page)
+        except (RuntimeError, ValueError, TypeError, OSError) as exc:
+            _warn(
+                f"Page {page_num}: images-only copy failed ({exc}); "
+                "image patches rendered from the full page may include "
+                "overlapping page ink"
+            )
+            render_page = page
+            patches_include_page_ink = True
+
+        img_group = _make_group(parent, "Images", fc_doc)
+        placed = 0
+        for idx, (rect, xref) in enumerate(instances, start=1):
+            ip = None
+            try:
+                dpi = _adaptive_patch_dpi(page, opts, rect)
+                zoom = dpi / 72.0
+                pix = render_page.get_pixmap(
+                    matrix=fitz.Matrix(zoom, zoom), clip=rect)
+                if int(getattr(pix, "width", 0) or 0) <= 0 or int(
+                        getattr(pix, "height", 0) or 0) <= 0:
+                    raise RuntimeError("image patch contains no pixels")
+                img_path = asset_dir / (
+                    "img_%s_p%d_i%d_%ddpi.png"
+                    % (digest[:16], page_num, idx, dpi)
+                )
+                _save_pixmap_atomic(pix, img_path)
+                raster_sha256 = _path_sha256(img_path)
+
+                corners = [
+                    _to_fc(point, page_h, opts, scale)
+                    for point in (
+                        (rect.x0, rect.y0), (rect.x0, rect.y1),
+                        (rect.x1, rect.y0), (rect.x1, rect.y1),
+                    )
+                ]
+                xs = [float(p.x) for p in corners]
+                ys = [float(p.y) for p in corners]
+                w_units = max(xs) - min(xs)
+                h_units = max(ys) - min(ys)
+                if w_units <= 0.0 or h_units <= 0.0:
+                    raise ValueError("image patch placement has no area")
+                center_x = (max(xs) + min(xs)) / 2.0
+                center_y = (max(ys) + min(ys)) / 2.0
+                # Behind native vectors; staggered against z-fighting where
+                # neighbouring patch bboxes overlap.
+                center_z = -0.1 - 0.002 * ((idx - 1) % 200)
+
+                ip = fc_doc.addObject(
+                    "Image::ImagePlane", "PDF_Image_p%d_i%d" % (page_num, idx))
+                if ip is None:
+                    raise RuntimeError(
+                        "ImagePlane factory returned no new host object")
+                ip.ImageFile = str(img_path)
+                ip.XSize = w_units
+                ip.YSize = h_units
+                ip.Placement = Placement(
+                    _v(center_x, center_y, center_z), Rotation())
+                add_property = getattr(ip, "addProperty", None)
+                if not callable(add_property):
+                    raise RuntimeError(
+                        "ImagePlane cannot embed its raster asset")
+                props = set(getattr(ip, "PropertiesList", []) or [])
+                if "PDFRasterFile" not in props:
+                    add_property(
+                        "App::PropertyFileIncluded", "PDFRasterFile",
+                        "PDF Import")
+                ip.PDFRasterFile = str(img_path)
+                if "PDFSourceSHA256" not in props:
+                    add_property(
+                        "App::PropertyString", "PDFSourceSHA256", "PDF Import")
+                ip.PDFSourceSHA256 = digest
+                if "PDFRasterSHA256" not in props:
+                    add_property(
+                        "App::PropertyString", "PDFRasterSHA256", "PDF Import")
+                ip.PDFRasterSHA256 = raster_sha256
+                _annotate_text_host_object(
+                    ip, "p%d:img%d" % (int(page_num), idx), "raster")
+                img_group.addObject(ip)
+                placed += 1
+            except (RuntimeError, OSError, ValueError, TypeError,
+                    AttributeError) as exc:
+                _warn(
+                    f"Page {page_num}: embedded image {idx} "
+                    f"(xref {xref}) placement failed: {exc}"
+                )
+                if ip is not None:
+                    try:
+                        _remove_owned_text_objects(fc_doc, img_group, [ip])
+                    except Exception:
+                        pass
+        if placed:
+            opts.image_plane_count = int(
+                getattr(opts, "image_plane_count", 0) or 0) + placed
+            _msg(
+                f"Page {page_num}: placed {placed} embedded image"
+                f"{'s' if placed != 1 else ''} individually"
+                + (" (patches may include overlapping page ink)"
+                   if patches_include_page_ink else "")
+            )
+        return placed
+    finally:
+        if tmp_doc is not None:
+            try:
+                tmp_doc.close()
+            except Exception:
+                pass
+
+
 # ──────────────────────────────────────────────────────────────────────
 # View autofit
 # ──────────────────────────────────────────────────────────────────────
@@ -7010,15 +7214,23 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             _msg(f"Page {page_num}: imported as raster image")
             return top_group, None
 
-    # ── Hybrid mode: place raster background, then overlay vectors ──
+    # ── Hybrid mode: native vectors/text + per-image planes (R-C dedupe) ──
+    # A full-page underlay would rasterize text, linework AND images, making
+    # every natively delivered item exist twice. Hybrid therefore places only
+    # the page's genuine embedded images, one ImagePlane per image block, in
+    # the Embedded-images section below (placed_full_page_raster_background
+    # stays False). Raster and raster_text_overlay modes keep the full-page
+    # render — there the raster IS the content delivery.
     if effective_mode == "hybrid":
-        _msg(f"Page {page_num}: placing {opts.raster_dpi} DPI raster background…")
-        _progress_update(5, f"Rendering raster image at {opts.raster_dpi} DPI...")
-        full_page_raster_result = _import_page_as_raster(
-            pdf_doc, page, page_num, page_h, opts, scale,
-            top_group or fc_doc, fc_doc)
-        placed_full_page_raster_background = True
-        _msg(f"Page {page_num}: overlaying vector geometry…")
+        _msg(
+            f"Page {page_num}: hybrid — vectors and text deliver natively; "
+            "embedded images placed individually (no full-page underlay)"
+        )
+        if opts.auto_resolved_mode == "hybrid":
+            opts.auto_reason = (
+                str(opts.auto_reason or "Vectors + embedded raster imagery").rstrip()
+                + "; embedded images placed individually (no full-page underlay)"
+            )
         # Fall through to vector import below
 
     # ── Legacy raster fallback (vectors mode, backwards compat) ──
@@ -7715,64 +7927,12 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         except (RuntimeError, ValueError, TypeError, AttributeError, IndexError) as e:
             _warn(f"Hatch group creation failed: {e}")
 
-    # ── Embedded images ──
+    # ── Embedded images (one verified ImagePlane per image instance) ──
     if not opts.ignore_images and not placed_full_page_raster_background:
         try:
-            img_group = _make_group(top_group or fc_doc, "Images", fc_doc)
-            imglist = page.get_images(full=True)
-            seen_xrefs = set()
-            for img_info in imglist:
-                xref = img_info[0]
-                if xref in seen_xrefs:
-                    continue
-                seen_xrefs.add(xref)
-                rects = page.get_image_rects(xref)
-                if not rects:
-                    continue
-                try:
-                    pix = fitz.Pixmap(pdf_doc, xref)
-                    # Convert any non-plain-RGB source to RGB before saving PNG.
-                    # This handles CMYK / DeviceN / grayscale / alpha safely.
-                    cs = getattr(pix, "colorspace", None)
-                    cs_n = None
-                    try:
-                        cs_n = int(getattr(cs, "n", 0)) if cs is not None else None
-                    except (TypeError, ValueError):
-                        cs_n = None
-                    needs_rgb = (
-                        pix.alpha
-                        or pix.n != 3
-                        or (cs_n is not None and cs_n != 3)
-                    )
-                    if needs_rgb:
-                        pix = fitz.Pixmap(fitz.csRGB, pix)
-                    tmpdir = os.path.join(
-                        FreeCAD.getUserAppDataDir(),
-                        "Mod", "PDFVectorImporter", "temp")
-                    os.makedirs(tmpdir, exist_ok=True)
-                    img_path = os.path.join(tmpdir, f"img_p{page_num}_x{xref}.png")
-                    pix.save(img_path)
-                except (RuntimeError, OSError, ValueError, TypeError) as e:
-                    _warn(f"Image xref {xref} extract failed: {e}")
-                    continue
-                for r in rects:
-                    pt0 = _to_fc((r.x0, r.y0), page_h, opts, scale)
-                    pt1 = _to_fc((r.x1, r.y1), page_h, opts, scale)
-                    w = abs(pt1.x - pt0.x)
-                    h = abs(pt1.y - pt0.y)
-                    try:
-                        ip = fc_doc.addObject(
-                            "Image::ImagePlane", "Image")
-                        ip.ImageFile = img_path
-                        ip.XSize = w
-                        ip.YSize = h
-                        ip.Placement = Placement(
-                            _v(min(pt0.x, pt1.x), min(pt0.y, pt1.y), 0),
-                            Rotation())
-                        img_group.addObject(ip)
-                        obj_count += 1
-                    except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as e:
-                        _warn(f"Image placement failed: {e}")
+            obj_count += _import_embedded_images_as_planes(
+                pdf_doc, page, page_num, page_h, opts, scale,
+                top_group or fc_doc, fc_doc)
         except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as e:
             _warn(f"Image import failed: {e}")
 
@@ -7841,6 +8001,7 @@ def _reset_import_run_state(opts: ImportOptions) -> None:
     opts.text_delivery_attempts.clear()
     opts.raster_page_count = 0
     opts.raster_fallback_reasons.clear()
+    opts.image_plane_count = 0
     opts.auto_resolved_mode = None
     opts.auto_reason = None
     opts.resolved_scale = None

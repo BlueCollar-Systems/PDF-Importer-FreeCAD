@@ -624,6 +624,19 @@ class TestReleaseSafety:
         assert "gh release create" not in workflow
         assert not re.search(r"^\s*if:", workflow, re.MULTILINE)
 
+    def test_legacy_python_jobs_emit_protected_syntax_check_names(self):
+        workflow = (
+            REPO_ROOT / ".github" / "workflows" / "fc-pdfimporter-ci.yml"
+        ).read_text(encoding="utf-8")
+        legacy_at = workflow.index("  legacy-syntax:")
+        modern_at = workflow.index("  syntax-check:", legacy_at)
+        legacy_block = workflow[legacy_at:modern_at]
+        assert re.search(
+            r"^\s+name:\s+syntax-check \(\$\{\{ matrix\.python-version \}\}\)\s*$",
+            legacy_block,
+            re.MULTILINE,
+        )
+
     def test_windows_release_never_overwrites_existing_assets(self):
         workflow = (
             REPO_ROOT / ".github" / "workflows" / "windows-release.yml"

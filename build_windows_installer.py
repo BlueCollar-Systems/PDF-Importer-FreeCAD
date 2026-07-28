@@ -22,8 +22,7 @@ STAGE_DIR = DIST_DIR / "installer_stage"
 INNO_SCRIPT = REPO_ROOT / "installer" / "PDFVectorImporter.iss"
 
 
-def read_version() -> str:
-    package_xml = ADDON_DIR / "package.xml"
+def _read_package_version(package_xml: Path) -> str:
     if not package_xml.exists():
         raise FileNotFoundError(f"Missing package metadata: {package_xml}")
 
@@ -32,6 +31,10 @@ def read_version() -> str:
     if not match:
         raise RuntimeError("Could not determine version from package.xml")
     return match.group(1).strip()
+
+
+def read_version() -> str:
+    return _read_package_version(ADDON_DIR / "package.xml")
 
 
 def find_iscc(explicit_path: str | None) -> Path:
@@ -64,11 +67,21 @@ def find_iscc(explicit_path: str | None) -> Path:
     )
 
 
-def stage_release() -> tuple[str, Path, Path]:
+def stage_release(source_zip: str | Path | None = None) -> tuple[str, Path, Path]:
     version = read_version()
     DIST_DIR.mkdir(parents=True, exist_ok=True)
 
-    zip_path = build_release.build(DIST_DIR)
+    if source_zip is None:
+        zip_path = build_release.build(DIST_DIR)
+    else:
+        zip_path = Path(source_zip).resolve()
+        expected_name = f"FreeCAD-PDF-Importer_v{version}.zip"
+        if not zip_path.is_file():
+            raise FileNotFoundError(f"Canonical release ZIP not found: {zip_path}")
+        if zip_path.name != expected_name:
+            raise RuntimeError(
+                f"Canonical release ZIP must be named {expected_name}, got {zip_path.name}"
+            )
 
     if STAGE_DIR.exists():
         shutil.rmtree(STAGE_DIR)
@@ -80,6 +93,12 @@ def stage_release() -> tuple[str, Path, Path]:
     source_dir = STAGE_DIR / "PDFVectorImporter"
     if not source_dir.is_dir():
         raise RuntimeError(f"Expected staged addon folder at {source_dir}")
+    staged_version = _read_package_version(source_dir / "package.xml")
+    if staged_version != version:
+        raise RuntimeError(
+            "Staged package version mismatch: "
+            f"repository={version} archive={staged_version}"
+        )
 
     return version, source_dir, zip_path
 
@@ -112,9 +131,17 @@ def main() -> int:
         default=None,
         help="Path to ISCC.exe (Inno Setup compiler). Optional if ISCC is on PATH.",
     )
+    parser.add_argument(
+        "--source-zip",
+        default=None,
+        help=(
+            "Use this already-published release ZIP as the installer payload. "
+            "The ZIP is validated and never rebuilt or modified."
+        ),
+    )
     args = parser.parse_args()
 
-    version, source_dir, zip_path = stage_release()
+    version, source_dir, zip_path = stage_release(args.source_zip)
     iscc = find_iscc(args.iscc)
     installer_exe = compile_installer(iscc, version, source_dir)
 

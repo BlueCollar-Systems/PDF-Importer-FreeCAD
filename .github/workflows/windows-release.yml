@@ -73,9 +73,28 @@ jobs:
         shell: pwsh
         run: choco install innosetup --yes --no-progress
 
-      - name: Build ZIP and Setup.exe
-        shell: pwsh
-        run: python build_windows_installer.py
+      # The release ZIP was minted by auto-release in a different runner. It is
+      # the canonical payload: rebuilding vendored console launchers here can
+      # embed a different runner path and make Setup.exe install bytes that do
+      # not match the companion ZIP.
+      - name: Download canonical release ZIP
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}"
+          SOURCE_ZIP="dist/FreeCAD-PDF-Importer_${TAG}.zip"
+          mkdir -p dist
+          gh release download "$TAG" \
+            --pattern "FreeCAD-PDF-Importer_${TAG}.zip" \
+            --dir dist
+          test -f "$SOURCE_ZIP"
+          echo "SOURCE_ZIP=$SOURCE_ZIP" >> "$GITHUB_ENV"
+
+      - name: Build Setup.exe from canonical release ZIP
+        shell: bash
+        run: python build_windows_installer.py --source-zip "$SOURCE_ZIP"
 
       - name: Smoke release ZIP
         shell: bash

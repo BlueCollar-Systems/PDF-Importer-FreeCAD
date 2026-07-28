@@ -54,6 +54,7 @@ jobs:
   # Syntax-only: the vendored PyMuPDF wheel is cp310-abi3, so the full
   # dependency suite runs on >=3.10 (D5 ABI floor).
   legacy-syntax:
+    name: syntax-check (${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       matrix:

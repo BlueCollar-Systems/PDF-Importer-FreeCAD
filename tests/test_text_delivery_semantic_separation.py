@@ -15,6 +15,8 @@ from pdfcadcore.generic_recognizer import analyze  # noqa: E402
 from pdfcadcore.primitives import (  # noqa: E402
     NormalizedText,
     PageData,
+    next_id,
+    reset_ids,
     text_items_for_analysis,
 )
 from pdfcadcore.resolved_scale import resolve_page_scale  # noqa: E402
@@ -94,6 +96,22 @@ def test_stacked_fraction_semantics_do_not_mutate_delivery_spans() -> None:
     assert merged.semantic_projection is True
     assert merged.source_span_ids == (2, 3, 4)
     assert merged.requires_individual_positioning is False
+
+
+def test_semantic_projection_does_not_consume_physical_identity_allocator() -> None:
+    delivery = [
+        _item(1, "1", x=1.0, y=4.0, font_size=3.0),
+        _item(2, "/", x=1.0, y=3.0, font_size=3.0),
+        _item(3, "4", x=1.0, y=2.0, font_size=3.0),
+    ]
+    reset_ids()
+    try:
+        semantic = semantic_text_projection(delivery)
+
+        assert [item.text for item in semantic] == ["1/4"]
+        assert next_id() == 1
+    finally:
+        reset_ids()
 
 
 def test_analysis_falls_back_to_delivery_text_when_no_projection_is_present() -> None:

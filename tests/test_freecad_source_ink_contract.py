@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import io
+import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -167,11 +168,17 @@ def test_mixed_physical_ink_is_explicit_and_does_not_change_requested_mode(
     assert item["text"] == "AB"
     assert evidence["classification"] == "mixed_visible_and_zero_ink"
     assert evidence["zero_ink_characters_layout_only"] is False
-    assert core._mixed_source_ink_requires_fallback(evidence) is True
+    assert core._mixed_source_ink_requires_fallback(evidence) is False
     assert [record["zero_visible_ink"] for record in evidence["characters"]] == [
         True,
         False,
     ]
+    if requested_mode != "raster":
+        manifest = core._build_source_ink_segments(item)
+        assert [segment["requested_type"] for segment in manifest["segments"]] == [
+            requested_mode,
+            requested_mode,
+        ]
 
 
 def test_exact_space_glyph_is_layout_only_and_does_not_force_fallback(
@@ -191,7 +198,7 @@ def test_exact_space_glyph_is_layout_only_and_does_not_force_fallback(
     assert zero_records[0]["glyph_name"].lower() == "space"
 
 
-def _synthetic_space_item() -> dict:
+def _synthetic_character_item(value: str) -> dict:
     span = {
         "font": "TestFont",
         "size": 12.0,
@@ -201,7 +208,7 @@ def _synthetic_space_item() -> dict:
             {
                 "origin": (10.0, 20.0),
                 "bbox": (10.0, 10.0, 16.0, 22.0),
-                "c": " ",
+                "c": value,
                 "synthetic": True,
             }
         ],
@@ -238,14 +245,55 @@ def _shared_validate(evidence: dict, item: dict) -> bool:
     )
 
 
-def test_synthetic_authority_rejects_false_boolean_even_after_redigest() -> None:
-    item = _synthetic_space_item()
-    evidence = copy.deepcopy(item["source_ink_evidence"])
-    assert _shared_validate(evidence, item) is True
+@pytest.mark.parametrize("value", [" ", "\u200b", "\u2060", "A"])
+def test_synthetic_rawdict_character_never_claims_physical_ink(value: str) -> None:
+    item = _synthetic_character_item(value)
 
-    evidence["characters"][0]["synthetic"] = False
+    assert "source_ink_evidence" not in item
+    assert "source_font_asset_bindings" not in item
+    assert "source_glyph_id_sequence" not in item
+
+
+@pytest.mark.parametrize("record_scope", ["top", "character", "font_binding"])
+def test_exact_source_ink_schemas_reject_redigested_extra_fields(
+    tmp_path: Path,
+    record_scope: str,
+) -> None:
+    item = _bound_pdf_item(tmp_path, "3d_text", "invisible_render_mode")
+    evidence = copy.deepcopy(item["source_ink_evidence"])
+    if record_scope == "top":
+        evidence["contradictory_extra_field"] = True
+    elif record_scope == "character":
+        evidence["characters"][0]["contradictory_extra_field"] = True
+    else:
+        evidence["font_asset_bindings"][0]["contradictory_extra_field"] = True
     evidence["evidence_sha256"] = core._source_ink_evidence_digest(evidence)
 
+    assert _shared_validate(evidence, item) is False
+
+
+def test_source_ink_digest_rejects_nan_and_verifier_fails_closed(
+    tmp_path: Path,
+) -> None:
+    item = _bound_pdf_item(tmp_path, "3d_text", "invisible_render_mode")
+    evidence = copy.deepcopy(item["source_ink_evidence"])
+    evidence["characters"][0]["opacity"] = math.nan
+
+    with pytest.raises(ValueError, match="non-finite"):
+        core._source_ink_evidence_digest(evidence)
+    evidence["evidence_sha256"] = "0" * 64
+    assert _shared_validate(evidence, item) is False
+
+
+def test_source_ink_digest_rejects_cycles_and_verifier_is_total(
+    tmp_path: Path,
+) -> None:
+    item = _bound_pdf_item(tmp_path, "3d_text", "invisible_render_mode")
+    evidence = copy.deepcopy(item["source_ink_evidence"])
+    evidence["characters"].append(evidence)
+
+    with pytest.raises(ValueError, match="cycle"):
+        core._source_ink_evidence_digest(evidence)
     assert _shared_validate(evidence, item) is False
 
 
@@ -412,7 +460,7 @@ def test_font_asset_declared_hashes_must_match_exact_bytes(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("requested_mode", REQUESTED_MODES[:-1])
-def test_mixed_item_uses_only_adjacent_item_specific_fallback(
+def test_obsolete_mixed_item_impossibility_cannot_advance_the_ladder(
     tmp_path: Path,
     requested_mode: str,
 ) -> None:
@@ -447,25 +495,20 @@ def test_mixed_item_uses_only_adjacent_item_specific_fallback(
     }
     deliverers["raster"] = raster_deliverer
 
-    terminal = core._run_text_item_fallback_ladder(
-        item,
-        requested_mode,
-        deliverers,
-        opts,
-    )
+    with pytest.raises(core.TextRepresentationFailure):
+        core._run_text_item_fallback_ladder(
+            item,
+            requested_mode,
+            deliverers,
+            opts,
+        )
 
-    ladder = list(core.TEXT_ITEM_FALLBACK_LADDERS[requested_mode])
     assert item["requested_type"] == requested_mode
-    assert [attempt["attempted_type"] for attempt in opts.text_delivery_attempts] == ladder
-    assert all(
-        attempt["outcome"] == "proven_impossible"
-        and attempt["proof"]["source_ink_evidence_sha256"]
-        == item["source_ink_evidence"]["evidence_sha256"]
-        for attempt in opts.text_delivery_attempts[:-1]
-    )
-    assert terminal["final_type"] == "raster"
-    assert opts.text_mode_fallbacks[-1]["requested"] == requested_mode
-    assert opts.text_mode_fallbacks[-1]["delivered"] == "raster"
+    assert [attempt["attempted_type"] for attempt in opts.text_delivery_attempts] == [
+        requested_mode
+    ]
+    assert opts.text_delivery_attempts[0]["outcome"] == "failed"
+    assert opts.text_mode_fallbacks == []
 
 
 def test_production_source_ink_paths_have_no_unicode_whitespace_gate() -> None:

@@ -71,6 +71,7 @@ class FakeDoc:
     def __init__(self, log):
         self.log = log
         self.Objects = []
+        self.recompute_batches = []
 
     def addObject(self, kind, name):
         host = FakeHost(self, "%s_%d" % (name, len(self.Objects)), kind)
@@ -87,6 +88,7 @@ class FakeDoc:
         self.Objects = [obj for obj in self.Objects if obj.Name != name]
 
     def recompute(self, objs=None):
+        self.recompute_batches.append(list(objs or []))
         for obj in objs or []:
             self.log.events.append(("recompute", obj))
         return len(objs or [])
@@ -219,6 +221,10 @@ def test_configure_host_runs_before_every_recompute(monkeypatch):
     )
 
     assert configured == [shape_string, calibrated, extrusion]
+    assert doc.recompute_batches == [
+        [shape_string],
+        [calibrated, extrusion],
+    ], "the calibrated support and dependent extrusion share one recompute pass"
     for host_obj in (shape_string, calibrated, extrusion):
         recompute_count = sum(
             1

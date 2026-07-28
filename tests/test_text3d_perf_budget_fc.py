@@ -59,15 +59,82 @@ try:
     for p in (os.path.join(repo, "PDFVectorImporter", "src"),
               os.path.join(repo, "PDFVectorImporter")):
         sys.path.insert(0, p)
+    loaded_core = sys.modules.get("PDFImporterCore")
+    loaded_path = os.path.abspath(getattr(loaded_core, "__file__", ""))
+    repo_core = os.path.abspath(
+        os.path.join(repo, "PDFVectorImporter", "src", "PDFImporterCore.py")
+    )
+    if loaded_core is not None and os.path.normcase(loaded_path) != os.path.normcase(repo_core):
+        del sys.modules["PDFImporterCore"]
+    for module_name, module in list(sys.modules.items()):
+        if module_name == "pdfcadcore" or module_name.startswith("pdfcadcore."):
+            module_path = os.path.abspath(getattr(module, "__file__", ""))
+            if module_path and not os.path.normcase(module_path).startswith(
+                os.path.normcase(os.path.abspath(repo) + os.sep)
+            ):
+                del sys.modules[module_name]
     import PDFImporterCore as core
+    import pdfcadcore.import_report as report_contract
+    captured_warnings = []
+    original_warn = core._warn
+    def capture_warning(message):
+        captured_warnings.append(str(message))
+        return original_warn(message)
+    core._warn = capture_warning
+    result["core_path"] = os.path.abspath(core.__file__)
+    result["report_contract_path"] = os.path.abspath(report_contract.__file__)
+    if os.path.normcase(result["core_path"]) != os.path.normcase(repo_core):
+        raise RuntimeError(
+            "performance probe loaded stale PDFImporterCore: %%s (expected %%s)"
+            %% (result["core_path"], repo_core)
+        )
     doc = FreeCAD.newDocument("perfbudget")
     opts = core.ImportOptions()
     opts.verbose = False
+    opts.import_report_path = out_path + ".import_report.json"
     t0 = time.perf_counter()
     core.import_pdf(pdf_path, opts)
     result["elapsed_s"] = round(time.perf_counter() - t0, 2)
     result["delivered"] = dict(getattr(opts, "text_delivered_counts", {}) or {})
     result["cache_stats"] = dict(getattr(opts, "wirestring_cache_stats", {}) or {})
+    result["phase_timings_ms"] = dict(getattr(opts, "phase_timings_ms", {}) or {})
+    report_extra = dict(getattr(opts, "_report_extra", {}) or {})
+    result["report_extra_keys"] = sorted(report_extra)
+    result["save_reopen"] = {
+        key: value
+        for key, value in dict(report_extra.get("save_reopen_inventory") or {}).items()
+        if key in {
+            "schema", "verified", "reason", "inventory_digest",
+            "reopened_inventory_digest", "shape_archive_evidence_digest",
+            "archive_unchanged_after_open", "phase_timings_ms",
+        }
+    }
+    result["warnings"] = captured_warnings
+    report_path = opts.import_report_path
+    result["report_path"] = report_path
+    if os.path.isfile(report_path):
+        result["report_bytes"] = os.path.getsize(report_path)
+        with open(report_path, "r", encoding="utf-8") as report_handle:
+            report_data = json.load(report_handle)
+        report_extra = dict(report_data.get("extra") or {})
+        inventory = dict(report_extra.get("actual_host_object_inventory") or {})
+        save_reopen = dict(report_extra.get("save_reopen_inventory") or {})
+        delivery = dict(report_extra.get("text_representation_delivery") or {})
+        result["report_contract_ready"] = dict(
+            report_extra.get("import_contract_ready") or {}
+        )
+        result["report_inventory_verified"] = inventory.get("verified") is True
+        result["report_inventory_objects"] = len(inventory.get("objects") or [])
+        result["report_save_reopen_verified"] = save_reopen.get("verified") is True
+        result["report_delivery_verified"] = delivery.get("verified") is True
+        result["report_delivery_items"] = len(delivery.get("items") or [])
+        result["report_payload_compact"] = not any(
+            key in save_reopen
+            for key in (
+                "expected_objects", "actual_objects", "geometry_comparisons",
+                "shape_archive_evidence",
+            )
+        ) and "terminal_attempts" not in delivery
     result["ok"] = True
 except Exception:
     result["error"] = traceback.format_exc()
@@ -107,6 +174,19 @@ def test_dense_page_3d_text_stays_inside_budget(tmp_path):
     )
     result = json.loads(Path(out_path).read_text(encoding="utf-8"))
     assert result.get("ok"), "probe failed: %s" % result.get("error", "")
+    assert Path(result["core_path"]).resolve() == (
+        REPO_ROOT / "PDFVectorImporter" / "src" / "PDFImporterCore.py"
+    ).resolve()
+    assert Path(result["report_contract_path"]).resolve() == (
+        REPO_ROOT / "PDFVectorImporter" / "pdfcadcore" / "import_report.py"
+    ).resolve()
+    assert result.get("report_contract_ready", {}).get("ready") is True, result.get(
+        "report_contract_ready"
+    )
+    assert result.get("report_inventory_verified") is True
+    assert result.get("report_save_reopen_verified") is True
+    assert result.get("report_delivery_verified") is True
+    assert result.get("report_payload_compact") is True
 
     min_spans = int(os.environ.get("BCS_FC_PERF_BUDGET_SPANS", DEFAULT_MIN_SPANS))
     delivered = result.get("delivered", {})

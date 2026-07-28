@@ -4,20 +4,30 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
+import stat
 import sys
+import tempfile
+import warnings
+import zipfile
 from pathlib import Path
 
 import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-for path in (REPO_ROOT / "PDFVectorImporter" / "src", REPO_ROOT / "PDFVectorImporter"):
+for path in (
+    REPO_ROOT / "PDFVectorImporter" / "src",
+    REPO_ROOT / "PDFVectorImporter",
+    REPO_ROOT / "tests",
+):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
 import PDFImporterCore as core  # noqa: E402
 from pdfcadcore import import_report as report_contract  # noqa: E402
 from pdfcadcore.fitz_loader import import_fitz  # noqa: E402
+import test_freecad_representation_contract as representation_fixtures  # noqa: E402
 
 
 class HostObject:
@@ -43,6 +53,7 @@ class HostObject:
         text_visibility=None,
         pdf_source_sha256: str = "",
         declared_raster_sha256: str = "",
+        font_delivery=None,
     ) -> None:
         self.Name = name
         self.TypeId = type_id
@@ -84,6 +95,8 @@ class HostObject:
             self.PDFSourceSHA256 = pdf_source_sha256
         if declared_raster_sha256:
             self.PDFRasterSHA256 = declared_raster_sha256
+        for property_name, value in dict(font_delivery or {}).items():
+            setattr(self, property_name, value)
         if type_id.startswith("Part::"):
             self.Shape = Shape(shape_nonempty)
 
@@ -127,11 +140,74 @@ class Shape:
         return not self._nonempty
 
 
+def _write_fcstd_archive(
+    path: Path,
+    shape_entries: dict[str, tuple[str, bytes]],
+    *,
+    extra_entries: list[tuple[str, bytes]] | None = None,
+    document_xml: bytes | None = None,
+) -> None:
+    """Write the small FCStd subset used by archive-evidence contract tests."""
+
+    if document_xml is None:
+        objects = []
+        for entity_id, (entry_name, _payload) in shape_entries.items():
+            objects.append(
+                '<Object name="%s"><Properties>'
+                '<Property name="Shape" type="Part::PropertyPartShape">'
+                '<Part file="%s"/></Property>'
+                "</Properties></Object>" % (entity_id, entry_name)
+            )
+        document_xml = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            "<Document><ObjectData>%s</ObjectData></Document>" % "".join(objects)
+        ).encode("utf-8")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("Document.xml", document_xml)
+            for _entity_id, (entry_name, payload) in shape_entries.items():
+                archive.writestr(entry_name, payload)
+            for entry_name, payload in list(extra_entries or []):
+                archive.writestr(entry_name, payload)
+
+
+def _corrupt_deflated_fcstd_member(path: Path, member_name: str) -> None:
+    """Replace a raw-DEFLATE block header without changing ZIP metadata."""
+
+    with zipfile.ZipFile(path, "r") as archive:
+        info = archive.getinfo(member_name)
+        assert info.compress_type == zipfile.ZIP_DEFLATED
+        assert info.compress_size > 0
+        data_offset = (
+            info.header_offset
+            + 30
+            + len(info.filename.encode("utf-8"))
+            + len(info.extra)
+        )
+    archive_bytes = bytearray(path.read_bytes())
+    archive_bytes[data_offset] = 0xFF
+    path.write_bytes(archive_bytes)
+
+
 def _zero_ink_source_evidence(
     source_item_id: str,
     source_text: str = "   ",
     pdf_sha256: str = "a" * 64,
 ) -> dict:
+    source_font_sha256 = "c" * 64
+    usable_font_sha256 = "d" * 64
+    font_binding = {
+        "asset_id": "sha256:" + usable_font_sha256,
+        "source_xref": 1,
+        "source_font_sha256": source_font_sha256,
+        "usable_font_sha256": usable_font_sha256,
+        "base_font_name": "TestFont",
+        "span_font_name": "TestFont",
+        "source_format": "ttf",
+        "usable_format": "ttf",
+        "source_origin": "test_exact_font",
+    }
     evidence = {
         "schema": "pdf_source_ink_evidence_v1",
         "authority": "pymupdf_rawdict_texttrace_exact_font",
@@ -144,15 +220,22 @@ def _zero_ink_source_evidence(
         "classification": "zero_visible_ink",
         "zero_ink_characters_layout_only": True,
         "all_characters_physically_resolved": True,
-        "font_asset_bindings": [],
-        "glyph_id_sequence": [None for _character in source_text],
+        "font_asset_bindings": [font_binding],
+        "glyph_id_sequence": [1 for _character in source_text],
         "characters": [
             {
-                "authority": "pymupdf_rawdict_synthetic_character",
+                "authority": "exact_pdf_font_glyph_bounds",
                 "character": character,
-                "synthetic": True,
-                "glyph_id": None,
-                "font_asset_binding": None,
+                "synthetic": False,
+                "glyph_id": 1,
+                "glyph_name": "space",
+                "glyph_bounds": None,
+                "advance_width": 600.0,
+                "font_asset_binding": font_binding,
+                "source_font_sha256": source_font_sha256,
+                "usable_font_sha256": usable_font_sha256,
+                "trace_type": 0,
+                "opacity": 1.0,
                 "zero_visible_ink": True,
                 "layout_only_zero_ink": True,
                 "physically_resolved": True,
@@ -165,6 +248,88 @@ def _zero_ink_source_evidence(
     return evidence
 
 
+def _visible_3d_font_delivery(tmp_path: Path) -> tuple[dict, dict]:
+    source_font_identity = {
+        "raw_name": "MissingSourceFont-Regular",
+        "normalized_key": "missingsourcefontregular",
+    }
+    fixture_item = {
+        "text": "3D",
+        "font_identity": source_font_identity,
+        "pdf_sha256": "a" * 64,
+        "page_number": 1,
+    }
+    fixture_path, _fixture_result = representation_fixtures._found_font_resolution(
+        fixture_item
+    )
+    payload = Path(fixture_path).read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    source_path = tmp_path / "installed-font.ttf"
+    source_path.write_bytes(payload)
+    stage_root = tmp_path / "delivery-assets"
+    stage_root.mkdir(exist_ok=True)
+    staged_path = stage_root / (digest + ".ttf")
+    staged_path.write_bytes(payload)
+    os.chmod(staged_path, stat.S_IREAD)
+    internal_identity = core._font_internal_identity_evidence(
+        payload,
+        source_font_identity,
+    )
+    coverage_evidence = core._font_bytes_glyph_coverage(payload, "3D")
+    evidence = {
+        "font_path": str(staged_path.resolve()),
+        "source_text": "3D",
+        "source_font_identity": source_font_identity,
+        "source_font_equivalence": False,
+        "font_substitution_applied": True,
+        "font_identity_verified": False,
+        "glyph_coverage_verified": True,
+        "delivered_font_sha256": digest,
+        "font_candidate_source": "installed_no_cost_substitute",
+        "source_font_asset_path": str(source_path.resolve()),
+        "source_font_asset_sha256": digest,
+        "staged_font_path": str(staged_path.resolve()),
+        "staged_font_sha256": digest,
+        "staged_asset_verified": True,
+        "staged_asset_read_only": True,
+        "font_internal_identity_evidence": internal_identity,
+        "font_internal_identity_sha256": internal_identity["evidence_sha256"],
+        "font_coverage_evidence": coverage_evidence,
+        "font_coverage_evidence_sha256": coverage_evidence[
+            "coverage_evidence_sha256"
+        ],
+    }
+    properties = {
+        "PDFSourceFontEquivalence": evidence["source_font_equivalence"],
+        "PDFFontSubstitutionApplied": evidence["font_substitution_applied"],
+        "PDFFontIdentityVerified": evidence["font_identity_verified"],
+        "PDFFontGlyphCoverageVerified": evidence["glyph_coverage_verified"],
+        "PDFDeliveredFontSHA256": evidence["delivered_font_sha256"],
+        "PDFFontCandidateSource": evidence["font_candidate_source"],
+        "PDFDeliveredFontPath": evidence["font_path"],
+        "PDFSourceFontAssetPath": evidence["source_font_asset_path"],
+        "PDFSourceFontAssetSHA256": evidence["source_font_asset_sha256"],
+        "PDFStagedFontPath": evidence["staged_font_path"],
+        "PDFStagedFontSHA256": evidence["staged_font_sha256"],
+        "PDFStagedFontVerified": evidence["staged_asset_verified"],
+        "PDFStagedFontReadOnly": evidence["staged_asset_read_only"],
+        "PDFFontInternalIdentitySHA256": evidence[
+            "font_internal_identity_sha256"
+        ],
+        "PDFFontCoverageEvidenceSHA256": evidence[
+            "font_coverage_evidence_sha256"
+        ],
+        "PDFSourceFontIdentityJSON": json.dumps(
+            evidence["source_font_identity"],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ),
+    }
+    return evidence, properties
+
+
 def _write_minimal_pdf(path: Path) -> None:
     fitz = import_fitz()
     document = fitz.open()
@@ -173,9 +338,39 @@ def _write_minimal_pdf(path: Path) -> None:
     document.close()
 
 
+def _minimal_pdf_bytes() -> bytes:
+    fitz = import_fitz()
+    document = fitz.open()
+    try:
+        document.new_page()
+        return bytes(document.tobytes())
+    finally:
+        document.close()
+
+
+_TEST_PDF_BYTES = _minimal_pdf_bytes()
+_TEST_PDF_SHA256 = hashlib.sha256(_TEST_PDF_BYTES).hexdigest()
+
+
+def _bind_test_page_authority(
+    opts: core.ImportOptions,
+    *,
+    source_path: Path | None = None,
+) -> str:
+    if source_path is not None:
+        core._initialize_pdf_source_attempt(str(source_path), opts)
+    else:
+        with tempfile.TemporaryDirectory(prefix="fc_inventory_v2_") as td:
+            path = Path(td) / "source.pdf"
+            path.write_bytes(_TEST_PDF_BYTES)
+            core._initialize_pdf_source_attempt(str(path), opts)
+    core._capture_page_visual_runtime_authority(opts, [1])
+    return opts._pdf_sha256
+
+
 def _aws_objects(
     image_file: str = "aws-page-1.png",
-    pdf_sha256: str = "a" * 64,
+    pdf_sha256: str = _TEST_PDF_SHA256,
 ):
     raster_sha256 = (
         hashlib.sha256(Path(image_file).read_bytes()).hexdigest()
@@ -198,10 +393,15 @@ def _aws_objects(
 
 def _aws_fallback_opts(
     raster_path: str = "",
-    pdf_sha256: str = "a" * 64,
+    pdf_sha256: str = "",
+    *,
+    source_path: Path | None = None,
 ) -> core.ImportOptions:
     opts = core.ImportOptions(import_mode="auto", import_text=True, text_mode="labels")
-    opts._pdf_sha256 = pdf_sha256
+    bound_digest = _bind_test_page_authority(opts, source_path=source_path)
+    if pdf_sha256 and pdf_sha256 != bound_digest:
+        raise ValueError("test PDF digest is not bound to the supplied source")
+    pdf_sha256 = bound_digest
     raster_sha256 = (
         hashlib.sha256(Path(raster_path).read_bytes()).hexdigest()
         if raster_path and Path(raster_path).is_file()
@@ -217,6 +417,7 @@ def _aws_fallback_opts(
             "created_entity_ids": ["PageRaster001"],
             "evidence": {
                 "host_entity_type": "Image::ImagePlane",
+                "source_page_number": 1,
                 "pdf_sha256": pdf_sha256,
                 "source_asset_sha256": raster_sha256,
                 "raster_content_verified": True,
@@ -229,6 +430,7 @@ def _aws_fallback_opts(
 
 def _direct_label_opts(*, delivered_count: bool = True) -> core.ImportOptions:
     opts = core.ImportOptions(import_mode="vector", import_text=True, text_mode="labels")
+    opts.text_delivery_obligation_source_item_ids.append("p1:text:0")
     opts.text_delivery_attempts.append(
         {
             "source_item_id": "p1:text:0",
@@ -260,6 +462,7 @@ def _direct_label_opts(*, delivered_count: bool = True) -> core.ImportOptions:
 
 def _direct_text_opts(*, view_style_verified: bool = True) -> core.ImportOptions:
     opts = core.ImportOptions(import_mode="vector", import_text=True, text_mode="text")
+    opts.text_delivery_obligation_source_item_ids.append("p1:text:0")
     opts.text_delivery_attempts.append(
         {
             "source_item_id": "p1:text:0",
@@ -380,7 +583,11 @@ def test_aws_image_only_fallback_report_is_truthful_and_ready(tmp_path) -> None:
     _write_minimal_pdf(pdf_path)
     pdf_sha256 = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
     objects = _aws_objects(str(raster_path), pdf_sha256)
-    opts = _aws_fallback_opts(str(raster_path), pdf_sha256)
+    opts = _aws_fallback_opts(
+        str(raster_path),
+        pdf_sha256,
+        source_path=pdf_path,
+    )
     inventory = core._build_host_object_inventory(objects)
     opts._report_extra = {
         "actual_host_object_inventory": inventory,
@@ -409,10 +616,11 @@ def test_aws_image_only_fallback_report_is_truthful_and_ready(tmp_path) -> None:
     assert report["extra"]["actual_host_object_inventory"]["counts"]["containers"] == 1
     assert report["extra"]["actual_text_entity_types"]["raster_text_patch"] == 1
     assert report["extra"]["text_representation_delivery"]["verified"] is True
-    assert report["extra"]["import_contract_ready"]["ready"] is True
+    assert opts._live_import_report.extra["import_contract_ready"]["ready"] is True
+    assert report["extra"]["import_contract_ready"]["ready"] is False
 
 
-def test_non_raster_request_with_zero_source_and_delivery_evidence_is_not_ready(
+def test_zero_source_contract_requires_an_explicit_verified_empty_projection(
     tmp_path,
 ) -> None:
     opts = core.ImportOptions(import_mode="vector", import_text=True, text_mode="labels")
@@ -440,10 +648,11 @@ def test_non_raster_request_with_zero_source_and_delivery_evidence_is_not_ready(
     extra = json.loads(report_path.read_text(encoding="utf-8"))["extra"]
     assert extra["actual_text_entity_types"]["count"] == 0
     assert extra["text_delivery_attempts"] == []
-    assert extra["text_representation_delivery"]["required"] is True
-    assert extra["text_representation_delivery"]["verified"] is False
-    assert extra["import_contract_ready"]["checks"]["text_delivery"] is False
-    assert extra["import_contract_ready"]["ready"] is False
+    assert extra["text_delivery_obligations"]["required"] is False
+    assert extra["text_representation_delivery"]["required"] is False
+    assert extra["text_representation_delivery"]["verified"] is True
+    assert extra["import_contract_ready"]["checks"]["text_delivery"] is True
+    assert extra["import_contract_ready"]["ready"] is True
 
 
 def test_generic_failure_cannot_be_hidden_before_a_verified_fallback() -> None:
@@ -456,7 +665,85 @@ def test_generic_failure_cannot_be_hidden_before_a_verified_fallback() -> None:
     )
 
     assert delivery["verified"] is False
-    assert "p1:page_attempt_0_not_proven_impossible" in delivery["invalid_reasons"]
+    assert any(
+        "lacks impossibility proof" in reason
+        for reason in delivery["invalid_reasons"]
+    )
+
+
+def test_delivery_summary_references_one_canonical_attempt_ledger() -> None:
+    opts = _direct_label_opts()
+    ledger = [dict(attempt) for attempt in opts.text_delivery_attempts]
+
+    delivery = core._build_text_representation_delivery(opts, ledger)
+
+    assert delivery["schema"] == "bcs.text_representation_delivery/1.1"
+    assert set(delivery) == {
+        "schema",
+        "required",
+        "requested_type",
+        "verified",
+        "attempt_count",
+        "source_item_count",
+        "delivered_item_count",
+        "failed_item_count",
+        "items",
+        "invalid_reasons",
+    }
+    assert "terminal_attempts" not in delivery
+    assert "terminal_attempt_indexes" not in delivery
+    assert "source_item_ids" not in delivery
+    assert delivery["items"] == [
+        {
+            "source_item_id": "p1:text:0",
+            "terminal_attempt_index": 0,
+            "final_type": "labels",
+            "verified": True,
+        }
+    ]
+    assert report_contract._freecad_delivery_terminal_attempts(
+        delivery,
+        ledger,
+    ) == [ledger[0]]
+
+    tampered_ledger = json.loads(json.dumps(ledger))
+    tampered_ledger[0]["source_item_id"] = "p1:different"
+    assert report_contract._freecad_delivery_terminal_attempts(
+        delivery,
+        tampered_ledger,
+    ) is None
+
+    tampered_delivery = json.loads(json.dumps(delivery))
+    tampered_delivery["items"][0]["terminal_attempt_index"] = 99
+    assert report_contract._freecad_delivery_terminal_attempts(
+        tampered_delivery,
+        ledger,
+    ) is None
+
+
+def test_serialized_attempt_evidence_sentinel_occurs_exactly_once(tmp_path) -> None:
+    opts = _direct_label_opts()
+    sentinel = "ONE_CANONICAL_LEDGER_SENTINEL_7ef9432c"
+    opts.text_delivery_attempts[0]["evidence"]["serialization_sentinel"] = sentinel
+    _attach_inventory(opts, _label_objects())
+    report_path = tmp_path / "canonical-ledger.json"
+
+    core.write_import_report(
+        pdf_path=str(tmp_path / "drawing.pdf"),
+        output_path=str(report_path),
+        opts=opts,
+        pages_imported=1,
+        total_pages=1,
+        text_count=1,
+    )
+
+    serialized = report_path.read_text(encoding="utf-8")
+    assert serialized.count(sentinel) == 1
+    extra = json.loads(serialized)["extra"]
+    assert "terminal_attempts" not in extra["text_representation_delivery"]
+    assert extra["text_representation_delivery"]["items"][0][
+        "terminal_attempt_index"
+    ] == 0
 
 
 def test_ready_rejects_delivery_ids_absent_from_reopened_inventory(tmp_path) -> None:
@@ -574,7 +861,10 @@ def test_delivery_aggregate_rejects_terminal_type_drift() -> None:
     )
 
     assert delivery["verified"] is False
-    assert "p1:text:0_terminal_type_drift" in delivery["invalid_reasons"]
+    assert any(
+        "terminal final_type mismatch" in reason
+        for reason in delivery["invalid_reasons"]
+    )
 
 
 def test_delivery_aggregate_rejects_leaked_prior_attempt() -> None:
@@ -590,7 +880,10 @@ def test_delivery_aggregate_rejects_leaked_prior_attempt() -> None:
     )
 
     assert delivery["verified"] is False
-    assert "p1:page_attempt_0_cleanup_entity_mismatch" in delivery["invalid_reasons"]
+    assert any(
+        "cleanup ownership mismatch" in reason
+        for reason in delivery["invalid_reasons"]
+    )
 
 
 def test_empty_or_unexpected_reopened_inventory_is_not_verified() -> None:
@@ -619,9 +912,10 @@ def test_post_baseline_filter_uses_identity_and_stable_names() -> None:
     assert post_baseline == [imported]
 
 
-def test_valid_mixed_item_fallback_is_not_a_representation_violation(tmp_path) -> None:
+def test_unclosed_mixed_item_fallback_is_not_report_ready(tmp_path) -> None:
     opts = _direct_label_opts()
     source_id = "p1:text:1"
+    opts.text_delivery_obligation_source_item_ids.append(source_id)
     proof = {
         "item_specific_proven_impossible": True,
         "importer_identity": core.FREECAD_TEXT_IMPORTER_IDENTITY,
@@ -721,7 +1015,8 @@ def test_valid_mixed_item_fallback_is_not_a_representation_violation(tmp_path) -
 
     extra = json.loads(report_path.read_text(encoding="utf-8"))["extra"]
     assert "representation_contract_violation" not in extra
-    assert extra["import_contract_ready"]["ready"] is True
+    assert extra["import_contract_ready"]["checks"]["text_delivery"] is False
+    assert extra["import_contract_ready"]["ready"] is False
 
 
 @pytest.mark.parametrize(
@@ -747,6 +1042,7 @@ def test_svg_child_delivery_binds_through_its_persisted_parent_source_id(
         import_text=True,
         text_mode=representation,
     )
+    opts.text_delivery_obligation_source_item_ids.append(parent_source_id)
     opts.text_delivery_attempts.append(
         {
             "source_item_id": parent_source_id,
@@ -871,12 +1167,8 @@ def test_ready_rejects_inexact_page_identity_in_item_fallback_proof(
     for attempt in opts.text_delivery_attempts[:-1]:
         proof = attempt["proof"]
         proof["page_number"] = proof_page
-        for source_result in proof["attempted_source_results"]:
-            source_result["page_number"] = proof_page
     fallback_proof = opts.text_mode_fallbacks[0]["proof"]
     fallback_proof["page_number"] = proof_page
-    for source_result in fallback_proof["attempted_source_results"]:
-        source_result["page_number"] = proof_page
     _attach_inventory(opts, _aws_objects())
     report_path = tmp_path / "fractional-proof-page.json"
 
@@ -900,6 +1192,7 @@ def test_no_source_fallback_rejects_visible_canonical_text() -> None:
     """The page helper must derive absence instead of trusting its caller."""
 
     opts = core.ImportOptions(import_mode="vector", import_text=True, text_mode="labels")
+    _bind_test_page_authority(opts)
     raw_tdict = {
         "blocks": [
             {
@@ -925,7 +1218,7 @@ def test_no_source_fallback_rejects_visible_canonical_text() -> None:
         core._record_no_source_text_page_fallback(
             opts,
             page_num=1,
-            pdf_sha256="a" * 64,
+            pdf_sha256=opts._pdf_sha256,
             raw_tdict=raw_tdict,
             raster_result={
                 "outcome": "verified",
@@ -1559,6 +1852,673 @@ def test_no_source_fallback_rejects_unbound_source_result_authority(
         "text_representation_delivery"
     ]
     assert delivery["verified"] is False
+
+
+def test_reopen_crosscheck_snapshots_each_actual_shape_once() -> None:
+    """One reopened inventory pass must supply both comparison and report records."""
+
+    before = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    after = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    expected = core._build_host_object_inventory([before])
+    edge = after.Shape.Edges[0]
+    original_discretize = edge.discretize
+    calls = []
+
+    def counting_discretize(**kwargs):
+        calls.append(dict(kwargs))
+        return original_discretize(**kwargs)
+
+    edge.discretize = counting_discretize
+
+    crosscheck = core._crosscheck_host_object_inventory(expected, [after])
+
+    assert crosscheck["verified"] is True
+    assert calls == [{"Number": core._SHAPE_FINGERPRINT_EDGE_SAMPLES}]
+
+
+def test_sampled_snapshot_does_not_also_export_brep() -> None:
+    """The tolerant fallback must not pay for serialization after choosing samples."""
+
+    geometry = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+
+    def reject_brep_export():
+        raise AssertionError("sampled snapshots must not export BREP")
+
+    geometry.Shape.exportBrepToString = reject_brep_export
+
+    inventory = core._build_host_object_inventory([geometry])
+
+    assert inventory["verified"] is True
+    assert inventory["objects"][0]["content"]["shape_fingerprint_verified"] is True
+
+
+def test_identical_shape_digest_skips_tolerant_alignment(monkeypatch) -> None:
+    """Exact raw evidence is already a stronger match than tolerant alignment."""
+
+    before = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    after = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    expected = core._build_host_object_inventory([before])
+    alignment_calls = []
+
+    def reject_tolerant_alignment(left, right):
+        alignment_calls.append((left, right))
+        return {"verified": False, "max_delta": None}
+
+    monkeypatch.setattr(
+        report_contract,
+        "_freecad_shape_geometry_comparison",
+        reject_tolerant_alignment,
+    )
+
+    crosscheck = core._crosscheck_host_object_inventory(expected, [after])
+
+    assert crosscheck["verified"] is True
+    assert alignment_calls == []
+    assert crosscheck["geometry_comparisons"][0]["max_delta"] == 0.0
+
+
+def test_fcstd_archive_evidence_hashes_unique_shape_entries(tmp_path) -> None:
+    archive_path = tmp_path / "persisted.FCStd"
+    _write_fcstd_archive(
+        archive_path,
+        {
+            "Geometry001": ("Geometry001.Shape.brp", b"geometry-brep"),
+            "Baseline001": ("Baseline001.Shape.brp", b"baseline-brep"),
+        },
+    )
+
+    evidence = core._read_fcstd_shape_archive_evidence(
+        archive_path,
+        ["Geometry001"],
+    )
+
+    assert evidence["verified"] is True
+    assert evidence["method"] == "fcstd_brep_archive_sha256"
+    assert evidence["fcstd_bytes"] == archive_path.stat().st_size
+    assert evidence["shape_mapping_count"] == 2
+    assert evidence["expected_shape_count"] == 1
+    assert evidence["expected_nonempty_shape_count"] == 1
+    assert evidence["expected_zero_ink_shape_count"] == 0
+    assert evidence["shape_entries"] == [
+        {
+            "entity_id": "Geometry001",
+            "entry_name": "Geometry001.Shape.brp",
+            "sha256": hashlib.sha256(b"geometry-brep").hexdigest(),
+            "bytes": len(b"geometry-brep"),
+            "compression_method": zipfile.ZIP_DEFLATED,
+            "crc32": evidence["shape_entries"][0]["crc32"],
+            "zero_visible_ink": False,
+        }
+    ]
+    assert evidence["evidence_digest"] == core._fcstd_archive_evidence_digest(
+        evidence
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        ("malformed_xml", "document_xml_malformed"),
+        ("dtd", "document_xml_unsafe_declaration"),
+        ("missing_document", "document_xml_missing"),
+        ("duplicate_document", "duplicate_archive_entry"),
+        ("duplicate_shape_entry", "duplicate_archive_entry"),
+        ("traversal", "unsafe_archive_entry_name"),
+        ("backslash", "unsafe_archive_entry_name"),
+        ("missing_shape", "shape_entry_missing"),
+        ("empty_shape", "shape_entry_empty"),
+        ("duplicate_object", "duplicate_document_object_name"),
+        ("shared_shape_entry", "duplicate_shape_entry_mapping"),
+    ],
+)
+def test_fcstd_archive_evidence_rejects_malformed_or_ambiguous_inputs(
+    tmp_path,
+    case,
+    reason,
+) -> None:
+    archive_path = tmp_path / (case + ".FCStd")
+    valid_xml = (
+        b"<Document><ObjectData><Object name='Geometry001'><Properties>"
+        b"<Property name='Shape'><Part file='Geometry001.Shape.brp'/></Property>"
+        b"</Properties></Object></ObjectData></Document>"
+    )
+    shape_entries = {"Geometry001": ("Geometry001.Shape.brp", b"brep")}
+    extra_entries = []
+    document_xml = valid_xml
+    if case == "malformed_xml":
+        document_xml = b"<Document><ObjectData>"
+    elif case == "dtd":
+        document_xml = b"<!DOCTYPE x [<!ENTITY y 'z'>]>" + valid_xml
+    elif case == "missing_document":
+        document_xml = None
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("Geometry001.Shape.brp", b"brep")
+    elif case == "duplicate_document":
+        extra_entries = [("Document.xml", valid_xml)]
+    elif case == "duplicate_shape_entry":
+        extra_entries = [("Geometry001.Shape.brp", b"second")]
+    elif case == "traversal":
+        document_xml = valid_xml.replace(
+            b"Geometry001.Shape.brp", b"../Geometry001.Shape.brp"
+        )
+        shape_entries = {
+            "Geometry001": ("../Geometry001.Shape.brp", b"brep")
+        }
+    elif case == "backslash":
+        document_xml = valid_xml.replace(
+            b"Geometry001.Shape.brp", b"folder\\Geometry001.Shape.brp"
+        )
+        shape_entries = {
+            "Geometry001": ("folder\\Geometry001.Shape.brp", b"brep")
+        }
+    elif case == "missing_shape":
+        shape_entries = {}
+    elif case == "empty_shape":
+        shape_entries = {"Geometry001": ("Geometry001.Shape.brp", b"")}
+    elif case == "duplicate_object":
+        document_xml = valid_xml.replace(
+            b"</ObjectData>",
+            b"<Object name='Geometry001'><Properties/></Object></ObjectData>",
+        )
+    elif case == "shared_shape_entry":
+        document_xml = valid_xml.replace(
+            b"</ObjectData>",
+            b"<Object name='Geometry002'><Properties><Property name='Shape'>"
+            b"<Part file='Geometry001.Shape.brp'/></Property></Properties></Object>"
+            b"</ObjectData>",
+        )
+
+    if case != "missing_document":
+        _write_fcstd_archive(
+            archive_path,
+            shape_entries,
+            extra_entries=extra_entries,
+            document_xml=document_xml,
+        )
+
+    evidence = core._read_fcstd_shape_archive_evidence(
+        archive_path,
+        ["Geometry001"],
+    )
+
+    assert evidence["verified"] is False
+    assert evidence["reason"] == reason
+
+
+def test_fcstd_archive_evidence_crc_reads_shape_payload(tmp_path) -> None:
+    archive_path = tmp_path / "crc.FCStd"
+    document_xml = (
+        b"<Document><ObjectData><Object name='Geometry001'><Properties>"
+        b"<Property name='Shape'><Part file='Geometry001.Shape.brp'/></Property>"
+        b"</Properties></Object></ObjectData></Document>"
+    )
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("Document.xml", document_xml)
+        archive.writestr("Geometry001.Shape.brp", b"stable-shape-bytes")
+    raw = archive_path.read_bytes()
+    assert raw.count(b"stable-shape-bytes") == 1
+    archive_path.write_bytes(raw.replace(b"stable-shape-bytes", b"tamper-shape-bytes"))
+
+    evidence = core._read_fcstd_shape_archive_evidence(
+        archive_path,
+        ["Geometry001"],
+    )
+
+    assert evidence["verified"] is False
+    assert evidence["reason"] == "shape_entry_crc_or_read_error"
+
+
+def test_fcstd_archive_evidence_rejects_invalid_deflated_document_xml(
+    tmp_path,
+) -> None:
+    archive_path = tmp_path / "invalid-document-deflate.FCStd"
+    _write_fcstd_archive(
+        archive_path,
+        {"Geometry001": ("Geometry001.Shape.brp", b"persisted-brep")},
+    )
+    _corrupt_deflated_fcstd_member(archive_path, "Document.xml")
+
+    evidence = core._read_fcstd_shape_archive_evidence(
+        archive_path,
+        ["Geometry001"],
+    )
+
+    assert evidence["verified"] is False
+    assert evidence["reason"] == "document_xml_crc_or_read_error"
+
+
+def test_fcstd_archive_evidence_rejects_invalid_deflated_shape_member(
+    tmp_path,
+) -> None:
+    archive_path = tmp_path / "invalid-shape-deflate.FCStd"
+    _write_fcstd_archive(
+        archive_path,
+        {
+            "Geometry001": (
+                "Geometry001.Shape.brp",
+                bytes(range(256)) * 1000,
+            )
+        },
+    )
+    _corrupt_deflated_fcstd_member(archive_path, "Geometry001.Shape.brp")
+
+    evidence = core._read_fcstd_shape_archive_evidence(
+        archive_path,
+        ["Geometry001"],
+    )
+
+    assert evidence["verified"] is False
+    assert evidence["reason"] == "shape_entry_crc_or_read_error"
+
+
+def test_archive_persistence_skips_live_brep_and_sampled_shape_passes(
+    tmp_path,
+) -> None:
+    before = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    after = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    for host_object in (before, after):
+        host_object.Shape.exportBrepToString = lambda: (_ for _ in ()).throw(
+            AssertionError("production persistence must not serialize live BREP")
+        )
+        host_object.Shape.Edges[0].discretize = lambda **_kwargs: (
+            (_ for _ in ()).throw(
+                AssertionError("production persistence must not sample live edges")
+            )
+        )
+    archive_path = tmp_path / "persisted.FCStd"
+    _write_fcstd_archive(
+        archive_path,
+        {"Geometry001": ("Geometry001.Shape.brp", b"persisted-brep")},
+    )
+    expected = core._build_host_object_inventory(
+        [before], shape_evidence_mode="cheap"
+    )
+    evidence = core._read_fcstd_shape_archive_evidence(
+        archive_path, ["Geometry001"]
+    )
+    assert core._bind_fcstd_shape_archive_evidence(expected, evidence) is True
+
+    crosscheck = core._crosscheck_host_object_inventory(
+        expected,
+        [after],
+        shape_evidence_mode="cheap",
+        archive_evidence=evidence,
+    )
+
+    assert crosscheck["verified"] is True
+    assert crosscheck["geometry_comparisons"] == []
+    assert expected["objects"][0]["content"]["shape_digest"] == evidence[
+        "shape_entries"
+    ][0]["sha256"]
+
+
+def test_archive_persistence_does_not_treat_live_topology_as_persisted_authority(
+    tmp_path,
+) -> None:
+    before = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    archive_path = tmp_path / "drift.FCStd"
+    _write_fcstd_archive(
+        archive_path,
+        {"Geometry001": ("Geometry001.Shape.brp", b"persisted-brep")},
+    )
+    evidence = core._read_fcstd_shape_archive_evidence(
+        archive_path, ["Geometry001"]
+    )
+
+    topology_drift = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    topology_drift.Shape.Edges.append(ShapeEdge())
+    expected = core._build_host_object_inventory(
+        [before], shape_evidence_mode="cheap"
+    )
+    assert core._crosscheck_host_object_inventory(
+        expected,
+        [topology_drift],
+        shape_evidence_mode="cheap",
+        archive_evidence=evidence,
+    )["verified"] is True
+
+    before.Shape.Length = 1.0
+    metric_drift = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    metric_drift.Shape.Length = 2.0
+    expected = core._build_host_object_inventory(
+        [before], shape_evidence_mode="cheap"
+    )
+    assert core._crosscheck_host_object_inventory(
+        expected,
+        [metric_drift],
+        shape_evidence_mode="cheap",
+        archive_evidence=evidence,
+    )["verified"] is True
+
+
+def test_archive_persistence_rejects_3d_text_base_link_drift(tmp_path) -> None:
+    expected_base = HostObject("CloneExpected", "Part::Feature")
+    changed_base = HostObject("CloneChanged", "Part::Feature")
+    before = HostObject(
+        "Extrusion001",
+        "Part::Extrusion",
+        representation="3d_text",
+        source_item_id="p1:text:0:3d",
+        parent_source_item_id="p1:text:0",
+        string="3D TEXT",
+        base=expected_base,
+    )
+    after = HostObject(
+        "Extrusion001",
+        "Part::Extrusion",
+        representation="3d_text",
+        source_item_id="p1:text:0:3d",
+        parent_source_item_id="p1:text:0",
+        string="3D TEXT",
+        base=changed_base,
+    )
+    archive_path = tmp_path / "base-drift.FCStd"
+    _write_fcstd_archive(
+        archive_path,
+        {"Extrusion001": ("Extrusion001.Shape.brp", b"persisted-extrusion")},
+    )
+    evidence = core._read_fcstd_shape_archive_evidence(
+        archive_path, ["Extrusion001"]
+    )
+    expected = core._build_host_object_inventory(
+        [before], shape_evidence_mode="cheap"
+    )
+
+    crosscheck = core._crosscheck_host_object_inventory(
+        expected,
+        [after],
+        shape_evidence_mode="cheap",
+        archive_evidence=evidence,
+    )
+
+    assert crosscheck["verified"] is False
+    assert crosscheck["mismatched_entities"][0]["entity_id"] == "Extrusion001"
+
+
+def test_save_reopen_fails_before_open_when_archive_is_malformed(
+    monkeypatch,
+) -> None:
+    geometry = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    geometry.Shape.exportBrepToString = lambda: (_ for _ in ()).throw(
+        AssertionError("failure must not fall back to live BREP")
+    )
+    geometry.Shape.Edges[0].discretize = lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("failure must not fall back to sampled geometry")
+    )
+
+    class Document:
+        Name = "Original"
+
+        @staticmethod
+        def saveCopy(path):
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("Document.xml", b"<Document><ObjectData>")
+            return True
+
+    open_calls = []
+    fake_freecad = type(
+        "FakeFreeCAD",
+        (),
+        {
+            "openDocument": staticmethod(
+                lambda *_args: open_calls.append(_args)
+            ),
+            "closeDocument": staticmethod(lambda *_args: None),
+            "setActiveDocument": staticmethod(lambda *_args: None),
+        },
+    )
+    monkeypatch.setattr(core, "FreeCAD", fake_freecad)
+    inventory = core._build_host_object_inventory(
+        [geometry], shape_evidence_mode="cheap"
+    )
+
+    result = core._save_reopen_host_object_inventory(Document(), inventory)
+
+    assert result["verified"] is False
+    assert result["reason"] == "document_xml_malformed"
+    assert open_calls == []
+    assert result["phase_timings_ms"]["cheap_inventory_ms"] == 0.0
+
+
+def test_save_reopen_rejects_fcstd_changed_during_open(monkeypatch) -> None:
+    before = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    after = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+
+    class Document:
+        Name = "Original"
+
+        @staticmethod
+        def saveCopy(path):
+            _write_fcstd_archive(
+                Path(path),
+                {"Geometry001": ("Geometry001.Shape.brp", b"persisted-brep")},
+            )
+            return True
+
+    reopened = type("Reopened", (), {"Name": "Reopened", "Objects": [after]})()
+
+    def tampering_open(path, *_args):
+        with Path(path).open("ab") as stream:
+            stream.write(b"changed-after-archive-hash")
+        return reopened
+
+    fake_freecad = type(
+        "FakeFreeCAD",
+        (),
+        {
+            "openDocument": staticmethod(tampering_open),
+            "closeDocument": staticmethod(lambda *_args: None),
+            "setActiveDocument": staticmethod(lambda *_args: None),
+        },
+    )
+    monkeypatch.setattr(core, "FreeCAD", fake_freecad)
+    inventory = core._build_host_object_inventory(
+        [before], shape_evidence_mode="cheap"
+    )
+
+    result = core._save_reopen_host_object_inventory(Document(), inventory)
+
+    assert result["verified"] is False
+    assert result["reason"] == "fcstd_archive_changed_after_open"
+    assert result["archive_unchanged_after_open"] is False
+
+
+def test_import_evidence_builder_never_dereferences_live_shape(monkeypatch) -> None:
+    class MetadataOnlyPart:
+        Name = "Geometry001"
+        TypeId = "Part::Feature"
+        PDFRepresentation = "geometry"
+        PDFSourceItemId = "p1:b0:l0:s0:geometry"
+        PDFParentSourceItemId = "p1:b0:l0:s0"
+        PDFSourceText = "SOURCE"
+
+        @property
+        def Shape(self):
+            raise AssertionError("production inventory must not dereference Shape")
+
+        @staticmethod
+        def isDerivedFrom(_type_id):
+            return False
+
+    before = MetadataOnlyPart()
+    observed = {}
+
+    def capture_save_reopen(fc_doc, inventory, baseline_entity_names=None):
+        observed["fc_doc"] = fc_doc
+        observed["inventory"] = inventory
+        observed["baseline"] = baseline_entity_names
+        return {"verified": True}
+
+    monkeypatch.setattr(
+        core,
+        "_save_reopen_host_object_inventory",
+        capture_save_reopen,
+    )
+    document = object()
+
+    inventory, save_reopen = core._build_persistence_host_evidence(
+        document,
+        [before],
+        {"Baseline"},
+    )
+
+    content = inventory["objects"][0]["content"]
+    assert content["shape_snapshot_method"] == "fcstd_archive_pending"
+    assert "shape_topology_counts" not in content
+    assert "shape_metrics" not in content
+    assert "shape_bounds" not in content
+    assert "shape_fingerprint_geometry" not in content
+    assert "shape_brep_sha256" not in content
+    assert save_reopen == {"verified": True}
+    assert observed == {
+        "fc_doc": document,
+        "inventory": inventory,
+        "baseline": {"Baseline"},
+    }
+
+
+def test_save_reopen_emits_compact_digest_references_without_object_copies(
+    monkeypatch,
+) -> None:
+    before = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    after = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+
+    class Document:
+        Name = "Original"
+
+        @staticmethod
+        def saveCopy(path):
+            _write_fcstd_archive(
+                Path(path),
+                {"Geometry001": ("Geometry001.Shape.brp", b"persisted-brep")},
+            )
+            return True
+
+    reopened = type("Reopened", (), {"Name": "Reopened", "Objects": [after]})()
+    fake_freecad = type(
+        "FakeFreeCAD",
+        (),
+        {
+            "openDocument": staticmethod(lambda *_args: reopened),
+            "closeDocument": staticmethod(lambda *_args: None),
+            "setActiveDocument": staticmethod(lambda *_args: None),
+        },
+    )
+    monkeypatch.setattr(core, "FreeCAD", fake_freecad)
+    inventory = core._build_host_object_inventory(
+        [before],
+        shape_evidence_mode="cheap",
+    )
+
+    result = core._save_reopen_host_object_inventory(Document(), inventory)
+
+    assert result["verified"] is True
+    assert result["schema"] == "bcs.freecad_save_reopen_inventory/1.0"
+    assert result["inventory_digest"] == inventory["inventory_digest"]
+    assert result["reopened_inventory_digest"] == inventory["inventory_digest"]
+    assert result["shape_archive_evidence_digest"] == inventory[
+        "shape_archive_evidence"
+    ]["evidence_digest"]
+    assert "expected_objects" not in result
+    assert "actual_objects" not in result
+    assert "geometry_comparisons" not in result
+    assert "shape_archive_evidence" not in result
+    public_inventory = core._public_report_value(inventory)
+    public_result = core._public_report_value(result)
+    assert report_contract._freecad_save_reopen_inventory_verified(
+        public_inventory,
+        public_result,
+    ) is True
 
 
 def test_reopen_crosscheck_rejects_nonempty_shape_topology_drift() -> None:
@@ -2359,6 +3319,113 @@ def test_public_inventory_does_not_serialize_transient_edge_samples() -> None:
     assert raw_bytes > len(public_json.encode("utf-8")) * 5
 
 
+def test_public_compact_fcstd_inventory_is_bound_and_tamper_evident(
+    tmp_path,
+) -> None:
+    """One manifest binds the FCStd, XML, exact BREP, inventory, and reopen."""
+
+    before = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    after = HostObject(
+        "Geometry001",
+        "Part::Feature",
+        representation="geometry",
+        source_item_id="p1:b0:l0:s0:geometry",
+        parent_source_item_id="p1:b0:l0:s0",
+    )
+    archive_path = tmp_path / "persisted.FCStd"
+    _write_fcstd_archive(
+        archive_path,
+        {"Geometry001": ("Geometry001.Shape.brp", b"persisted exact BREP")},
+    )
+    private_expected = core._build_host_object_inventory(
+        [before], shape_evidence_mode="cheap"
+    )
+    archive_evidence = core._read_fcstd_shape_archive_evidence(
+        archive_path,
+        ["Geometry001"],
+    )
+    assert core._bind_fcstd_shape_archive_evidence(
+        private_expected,
+        archive_evidence,
+    ) is True
+    private_crosscheck = core._compact_crosscheck_host_object_inventory(
+        private_expected,
+        [after],
+        archive_evidence,
+    )
+    private_crosscheck.update(
+        {
+            "method": "temporary_fcstd_save_copy_archive_reopen",
+            "archive_unchanged_after_open": True,
+            "phase_timings_ms": {
+                "save_ms": 1.0,
+                "archive_hash_ms": 2.0,
+                "open_ms": 3.0,
+                "cheap_inventory_ms": 4.0,
+            },
+        }
+    )
+    public_expected = core._public_report_value(private_expected)
+    public_crosscheck = core._public_report_value(private_crosscheck)
+
+    assert report_contract._freecad_host_inventory_verified(
+        public_expected,
+        {"primitives": 0, "images": 0},
+    ) is True
+    assert report_contract._freecad_save_reopen_inventory_verified(
+        public_expected,
+        public_crosscheck,
+    ) is True
+
+    tampered_manifest = json.loads(json.dumps(public_expected))
+    tampered_manifest["shape_archive_evidence"]["fcstd_sha256"] = "f" * 64
+    assert report_contract._freecad_save_reopen_inventory_verified(
+        tampered_manifest,
+        public_crosscheck,
+    ) is False
+
+    tampered_inventory_digest = json.loads(json.dumps(public_crosscheck))
+    tampered_inventory_digest["inventory_digest"] = "f" * 64
+    assert report_contract._freecad_save_reopen_inventory_verified(
+        public_expected,
+        tampered_inventory_digest,
+    ) is False
+
+    tampered_archive_digest = json.loads(json.dumps(public_crosscheck))
+    tampered_archive_digest["shape_archive_evidence_digest"] = "f" * 64
+    assert report_contract._freecad_save_reopen_inventory_verified(
+        public_expected,
+        tampered_archive_digest,
+    ) is False
+
+    duplicated_payload = json.loads(json.dumps(public_crosscheck))
+    duplicated_payload["actual_objects"] = public_expected["objects"]
+    assert report_contract._freecad_save_reopen_inventory_verified(
+        public_expected,
+        duplicated_payload,
+    ) is False
+
+    tampered_timing = json.loads(json.dumps(public_crosscheck))
+    tampered_timing["phase_timings_ms"]["archive_hash_ms"] = -1.0
+    assert report_contract._freecad_save_reopen_inventory_verified(
+        public_expected,
+        tampered_timing,
+    ) is False
+
+    tampered_toc = json.loads(json.dumps(public_crosscheck))
+    tampered_toc["archive_unchanged_after_open"] = False
+    assert report_contract._freecad_save_reopen_inventory_verified(
+        public_expected,
+        tampered_toc,
+    ) is False
+
+
 def test_ready_rejects_unrecognized_delivered_count_bucket(tmp_path) -> None:
     """Unknown integer buckets must not disappear from exact accounting."""
 
@@ -2494,6 +3561,7 @@ def test_ready_rejects_3d_text_that_omits_required_support_structure(
     opts = core.ImportOptions(
         import_mode="vector", import_text=True, text_mode="3d_text"
     )
+    opts.text_delivery_obligation_source_item_ids.append(source_id)
     opts.text_delivery_attempts.append(
         {
             "source_item_id": source_id,
@@ -2554,6 +3622,8 @@ def test_legitimate_3d_text_delivery_with_support_objects_remains_ready(
     opts = core.ImportOptions(
         import_mode="vector", import_text=True, text_mode="3d_text"
     )
+    font_evidence, font_properties = _visible_3d_font_delivery(tmp_path)
+    opts.text_delivery_obligation_source_item_ids.append(source_id)
     opts.text_delivery_attempts.append(
         {
             "source_item_id": source_id,
@@ -2577,6 +3647,7 @@ def test_legitimate_3d_text_delivery_with_support_objects_remains_ready(
                 "solid_count": 1,
                 "volume": 1.0,
                 "view_style_verified": True,
+                **font_evidence,
             },
         }
     )
@@ -2587,6 +3658,7 @@ def test_legitimate_3d_text_delivery_with_support_objects_remains_ready(
         representation="3d_text",
         source_item_id=source_id,
         string="3D",
+        font_delivery=font_properties,
     )
     scale_support = HostObject(
         "ScaleSupport001",
@@ -2594,6 +3666,7 @@ def test_legitimate_3d_text_delivery_with_support_objects_remains_ready(
         representation="3d_text",
         source_item_id=source_id,
         string="3D",
+        font_delivery=font_properties,
     )
     extrusion = HostObject(
         "Extrusion001",
@@ -2601,6 +3674,7 @@ def test_legitimate_3d_text_delivery_with_support_objects_remains_ready(
         representation="3d_text",
         source_item_id=source_id,
         base=scale_support,
+        font_delivery=font_properties,
     )
     objects = [
         HostObject("PDF_Page_1", "App::DocumentObjectGroup"),
@@ -2625,6 +3699,206 @@ def test_legitimate_3d_text_delivery_with_support_objects_remains_ready(
     ]
     assert ready["checks"]["delivery_inventory_binding"] is True
     assert ready["ready"] is True
+
+
+def test_compact_fcstd_archive_3d_text_delivery_binds_to_exact_shape_entries(
+    tmp_path,
+) -> None:
+    """Compact BREP evidence must satisfy the same native 3D Text contract."""
+
+    source_id = "p1:text:0"
+    font_evidence, font_properties = _visible_3d_font_delivery(tmp_path)
+    attempt = {
+        "source_item_id": source_id,
+        "requested_type": "3d_text",
+        "attempted_type": "3d_text",
+        "final_type": "3d_text",
+        "outcome": "verified",
+        "created_entity_ids": [
+            "ShapeString001",
+            "ScaleSupport001",
+            "Extrusion001",
+        ],
+        "delivery_entity_ids": ["Extrusion001"],
+        "support_entity_ids": ["ShapeString001", "ScaleSupport001"],
+        "removed_entity_ids": [],
+        "cleanup_complete": True,
+        "delivery_count": 1,
+        "evidence": {
+            "source_text": "3D",
+            "source_text_preserved": True,
+            "solid_count": 1,
+            "volume": 1.0,
+            "view_style_verified": True,
+            **font_evidence,
+        },
+    }
+    opts = core.ImportOptions(
+        import_mode="vector",
+        import_text=True,
+        text_mode="3d_text",
+    )
+    opts.text_delivery_obligation_source_item_ids.append(source_id)
+    opts.text_delivery_attempts.append(attempt)
+    shape_string = HostObject(
+        "ShapeString001",
+        "Part::Part2DObjectPython",
+        representation="3d_text",
+        source_item_id=source_id,
+        string="3D",
+        font_delivery=font_properties,
+    )
+    scale_support = HostObject(
+        "ScaleSupport001",
+        "Part::Part2DObjectPython",
+        representation="3d_text",
+        source_item_id=source_id,
+        font_delivery=font_properties,
+    )
+    extrusion = HostObject(
+        "Extrusion001",
+        "Part::Extrusion",
+        representation="3d_text",
+        source_item_id=source_id,
+        base=scale_support,
+        font_delivery=font_properties,
+    )
+    inventory = core._build_host_object_inventory(
+        [shape_string, scale_support, extrusion],
+        shape_evidence_mode="cheap",
+    )
+    archive_path = tmp_path / "compact-3d-text.FCStd"
+    _write_fcstd_archive(
+        archive_path,
+        {
+            "ShapeString001": ("ShapeString001.Shape.brp", b"shape-string"),
+            "ScaleSupport001": ("ScaleSupport001.Shape.brp", b"scaled-shape"),
+            "Extrusion001": ("Extrusion001.Shape.brp", b"extruded-solid"),
+        },
+    )
+    archive_evidence = core._read_fcstd_shape_archive_evidence(
+        archive_path,
+        ["ShapeString001", "ScaleSupport001", "Extrusion001"],
+    )
+    assert core._bind_fcstd_shape_archive_evidence(
+        inventory,
+        archive_evidence,
+    ) is True
+
+    public_inventory = core._public_report_value(inventory)
+    delivery = core._public_report_value(
+        core._build_text_representation_delivery(opts, opts.text_delivery_attempts)
+    )
+    public_attempts = core._public_report_value(opts.text_delivery_attempts)
+    assert report_contract._freecad_delivery_inventory_binding_verified(
+        delivery,
+        public_attempts,
+        public_inventory,
+        "a" * 64,
+    ) is True
+
+    tampered = json.loads(json.dumps(public_inventory))
+    tampered["shape_archive_evidence"]["shape_entries"][0]["sha256"] = "f" * 64
+    assert report_contract._freecad_delivery_inventory_binding_verified(
+        delivery,
+        public_attempts,
+        tampered,
+        "a" * 64,
+    ) is False
+
+
+def test_compact_fcstd_archive_zero_ink_3d_text_binds_empty_shape(
+    tmp_path,
+) -> None:
+    """An exact empty BREP is the persisted shape proof for layout-only text."""
+
+    source_id = "p1:b0:l0:s0"
+    source_text = "   "
+    pdf_sha256 = "a" * 64
+    source_evidence = _zero_ink_source_evidence(
+        source_id,
+        source_text,
+        pdf_sha256,
+    )
+    entity_id = "PDF_Empty_3D_Text"
+    attempt = {
+        "source_item_id": source_id,
+        "requested_type": "3d_text",
+        "attempted_type": "3d_text",
+        "final_type": "3d_text",
+        "outcome": "verified",
+        "created_entity_ids": [entity_id],
+        "delivery_entity_ids": [entity_id],
+        "support_entity_ids": [],
+        "removed_entity_ids": [],
+        "cleanup_complete": True,
+        "delivery_count": 1,
+        "evidence": {
+            "source_text": source_text,
+            "source_text_preserved": True,
+            "source_ink_evidence": source_evidence,
+            "source_ink_evidence_persisted": True,
+            "source_pdf_sha256": pdf_sha256,
+            "source_page_number": 1,
+            "source_font_identity": source_evidence["font_identity"],
+            "source_font_asset_bindings": source_evidence["font_asset_bindings"],
+            "source_glyph_id_sequence": source_evidence["glyph_id_sequence"],
+            "physical_visibility": False,
+            "vertex_count": 0,
+            "edge_count": 0,
+            "face_count": 0,
+            "solid_count": 0,
+            "volume": 0.0,
+            "shape_is_null": True,
+            "zero_visible_ink_verified": True,
+        },
+    }
+    opts = core.ImportOptions(
+        import_mode="vector",
+        import_text=True,
+        text_mode="3d_text",
+    )
+    opts.text_delivery_obligation_source_item_ids.append(source_id)
+    opts.text_delivery_attempts.append(attempt)
+    inventory = core._build_host_object_inventory(
+        [
+            HostObject(
+                entity_id,
+                "Part::Feature",
+                representation="3d_text",
+                source_item_id=source_id,
+                shape_nonempty=False,
+                string=source_text,
+                text_visibility=False,
+                source_ink_classification="zero_visible_ink",
+                source_ink_digest=source_evidence["evidence_sha256"],
+            )
+        ],
+        shape_evidence_mode="cheap",
+    )
+    archive_path = tmp_path / "compact-zero-ink-3d-text.FCStd"
+    _write_fcstd_archive(
+        archive_path,
+        {entity_id: (entity_id + ".Shape.brp", b"")},
+    )
+    archive_evidence = core._read_fcstd_shape_archive_evidence(
+        archive_path,
+        [],
+        expected_zero_ink_shape_entity_ids=[entity_id],
+    )
+    assert core._bind_fcstd_shape_archive_evidence(
+        inventory,
+        archive_evidence,
+    ) is True
+
+    assert report_contract._freecad_delivery_inventory_binding_verified(
+        core._public_report_value(
+            core._build_text_representation_delivery(opts, opts.text_delivery_attempts)
+        ),
+        core._public_report_value(opts.text_delivery_attempts),
+        core._public_report_value(inventory),
+        pdf_sha256,
+    ) is True
 
 
 def test_zero_ink_inventory_binds_exact_source_text_and_physical_evidence() -> None:
@@ -2661,10 +3935,130 @@ def test_zero_ink_inventory_binds_exact_source_text_and_physical_evidence() -> N
     assert core._crosscheck_host_object_inventory(inventory, [after])["verified"] is False
 
 
+def test_zero_ink_cheap_inventory_is_bound_to_exact_empty_fcstd_shape(
+    tmp_path,
+) -> None:
+    """All-space 3D text remains valid when its persisted shape is exactly empty."""
+
+    source_id = "p1:b0:l0:s0"
+    source_text = "   "
+    evidence = _zero_ink_source_evidence(source_id, source_text)
+    entity_id = "PDF_Empty_3D_Text"
+    host_object = HostObject(
+        entity_id,
+        "Part::Feature",
+        representation="3d_text",
+        source_item_id=source_id,
+        shape_nonempty=False,
+        string=source_text,
+        text_visibility=False,
+        source_ink_classification="zero_visible_ink",
+        source_ink_digest=evidence["evidence_sha256"],
+    )
+    inventory = core._build_host_object_inventory(
+        [host_object],
+        shape_evidence_mode="cheap",
+    )
+    archive_path = tmp_path / "zero-ink.FCStd"
+    _write_fcstd_archive(
+        archive_path,
+        {entity_id: (entity_id + ".Shape.brp", b"")},
+    )
+
+    archive_evidence = core._read_fcstd_shape_archive_evidence(
+        archive_path,
+        [],
+        expected_zero_ink_shape_entity_ids=[entity_id],
+    )
+
+    assert archive_evidence["verified"] is True
+    assert archive_evidence["shape_entries"] == [
+        {
+            "entity_id": entity_id,
+            "entry_name": entity_id + ".Shape.brp",
+            "sha256": hashlib.sha256(b"").hexdigest(),
+            "bytes": 0,
+            "compression_method": zipfile.ZIP_DEFLATED,
+            "crc32": 0,
+            "zero_visible_ink": True,
+        }
+    ]
+    assert core._bind_fcstd_shape_archive_evidence(
+        inventory,
+        archive_evidence,
+    ) is True
+    assert report_contract._freecad_host_inventory_verified(
+        core._public_report_value(inventory),
+        {"primitives": 0, "images": 0},
+    ) is True
+
+
+def test_zero_ink_cheap_inventory_rejects_nonempty_or_mismatched_archive_entry(
+    tmp_path,
+) -> None:
+    source_id = "p1:b0:l0:s0"
+    source_text = " "
+    source_evidence = _zero_ink_source_evidence(source_id, source_text)
+    entity_id = "PDF_Empty_3D_Text"
+    inventory = core._build_host_object_inventory(
+        [
+            HostObject(
+                entity_id,
+                "Part::Feature",
+                representation="3d_text",
+                source_item_id=source_id,
+                shape_nonempty=False,
+                string=source_text,
+                source_ink_classification="zero_visible_ink",
+                source_ink_digest=source_evidence["evidence_sha256"],
+            )
+        ],
+        shape_evidence_mode="cheap",
+    )
+    archive_path = tmp_path / "not-empty.FCStd"
+    _write_fcstd_archive(
+        archive_path,
+        {entity_id: (entity_id + ".Shape.brp", b"unexpected geometry")},
+    )
+    archive_evidence = core._read_fcstd_shape_archive_evidence(
+        archive_path,
+        [],
+        expected_zero_ink_shape_entity_ids=[entity_id],
+    )
+    assert archive_evidence["verified"] is False
+    assert archive_evidence["reason"] == "zero_ink_shape_entry_nonempty"
+
+    empty_path = tmp_path / "empty.FCStd"
+    _write_fcstd_archive(
+        empty_path,
+        {entity_id: (entity_id + ".Shape.brp", b"")},
+    )
+    archive_evidence = core._read_fcstd_shape_archive_evidence(
+        empty_path,
+        [],
+        expected_zero_ink_shape_entity_ids=[entity_id],
+    )
+    assert core._bind_fcstd_shape_archive_evidence(inventory, archive_evidence) is True
+    public_inventory = core._public_report_value(inventory)
+    public_inventory["objects"][0]["content"]["shape_archive_entry"] = (
+        "different.Shape.brp"
+    )
+    assert report_contract._freecad_host_inventory_verified(
+        public_inventory,
+        {"primitives": 0, "images": 0},
+    ) is False
+
+
 def test_synthetic_source_character_cannot_be_relabelled_as_visible_ink() -> None:
     source_id = "p1:b0:l0:s0"
     source_text = " "
     evidence = _zero_ink_source_evidence(source_id, source_text)
+    evidence["characters"][0]["authority"] = (
+        "pymupdf_rawdict_synthetic_character"
+    )
+    evidence["characters"][0]["synthetic"] = True
+    evidence["characters"][0]["glyph_id"] = None
+    evidence["glyph_id_sequence"] = [None]
     evidence["classification"] = "visible_ink"
     evidence["characters"][0]["zero_visible_ink"] = False
     evidence["evidence_sha256"] = core._source_ink_evidence_digest(evidence)
@@ -2750,6 +4144,7 @@ def test_physically_zero_ink_requested_representation_is_report_ready(
         import_text=True,
         text_mode=representation,
     )
+    opts.text_delivery_obligation_source_item_ids.append(source_id)
     opts.text_delivery_attempts.append(
         {
             "source_item_id": source_id,

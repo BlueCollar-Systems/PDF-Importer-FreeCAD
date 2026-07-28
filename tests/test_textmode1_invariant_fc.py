@@ -17,6 +17,10 @@ for path in (REPO_ROOT, REPO_ROOT / "PDFVectorImporter" / "src"):
 
 import PDFImporterCore as core  # noqa: E402
 from PDFVectorImporter.src import PDFSvgTextRenderer as renderer  # noqa: E402
+from test_freecad_report_inventory import (  # noqa: E402
+    _bind_test_page_authority,
+    _write_minimal_pdf,
+)
 
 
 def test_readme_documents_six_distinct_modes_and_exact_controller_ladders():
@@ -42,6 +46,7 @@ def test_readme_documents_six_distinct_modes_and_exact_controller_ladders():
 
 def _report(tmp_path, requested, delivered, count):
     opts = core.ImportOptions(text_mode=requested)
+    opts.text_delivery_obligation_source_item_ids.append("p1:text:0")
     bucket_by_type = {
         "labels": "native_label",
         "text": "native_text",
@@ -105,7 +110,10 @@ def test_glyphs_and_geometry_are_not_treated_as_equivalent_peer_modes(tmp_path):
     violation = report["extra"]["representation_contract_violation"]
     assert violation["requested_type"] == "glyphs"
     assert violation["reason"] == "invalid_item_bound_representation_delivery"
-    assert "p1:text:0_non_adjacent_or_repeated_ladder" in violation["invalid_reasons"]
+    assert any(
+        "attempts do not start with requested_type" in reason
+        for reason in violation["invalid_reasons"]
+    )
 
 
 @pytest.mark.parametrize("mode", ["labels", "3d_text", "glyphs", "geometry"])
@@ -183,7 +191,7 @@ def test_auto_raster_content_classification_cannot_discard_requested_text(mode):
 
 
 @pytest.mark.parametrize("mode", ["labels", "text", "3d_text", "glyphs", "geometry"])
-def test_raster_page_strategy_preserves_independent_structural_text_request(mode):
+def test_raster_page_strategy_preserves_page_and_text_requests_orthogonally(mode):
     opts = core.ImportOptions(import_mode="raster", import_text=True, text_mode=mode)
 
     assert core._raster_page_requires_text_contract_probe(opts) is True
@@ -321,7 +329,6 @@ def test_failed_fast_text_probe_with_canonical_text_never_places_masking_raster(
     monkeypatch.setattr(core, "FreeCAD", SimpleNamespace(GuiUp=False))
     monkeypatch.setattr(core, "_warn", lambda *_args: None)
     monkeypatch.setattr(core, "_msg", lambda *_args: None)
-    monkeypatch.setattr(core, "_pdf_file_sha256", lambda _path: "e" * 64)
     monkeypatch.setattr(core, "_import_page_as_raster", record_raster)
     monkeypatch.setattr(core, "_render_canonical_text_items", render_visible_items)
     opts = core.ImportOptions(
@@ -331,6 +338,7 @@ def test_failed_fast_text_probe_with_canonical_text_never_places_masking_raster(
         raster_fallback=False,
         ignore_images=True,
     )
+    _bind_test_page_authority(opts)
 
     _group, text_info = core._import_pdf_page_inner(
         Pdf(), "fixture.pdf", 1, opts, Document()
@@ -345,6 +353,7 @@ def test_failed_fast_text_probe_with_canonical_text_never_places_masking_raster(
 @pytest.mark.parametrize("mode", ["labels", "text", "3d_text", "glyphs", "geometry"])
 def test_page_without_source_item_uses_page_scoped_visual_fallback(mode):
     opts = core.ImportOptions(import_mode="auto", import_text=True, text_mode=mode)
+    _bind_test_page_authority(opts)
     attempts_ref = opts.text_delivery_attempts
     fallbacks_ref = opts.text_mode_fallbacks
     counts_ref = opts.text_delivered_counts
@@ -352,14 +361,15 @@ def test_page_without_source_item_uses_page_scoped_visual_fallback(mode):
     info = core._record_no_source_text_page_fallback(
         opts,
         page_num=1,
-        pdf_sha256="a" * 64,
+        pdf_sha256=opts._pdf_sha256,
         raw_tdict={"blocks": [{"type": 1}]},
         raster_result={
             "outcome": "verified",
             "created_entity_ids": ["PageRaster001"],
             "evidence": {
                 "host_entity_type": "Image::ImagePlane",
-                "pdf_sha256": "a" * 64,
+                "source_page_number": 1,
+                "pdf_sha256": opts._pdf_sha256,
                 "source_asset_sha256": "f" * 64,
                 "raster_content_verified": True,
                 "raster_file_included": True,
@@ -383,6 +393,10 @@ def test_page_without_source_item_uses_page_scoped_visual_fallback(mode):
 
 def test_no_source_page_fallback_rolls_back_all_ledgers_on_write_failure(monkeypatch):
     opts = core.ImportOptions(import_mode="auto", import_text=True, text_mode="labels")
+    _bind_test_page_authority(opts)
+    observations_before = json.loads(
+        json.dumps(opts.page_visual_source_observations)
+    )
 
     def fail_attempt(*_args, **_kwargs):
         raise RuntimeError("ledger write failed")
@@ -393,14 +407,15 @@ def test_no_source_page_fallback_rolls_back_all_ledgers_on_write_failure(monkeyp
         core._record_no_source_text_page_fallback(
             opts,
             page_num=1,
-            pdf_sha256="c" * 64,
+            pdf_sha256=opts._pdf_sha256,
             raw_tdict={"blocks": [{"type": 1}]},
             raster_result={
                 "outcome": "verified",
                 "created_entity_ids": ["PageRaster003"],
                 "evidence": {
                     "host_entity_type": "Image::ImagePlane",
-                    "pdf_sha256": "c" * 64,
+                    "source_page_number": 1,
+                    "pdf_sha256": opts._pdf_sha256,
                     "source_asset_sha256": "f" * 64,
                     "raster_content_verified": True,
                     "raster_file_included": True,
@@ -411,12 +426,11 @@ def test_no_source_page_fallback_rolls_back_all_ledgers_on_write_failure(monkeyp
     assert opts.text_delivery_attempts == []
     assert opts.text_mode_fallbacks == []
     assert opts.text_delivered_counts == {}
-    assert opts.page_visual_source_observations == {}
+    assert opts.page_visual_source_observations == observations_before
 def test_public_page_import_rolls_back_post_baseline_objects_and_reports_truth(
     monkeypatch,
+    tmp_path,
 ):
-    from pdfcadcore import fitz_loader
-
     class HostObject:
         def __init__(self, name):
             self.Name = name
@@ -456,14 +470,29 @@ def test_public_page_import_rolls_back_post_baseline_objects_and_reports_truth(
         def __init__(self):
             self.closed = False
 
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
         def close(self):
             self.closed = True
+
+        def __len__(self):
+            return 1
+
+        def load_page(self, _index):
+            return SimpleNamespace(
+                rect=SimpleNamespace(height=100.0),
+                get_text=lambda _kind: "",
+            )
 
     document = Document()
     existing = document.addObject("Part::Feature", "Existing")
     opened = []
 
-    def safe_open(_path):
+    def open_attempt(_opts):
         pdf = Pdf()
         opened.append(pdf)
         return pdf
@@ -484,13 +513,19 @@ def test_public_page_import_rolls_back_post_baseline_objects_and_reports_truth(
             },
         )
 
-    monkeypatch.setattr(fitz_loader, "safe_open", safe_open)
-    monkeypatch.setattr(core, "_ensure_doc", lambda: document)
+    monkeypatch.setattr(core, "_open_pdf_source_attempt", open_attempt)
+    monkeypatch.setattr(
+        core,
+        "_ensure_doc_with_ownership",
+        lambda: (document, False),
+    )
     monkeypatch.setattr(core, "_import_pdf_page_inner", fail_page)
     opts = core.ImportOptions(import_mode="auto", import_text=True, text_mode="labels")
+    source_path = tmp_path / "fixture.pdf"
+    _write_minimal_pdf(source_path)
 
     with pytest.raises(core.TextRepresentationFailure) as raised:
-        core.import_pdf_page("fixture.pdf", 1, opts, autofit=False)
+        core.import_pdf_page(str(source_path), 1, opts, autofit=False)
 
     rollback = raised.value.attempt["rollback"]
     expected = {"PDF_Page_1", "Page_1_raster", "Text"}
@@ -518,7 +553,14 @@ def test_explicit_requested_raster_has_no_false_fallback_chain():
         raw_tdict={"blocks": []},
         raster_result={
             "created_entity_ids": ["PageRaster002"],
-            "evidence": {"host_entity_type": "Image::ImagePlane"},
+            "evidence": {
+                "host_entity_type": "Image::ImagePlane",
+                "source_page_number": 2,
+                "pdf_sha256": "b" * 64,
+                "source_asset_sha256": "c" * 64,
+                "raster_content_verified": True,
+                "raster_file_included": True,
+            },
         },
     )
 
@@ -588,13 +630,16 @@ def test_explicit_requested_raster_live_branch_records_verified_delivery(monkeyp
         "created_entity_ids": ["PageRaster001"],
         "evidence": {
             "host_entity_type": "Image::ImagePlane",
+            "source_page_number": 1,
             "pdf_sha256": "c" * 64,
+            "source_asset_sha256": "d" * 64,
+            "raster_content_verified": True,
+            "raster_file_included": True,
         },
     }
     monkeypatch.setattr(core, "FreeCAD", SimpleNamespace(GuiUp=False))
     monkeypatch.setattr(core, "_msg", lambda *_args: None)
     monkeypatch.setattr(core, "_warn", lambda *_args: None)
-    monkeypatch.setattr(core, "_pdf_file_sha256", lambda _path: "c" * 64)
     monkeypatch.setattr(core, "_import_page_as_raster", lambda *_args: raster_result)
     opts = core.ImportOptions(
         import_mode="raster",
@@ -602,6 +647,8 @@ def test_explicit_requested_raster_live_branch_records_verified_delivery(monkeyp
         text_mode="raster",
         ignore_images=True,
     )
+    _bind_test_page_authority(opts)
+    raster_result["evidence"]["pdf_sha256"] = opts._pdf_sha256
 
     _group, text_info = core._import_pdf_page_inner(
         Pdf(), "fixture.pdf", 1, opts, Document()
@@ -622,6 +669,10 @@ def test_explicit_requested_raster_live_branch_records_verified_delivery(monkeyp
             "support_entity_ids": [],
             "removed_entity_ids": [],
             "cleanup_complete": True,
+            "record_verified": True,
+            "type_verified": True,
+            "visual_verified": True,
+            "ownership_verified": True,
             "delivery_count": 1,
             "evidence": raster_result["evidence"],
         }
@@ -629,7 +680,7 @@ def test_explicit_requested_raster_live_branch_records_verified_delivery(monkeyp
     assert opts.text_mode_fallbacks == []
 
 
-def test_auto_and_hybrid_structural_pages_do_not_request_full_page_masking_raster():
+def test_auto_raster_with_structural_text_resolves_hybrid_without_masking_raster():
     auto = core.ImportOptions(import_mode="auto", import_text=True, text_mode="labels")
     explicit_hybrid = core.ImportOptions(
         import_mode="hybrid", import_text=True, text_mode="labels"
@@ -643,7 +694,7 @@ def test_auto_and_hybrid_structural_pages_do_not_request_full_page_masking_raste
     )
 
     assert (auto_mode, auto_probe) == ("hybrid", False)
-    assert (image_only_mode, image_only_probe) == ("raster", True)
+    assert (image_only_mode, image_only_probe) == ("hybrid", False)
     assert core._should_place_full_page_raster(auto_mode) is False
     assert core._should_place_full_page_raster("hybrid") is False
     assert core._should_place_full_page_raster(explicit_hybrid.import_mode) is False

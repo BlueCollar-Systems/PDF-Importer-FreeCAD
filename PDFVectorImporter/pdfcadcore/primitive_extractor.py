@@ -928,8 +928,9 @@ def _merge_stacked_fractions(items: List[NormalizedText]) -> List[NormalizedText
        Only matched when neither digit item is itself a concatenated fraction.
 
     NOTE: Merged fractions use reduced font_size (~0.6x) to match stacked footprint.
-    Replacement items take ids from the global counter; the semantic projection
-    re-indexes its copies afterwards. Physical source ids are never changed.
+    Replacement items reuse a constituent id until the semantic projection
+    re-indexes its copies. Analysis must not consume the global physical-id
+    allocator or make later source identities depend on recognition results.
     """
     if len(items) < 2:
         return items
@@ -1001,7 +1002,7 @@ def _merge_stacked_fractions(items: List[NormalizedText]) -> List[NormalizedText
                     stacked_size = avg_size * _FRAC_STACKED_SCALE
                     first = selected[0]
                     merged_item = NormalizedText(
-                        id=next_id(),
+                        id=slash.id,
                         text=merged_text,
                         normalized=merged_text.upper().strip(),
                         insertion=slash.insertion,
@@ -1092,7 +1093,7 @@ def _merge_stacked_fractions(items: List[NormalizedText]) -> List[NormalizedText
                         # Apply stacked fraction scale to match original footprint
                         stacked_size = avg_size * _FRAC_STACKED_SCALE
                         merged_item = NormalizedText(
-                            id=next_id(),
+                            id=slash.id,
                             text=merged_text,
                             normalized=merged_text.upper().strip(),
                             insertion=slash.insertion,
@@ -1150,7 +1151,7 @@ def _merge_stacked_fractions(items: List[NormalizedText]) -> List[NormalizedText
                             # Apply stacked fraction scale to match original footprint
                             stacked_size = avg_size * _FRAC_STACKED_SCALE
                             merged_item = NormalizedText(
-                                id=next_id(),
+                                id=slash.id,
                                 text=merged_text,
                                 normalized=merged_text.upper().strip(),
                                 insertion=slash.insertion,

@@ -255,7 +255,7 @@ def _attach_visible_source_ink(item):
             "synthetic": False,
             "glyph_id": index + 1,
             "glyph_name": "glyph%05d" % (index + 1),
-            "glyph_bounds": (0.0, 0.0, 500.0, 700.0),
+            "glyph_bounds": [0.0, 0.0, 500.0, 700.0],
             "advance_width": 600.0,
             "layout_only_zero_ink": False,
             "font_asset_binding": dict(binding),

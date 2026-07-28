@@ -15,32 +15,13 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 MANIFEST_PATH = SCRIPT_DIR / "pdfcadcore_sync_manifest.json"
-
-REPO_CORE_DIRS: Dict[str, Path] = {
-    "FC": Path(r"C:\1PDF-Importer-FreeCAD") / "PDFVectorImporter" / "pdfcadcore",
-    "BL": Path(r"C:\1PDF-Importer-Blender") / "pdf_vector_importer" / "pdfcadcore",
-    "LC": Path(r"C:\1PDF-Importer-LibreCAD") / "pdfcadcore",
-}
-
-REPO_CONTEXT_BUILDER_PATHS: Tuple[Path, ...] = (
-    Path(r"C:\1 Structural_Steel_Shapes_App") / "repo_context_builder_core.py",
-    Path(r"C:\1BlueCollar-Website") / "repo_context_builder_core.py",
-    Path(r"C:\1PDF-Importer-SketchUp") / "repo_context_builder_core.py",
-    Path(r"C:\1PDF-Importer-Blender") / "repo_context_builder_core.py",
-    Path(r"C:\1PDF-Importer-FreeCAD") / "repo_context_builder_core.py",
-    Path(r"C:\1PDF-Importer-LibreCAD") / "repo_context_builder_core.py",
-)
+VALID_REPOS: Tuple[str, ...] = ("FC", "BL", "LC")
 
 # The checker itself ships as three byte-identical copies (FC canonical +
 # BL/LC) and drifted twice on 2026-06-09 under concurrent edits, so it is in
 # its own manifest exactly like repo_context_builder_core.py (board Q-09-c).
-# Workflow: edit FC's copy, Copy-Item to BL/LC, then --write-manifest.
+# Workflow: edit FC's copy, then name each intended peer explicitly.
 SELF_NAME = "pdfcadcore_sync_check.py"
-SELF_COPY_PATHS: Tuple[Path, ...] = (
-    Path(r"C:\1PDF-Importer-FreeCAD") / SELF_NAME,
-    Path(r"C:\1PDF-Importer-Blender") / SELF_NAME,
-    Path(r"C:\1PDF-Importer-LibreCAD") / SELF_NAME,
-)
 
 # No intentional divergences: all repos must match the canonical manifest exactly.
 # A real per-repo difference must be recorded with its own expected hash, never a blind skip.
@@ -66,25 +47,93 @@ def load_manifest() -> Dict[str, str]:
     return {str(k): str(v).lower() for k, v in data.items()}
 
 
+def repo_core_dir(root: Path, repo: str) -> Path:
+    if repo == "FC":
+        return root / "PDFVectorImporter" / "pdfcadcore"
+    if repo == "BL":
+        return root / "pdf_vector_importer" / "pdfcadcore"
+    if repo == "LC":
+        return root / "pdfcadcore"
+    raise ValueError(f"unknown repository code: {repo}")
+
+
+def repo_layouts_at(root: Path) -> List[str]:
+    layouts: List[str] = []
+    if repo_core_dir(root, "FC").is_dir():
+        layouts.append("FC")
+    if repo_core_dir(root, "BL").is_dir():
+        layouts.append("BL")
+    if repo_core_dir(root, "LC").is_dir() and (root / "dxf_builder.py").is_file():
+        layouts.append("LC")
+    return layouts
+
+
+def detect_repo_at(root: Path) -> Optional[str]:
+    layouts = repo_layouts_at(root)
+    return layouts[0] if len(layouts) == 1 else None
+
+
 def detect_local_repo() -> Optional[str]:
-    if (SCRIPT_DIR / "PDFVectorImporter" / "pdfcadcore").is_dir():
-        return "FC"
-    if (SCRIPT_DIR / "pdf_vector_importer" / "pdfcadcore").is_dir():
-        return "BL"
-    if (SCRIPT_DIR / "pdfcadcore").is_dir() and (SCRIPT_DIR / "dxf_builder.py").is_file():
-        return "LC"
-    return None
+    return detect_repo_at(SCRIPT_DIR)
 
 
 def local_core_dir(repo: str) -> Path:
     """Return the detected checkout's core, never a same-host main checkout."""
-    if repo == "FC":
-        return SCRIPT_DIR / "PDFVectorImporter" / "pdfcadcore"
-    if repo == "BL":
-        return SCRIPT_DIR / "pdf_vector_importer" / "pdfcadcore"
-    if repo == "LC":
-        return SCRIPT_DIR / "pdfcadcore"
-    raise ValueError(f"unknown repository code: {repo}")
+    return repo_core_dir(SCRIPT_DIR, repo)
+
+
+def parse_peer_roots(
+    specs: Iterable[str],
+    local_repo: str,
+    parser: argparse.ArgumentParser,
+) -> Dict[str, Path]:
+    """Parse explicit HOST=PATH peers and reject ambiguity before any writes."""
+    peers: Dict[str, Path] = {}
+    roots: Dict[Path, str] = {}
+    local_root = SCRIPT_DIR.resolve()
+
+    for spec in specs:
+        if "=" not in spec:
+            parser.error(f"invalid --peer-root {spec!r}; expected HOST=PATH")
+        host_text, path_text = spec.split("=", 1)
+        host = host_text.strip().upper()
+        raw_path = path_text.strip()
+        if host not in VALID_REPOS:
+            parser.error(
+                f"invalid peer host {host_text!r}; expected one of {', '.join(VALID_REPOS)}"
+            )
+        if not raw_path:
+            parser.error(f"invalid --peer-root {spec!r}; PATH is empty")
+        if host in peers:
+            parser.error(f"duplicate peer host {host}; list each host at most once")
+        try:
+            root = Path(raw_path).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            parser.error(f"peer root for {host} does not exist or is inaccessible: {exc}")
+        if not root.is_dir():
+            parser.error(f"peer root for {host} is not a directory: {root}")
+        if root == local_root:
+            parser.error(f"peer root for {host} is the local checkout: {root}")
+        if root in roots:
+            parser.error(
+                f"duplicate peer root {root} for {roots[root]} and {host}"
+            )
+        peers[host] = root
+        roots[root] = host
+
+    for host, root in peers.items():
+        if host == local_repo:
+            parser.error(
+                f"peer host {host} duplicates the detected local {local_repo} checkout"
+            )
+        layouts = repo_layouts_at(root)
+        if layouts != [host]:
+            found = ", ".join(layouts) if layouts else "none"
+            parser.error(
+                f"peer root {root} does not match the declared {host} layout "
+                f"(detected: {found})"
+            )
+    return peers
 
 
 def iter_core_files(core_dir: Path) -> Iterable[Path]:
@@ -155,7 +204,10 @@ def check_repo_context_builder(
 
     expected = manifest[key]
     existing: List[Tuple[Path, str]] = []
-    for path in paths if paths is not None else REPO_CONTEXT_BUILDER_PATHS:
+    candidates = paths if paths is not None else (
+        SCRIPT_DIR / "repo_context_builder_core.py",
+    )
+    for path in candidates:
         if path.is_file():
             existing.append((path, sha256_file(path)))
 
@@ -192,11 +244,11 @@ def check_self_copies(
     if SELF_NAME not in manifest:
         return [f"manifest missing {SELF_NAME} (rerun --write-manifest)"]
     expected = manifest[SELF_NAME]
-    candidates = {p.resolve() for p in paths} if paths is not None else {
-        Path(__file__).resolve()
-    }
-    if paths is None:
-        candidates.update(p.resolve() for p in SELF_COPY_PATHS if p.is_file())
+    candidates = (
+        {p.resolve() for p in paths}
+        if paths is not None
+        else {Path(__file__).resolve()}
+    )
     errors: List[str] = []
     seen = 0
     for path in sorted(candidates):
@@ -219,27 +271,54 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--fix",
         action="store_true",
-        help="Copy canonical FC files into drifted BL/LC copies (local dev only).",
+        help=(
+            "From a manifest-verified local FC checkout, copy canonical core files "
+            "only into explicitly named peers."
+        ),
     )
     parser.add_argument(
         "--write-manifest",
         action="store_true",
-        help="Rewrite pdfcadcore_sync_manifest.json from canonical FC pdfcadcore.",
+        help="Rewrite pdfcadcore_sync_manifest.json from the detected local core.",
     )
     parser.add_argument(
         "--skip-cross-repo",
         action="store_true",
-        help="Only validate the current repo against the manifest.",
+        help=(
+            "Deprecated no-op; checks are local-only unless --peer-root is supplied."
+        ),
+    )
+    parser.add_argument(
+        "--peer-root",
+        action="append",
+        default=[],
+        metavar="HOST=PATH",
+        help=(
+            "Explicit peer checkout root (HOST is FC, BL, or LC). "
+            "Repeat once per intended peer."
+        ),
     )
     args = parser.parse_args(argv)
+    if args.fix and args.write_manifest:
+        parser.error("--fix and --write-manifest cannot be combined")
 
     local_repo = detect_local_repo()
-    if args.skip_cross_repo and local_repo:
-        canonical_dir = local_core_dir(local_repo)
-    else:
-        canonical_dir = (
-            local_core_dir("FC") if local_repo == "FC" else REPO_CORE_DIRS["FC"]
+    if local_repo is None:
+        layouts = repo_layouts_at(SCRIPT_DIR)
+        detail = f"ambiguous layouts: {', '.join(layouts)}" if layouts else "no known layout"
+        parser.error(f"cannot detect the local repository at {SCRIPT_DIR} ({detail})")
+    if args.fix and local_repo != "FC":
+        parser.error("--fix is allowed only from a detected local FreeCAD checkout")
+    peers = parse_peer_roots(args.peer_root, local_repo, parser)
+    if args.fix and not peers:
+        parser.error("--fix requires at least one explicit --peer-root HOST=PATH")
+    if args.skip_cross_repo:
+        print(
+            "NOTE: --skip-cross-repo is deprecated and has no effect; "
+            "only explicit --peer-root values enable peer checks"
         )
+
+    canonical_dir = local_core_dir(local_repo)
     if args.write_manifest:
         manifest: Dict[str, str] = {}
         for path in iter_core_files(canonical_dir):
@@ -248,49 +327,53 @@ def main(argv: Optional[List[str]] = None) -> int:
         if rcb.is_file():
             manifest["repo_context_builder_core.py"] = sha256_file(rcb)
         manifest[SELF_NAME] = sha256_file(Path(__file__).resolve())
-        MANIFEST_PATH.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        payload = json.dumps(manifest, indent=2) + "\n"
+        MANIFEST_PATH.write_text(payload, encoding="utf-8")
         print(f"Wrote manifest: {MANIFEST_PATH}")
-        if not args.skip_cross_repo:
-            for repo, core_dir in REPO_CORE_DIRS.items():
-                if repo == "FC":
-                    continue
-                repo_root = core_dir.parents[1] if repo == "BL" else core_dir.parent
-                dest_manifest = repo_root / "pdfcadcore_sync_manifest.json"
-                if repo_root.is_dir():
-                    dest_manifest.write_text(
-                        json.dumps(manifest, indent=2) + "\n",
-                        encoding="utf-8",
-                    )
-                    print(f"Copied manifest -> {dest_manifest}")
+        for repo, repo_root in peers.items():
+            dest_manifest = repo_root / "pdfcadcore_sync_manifest.json"
+            dest_manifest.write_text(payload, encoding="utf-8")
+            print(f"Copied manifest -> {repo}: {dest_manifest}")
         return 0
 
     manifest = load_manifest()
     errors: List[str] = []
 
-    if local_repo:
-        core_dir = local_core_dir(local_repo)
-        errors.extend(check_repo_core(local_repo, core_dir, manifest, args.fix, canonical_dir))
-    else:
-        print("WARN: could not detect local repo layout")
+    local_errors = check_repo_core(
+        local_repo,
+        canonical_dir,
+        manifest,
+        False,
+        canonical_dir,
+    )
+    errors.extend(local_errors)
+    peer_fix = args.fix and not local_errors
+    if args.fix and local_errors:
+        print(
+            "REFUSED: local FreeCAD core does not match the manifest; "
+            "no peer files were changed"
+        )
 
-    if not args.skip_cross_repo:
-        for repo, core_dir in REPO_CORE_DIRS.items():
-            if local_repo and repo == local_repo:
-                continue
-            if core_dir.is_dir():
-                errors.extend(check_repo_core(repo, core_dir, manifest, args.fix, canonical_dir))
-
-    if args.skip_cross_repo:
+    for repo, repo_root in peers.items():
         errors.extend(
-            check_repo_context_builder(
+            check_repo_core(
+                repo,
+                repo_core_dir(repo_root, repo),
                 manifest,
-                (SCRIPT_DIR / "repo_context_builder_core.py",),
+                peer_fix,
+                canonical_dir,
             )
         )
-        errors.extend(check_self_copies(manifest, (Path(__file__).resolve(),)))
-    else:
-        errors.extend(check_repo_context_builder(manifest))
-        errors.extend(check_self_copies(manifest))
+
+    context_paths = [SCRIPT_DIR / "repo_context_builder_core.py"]
+    context_paths.extend(
+        repo_root / "repo_context_builder_core.py"
+        for repo_root in peers.values()
+    )
+    self_paths = [Path(__file__).resolve()]
+    self_paths.extend(repo_root / SELF_NAME for repo_root in peers.values())
+    errors.extend(check_repo_context_builder(manifest, context_paths))
+    errors.extend(check_self_copies(manifest, self_paths))
 
     if errors:
         print("DRIFT DETECTED:")

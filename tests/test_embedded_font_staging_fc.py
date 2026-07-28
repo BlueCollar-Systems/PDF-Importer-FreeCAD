@@ -15,11 +15,13 @@ from fontTools.ttLib import TTFont
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "PDFVectorImporter" / "src"
 MOD_ROOT = REPO_ROOT / "PDFVectorImporter"
-for path in (str(SRC_DIR), str(MOD_ROOT)):
+TESTS_DIR = REPO_ROOT / "tests"
+for path in (str(SRC_DIR), str(MOD_ROOT), str(TESTS_DIR)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
 import PDFImporterCore as core  # noqa: E402
+import test_freecad_representation_contract as representation_fixtures  # noqa: E402
 
 
 PDF_SHA_A = "a" * 64
@@ -96,7 +98,7 @@ def _proof_item(font="Siwa-Regular", *, pdf_sha256=PDF_SHA_A, page_number=1):
             "synthetic": False,
             "glyph_id": index + 1,
             "glyph_name": "glyph%05d" % (index + 1),
-            "glyph_bounds": (0.0, 0.0, 500.0, 700.0),
+            "glyph_bounds": [0.0, 0.0, 500.0, 700.0],
             "advance_width": 600.0,
             "layout_only_zero_ink": False,
             "font_asset_binding": dict(binding),
@@ -276,6 +278,136 @@ def test_page_embedded_cff_is_staged_content_addressed_and_resolved_exactly(tmp_
     assert record["source"] == "pdf_embedded"
     assert record["xref"] == 5
     assert record["sha256"] in path.name
+
+
+def test_exact_font_staging_uses_writable_cache_outside_installed_mod(
+    monkeypatch, tmp_path
+):
+    raw = _raw_cff_fixture()
+    roaming = tmp_path / "roaming" / "FreeCAD"
+    installed_font_cache = (
+        roaming / "Mod" / "PDFVectorImporter" / "font_cache"
+    )
+    installed_font_cache.parent.mkdir(parents=True)
+    installed_font_cache.write_bytes(b"installed Mod tree is not a cache")
+    user_cache = tmp_path / "local" / "FreeCAD" / "Cache"
+
+    class FakeFreeCAD:
+        @staticmethod
+        def getUserAppDataDir():
+            return str(roaming)
+
+        @staticmethod
+        def getUserCachePath():
+            return str(user_cache)
+
+    class FakePage:
+        @staticmethod
+        def get_fonts(full=True):
+            assert full is True
+            return [
+                (
+                    5,
+                    "cff",
+                    "Type1",
+                    "ABCDEF+TestCFF-Regular",
+                    "T1_0",
+                    "WinAnsiEncoding",
+                    0,
+                )
+            ]
+
+    class FakePdf:
+        @staticmethod
+        def extract_font(xref):
+            assert xref == 5
+            return ("ABCDEF+TestCFF-Regular", "cff", "Type1", raw)
+
+    monkeypatch.setattr(core, "FreeCAD", FakeFreeCAD())
+    expected_cache = user_cache / "PDFVectorImporter" / "font_cache"
+    assert core._shapestring_font_cache_dir() == expected_cache
+    assert installed_font_cache != expected_cache
+
+    opts = core.ImportOptions(text_mode="3d_text")
+    staged = core._stage_page_shapestring_fonts(
+        FakePdf(),
+        FakePage(),
+        opts,
+        pdf_sha256=PDF_SHA_A,
+        page_number=1,
+    )
+    record = staged["testcffregular"]
+    resolved, source_results = core._resolve_shapestring_font_path_with_evidence(
+        "ABCDEF+TestCFF-Regular",
+        opts,
+        pdf_sha256=PDF_SHA_A,
+        page_number=1,
+    )
+
+    assert resolved == record["path"]
+    assert Path(resolved).parent == expected_cache
+    assert hashlib.sha256(Path(resolved).read_bytes()).hexdigest() == record["sha256"]
+    assert len(source_results) == 1
+    result = source_results[0]
+    assert result["source"] == "embedded_font"
+    assert result["outcome"] == "found"
+    assert result["font_identity"] == {
+        "raw_name": "ABCDEF+TestCFF-Regular",
+        "normalized_key": "testcffregular",
+    }
+    assert result["path"] == record["path"]
+    assert result["sha256"] == record["sha256"]
+    assert result["xref"] == 5
+    assert result["pdf_sha256"] == PDF_SHA_A
+    assert result["page_number"] == 1
+    assert result["staging_complete"] is True
+    assert result["font_identity_verified"] is True
+    assert result["approved_font_root"] == str(expected_cache.resolve())
+    assert result["internal_identity_evidence"]["font_identity_verified"] is True
+
+
+def test_font_cache_selection_fails_closed_when_no_candidate_is_writable(
+    monkeypatch, tmp_path
+):
+    blocked = tmp_path / "blocked"
+    blocked.write_bytes(b"not a directory")
+
+    class FakeFreeCAD:
+        @staticmethod
+        def getUserCachePath():
+            return str(blocked)
+
+    monkeypatch.setattr(core, "FreeCAD", FakeFreeCAD())
+    monkeypatch.setattr(core.tempfile, "gettempdir", lambda: str(blocked))
+
+    with pytest.raises(OSError, match="writable font cache"):
+        core._shapestring_font_cache_dir()
+
+
+def test_font_cache_accepts_writable_candidate_on_different_windows_volume(
+    monkeypatch, tmp_path
+):
+    roaming = tmp_path / "roaming" / "FreeCAD"
+    user_cache = tmp_path / "local" / "FreeCAD" / "Cache"
+
+    class FakeFreeCAD:
+        @staticmethod
+        def getUserAppDataDir():
+            return str(roaming)
+
+        @staticmethod
+        def getUserCachePath():
+            return str(user_cache)
+
+    def different_volume(_paths):
+        raise ValueError("Paths don't have the same drive")
+
+    monkeypatch.setattr(core, "FreeCAD", FakeFreeCAD())
+    monkeypatch.setattr(core.os.path, "commonpath", different_volume)
+
+    assert core._shapestring_font_cache_dir() == (
+        user_cache / "PDFVectorImporter" / "font_cache"
+    )
 
 
 def test_type0_identity_truetype_without_cmap_is_repaired_from_pdf_tounicode(tmp_path):
@@ -920,8 +1052,13 @@ def test_stale_prior_page_record_cannot_mask_current_page_staging_failure(tmp_pa
     assert results[0]["page_number"] == 2
 
 
-def test_missing_staged_font_file_is_invalid_and_terminal(tmp_path):
-    missing = tmp_path / "missing.otf"
+def test_missing_staged_font_file_is_invalid_and_uses_same_rung_substitute(
+    monkeypatch,
+    tmp_path,
+):
+    cache_root = tmp_path / "font-cache"
+    cache_root.mkdir()
+    missing = cache_root / "missing.otf"
     opts = core.ImportOptions(text_mode="3d_text")
     records = {
         "siwaregular": {
@@ -933,6 +1070,7 @@ def test_missing_staged_font_file_is_invalid_and_terminal(tmp_path):
     }
     _set_completed_font_session(opts, records=records)
     item = _proof_item()
+    monkeypatch.setattr(core, "_shapestring_font_cache_dir", lambda: cache_root)
 
     path, results = core._resolve_shapestring_font_path_with_evidence(
         "Siwa-Regular",
@@ -945,21 +1083,48 @@ def test_missing_staged_font_file_is_invalid_and_terminal(tmp_path):
     assert len(results) == 1
     assert results[0]["source"] == "embedded_font"
     assert results[0]["outcome"] == "invalid"
+    assert results[0]["reason"] == "staged_font_file_missing"
     assert results[0]["font_identity"] == item["font_identity"]
-    with pytest.raises(core.TextRepresentationFailure) as raised:
-        core._deliver_text_item_3d(
-            item,
-            "3d_text",
-            opts,
-            text_group=None,
-            page_h=100.0,
-            scale=1.0,
-        )
-    assert raised.value.attempt["reason"] == "exact_font_resolution_invalid"
-    assert raised.value.attempt["outcome"] == "failed"
-    assert raised.value.attempt["created_entity_ids"] == []
-    assert raised.value.attempt["removed_entity_ids"] == []
-    assert raised.value.attempt["cleanup_complete"] is True
+
+    fixture_path, _fixture_evidence = representation_fixtures._found_font_resolution(
+        item
+    )
+    candidate_root = tmp_path / "approved-fonts"
+    candidate_root.mkdir()
+    candidate = candidate_root / "covering.ttf"
+    candidate.write_bytes(Path(fixture_path).read_bytes())
+    monkeypatch.setattr(
+        core,
+        "_no_cost_font_candidate_roots",
+        lambda: [("installed_no_cost_substitute", candidate_root)],
+    )
+    document, draft, group = representation_fixtures._install_host(monkeypatch)
+
+    delivered = core._deliver_text_item_3d(
+        item,
+        "3d_text",
+        opts,
+        text_group=group,
+        page_h=100.0,
+        scale=1.0,
+    )
+
+    assert delivered["requested_type"] == "3d_text"
+    assert delivered["attempted_type"] == "3d_text"
+    assert delivered["final_type"] == "3d_text"
+    assert delivered["outcome"] == "verified"
+    assert delivered["evidence"]["font_substitution_applied"] is True
+    assert delivered["evidence"]["source_font_equivalence"] is False
+    assert delivered["evidence"]["exact_font_rejection"]["reason"] == (
+        "exact_font_source_invalid"
+    )
+    delivered_font = Path(delivered["evidence"]["font_path"])
+    assert delivered_font.parent == cache_root / "delivery-assets"
+    assert delivered["evidence"]["staged_asset_verified"] is True
+    assert delivered["evidence"]["staged_asset_read_only"] is True
+    assert len(document.Objects) == 3
+    assert len(draft.calls) == 1
+    assert draft.label_calls == []
 
 
 def test_unreadable_staged_font_file_is_invalid(monkeypatch, tmp_path):
@@ -995,7 +1160,7 @@ def test_unreadable_staged_font_file_is_invalid(monkeypatch, tmp_path):
     assert results[0]["reason"] == "staged_font_file_unreadable"
 
 
-def test_staged_font_sha_mismatch_is_invalid(tmp_path):
+def test_staged_font_sha_mismatch_is_invalid(monkeypatch, tmp_path):
     staged_path = tmp_path / "font.otf"
     staged_path.write_bytes(b"actual")
     record = {
@@ -1006,6 +1171,7 @@ def test_staged_font_sha_mismatch_is_invalid(tmp_path):
     }
     opts = core.ImportOptions()
     _set_completed_font_session(opts, records={"siwaregular": record})
+    monkeypatch.setattr(core, "_shapestring_font_cache_dir", lambda: tmp_path)
 
     path, results = core._resolve_shapestring_font_path_with_evidence(
         "Siwa-Regular",

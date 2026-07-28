@@ -18,13 +18,20 @@ _lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
 if _lib_dir not in sys.path:
     sys.path.insert(0, _lib_dir)
 
+_mod_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _mod_root not in sys.path:
+    sys.path.insert(0, _mod_root)
+
+from pdfcadcore.fitz_loader import (  # noqa: E402
+    PdfOpenError,
+    import_fitz as _import_fitz,
+    safe_open as _safe_open,
+)
+
 try:
-    import pymupdf as fitz  # PyMuPDF >= 1.24 preferred name
+    fitz = _import_fitz(prefer_lib_dir=_lib_dir)
 except ImportError:
-    try:
-        import fitz  # Legacy fallback
-    except ImportError:
-        fitz = None
+    fitz = None
 
 # Shelved 2026-07-06: closed-region shape extrusion deferred; code retained.
 SHAPE_EXTRUSION_UI_ENABLED = False
@@ -231,11 +238,11 @@ class ImportPDFDialog(QtWidgets.QDialog):
             self.file_edit.setText(path)
             if fitz:
                 try:
-                    with fitz.open(path) as doc:
+                    with _safe_open(path, prefer_lib_dir=_lib_dir) as doc:
                         self._page_count = doc.page_count
                     self.page_edit.setPlaceholderText(
                         f"1-{self._page_count}  (PDF has {self._page_count} pages)")
-                except (RuntimeError, OSError, ValueError):
+                except (PdfOpenError, RuntimeError, OSError, ValueError):
                     pass
 
     _PARAM_PATH = "User parameter:BaseApp/Preferences/Mod/PDFVectorImporter"
@@ -490,10 +497,7 @@ class ImportPDFVectorCommand:
     def Activated(self):
         # Re-check for fitz each time (may have been installed mid-session)
         try:
-            try:
-                import pymupdf as fitz  # noqa: F811, F401  # PyMuPDF >= 1.24 preferred name
-            except ImportError:
-                import fitz  # noqa: F811, F401  # Legacy fallback
+            fitz = _import_fitz(prefer_lib_dir=_lib_dir)  # noqa: F841
         except ImportError:
             QtWidgets.QMessageBox.warning(
                 None, "PyMuPDF Not Found",
@@ -512,7 +516,14 @@ class ImportPDFVectorCommand:
 
         import PDFVectorImporter.src.PDFImporterCore as core
         try:
-            core.import_pdf(pdf_path, opts)
+            result = core.import_pdf(pdf_path, opts)
+            if result is False:
+                FreeCAD.Console.PrintMessage("PDF import cancelled; no changes retained.\n")
+                return
+            if result is not True:
+                raise RuntimeError(
+                    "PDF importer returned a non-success result; no completion was accepted"
+                )
             if opts.import_mode == "auto" and getattr(opts, "auto_resolved_mode", None):
                 reason = getattr(opts, "auto_reason", "") or ""
                 detail = f" ({reason})" if reason else ""

@@ -99,6 +99,38 @@ def _impossibility_proof(item, requested, attempted, **overrides):
     return proof
 
 
+def _closed_svg_impossibility_proof(item, requested, attempted):
+    reason_code = "svg_glyph_outlines_unavailable"
+    return {
+        "item_specific_proven_impossible": True,
+        "importer_identity": item["importer_identity"],
+        "pdf_sha256": item["pdf_sha256"],
+        "page_number": item["page_number"],
+        "source_item_id": item["source_item_id"],
+        "requested_type": requested,
+        "attempted_type": attempted,
+        "reason_code": reason_code,
+        "evidence": {
+            "source_item_id": item["source_item_id"],
+            "glyph_definition_count": 0,
+        },
+        "attempted_source_results": [
+            {
+                "source": "svg_item_renderer",
+                "outcome": "proven_impossible",
+                "reason_code": reason_code,
+                "pdf_sha256": item["pdf_sha256"],
+                "page_number": item["page_number"],
+                "source_item_id": item["source_item_id"],
+            }
+        ],
+        "attempted_sources_complete": True,
+        "created_entity_ids": [],
+        "removed_entity_ids": [],
+        "cleanup_complete": True,
+    }
+
+
 def _impossible_attempt(item, requested, attempted, proof):
     return {
         "source_item_id": item["source_item_id"],
@@ -179,7 +211,9 @@ def test_report_never_fabricates_fallback_to_hide_unexplained_mode_divergence(tm
     violation = report["extra"]["representation_contract_violation"]
     assert violation["requested_type"] == "3d_text"
     assert violation["reason"] == "invalid_item_bound_representation_delivery"
-    assert violation["invalid_reasons"] == ["no_item_bound_delivery_attempts"]
+    assert violation["invalid_reasons"] == [
+        "delivered text entities exist without independent source obligations"
+    ]
 
 
 def test_report_includes_exact_attempt_ledger_and_proven_fallback(tmp_path):
@@ -222,7 +256,13 @@ def test_report_includes_exact_attempt_ledger_and_proven_fallback(tmp_path):
     assert report["fallback"]["text"]["requested"] == "3d_text"
     assert report["fallback"]["text"]["delivered"] == "glyphs"
     assert report["fallback"]["text"]["source_item_ids"] == ["p1:b0:l0:s0"]
-    assert report["extra"]["text_delivery_attempts"] == opts.text_delivery_attempts
+    reported_attempt = report["extra"]["text_delivery_attempts"][0]
+    assert reported_attempt["source_item_id"] == opts.text_delivery_attempts[0][
+        "source_item_id"
+    ]
+    assert reported_attempt["record_verified"] is False
+    assert reported_attempt["referenced_entity_ids"] == []
+    assert reported_attempt["reused_entity_ids"] == []
 
 
 def test_terminal_representation_failure_writes_a_failure_report(tmp_path):
@@ -258,7 +298,15 @@ def test_terminal_representation_failure_writes_a_failure_report(tmp_path):
     assert report["extra"]["result_status"] == "failed"
     assert report["extra"]["terminal_failure"]["type"] == "TextRepresentationFailure"
     assert report["extra"]["terminal_failure"]["attempt"] == attempt
-    assert report["extra"]["text_delivery_attempts"] == [attempt]
+    reported_attempt = report["extra"]["text_delivery_attempts"][0]
+    assert {
+        key: reported_attempt[key]
+        for key in attempt
+    } == attempt
+    assert reported_attempt["record_verified"] is False
+    assert reported_attempt["type_verified"] is False
+    assert reported_attempt["visual_verified"] is False
+    assert reported_attempt["ownership_verified"] is False
     assert "text" not in report["fallback"]
 
 
@@ -398,24 +446,24 @@ def test_empty_or_unverified_result_stops_without_fallback(invalid_case):
     assert opts.text_mode_fallbacks == []
 
 
-def test_exact_bound_proof_advances_to_only_the_next_rung():
-    item = _fallback_item(requested="3d_text")
-    opts = core.ImportOptions(text_mode="3d_text")
-    proof = _impossibility_proof(item, "3d_text", "3d_text")
-    attempt = _impossible_attempt(item, "3d_text", "3d_text", proof)
+def test_closed_svg_proof_advances_to_only_the_next_rung():
+    item = _fallback_item(requested="glyphs")
+    opts = core.ImportOptions(text_mode="glyphs")
+    proof = _closed_svg_impossibility_proof(item, "glyphs", "glyphs")
+    attempt = _impossible_attempt(item, "glyphs", "glyphs", proof)
     calls = []
 
-    def text_3d_impossible(_item, mode, _opts):
+    def glyphs_impossible(_item, mode, _opts):
         calls.append(mode)
         raise core.TextItemImpossible(
-            "The exact source font is unavailable for this item",
+            "The SVG source contains no usable glyph outlines",
             attempt=attempt,
             proof=proof,
         )
 
-    def glyphs_verified(_item, mode, _opts):
+    def geometry_verified(_item, mode, _opts):
         calls.append(mode)
-        return _verified_result(item, mode, entity_id="Glyph001")
+        return _verified_result(item, mode, entity_id="Geometry001")
 
     def unexpected_rung(_item, mode, _opts):
         calls.append(mode)
@@ -423,51 +471,52 @@ def test_exact_bound_proof_advances_to_only_the_next_rung():
 
     result = core._run_text_item_fallback_ladder(
         item,
-        "3d_text",
+        "glyphs",
         {
-            "3d_text": text_3d_impossible,
-            "glyphs": glyphs_verified,
-            "geometry": unexpected_rung,
+            "glyphs": glyphs_impossible,
+            "geometry": geometry_verified,
+            "3d_text": unexpected_rung,
             "labels": unexpected_rung,
             "raster": unexpected_rung,
         },
         opts,
     )
 
-    assert calls == ["3d_text", "glyphs"]
-    assert result["requested_type"] == "3d_text"
-    assert result["attempted_type"] == "glyphs"
-    assert result["final_type"] == "glyphs"
-    assert result["attempted_types"] == ["3d_text", "glyphs"]
+    assert calls == ["glyphs", "geometry"]
+    assert result["requested_type"] == "glyphs"
+    assert result["attempted_type"] == "geometry"
+    assert result["final_type"] == "geometry"
+    assert result["attempted_types"] == ["glyphs", "geometry"]
     assert result["proof_chain"] == [proof]
     assert [entry["outcome"] for entry in opts.text_delivery_attempts] == [
         "proven_impossible",
         "verified",
     ]
     assert [entry["attempted_type"] for entry in opts.text_delivery_attempts] == [
-        "3d_text",
         "glyphs",
+        "geometry",
     ]
     assert len(opts.text_mode_fallbacks) == 1
     event = opts.text_mode_fallbacks[0]
-    assert event["requested"] == "3d_text"
-    assert event["delivered"] == "glyphs"
+    assert event["requested"] == "glyphs"
+    assert event["delivered"] == "geometry"
     assert event["source_item_ids"] == [item["source_item_id"]]
     assert event["proof"]["importer_identity"] == item["importer_identity"]
     assert event["proof"]["proof_chain"] == [proof]
 
 
 @pytest.mark.parametrize("requested", ["labels", "3d_text", "glyphs", "geometry"])
-def test_exact_3d_font_proof_schema_accepts_any_original_ladder_request(requested):
+def test_obsolete_exact_font_proof_is_rejected_for_every_ladder_request(requested):
     item = _fallback_item(requested=requested)
     proof = _impossibility_proof(item, requested, "3d_text")
 
-    assert core._validate_item_impossibility_proof(
-        item,
-        requested,
-        "3d_text",
-        proof,
-    ) == proof
+    with pytest.raises(ValueError, match="fidelity evidence, not fallback authority"):
+        core._validate_item_impossibility_proof(
+            item,
+            requested,
+            "3d_text",
+            proof,
+        )
 
 
 def test_incomplete_cleanup_stops_even_with_otherwise_valid_proof():
@@ -661,23 +710,27 @@ def test_layout_or_generic_failure_reason_cannot_authorize_substitution(reason_c
 
 
 def test_each_rung_receives_an_unmutated_source_item_snapshot():
-    item = _fallback_item(requested="3d_text")
+    item = _fallback_item(requested="glyphs")
     item["text"] = "ORIGINAL"
-    opts = core.ImportOptions(text_mode="3d_text")
+    opts = core.ImportOptions(text_mode="glyphs")
     calls = []
 
     def mutate_first_rung(delivered_item, mode, _opts):
         calls.append(mode)
         delivered_item["text"] = "MUTATED"
-        proof = _impossibility_proof(delivered_item, "3d_text", "3d_text")
+        proof = _closed_svg_impossibility_proof(
+            delivered_item,
+            "glyphs",
+            "glyphs",
+        )
         attempt = _impossible_attempt(
             delivered_item,
-            "3d_text",
-            "3d_text",
+            "glyphs",
+            "glyphs",
             proof,
         )
         raise core.TextItemImpossible(
-            "exact source font unavailable",
+            "SVG glyph outlines unavailable",
             attempt=attempt,
             proof=proof,
         )
@@ -689,14 +742,14 @@ def test_each_rung_receives_an_unmutated_source_item_snapshot():
 
     result = core._run_text_item_fallback_ladder(
         item,
-        "3d_text",
-        {"3d_text": mutate_first_rung, "glyphs": verify_second_rung},
+        "glyphs",
+        {"glyphs": mutate_first_rung, "geometry": verify_second_rung},
         opts,
     )
 
-    assert calls == ["3d_text", "glyphs"]
+    assert calls == ["glyphs", "geometry"]
     assert item["text"] == "ORIGINAL"
-    assert result["final_type"] == "glyphs"
+    assert result["final_type"] == "geometry"
 
 
 def test_deliverer_cannot_rebind_proof_by_mutating_item_identity():

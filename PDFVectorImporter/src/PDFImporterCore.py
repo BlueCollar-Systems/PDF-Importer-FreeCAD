@@ -18,13 +18,16 @@ import math
 from contextlib import contextmanager
 import os
 import re
+import stat
 import sys
 import tempfile
 import time
-import traceback
+import zipfile
+import zlib
+import xml.etree.ElementTree as ElementTree
 from io import BytesIO
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Tuple, Any
 
 # Ensure bundled PyMuPDF is importable (skip namespace-only stubs in lib/)
@@ -37,11 +40,14 @@ if _mod_root not in sys.path:
     sys.path.insert(0, _mod_root)
 from pdfcadcore.fitz_loader import import_fitz as _import_fitz
 from pdfcadcore.page_visual import (
-    PAGE_VISUAL_FALLBACK_PROOF_SCHEMA,
-    PAGE_VISUAL_REASON_CODE,
-    page_visual_fallback_proof_verified,
-    page_visual_proof_digest,
-    raw_text_dictionary_digest,
+    PAGE_VISUAL_FALLBACK_PROOF_V2_SCHEMA,
+    build_page_visual_fallback_proof_v2,
+    capture_fresh_page_visual_authority,
+    page_visual_fallback_proof_v2_verified,
+    page_visual_source_observation_v2_verified,
+)
+from pdfcadcore.text_delivery_report import (
+    build_text_representation_delivery as _build_shared_text_delivery,
 )
 
 fitz = _import_fitz(prefer_lib_dir=_lib_dir)
@@ -79,6 +85,24 @@ AUTO_GLYPH_TEXT_BLOCK_THRESHOLD = 50  # was 200 — text-sparse maps still trigg
 AUTO_GLYPH_WORD_THRESHOLD = 400       # was 800 — lower text requirement
 AUTO_GLYPH_STROKE_SPARSE_RATIO = 0.05
 AUTO_GLYPH_TINY_RECT_AREA_PT2 = 36.0
+
+
+class ImportCancelled(RuntimeError):
+    """Typed signal that the user cancelled one atomic import attempt."""
+
+
+class ImportLifecycleError(RuntimeError):
+    """Typed rejection when an import cannot satisfy its acceptance contract."""
+
+
+class ImportCleanupError(ImportLifecycleError):
+    """Retryable failure to remove or restore attempt-owned runtime state."""
+
+    retryable = True
+
+    def __init__(self, message: str, *, details: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(message)
+        self.details = dict(details or {})
 
 # Fill-art flood detection — catches map PDFs, illustrated layouts, decorative
 # art where most drawing groups are filled shapes rather than engineering strokes.
@@ -455,11 +479,14 @@ class ImportOptions:
     raster_fallback: bool = True             # render page as image if no vectors
     raster_dpi: int = 300                    # DPI for raster fallback rendering (BCS-ARCH-001)
     raster_dpi_user_set: bool = False        # True when user explicitly chose the DPI
+    # Explicit DPI is an output contract. Degradation is opt-in and is never
+    # inferred from memory pressure or a failed renderer retry.
+    allow_raster_dpi_degradation: bool = False
     # Import mode: "auto" | "vector" | "raster" | "hybrid"  (BCS-ARCH-001)
     #   auto    — detect scanned/image-heavy and vector-glyph-flood pages
     #   vectors — vector geometry only (original behavior)
     #   raster  — render full page as image, skip vectors
-    #   hybrid  — raster background + vector geometry on top
+    #   hybrid  — vector geometry plus genuine embedded image occurrences
     import_mode: str = "auto"
     # Optional 3D model generation.  "auto" only runs when text evidence
     # indicates an honest third dimension; "extrude" forces closed-shape
@@ -508,6 +535,10 @@ class ImportOptions:
     # Per-item requested-representation attempt ledger.  Entries carry stable
     # source ids plus exact created/removed host object ids and cleanup state.
     text_delivery_attempts: List[Dict[str, Any]] = field(default_factory=list)
+    # Source identities registered before any delivery attempt. This is the
+    # independent obligation set used to catch missing, fabricated, or extra
+    # ledger items; it must never be reconstructed from the attempt ledger.
+    text_delivery_obligation_source_item_ids: List[str] = field(default_factory=list)
     # Independent page observations used to revalidate page-scoped visual
     # fallback proofs while building the report.  These are not text items.
     page_visual_source_observations: Dict[str, Dict[str, Any]] = field(
@@ -520,6 +551,37 @@ class ImportOptions:
     resolved_scale: Optional[Dict[str, Any]] = None
     scale_hints: Dict[str, Any] = field(default_factory=dict)
     phase_timings_ms: Dict[str, float] = field(default_factory=dict)
+    # One import attempt owns one immutable source byte snapshot. The original
+    # path is display metadata only after initialization; every parser pass and
+    # external helper is bound to these fields instead.
+    _pdf_sha256: str = field(default="", repr=False)
+    _pdf_source_bytes: Optional[bytes] = field(default=None, repr=False)
+    _pdf_source_snapshot_path: Optional[str] = field(default=None, repr=False)
+    _pdf_source_snapshot_owner: Any = field(default=None, repr=False, compare=False)
+    _pdf_source_provenance: Dict[str, Any] = field(default_factory=dict, repr=False)
+    _page_visual_authority: Any = field(default=None, repr=False, compare=False)
+    _page_visual_session_anchor: Optional[Dict[str, Any]] = field(
+        default=None,
+        repr=False,
+    )
+    _page_raster_fallback_contexts: Dict[int, Any] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+    _source_cleanup_error: Optional[Dict[str, Any]] = field(
+        default=None,
+        repr=False,
+    )
+    _attempt_path_journal: Dict[str, Dict[str, Any]] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    _import_cancellation_checkpoint: Any = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 def _default_import_report_path(pdf_path: str) -> str:
@@ -533,6 +595,415 @@ def _pdf_file_sha256(pdf_path: str) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _snapshot_protection_evidence(
+    snapshot_path: Path,
+    snapshot_root: Path,
+) -> Dict[str, Any]:
+    """Measure read-only and privacy protection without optimistic claims."""
+
+    path = Path(snapshot_path)
+    root = Path(snapshot_root)
+    file_mode = stat.S_IMODE(path.stat().st_mode)
+    root_mode = stat.S_IMODE(root.stat().st_mode)
+    mode_blocks_write = not bool(
+        file_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
+    )
+    write_open_rejected = False
+    descriptor = None
+    try:
+        descriptor = os.open(str(path), os.O_WRONLY)
+    except PermissionError:
+        write_open_rejected = True
+    except OSError:
+        write_open_rejected = False
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    read_only_verified = bool(mode_blocks_write and write_open_rejected)
+    if os.name == "nt":
+        private = False
+        private_verified = False
+        privacy_method = "windows_acl_not_verified"
+    else:
+        private = not bool(root_mode & (stat.S_IRWXG | stat.S_IRWXO))
+        private_verified = private
+        privacy_method = "posix_directory_mode_bits"
+    return {
+        "snapshot_read_only": read_only_verified,
+        "snapshot_read_only_verified": read_only_verified,
+        "snapshot_mode_blocks_write": mode_blocks_write,
+        "snapshot_write_open_rejected": write_open_rejected,
+        "snapshot_private": private,
+        "snapshot_private_verified": private_verified,
+        "snapshot_privacy_method": privacy_method,
+        "snapshot_protection_method": (
+            "file_mode_bits_and_denied_write_open+" + privacy_method
+        ),
+    }
+
+
+def _detach_pdf_source_authority(opts: ImportOptions) -> List[str]:
+    """Remove every live capability that can re-read the retained source bytes."""
+
+    errors: List[str] = []
+    live_report = getattr(opts, "_live_import_report", None)
+    if live_report is not None:
+        try:
+            live_report._page_visual_authority = None
+        except (AttributeError, RuntimeError, TypeError) as exc:
+            errors.append("live_report_authority_detach: %s" % exc)
+        try:
+            if getattr(live_report, "_page_visual_authority", None) is not None:
+                errors.append("live report retained page-visual authority")
+        except (AttributeError, RuntimeError, TypeError) as exc:
+            errors.append("live_report_authority_verify: %s" % exc)
+    opts._page_visual_authority = None
+    opts._page_visual_session_anchor = None
+    return errors
+
+
+def _dispose_pdf_source_attempt(opts: ImportOptions) -> None:
+    """Release an attempt snapshot, retaining ownership when cleanup must retry."""
+
+    cleanup_errors = _detach_pdf_source_authority(opts)
+    owner = getattr(opts, "_pdf_source_snapshot_owner", None)
+    raw_path = getattr(opts, "_pdf_source_snapshot_path", None)
+    snapshot_path = Path(raw_path) if isinstance(raw_path, str) and raw_path else None
+    if snapshot_path is not None and snapshot_path.exists():
+        try:
+            snapshot_path.chmod(stat.S_IREAD | stat.S_IWRITE)
+        except (OSError, RuntimeError, ValueError) as exc:
+            cleanup_errors.append("snapshot_chmod: %s" % exc)
+    if owner is not None:
+        try:
+            owner.cleanup()
+        except (OSError, RuntimeError, AttributeError) as exc:
+            cleanup_errors.append("snapshot_owner_cleanup: %s" % exc)
+    elif snapshot_path is not None and snapshot_path.exists():
+        cleanup_errors.append("snapshot owner is unavailable while snapshot still exists")
+    if snapshot_path is not None and snapshot_path.exists():
+        cleanup_errors.append("snapshot file still exists after cleanup")
+    if cleanup_errors:
+        details = {
+            "retryable": True,
+            "snapshot_path": str(snapshot_path) if snapshot_path is not None else None,
+            "errors": cleanup_errors,
+        }
+        opts._source_cleanup_error = details
+        raise ImportCleanupError(
+            "PDF source snapshot cleanup failed and can be retried",
+            details=details,
+        )
+
+    opts._pdf_sha256 = ""
+    opts._pdf_source_bytes = None
+    opts._pdf_source_snapshot_path = None
+    opts._pdf_source_snapshot_owner = None
+    opts._pdf_source_provenance = {}
+    opts._source_cleanup_error = None
+
+
+def _initialize_pdf_source_attempt(pdf_path: str, opts: ImportOptions) -> str:
+    """Read the requested PDF exactly once and bind an attempt-owned snapshot."""
+
+    _dispose_pdf_source_attempt(opts)
+    source_path = Path(pdf_path)
+    payload = bytes(source_path.read_bytes())
+    if not payload:
+        raise OSError("PDF source is empty")
+    digest = hashlib.sha256(payload).hexdigest()
+    owner = tempfile.TemporaryDirectory(prefix="bc_pdf_source_attempt_")
+    snapshot_root = Path(owner.name)
+    snapshot_path = snapshot_root / (digest + ".pdf")
+    opts._pdf_sha256 = digest
+    opts._pdf_source_bytes = payload
+    opts._pdf_source_snapshot_path = str(snapshot_path)
+    opts._pdf_source_snapshot_owner = owner
+    opts._pdf_source_provenance = {
+        "source_path": str(source_path.resolve()),
+        "pdf_sha256": digest,
+        "size_bytes": len(payload),
+        "snapshot_path": str(snapshot_path),
+        "snapshot_read_only": False,
+        "snapshot_read_only_verified": False,
+        "snapshot_private": False,
+        "snapshot_private_verified": False,
+        "snapshot_privacy_method": "not_measured",
+        "snapshot_protection_method": "not_measured",
+    }
+    try:
+        snapshot_root.chmod(stat.S_IRWXU)
+        snapshot_path.write_bytes(payload)
+        if (
+            snapshot_path.stat().st_size != len(payload)
+            or _pdf_file_sha256(str(snapshot_path)) != digest
+        ):
+            raise OSError("immutable PDF source snapshot verification failed")
+        snapshot_path.chmod(stat.S_IREAD)
+        protection = _snapshot_protection_evidence(snapshot_path, snapshot_root)
+        opts._pdf_source_provenance.update(protection)
+        if protection["snapshot_read_only_verified"] is not True:
+            raise OSError("PDF source snapshot could not be made read-only")
+        if os.name != "nt" and protection["snapshot_private_verified"] is not True:
+            raise OSError("PDF source snapshot directory could not be made private")
+    except Exception:
+        _dispose_pdf_source_attempt(opts)
+        raise
+    return str(snapshot_path)
+
+
+def _validated_pdf_source_bytes(opts: ImportOptions) -> bytes:
+    """Return the exact attempt bytes only while their digest binding is valid."""
+
+    payload = getattr(opts, "_pdf_source_bytes", None)
+    digest = str(getattr(opts, "_pdf_sha256", "") or "")
+    provenance = getattr(opts, "_pdf_source_provenance", None)
+    if (
+        type(payload) is not bytes
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or hashlib.sha256(payload).hexdigest() != digest
+        or not isinstance(provenance, dict)
+        or provenance.get("pdf_sha256") != digest
+        or provenance.get("size_bytes") != len(payload)
+    ):
+        raise ValueError("PDF source bytes do not match the bound digest")
+    return payload
+
+
+def _validated_pdf_source_snapshot_path(opts: ImportOptions) -> str:
+    """Return the external-tool path only while it matches the attempt bytes."""
+
+    payload = _validated_pdf_source_bytes(opts)
+    digest = str(opts._pdf_sha256)
+    raw_path = getattr(opts, "_pdf_source_snapshot_path", None)
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError("PDF source snapshot path is unavailable")
+    snapshot_path = Path(raw_path)
+    try:
+        valid = bool(
+            snapshot_path.is_file()
+            and snapshot_path.stat().st_size == len(payload)
+            and _pdf_file_sha256(str(snapshot_path)) == digest
+        )
+    except OSError:
+        valid = False
+    if not valid:
+        raise ValueError("PDF source snapshot digest does not match the attempt")
+    provenance = getattr(opts, "_pdf_source_provenance", None)
+    if not isinstance(provenance, dict):
+        raise ValueError("PDF source snapshot protection evidence is unavailable")
+    try:
+        current_protection = _snapshot_protection_evidence(
+            snapshot_path,
+            snapshot_path.parent,
+        )
+    except OSError as exc:
+        raise ValueError("PDF source snapshot protection could not be measured") from exc
+    protection_fields = (
+        "snapshot_read_only",
+        "snapshot_read_only_verified",
+        "snapshot_mode_blocks_write",
+        "snapshot_write_open_rejected",
+        "snapshot_private",
+        "snapshot_private_verified",
+        "snapshot_privacy_method",
+        "snapshot_protection_method",
+    )
+    if (
+        provenance.get("snapshot_path") != str(snapshot_path)
+        or current_protection.get("snapshot_read_only_verified") is not True
+        or any(
+            provenance.get(field) != current_protection.get(field)
+            for field in protection_fields
+        )
+    ):
+        raise ValueError("PDF source snapshot protection does not match the attempt")
+    return str(snapshot_path)
+
+
+@contextmanager
+def _verified_pdf_snapshot_consumer(opts: ImportOptions, consumer: str):
+    """Bracket an external path consumer with exact snapshot digest checks."""
+
+    label = str(consumer or "external consumer").strip()
+    before = _validated_pdf_source_snapshot_path(opts)
+    try:
+        yield before
+    finally:
+        try:
+            after = _validated_pdf_source_snapshot_path(opts)
+        except ValueError as exc:
+            raise ValueError(
+                "PDF source snapshot protection or digest changed during %s" % label
+            ) from exc
+        if Path(after) != Path(before):
+            raise ValueError("PDF source snapshot path changed during %s" % label)
+
+
+def _journal_attempt_path(opts: ImportOptions, path: Any) -> str:
+    """Record exact pre-attempt file state before any publication mutates it."""
+
+    target = Path(path).resolve()
+    key = os.path.normcase(str(target))
+    journal = getattr(opts, "_attempt_path_journal", None)
+    if not isinstance(journal, dict):
+        journal = {}
+        opts._attempt_path_journal = journal
+    if key in journal:
+        return str(target)
+    if target.exists() and not target.is_file():
+        raise ImportLifecycleError("attempt publication path is not a file: %s" % target)
+    existed = target.is_file()
+    payload = target.read_bytes() if existed else None
+    mode = stat.S_IMODE(target.stat().st_mode) if existed else None
+    journal[key] = {
+        "path": str(target),
+        "existed": existed,
+        "bytes": payload,
+        "sha256": hashlib.sha256(payload).hexdigest() if payload is not None else None,
+        "mode": mode,
+    }
+    return str(target)
+
+
+def _journal_new_attempt_path(opts: ImportOptions, path: Any) -> str:
+    """Own a newly-created staging file so rollback can retry its removal."""
+
+    target = Path(path).resolve()
+    key = os.path.normcase(str(target))
+    journal = getattr(opts, "_attempt_path_journal", None)
+    if not isinstance(journal, dict):
+        journal = {}
+        opts._attempt_path_journal = journal
+    if key in journal:
+        raise ImportLifecycleError("attempt staging path is already journaled: %s" % target)
+    journal[key] = {
+        "path": str(target),
+        "existed": False,
+        "bytes": None,
+        "sha256": None,
+        "mode": None,
+    }
+    return str(target)
+
+
+def _forget_attempt_path(opts: ImportOptions, path: Any) -> None:
+    """Release a staging-path claim only after its deletion is verified."""
+
+    journal = getattr(opts, "_attempt_path_journal", None)
+    if isinstance(journal, dict):
+        journal.pop(os.path.normcase(str(Path(path).resolve())), None)
+
+
+def _rollback_attempt_paths(opts: ImportOptions) -> Dict[str, Any]:
+    """Restore pre-existing bytes and remove every newly published attempt file."""
+
+    journal = getattr(opts, "_attempt_path_journal", None)
+    if not isinstance(journal, dict):
+        journal = {}
+    restored: List[str] = []
+    removed: List[str] = []
+    errors: List[str] = []
+    for entry in reversed(list(journal.values())):
+        if not isinstance(entry, dict):
+            errors.append("invalid attempt path journal entry")
+            continue
+        target = Path(str(entry.get("path") or ""))
+        try:
+            if entry.get("existed") is True:
+                payload = entry.get("bytes")
+                if type(payload) is not bytes:
+                    raise ValueError("pre-existing file bytes are unavailable")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists():
+                    target.chmod(stat.S_IREAD | stat.S_IWRITE)
+                fd, temp_name = tempfile.mkstemp(
+                    prefix=target.name + ".rollback.",
+                    dir=str(target.parent),
+                )
+                os.close(fd)
+                temp_path = Path(temp_name)
+                try:
+                    temp_path.write_bytes(payload)
+                    os.replace(str(temp_path), str(target))
+                finally:
+                    if temp_path.exists():
+                        temp_path.unlink()
+                original_mode = entry.get("mode")
+                if type(original_mode) is int:
+                    target.chmod(original_mode)
+                if (
+                    not target.is_file()
+                    or target.read_bytes() != payload
+                    or hashlib.sha256(payload).hexdigest() != entry.get("sha256")
+                ):
+                    raise OSError("pre-existing file bytes were not restored exactly")
+                restored.append(str(target))
+            else:
+                if target.exists():
+                    target.chmod(stat.S_IREAD | stat.S_IWRITE)
+                    target.unlink()
+                if target.exists():
+                    raise OSError("new attempt file still exists after cleanup")
+                removed.append(str(target))
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            errors.append("%s: %s" % (target, exc))
+    complete = not errors
+    if complete:
+        opts._attempt_path_journal = {}
+    return {
+        "restored_paths": restored,
+        "removed_paths": removed,
+        "cleanup_errors": errors,
+        "cleanup_complete": complete,
+    }
+
+
+def _accept_attempt_paths(opts: ImportOptions) -> None:
+    """Forget rollback bytes only after the transaction commits successfully."""
+
+    opts._attempt_path_journal = {}
+
+
+def _open_pdf_source_attempt(opts: ImportOptions):
+    """Open a new validated PyMuPDF pass over the retained exact bytes."""
+
+    from pdfcadcore.fitz_loader import safe_open_bytes
+
+    return safe_open_bytes(
+        _validated_pdf_source_bytes(opts),
+        prefer_lib_dir=_lib_dir,
+    )
+
+
+def _capture_page_visual_runtime_authority(
+    opts: ImportOptions,
+    pages: List[int],
+) -> Any:
+    """Capture v2 observations for exactly the selected pages of this attempt."""
+
+    if not isinstance(pages, list) or not pages:
+        raise ValueError("selected pages must be a nonempty list")
+    page_scope_ids: Dict[int, str] = {}
+    for page_number in pages:
+        if type(page_number) is not int or page_number <= 0:
+            raise ValueError("selected page numbers must be positive exact integers")
+        page_scope_ids[page_number] = "p%d:page" % page_number
+    authority = capture_fresh_page_visual_authority(
+        _validated_pdf_source_bytes(opts),
+        importer_identity=FREECAD_TEXT_IMPORTER_IDENTITY,
+        page_scope_ids=page_scope_ids,
+    )
+    if authority.pdf_sha256 != opts._pdf_sha256:
+        raise ValueError("page visual authority PDF digest does not match the attempt")
+    opts._page_visual_authority = authority
+    opts._page_visual_session_anchor = authority.session_anchor()
+    opts.page_visual_source_observations.clear()
+    opts.page_visual_source_observations.update(authority.observations())
+    return authority
 
 
 def _report_fallback_state(opts: ImportOptions):
@@ -600,24 +1071,43 @@ def _resolve_raster_text_contract_mode(
     source_text_blocks: Optional[int],
     opts: ImportOptions,
 ) -> Tuple[str, bool]:
-    """Preserve a structural text request without a masking page raster.
+    """Resolve page strategy without changing an explicit Raster request.
 
-    The boolean result means the page raster remains a background while the
-    requested structural text representation is rendered or proven impossible.
-    An explicitly selected Raster page strategy retains that background.  An
-    Auto-classified page with source text continues through the structural
-    Hybrid path instead of receiving a complete-page masking raster.
+    Explicit Raster remains the page representation.  Its boolean companion
+    requires a verified text-suppressed background before structural text is
+    delivered independently.  Auto may choose Hybrid because Auto, unlike an
+    explicit Raster request, delegates the page-strategy decision.
     """
     normalized = str(effective_mode or "").strip().lower()
     if not _auto_raster_needs_text_overlay(normalized, source_text_blocks, opts):
         return normalized, False
     if str(getattr(opts, "import_mode", "") or "").strip().lower() == "raster":
         return "raster", True
-    if source_text_blocks is None:
-        return "hybrid", False
-    if int(source_text_blocks or 0) > 0:
-        return "hybrid", False
-    return "raster", True
+    return "hybrid", False
+
+
+def _auto_sparse_page_mode(
+    n_drawings: int,
+    n_text_blocks: Optional[int],
+    n_images: int,
+) -> str:
+    """Resolve sparse Auto pages without inventing a full-page Raster fallback."""
+
+    if (
+        type(n_drawings) is not int
+        or n_drawings < 0
+        or (n_text_blocks is not None and (type(n_text_blocks) is not int or n_text_blocks < 0))
+        or type(n_images) is not int
+        or n_images < 0
+    ):
+        raise ValueError("sparse page profile is invalid")
+    if n_text_blocks is None:
+        return "hybrid" if n_images > 0 else "vector"
+    if n_drawings < 5 and n_text_blocks == 0:
+        return "hybrid" if n_images > 0 else "vector"
+    if n_drawings < 5 and n_text_blocks > 0:
+        return "hybrid" if n_images > 0 else "vector"
+    return ""
 
 
 def _should_place_full_page_raster(effective_mode: str) -> bool:
@@ -695,7 +1185,27 @@ def _model3d_report_payload(opts: ImportOptions) -> Dict[str, Any]:
     return payload
 
 
-def _build_text_representation_delivery(
+def _register_text_delivery_obligations(
+    opts: ImportOptions,
+    source_item_ids: List[str],
+) -> None:
+    """Register exact source identities before delivery attempts begin."""
+
+    ledger = getattr(opts, "text_delivery_obligation_source_item_ids", None)
+    if not isinstance(ledger, list):
+        raise ValueError("text delivery obligation ledger is unavailable")
+    for source_item_id in source_item_ids:
+        if (
+            not isinstance(source_item_id, str)
+            or not source_item_id
+            or source_item_id != source_item_id.strip()
+        ):
+            raise ValueError("text delivery obligation identity is invalid")
+        if source_item_id not in ledger:
+            ledger.append(source_item_id)
+
+
+def _validate_freecad_text_representation_delivery(
     opts: ImportOptions,
     attempts: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -757,6 +1267,31 @@ def _build_text_representation_delivery(
         if normalize_type(proof.get("attempted_type")) != attempted_type:
             return "proof_attempted_type_invalid"
 
+        page_scoped = proof.get("page_specific_proven_impossible") is True
+        if page_scoped:
+            if proof.get("schema") != PAGE_VISUAL_FALLBACK_PROOF_V2_SCHEMA:
+                return "proof_page_visual_v2_required"
+            authority = getattr(opts, "_page_visual_authority", None)
+            observation = getattr(opts, "page_visual_source_observations", {}).get(
+                source_item_id
+            )
+            if digest != str(getattr(opts, "_pdf_sha256", "") or ""):
+                return "proof_page_visual_pdf_binding_invalid"
+            if not page_visual_source_observation_v2_verified(
+                observation,
+                authority,
+            ):
+                return "proof_page_visual_observation_invalid"
+            if not page_visual_fallback_proof_v2_verified(
+                proof,
+                observation=observation,
+                authority=authority,
+                expected_requested_type=requested_type,
+                expected_attempted_type=attempted_type,
+            ):
+                return "proof_page_visual_evidence_invalid"
+            return ""
+
         attempted_source_results = proof.get("attempted_source_results")
         if not isinstance(attempted_source_results, list) or not attempted_source_results:
             return "proof_source_results_invalid"
@@ -775,25 +1310,6 @@ def _build_text_representation_delivery(
                 and result.get("source_item_id") != source_item_id
             ):
                 return "proof_source_result_item_id_invalid"
-        if proof.get("reason_code") == PAGE_VISUAL_REASON_CODE:
-            observation = getattr(opts, "page_visual_source_observations", {}).get(
-                source_item_id
-            )
-            expected_raw_digest = (
-                observation.get("raw_text_dictionary_sha256")
-                if isinstance(observation, dict)
-                else None
-            )
-            if not page_visual_fallback_proof_verified(
-                proof,
-                expected_pdf_sha256=digest,
-                expected_page_number=page_number,
-                expected_source_scope_id=source_item_id,
-                expected_requested_type=requested_type,
-                expected_attempted_type=attempted_type,
-                expected_raw_text_dictionary_sha256=expected_raw_digest,
-            ):
-                return "proof_page_visual_evidence_invalid"
         return ""
 
     requested_raw = str(getattr(opts, "text_mode", "") or "none").strip().lower()
@@ -801,13 +1317,24 @@ def _build_text_representation_delivery(
     expected_pdf_digest = str(getattr(opts, "_pdf_sha256", "") or "").strip().lower()
     if re.fullmatch(r"[0-9a-f]{64}", expected_pdf_digest) is None:
         expected_pdf_digest = ""
-    required = bool(getattr(opts, "import_text", False) and requested != "none")
     raw_attempts = list(attempts or [])
+    obligation_ids = list(
+        getattr(opts, "text_delivery_obligation_source_item_ids", []) or []
+    )
+    # A successfully extracted page with no canonical text items has no text
+    # delivery work. Extraction failures are raised before this gate, so an
+    # empty independent obligation set is not permission to hide a failure.
+    required = bool(
+        getattr(opts, "import_text", False)
+        and requested != "none"
+        and (obligation_ids or raw_attempts)
+    )
     normalized_attempts = [
         dict(attempt) for attempt in raw_attempts if isinstance(attempt, dict)
     ]
     source_ids: List[str] = []
     attempts_by_source: Dict[str, List[Dict[str, Any]]] = {}
+    attempt_indexes_by_source: Dict[str, List[int]] = {}
     invalid_reasons: List[str] = []
 
     if len(normalized_attempts) != len(raw_attempts):
@@ -828,6 +1355,7 @@ def _build_text_representation_delivery(
         if source_id not in source_ids:
             source_ids.append(source_id)
         attempts_by_source.setdefault(source_id, []).append(attempt)
+        attempt_indexes_by_source.setdefault(source_id, []).append(index)
 
     raw_fallback_events = list(getattr(opts, "text_mode_fallbacks", []) or [])
     fallback_events = [
@@ -839,6 +1367,8 @@ def _build_text_representation_delivery(
         invalid_reasons.append("malformed_fallback_event")
     final_types: Dict[str, str] = {}
     terminal_attempts: List[Dict[str, Any]] = []
+    terminal_attempt_indexes: List[int] = []
+    delivery_items: List[Dict[str, Any]] = []
     removed_entity_ids: List[str] = []
     entity_identity_owners: Dict[str, str] = {}
     matched_fallback_event_indexes = set()
@@ -861,6 +1391,7 @@ def _build_text_representation_delivery(
         source_attempts = attempts_by_source[source_id]
         terminal = source_attempts[-1]
         terminal_attempts.append(dict(terminal))
+        terminal_attempt_indexes.append(attempt_indexes_by_source[source_id][-1])
         attempted_sequence = [
             normalize_type(attempt.get("attempted_type"))
             for attempt in source_attempts
@@ -931,11 +1462,23 @@ def _build_text_representation_delivery(
                 or prior_proof.get("removed_entity_ids") != removed_ids
                 or not str(prior.get("reason_code") or "").strip()
                 or prior_proof.get("reason_code") != prior.get("reason_code")
-                or not isinstance(prior_proof.get("evidence"), dict)
-                or not prior_proof.get("evidence")
-                or not isinstance(prior_proof.get("attempted_source_results"), list)
-                or not prior_proof.get("attempted_source_results")
-                or prior_proof.get("attempted_sources_complete") is not True
+                or not (
+                    (
+                        prior_proof.get("page_specific_proven_impossible") is True
+                        and prior_proof.get("schema")
+                        == PAGE_VISUAL_FALLBACK_PROOF_V2_SCHEMA
+                    )
+                    or (
+                        isinstance(prior_proof.get("evidence"), dict)
+                        and bool(prior_proof.get("evidence"))
+                        and isinstance(
+                            prior_proof.get("attempted_source_results"),
+                            list,
+                        )
+                        and bool(prior_proof.get("attempted_source_results"))
+                        and prior_proof.get("attempted_sources_complete") is True
+                    )
+                )
             ):
                 invalid_reasons.append(
                     "%s_attempt_%d_proof_invalid" % (source_id, local_index)
@@ -972,18 +1515,57 @@ def _build_text_representation_delivery(
         elif final_type in {"labels", "text"}:
             native_evidence = terminal["evidence"]
             expected_proxy_type = "Label" if final_type == "labels" else "Text"
-            if (
-                native_evidence.get("host_entity_type") != "App::FeaturePython"
-                or native_evidence.get("host_proxy_type") != expected_proxy_type
-                or not isinstance(native_evidence.get("source_text"), str)
-                or not native_evidence.get("source_text")
-                or native_evidence.get("source_text_preserved") is not True
-                or native_evidence.get("view_style_verified") is not True
-                or (
-                    final_type == "labels"
-                    and native_evidence.get("label_marker_absent") is not True
+
+            def native_host_evidence_verified(
+                candidate: Any,
+                *,
+                proxy_type: str = expected_proxy_type,
+                representation: str = final_type,
+            ) -> bool:
+                return bool(
+                    isinstance(candidate, dict)
+                    and candidate.get("host_entity_type") == "App::FeaturePython"
+                    and candidate.get("host_proxy_type") == proxy_type
+                    and isinstance(candidate.get("source_text"), str)
+                    and candidate.get("source_text")
+                    and candidate.get("source_text_preserved") is True
+                    and candidate.get("view_style_verified") is True
+                    and (
+                        representation != "labels"
+                        or candidate.get("label_marker_absent") is True
+                    )
                 )
-            ):
+
+            segment_manifest = native_evidence.get("source_segment_manifest")
+            segment_deliveries = native_evidence.get("segment_deliveries")
+            if segment_manifest is not None or segment_deliveries is not None:
+                child_ids = native_evidence.get("child_source_item_ids")
+                segmented_native_verified = bool(
+                    isinstance(segment_manifest, dict)
+                    and segment_manifest.get("schema")
+                    == "bcs.freecad_text_source_segments/1.0"
+                    and segment_manifest.get("parent_source_item_id") == source_id
+                    and segment_manifest.get("requested_type") == requested
+                    and isinstance(segment_deliveries, list)
+                    and len(segment_deliveries) >= 2
+                    and isinstance(child_ids, list)
+                    and [child.get("source_item_id") for child in segment_deliveries]
+                    == child_ids
+                    and all(
+                        isinstance(child, dict)
+                        and child.get("requested_type") == requested
+                        and normalize_type(child.get("attempted_type")) == final_type
+                        and normalize_type(child.get("final_type")) == final_type
+                        and child.get("outcome") == "verified"
+                        and child.get("cleanup_complete") is True
+                        and native_host_evidence_verified(child.get("evidence"))
+                        for child in segment_deliveries
+                    )
+                )
+                native_visual_verified = segmented_native_verified
+            else:
+                native_visual_verified = native_host_evidence_verified(native_evidence)
+            if not native_visual_verified:
                 invalid_reasons.append(
                     "%s_%s_visual_evidence_unverified" % (source_id, final_type)
                 )
@@ -1079,6 +1661,16 @@ def _build_text_representation_delivery(
             fallback_proof_attempted = (
                 attempted_sequence[-2] if len(attempted_sequence) >= 2 else ""
             )
+
+            def fallback_chain_metadata(event: Dict[str, Any]) -> Dict[str, Any]:
+                proof = event.get("proof")
+                if (
+                    isinstance(proof, dict)
+                    and proof.get("page_specific_proven_impossible") is True
+                ):
+                    return event
+                return proof if isinstance(proof, dict) else {}
+
             matching_fallback_event_indexes = [
                 event_index
                 for event_index, event in enumerate(fallback_events)
@@ -1093,14 +1685,25 @@ def _build_text_representation_delivery(
                 and normalize_type(event["proof"].get("requested_type")) == requested
                 and normalize_type(event["proof"].get("attempted_type"))
                 == fallback_proof_attempted
-                and event["proof"].get("attempted_types") == attempted_sequence
-                and event["proof"].get("proof_chain") == expected_proof_chain
-                and event["proof"].get("transition_chain") == expected_transitions
-                and event["proof"].get("created_entity_ids") == expected_created_ids
-                and event["proof"].get("removed_entity_ids") == expected_removed_ids
-                and event["proof"].get("cleanup_complete") is True
-                and isinstance(event["proof"].get("evidence"), dict)
-                and bool(event["proof"].get("evidence"))
+                and fallback_chain_metadata(event).get("attempted_types")
+                == attempted_sequence
+                and fallback_chain_metadata(event).get("proof_chain")
+                == expected_proof_chain
+                and fallback_chain_metadata(event).get("transition_chain")
+                == expected_transitions
+                and fallback_chain_metadata(event).get("created_entity_ids")
+                == expected_created_ids
+                and fallback_chain_metadata(event).get("removed_entity_ids")
+                == expected_removed_ids
+                and fallback_chain_metadata(event).get("cleanup_complete") is True
+                and (
+                    event["proof"].get("schema")
+                    == PAGE_VISUAL_FALLBACK_PROOF_V2_SCHEMA
+                    or (
+                        isinstance(event["proof"].get("evidence"), dict)
+                        and bool(event["proof"].get("evidence"))
+                    )
+                )
                 and not proof_authority_error(
                     event["proof"],
                     source_item_id=source_id,
@@ -1118,6 +1721,19 @@ def _build_text_representation_delivery(
             if not fallback_verified:
                 invalid_reasons.append("%s_fallback_proof_missing" % source_id)
 
+        delivery_items.append(
+            {
+                "source_item_id": source_id,
+                "terminal_attempt_index": terminal_attempt_indexes[-1],
+                "final_type": final_type,
+                "verified": bool(
+                    outcome == "verified"
+                    and final_type
+                    and final_type == terminal_attempted
+                ),
+            }
+        )
+
     if len(matched_fallback_event_indexes) != len(fallback_events):
         invalid_reasons.append("unbound_or_inflated_fallback_event")
 
@@ -1126,16 +1742,233 @@ def _build_text_representation_delivery(
 
     verified = bool(not required or (source_ids and not invalid_reasons))
     return {
+        "schema": "bcs.freecad_text_representation_delivery/1.1",
         "required": required,
         "requested_type": requested,
         "attempt_count": len(normalized_attempts),
-        "source_item_ids": source_ids,
-        "terminal_attempts": terminal_attempts,
+        "items": delivery_items,
         "removed_entity_ids": list(dict.fromkeys(removed_entity_ids)),
-        "final_types": final_types,
         "invalid_reasons": list(dict.fromkeys(invalid_reasons)),
         "verified": verified,
     }
+
+
+def _canonical_text_delivery_attempts(
+    opts: ImportOptions,
+    attempts: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Project FreeCAD attempts into the strict shared lifecycle vocabulary."""
+
+    def exact_text(value: Any) -> bool:
+        return bool(
+            isinstance(value, str)
+            and value
+            and value == value.strip()
+        )
+
+    def entity_ids(value: Any, default: List[str]) -> Tuple[List[str], bool]:
+        if value is None:
+            return list(default), True
+        if not isinstance(value, list):
+            return [], False
+        valid = bool(
+            all(exact_text(entity_id) for entity_id in value)
+            and len(value) == len(set(value))
+        )
+        return (list(value) if valid else []), valid
+
+    canonical: List[Dict[str, Any]] = []
+    input_validity: List[bool] = []
+    for raw_attempt in list(attempts or []):
+        if not isinstance(raw_attempt, dict):
+            canonical.append(
+                {
+                    "source_item_id": "",
+                    "requested_type": "",
+                    "attempted_type": "",
+                    "final_type": None,
+                    "outcome": "failed",
+                    "cleanup_complete": False,
+                    "record_verified": False,
+                    "type_verified": False,
+                    "visual_verified": False,
+                    "ownership_verified": False,
+                    "created_entity_ids": [],
+                    "removed_entity_ids": [],
+                    "delivery_entity_ids": [],
+                    "support_entity_ids": [],
+                    "referenced_entity_ids": [],
+                    "reused_entity_ids": [],
+                    "evidence": {"malformed_attempt": True},
+                }
+            )
+            input_validity.append(False)
+            continue
+
+        attempt = dict(raw_attempt)
+        outcome = attempt.get("outcome")
+        created, created_valid = entity_ids(
+            attempt.get("created_entity_ids"),
+            [],
+        )
+        removed, removed_valid = entity_ids(
+            attempt.get("removed_entity_ids"),
+            [],
+        )
+        default_delivery = (
+            [entity_id for entity_id in created if entity_id not in set(removed)]
+            if outcome == "verified"
+            else []
+        )
+        delivery, delivery_valid = entity_ids(
+            attempt.get("delivery_entity_ids"),
+            default_delivery,
+        )
+        support, support_valid = entity_ids(
+            attempt.get("support_entity_ids"),
+            [],
+        )
+        retained = list(dict.fromkeys(delivery + support))
+        referenced, referenced_valid = entity_ids(
+            attempt.get("referenced_entity_ids"),
+            retained,
+        )
+        reused, reused_valid = entity_ids(
+            attempt.get("reused_entity_ids"),
+            [entity_id for entity_id in retained if entity_id not in set(created)],
+        )
+        arrays_valid = bool(
+            created_valid
+            and removed_valid
+            and delivery_valid
+            and support_valid
+            and referenced_valid
+            and reused_valid
+        )
+        state_valid = bool(
+            exact_text(attempt.get("source_item_id"))
+            and exact_text(attempt.get("requested_type"))
+            and exact_text(attempt.get("attempted_type"))
+            and exact_text(outcome)
+            and outcome in {"proven_impossible", "verified", "failed"}
+        )
+        evidence_present = bool(
+            any(
+                isinstance(attempt.get(field), dict) and bool(attempt.get(field))
+                for field in ("evidence", "proof")
+            )
+        )
+        record_verified = bool(
+            outcome == "verified"
+            and attempt.get("cleanup_complete") is True
+            and state_valid
+            and arrays_valid
+            and evidence_present
+        )
+        final_type = attempt.get("final_type")
+        type_verified = bool(
+            record_verified
+            and exact_text(final_type)
+            and final_type == attempt.get("attempted_type")
+        )
+        created_set = set(created)
+        removed_set = set(removed)
+        delivery_set = set(delivery)
+        support_set = set(support)
+        reused_set = set(reused)
+        retained_set = delivery_set.union(support_set)
+        ownership_verified = bool(
+            record_verified
+            and delivery_set
+            and removed_set.issubset(created_set)
+            and not delivery_set.intersection(support_set)
+            and reused_set == retained_set.difference(created_set)
+            and not reused_set.intersection(created_set.union(removed_set))
+            and created_set
+            == removed_set.union(retained_set.difference(reused_set))
+        )
+        visual_verified = bool(record_verified and evidence_present)
+
+        attempt.update(
+            {
+                "created_entity_ids": created,
+                "removed_entity_ids": removed,
+                "delivery_entity_ids": delivery,
+                "support_entity_ids": support,
+                "referenced_entity_ids": referenced,
+                "reused_entity_ids": reused,
+                "record_verified": record_verified,
+                "type_verified": type_verified,
+                "visual_verified": visual_verified,
+                "ownership_verified": ownership_verified,
+            }
+        )
+        canonical.append(attempt)
+        input_validity.append(bool(state_valid and arrays_valid))
+
+    deep_validation = _validate_freecad_text_representation_delivery(
+        opts,
+        canonical,
+    )
+    terminal_index_by_source: Dict[str, int] = {}
+    for index, attempt in enumerate(canonical):
+        source_item_id = attempt.get("source_item_id")
+        if exact_text(source_item_id):
+            terminal_index_by_source[source_item_id] = index
+    deep_verified = bool(
+        deep_validation.get("verified") is True
+        and all(input_validity)
+    )
+    for terminal_index in terminal_index_by_source.values():
+        terminal = canonical[terminal_index]
+        for field_name in (
+            "record_verified",
+            "type_verified",
+            "visual_verified",
+            "ownership_verified",
+        ):
+            terminal[field_name] = bool(
+                terminal.get(field_name) is True
+                and input_validity[terminal_index]
+                and deep_verified
+            )
+    return canonical
+
+
+def _build_text_representation_delivery(
+    opts: ImportOptions,
+    attempts: List[Dict[str, Any]],
+    *,
+    expected_source_item_ids: Optional[List[str]] = None,
+    required: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Build schema-1.1 from one canonical ledger after FreeCAD validation."""
+
+    requested_raw = str(getattr(opts, "text_mode", "") or "none").strip().lower()
+    try:
+        requested = _normalize_requested_text_type(requested_raw)
+    except (TypeError, ValueError):
+        requested = requested_raw
+    canonical = _canonical_text_delivery_attempts(opts, attempts)
+    if isinstance(attempts, list):
+        attempts[:] = canonical
+    if expected_source_item_ids is None:
+        expected_source_item_ids = list(
+            dict.fromkeys(
+                attempt.get("source_item_id")
+                for attempt in canonical
+                if isinstance(attempt.get("source_item_id"), str)
+                and bool(attempt.get("source_item_id"))
+            )
+        )
+    if required is None:
+        required = bool(expected_source_item_ids)
+    return _build_shared_text_delivery(
+        canonical,
+        requested_type=requested,
+        required=bool(required),
+        expected_source_item_ids=expected_source_item_ids,
+    )
 
 
 def _public_report_value(value: Any) -> Any:
@@ -1177,6 +2010,43 @@ def write_import_report(
         build_import_report,
     )
 
+    _invoke_import_cancellation_checkpoint(opts, "report construction")
+    runtime_source_present = bool(
+        getattr(opts, "_pdf_source_bytes", None) is not None
+        or getattr(opts, "_pdf_source_snapshot_path", None)
+    )
+    source_pdf_path = (
+        _validated_pdf_source_snapshot_path(opts)
+        if runtime_source_present
+        else pdf_path
+    )
+    bound_source_provenance = getattr(opts, "_pdf_source_provenance", None)
+    source_display_path = str(
+        (
+            bound_source_provenance.get("source_path")
+            if isinstance(bound_source_provenance, dict)
+            else None
+        )
+        or pdf_path
+    )
+    bound_source_sha256 = (
+        str(getattr(opts, "_pdf_sha256", "") or "")
+        if runtime_source_present
+        else None
+    )
+    if bool(getattr(opts, "_atomic_import_active", False)):
+        _journal_attempt_path(opts, output_path)
+        _journal_attempt_path(
+            opts,
+            Path(output_path).with_name("parts_bootstrap.json"),
+        )
+        if list(getattr(opts, "_source_provenance_objects", []) or []):
+            _journal_attempt_path(
+                opts,
+                Path(output_path).with_name("source_provenance.json"),
+            )
+    page_visual_authority = getattr(opts, "_page_visual_authority", None)
+
     phases = dict(getattr(opts, "phase_timings_ms", {}) or {})
     if elapsed_ms > 0 and "total_ms" not in phases:
         phases["total_ms"] = float(elapsed_ms)
@@ -1194,6 +2064,7 @@ def write_import_report(
     # Add text entity info to extra if available
     if hasattr(opts, '_report_extra') and opts._report_extra:
         extra.update(_public_report_value(opts._report_extra))
+    _invoke_import_cancellation_checkpoint(opts, "report text delivery")
     raw_delivered_counts = getattr(opts, "text_delivered_counts", {}) or {}
     raw_delivered_count_items = (
         list(raw_delivered_counts.items())
@@ -1241,14 +2112,43 @@ def write_import_report(
         delivered_counts_valid
     )
 
-    text_attempts = [
-        dict(attempt)
-        for attempt in (getattr(opts, "text_delivery_attempts", []) or [])
-    ]
-    extra["text_delivery_attempts"] = text_attempts
+    obligation_source_item_ids = list(
+        getattr(opts, "text_delivery_obligation_source_item_ids", []) or []
+    )
+    if (
+        any(
+            not isinstance(source_item_id, str)
+            or not source_item_id
+            or source_item_id != source_item_id.strip()
+            for source_item_id in obligation_source_item_ids
+        )
+        or len(obligation_source_item_ids) != len(set(obligation_source_item_ids))
+    ):
+        raise ValueError("text delivery obligation identities are invalid")
+    try:
+        obligation_requested_type = _normalize_requested_text_type(
+            str(opts.text_mode or "none")
+        )
+    except (TypeError, ValueError):
+        obligation_requested_type = str(opts.text_mode or "")
+    obligation_required = bool(obligation_source_item_ids)
+    extra["text_delivery_obligations"] = {
+        "schema": "bcs.text_delivery_obligations/1.0",
+        "required": obligation_required,
+        "requested_type": obligation_requested_type,
+        "source_item_ids": obligation_source_item_ids,
+    }
+
+    text_attempts = list(getattr(opts, "text_delivery_attempts", []) or [])
     extra["text_representation_delivery"] = _build_text_representation_delivery(
         opts,
         text_attempts,
+        expected_source_item_ids=obligation_source_item_ids,
+        required=obligation_required,
+    )
+    extra["text_delivery_attempts"] = text_attempts
+    extra["page_visual_source_observations"] = copy.deepcopy(
+        getattr(opts, "page_visual_source_observations", {}) or {}
     )
 
     font_stage_failures = [
@@ -1266,7 +2166,10 @@ def write_import_report(
         if isinstance(event, dict)
         and type(event.get("count")) is int
         and event.get("count") > 0
-        and bool((event.get("proof") or {}).get("item_specific_proven_impossible"))
+        and bool(
+            (event.get("proof") or {}).get("item_specific_proven_impossible")
+            or (event.get("proof") or {}).get("page_specific_proven_impossible")
+        )
         and bool(event.get("source_item_ids"))
     ]
     text_fallback: Optional[Dict[str, Any]] = None
@@ -1278,14 +2181,26 @@ def write_import_report(
 
     delivery_summary = extra["text_representation_delivery"]
     extra.pop("representation_contract_violation", None)
+    delivered_without_obligations = bool(
+        delivery_summary.get("required") is False
+        and (
+            int((extra.get("actual_text_entity_types") or {}).get("count") or 0) > 0
+            or int(text_count or 0) > 0
+        )
+    )
     if (
         delivery_summary.get("required") is True
         and delivery_summary.get("verified") is not True
-    ):
+    ) or delivered_without_obligations:
+        invalid_reasons = list(delivery_summary.get("invalid_reasons") or [])
+        if delivered_without_obligations:
+            invalid_reasons.append(
+                "delivered text entities exist without independent source obligations"
+            )
         extra["representation_contract_violation"] = {
             "requested_type": delivery_summary.get("requested_type"),
             "reason": "invalid_item_bound_representation_delivery",
-            "invalid_reasons": list(delivery_summary.get("invalid_reasons") or []),
+            "invalid_reasons": list(dict.fromkeys(invalid_reasons)),
         }
     if skips:
         extra["shapestring_skips"] = skips
@@ -1297,6 +2212,7 @@ def write_import_report(
     if scale_hints:
         extra["scale_hints"] = scale_hints
 
+    _invoke_import_cancellation_checkpoint(opts, "report assembly")
     report = build_import_report(
         host_app="freecad",
         host_version=_freecad_version(),
@@ -1305,7 +2221,7 @@ def write_import_report(
             f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
         ),
         importer_version=_importer_version(),
-        pdf_path=pdf_path,
+        pdf_path=source_pdf_path,
         mode=opts.import_mode,
         pages=int(pages_imported),
         primitive_count=primitive_count,
@@ -1322,7 +2238,13 @@ def write_import_report(
         peak_mb=sample_process_mb(),
         performance_phases=phases or None,
         extra=extra,
+        page_visual_authority=page_visual_authority,
     )
+    if runtime_source_present:
+        _validated_pdf_source_snapshot_path(opts)
+    report.input["file"] = str(pdf_path)
+    report._page_visual_authority = page_visual_authority
+    opts._live_import_report = report
 
     if text_fallback and isinstance(getattr(report, "fallback", None), dict):
         fallback_text = report.fallback.get("text")
@@ -1342,16 +2264,23 @@ def write_import_report(
         session_id = ensure_import_session_id(opts)
         sidecar_path = str(Path(output_path).with_name("source_provenance.json"))
         build_stamp = str((report.report_meta or {}).get("build_stamp") or "")
+        _invoke_import_cancellation_checkpoint(
+            opts, "report provenance publication"
+        )
         write_source_provenance_sidecar(
             output_path=sidecar_path,
             import_session_id=session_id,
-            pdf_path=pdf_path,
+            pdf_path=source_pdf_path,
+            source_display_path=source_display_path,
+            source_sha256=bound_source_sha256,
             objects=provenance_objects,
             host_app="freecad",
             importer_version=_importer_version(),
             build_stamp=build_stamp,
             page_count=int(total_pages or pages_imported or 0) or None,
         )
+        if runtime_source_present:
+            _validated_pdf_source_snapshot_path(opts)
         extra_ref = report.extra
         extra_ref["source_provenance_path"] = Path(sidecar_path).name
         extra_ref["source_provenance"] = {
@@ -1360,6 +2289,7 @@ def write_import_report(
             "object_count": len(provenance_objects),
         }
 
+    _invoke_import_cancellation_checkpoint(opts, "report bootstrap construction")
     from pdfcadcore.parts_bootstrap import extract_bootstrap_rows, write_parts_bootstrap_sidecar
 
     bootstrap_path = str(Path(output_path).with_name("parts_bootstrap.json"))
@@ -1367,7 +2297,13 @@ def write_import_report(
     bootstrap_text_items = list(getattr(opts, "_bootstrap_text_items", []) or [])
     if not bootstrap_text_items:
         for page_text in list(getattr(opts, "_model3d_text_evidence", []) or []):
+            _invoke_import_cancellation_checkpoint(
+                opts, "report bootstrap source page"
+            )
             for line in str(page_text).splitlines():
+                _invoke_import_cancellation_checkpoint(
+                    opts, "report bootstrap source line"
+                )
                 line = line.strip()
                 if line:
                     bootstrap_text_items.append({"text": line, "page": 1})
@@ -1378,13 +2314,18 @@ def write_import_report(
     }
     if build_stamp:
         import_build_stamp["build_stamp"] = build_stamp
+    _invoke_import_cancellation_checkpoint(opts, "report bootstrap publication")
     write_parts_bootstrap_sidecar(
         bootstrap_path,
-        pdf_path,
+        source_pdf_path,
+        source_display_path=source_display_path,
+        source_sha256=bound_source_sha256,
         page_count=int(total_pages or pages_imported or 0) or None,
         rows=bootstrap_rows,
         import_build_stamp=import_build_stamp,
     )
+    if runtime_source_present:
+        _validated_pdf_source_snapshot_path(opts)
     extra_ref = report.extra
     extra_ref["parts_bootstrap"] = {
         "schema": "bcs.parts_bootstrap/1.0",
@@ -1393,21 +2334,84 @@ def write_import_report(
         "note": "BOM row extraction from drawing text" if bootstrap_rows else "no BOM rows detected",
     }
 
+    _invoke_import_cancellation_checkpoint(opts, "report publication")
     report.write_json(output_path)
-    try:
-        import_build_stamp["report_sha256"] = hashlib.sha256(
-            Path(output_path).read_bytes()
-        ).hexdigest()
-        write_parts_bootstrap_sidecar(
-            bootstrap_path,
-            pdf_path,
-            page_count=int(total_pages or pages_imported or 0) or None,
-            rows=bootstrap_rows,
-            import_build_stamp=import_build_stamp,
-        )
-    except OSError:
-        pass
+    _invoke_import_cancellation_checkpoint(opts, "report publication verification")
+    import_build_stamp["report_sha256"] = hashlib.sha256(
+        Path(output_path).read_bytes()
+    ).hexdigest()
+    _invoke_import_cancellation_checkpoint(opts, "report bootstrap finalization")
+    write_parts_bootstrap_sidecar(
+        bootstrap_path,
+        source_pdf_path,
+        source_display_path=source_display_path,
+        source_sha256=bound_source_sha256,
+        page_count=int(total_pages or pages_imported or 0) or None,
+        rows=bootstrap_rows,
+        import_build_stamp=import_build_stamp,
+    )
+    if runtime_source_present:
+        _validated_pdf_source_snapshot_path(opts)
+    _invoke_import_cancellation_checkpoint(opts, "report publication complete")
     return output_path
+
+
+def _require_live_import_contract_ready(opts: ImportOptions):
+    """Return the live report only when every authority-backed gate is exact true."""
+
+    report = getattr(opts, "_live_import_report", None)
+    extra = getattr(report, "extra", None)
+    readiness = extra.get("import_contract_ready") if isinstance(extra, dict) else None
+    if not isinstance(readiness, dict) or readiness.get("ready") is not True:
+        raise ImportLifecycleError("live import_contract_ready is not exact True")
+    authority = getattr(opts, "_page_visual_authority", None)
+    if authority is None:
+        raise ImportLifecycleError("live page-visual authority is unavailable")
+    if getattr(report, "_page_visual_authority", None) is not authority:
+        raise ImportLifecycleError("live report lost its page-visual authority binding")
+    report_input = getattr(report, "input", None)
+    expected_digest = str(getattr(opts, "_pdf_sha256", "") or "")
+    if (
+        not isinstance(report_input, dict)
+        or report_input.get("sha256") != expected_digest
+        or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+    ):
+        raise ImportLifecycleError("live report PDF digest binding is invalid")
+    report_extra = getattr(opts, "_report_extra", None)
+    if not isinstance(report_extra, dict):
+        raise ImportLifecycleError("live persistence evidence is unavailable")
+    host_inventory = report_extra.get("actual_host_object_inventory")
+    save_reopen = report_extra.get("save_reopen_inventory")
+    if not isinstance(host_inventory, dict) or host_inventory.get("verified") is not True:
+        raise ImportLifecycleError("live host inventory is not verified")
+    if not isinstance(save_reopen, dict) or save_reopen.get("verified") is not True:
+        raise ImportLifecycleError("save/reopen inventory is not verified")
+    try:
+        raster_required = bool(_inventory_required_included_rasters(host_inventory))
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise ImportLifecycleError(
+            "live raster persistence obligations are invalid"
+        ) from exc
+    if raster_required:
+        raster_evidence = host_inventory.get("raster_archive_evidence")
+        raster_digest = str(
+            save_reopen.get("raster_archive_evidence_digest") or ""
+        )
+        if (
+            not isinstance(raster_evidence, dict)
+            or raster_evidence.get("verified") is not True
+            or raster_evidence.get("schema")
+            != _FCSTD_RASTER_ARCHIVE_EVIDENCE_SCHEMA
+            or raster_evidence.get("method")
+            != _FCSTD_RASTER_ARCHIVE_EVIDENCE_METHOD
+            or re.fullmatch(r"[0-9a-f]{64}", raster_digest) is None
+            or raster_evidence.get("evidence_digest") != raster_digest
+            or raster_digest != _fcstd_archive_evidence_digest(raster_evidence)
+        ):
+            raise ImportLifecycleError(
+                "included raster FCStd persistence evidence is not verified"
+            )
+    return report
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1829,14 +2833,56 @@ def cleanup_temp_files():
     if removed:
         _msg(f"Cleaned up {removed} temporary raster image(s)")
 
-def _ensure_doc():
+def _ensure_doc_with_ownership() -> Tuple[Any, bool]:
+    """Return the active document and whether this import created it."""
+
     doc = FreeCAD.ActiveDocument
-    if doc is None:
+    created = doc is None
+    if created:
         doc = FreeCAD.newDocument("PDF_Import")
+    if doc is None:
+        raise ImportLifecycleError("FreeCAD did not provide an import document")
     # Note: temp file cleanup is deferred to explicit calls, not run
     # automatically here, to avoid deleting images still referenced by
     # Image::ImagePlane objects from the previous import.
+    return doc, created
+
+
+def _ensure_doc():
+    doc, _created = _ensure_doc_with_ownership()
     return doc
+
+
+def _close_attempt_created_document(fc_doc, created_by_attempt: bool) -> None:
+    """Close a failed attempt's document without touching pre-existing documents."""
+
+    if created_by_attempt is not True:
+        return
+    document_name = str(getattr(fc_doc, "Name", "") or "")
+    close_document = getattr(FreeCAD, "closeDocument", None)
+    if not document_name or not callable(close_document):
+        raise ImportCleanupError(
+            "attempt-created FreeCAD document could not be closed",
+            details={
+                "retryable": True,
+                "document_name": document_name,
+                "errors": ["FreeCAD.closeDocument is unavailable"],
+            },
+        )
+    try:
+        close_document(document_name)
+        get_document = getattr(FreeCAD, "getDocument", None)
+        if callable(get_document) and get_document(document_name) is not None:
+            raise RuntimeError("document remains open after closeDocument")
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        raise ImportCleanupError(
+            "attempt-created FreeCAD document cleanup failed",
+            details={
+                "retryable": True,
+                "document_name": document_name,
+                "errors": [str(exc)],
+            },
+        ) from exc
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -2469,11 +3515,77 @@ def _render_text_spans_exact_labels(
 
 
 def _shapestring_font_cache_dir() -> Path:
+    candidates: List[Path] = []
+    installed_mod_root = ""
     try:
-        base = Path(FreeCAD.getUserAppDataDir())
-        return base / "Mod" / "PDFVectorImporter" / "font_cache"
-    except (AttributeError, RuntimeError, TypeError, ValueError):
-        return Path(tempfile.gettempdir()) / "bc_fc_pdf_font_cache"
+        app_data = FreeCAD.getUserAppDataDir()
+        if isinstance(app_data, (str, os.PathLike)) and str(app_data).strip():
+            installed_mod_root = os.path.normcase(
+                os.path.abspath(os.fspath(Path(app_data) / "Mod"))
+            )
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        installed_mod_root = ""
+    try:
+        user_cache = FreeCAD.getUserCachePath()
+        if isinstance(user_cache, (str, os.PathLike)) and str(user_cache).strip():
+            candidates.append(
+                Path(user_cache) / "PDFVectorImporter" / "font_cache"
+            )
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        pass
+    candidates.append(Path(tempfile.gettempdir()) / "bc_fc_pdf_font_cache")
+
+    failures: List[str] = []
+    seen: set = set()
+    marker = b"bcs-pdf-font-cache-write-probe-v1"
+    for candidate in candidates:
+        probe_path = ""
+        try:
+            normalized = os.path.normcase(os.path.abspath(os.fspath(candidate)))
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            inside_installed_mod = False
+            if installed_mod_root:
+                try:
+                    inside_installed_mod = (
+                        os.path.commonpath([normalized, installed_mod_root])
+                        == installed_mod_root
+                    )
+                except ValueError:
+                    # Windows paths on different volumes cannot share a common
+                    # path and therefore cannot place the cache inside Mod.
+                    inside_installed_mod = False
+            if inside_installed_mod:
+                failures.append("%s: inside installed Mod tree" % candidate)
+                continue
+            candidate.mkdir(parents=True, exist_ok=True)
+            descriptor, probe_path = tempfile.mkstemp(
+                prefix=".bcs_font_cache_probe_",
+                suffix=".tmp",
+                dir=str(candidate),
+            )
+            with os.fdopen(descriptor, "wb") as probe:
+                probe.write(marker)
+                probe.flush()
+                os.fsync(probe.fileno())
+            if Path(probe_path).read_bytes() != marker:
+                raise OSError("font cache write probe did not round-trip")
+            os.remove(probe_path)
+            probe_path = ""
+            return candidate
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            failures.append("%s: %s: %s" % (candidate, exc.__class__.__name__, exc))
+        finally:
+            if probe_path:
+                try:
+                    os.remove(probe_path)
+                except OSError:
+                    pass
+    raise OSError(
+        "No writable font cache directory is available (%s)"
+        % "; ".join(failures)
+    )
 
 
 def _stage_page_shapestring_fonts(
@@ -2896,16 +4008,24 @@ def _resolve_shapestring_font_path_with_evidence(
 
         staged_path = Path(path_value)
         try:
-            if not staged_path.is_file():
-                return None, [source_result(
-                    "embedded_font",
-                    "invalid",
-                    font_identity,
-                    reason="staged_font_file_missing",
-                    path=path_value,
-                    sha256=sha_value,
-                )]
-            actual_sha = hashlib.sha256(staged_path.read_bytes()).hexdigest()
+            approved_root = (
+                staged_path.parent.resolve(strict=True)
+                if _allow_unbound_compat
+                else _shapestring_font_cache_dir().resolve(strict=True)
+            )
+            canonical_path, staged_bytes, actual_sha = _read_stable_font_asset(
+                staged_path,
+                approved_root=approved_root,
+            )
+        except FileNotFoundError:
+            return None, [source_result(
+                "embedded_font",
+                "invalid",
+                font_identity,
+                reason="staged_font_file_missing",
+                path=path_value,
+                sha256=sha_value,
+            )]
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             return None, [source_result(
                 "embedded_font",
@@ -2926,13 +4046,31 @@ def _resolve_shapestring_font_path_with_evidence(
                 sha256=sha_value,
                 actual_sha256=actual_sha,
             )]
-        return path_value, [source_result(
+        internal_identity = _font_internal_identity_evidence(
+            staged_bytes,
+            font_identity,
+        )
+        if internal_identity.get("font_identity_verified") is not True:
+            return None, [source_result(
+                "embedded_font",
+                "invalid",
+                font_identity,
+                reason="embedded_font_internal_identity_mismatch",
+                path=str(canonical_path),
+                sha256=actual_sha,
+                font_identity_verified=False,
+                internal_identity_evidence=internal_identity,
+            )]
+        return str(canonical_path), [source_result(
             "embedded_font",
             "found",
             font_identity,
-            path=path_value,
-            sha256=sha_value,
+            path=str(canonical_path),
+            sha256=actual_sha,
             xref=xref_value,
+            font_identity_verified=True,
+            internal_identity_evidence=internal_identity,
+            approved_font_root=str(approved_root),
         )]
 
     exact_nonembedded_observation: Optional[Dict[str, Any]] = None
@@ -3070,18 +4208,19 @@ def _resolve_shapestring_font_path_with_evidence(
         ))
         return None, results
 
-    system_path = os.path.join(
-        os.environ.get("WINDIR", r"C:\Windows"), "Fonts", filename
-    )
+    system_root = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+    system_path = os.path.join(str(system_root), filename)
     try:
         if not Path(system_path).is_file():
             results.append(source_result(
                 "system_font", "not_found", font_identity
             ))
             return None, results
-        with open(system_path, "rb") as font_file:
-            font_file.read(1)
-    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        canonical_path, system_bytes, system_sha256 = _read_stable_font_asset(
+            system_path,
+            approved_root=system_root,
+        )
+    except Exception as exc:
         results.append(source_result(
             "system_font",
             "invalid",
@@ -3092,10 +4231,32 @@ def _resolve_shapestring_font_path_with_evidence(
         ))
         return None, results
 
+    internal_identity = _font_internal_identity_evidence(system_bytes, font_identity)
+    if internal_identity.get("font_identity_verified") is not True:
+        results.append(source_result(
+            "system_font",
+            "invalid",
+            font_identity,
+            reason="system_font_internal_identity_mismatch",
+            path=str(canonical_path),
+            font_sha256=system_sha256,
+            font_identity_verified=False,
+            internal_identity_evidence=internal_identity,
+        ))
+        return None, results
+
     results.append(source_result(
-        "system_font", "found", font_identity, path=system_path
+        "system_font",
+        "found",
+        font_identity,
+        path=str(canonical_path),
+        sha256=system_sha256,
+        font_sha256=system_sha256,
+        font_identity_verified=True,
+        internal_identity_evidence=internal_identity,
+        approved_font_root=str(system_root.resolve(strict=True)),
     ))
-    return system_path, results
+    return str(canonical_path), results
 
 
 def _resolve_shapestring_font_path(
@@ -3109,6 +4270,864 @@ def _resolve_shapestring_font_path(
         return path
     except Exception:
         return None
+
+
+def _font_evidence_digest(evidence: Dict[str, Any]) -> str:
+    unsigned = {
+        key: value
+        for key, value in dict(evidence or {}).items()
+        if key not in {"evidence_sha256", "coverage_evidence_sha256"}
+    }
+    return hashlib.sha256(
+        json.dumps(
+            unsigned,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _font_identity_aliases(value: Any) -> set[str]:
+    """Return conservative canonical aliases for one internal/PDF font name."""
+
+    try:
+        key = _canonical_font_identity(str(value or ""))["normalized_key"]
+    except Exception:
+        key = ""
+    if not key:
+        return set()
+    aliases = {key}
+    if key.endswith("psmt") and len(key) > 4:
+        aliases.add(key[:-4])
+    if key.endswith("mt") and len(key) > 2:
+        aliases.add(key[:-2])
+    aliases.update(
+        alias.replace("psbold", "bold")
+        .replace("psitalic", "italic")
+        .replace("psregular", "regular")
+        for alias in list(aliases)
+    )
+    return {alias for alias in aliases if alias}
+
+
+def _font_style_signature(value: Any) -> Tuple[bool, bool]:
+    aliases = tuple(sorted(_font_identity_aliases(value)))
+    return (
+        any(
+            token in alias
+            for alias in aliases
+            for token in ("bold", "demi", "semibold", "black")
+        ),
+        any(
+            token in alias
+            for alias in aliases
+            for token in ("italic", "oblique")
+        ),
+    )
+
+
+def _font_style_details(value: Any) -> Dict[str, bool]:
+    """Describe only an explicitly named style; a family name has no style."""
+
+    key = _canonical_font_identity(str(value or ""))["normalized_key"]
+    style_suffixes = (
+        "semibolditalic",
+        "semiboldoblique",
+        "bolditalic",
+        "boldoblique",
+        "demiitalic",
+        "demioblique",
+        "blackitalic",
+        "blackoblique",
+        "semibold",
+        "bold",
+        "demi",
+        "black",
+        "italic",
+        "oblique",
+        "regular",
+        "roman",
+        "normal",
+        "book",
+    )
+    matched_suffix = next(
+        (suffix for suffix in style_suffixes if key.endswith(suffix)),
+        "",
+    )
+    return {
+        "explicit": bool(matched_suffix),
+        "bold": any(
+            token in matched_suffix for token in ("bold", "semibold", "demi", "black")
+        ),
+        "italic": any(token in matched_suffix for token in ("italic", "oblique")),
+        "regular": matched_suffix in {"regular", "roman", "normal", "book"},
+    }
+
+
+def _font_internal_identity_evidence(
+    font_bytes: bytes,
+    source_font_identity: Dict[str, str],
+) -> Dict[str, Any]:
+    """Validate a paired internal family/style identity, never a source label."""
+
+    source_raw_name = str(source_font_identity.get("raw_name", "") or "")
+    source_key = _canonical_font_identity(source_raw_name)["normalized_key"]
+    source_style_details = _font_style_details(source_raw_name)
+    evidence: Dict[str, Any] = {
+        "font_identity_verified": False,
+        "source_font_identity": copy.deepcopy(source_font_identity),
+        "font_sha256": hashlib.sha256(font_bytes).hexdigest(),
+        "internal_names": [],
+        "internal_name_keys": [],
+        "source_style_signature": list(_font_style_signature(source_raw_name)),
+        "source_style_explicit": source_style_details["explicit"],
+        "internal_style_signatures": [],
+        "internal_family_style_pairs": [],
+        "matched_identity_records": [],
+        "os2_fs_selection": None,
+        "head_mac_style": None,
+    }
+    font = None
+    try:
+        from fontTools.ttLib import TTFont
+
+        font = TTFont(
+            BytesIO(font_bytes),
+            lazy=False,
+            recalcBBoxes=False,
+            recalcTimestamp=False,
+        )
+        name_table = font["name"]
+        relevant_name_ids = {1, 2, 4, 6, 16, 17}
+        grouped_names: Dict[Tuple[int, int, int], Dict[int, set[str]]] = {}
+        for record in name_table.names:
+            if record.nameID not in relevant_name_ids:
+                continue
+            decoded = str(record.toUnicode()).strip()
+            if not decoded:
+                continue
+            group_key = (
+                int(record.platformID),
+                int(record.platEncID),
+                int(record.langID),
+            )
+            grouped_names.setdefault(group_key, {}).setdefault(
+                int(record.nameID), set()
+            ).add(decoded)
+        internal_names = sorted(
+            {
+                name
+                for grouped in grouped_names.values()
+                for names in grouped.values()
+                for name in names
+            },
+            key=str.casefold,
+        )
+        internal_keys = sorted(
+            {
+                alias
+                for name in internal_names
+                for alias in _font_identity_aliases(name)
+            }
+        )
+        source_aliases = _font_identity_aliases(source_raw_name)
+        internal_styles = sorted({_font_style_signature(name) for name in internal_names})
+        os2_fs_selection = (
+            int(font["OS/2"].fsSelection) if "OS/2" in font else None
+        )
+        head_mac_style = int(font["head"].macStyle) if "head" in font else None
+        pairs: List[Dict[str, Any]] = []
+        matches: List[Dict[str, Any]] = []
+        for group_key in sorted(grouped_names):
+            grouped = grouped_names[group_key]
+            families = sorted(
+                grouped.get(16) or grouped.get(1) or set(),
+                key=str.casefold,
+            )
+            subfamilies = sorted(
+                grouped.get(17) or grouped.get(2) or set(),
+                key=str.casefold,
+            )
+            full_names = sorted(
+                (grouped.get(4) or set()) | (grouped.get(6) or set()),
+                key=str.casefold,
+            )
+            for family in families:
+                family_aliases = _font_identity_aliases(family)
+                for subfamily in subfamilies:
+                    style_details = _font_style_details(subfamily)
+                    style_aliases = _font_identity_aliases(subfamily)
+                    combined_aliases = {
+                        alias
+                        for combined in (
+                            "%s %s" % (family, subfamily),
+                            "%s-%s" % (family, subfamily),
+                        )
+                        for alias in _font_identity_aliases(combined)
+                    }
+                    full_aliases = {
+                        alias
+                        for full_name in full_names
+                        for alias in _font_identity_aliases(full_name)
+                    }
+                    os2_consistent = bool(
+                        os2_fs_selection is None
+                        or (
+                            bool(os2_fs_selection & 0x20) == style_details["bold"]
+                            and bool(os2_fs_selection & 0x01)
+                            == style_details["italic"]
+                        )
+                    )
+                    head_consistent = bool(
+                        head_mac_style is None
+                        or (
+                            bool(head_mac_style & 0x01) == style_details["bold"]
+                            and bool(head_mac_style & 0x02)
+                            == style_details["italic"]
+                        )
+                    )
+                    flags_consistent = os2_consistent and head_consistent
+                    # A bare family match is not a family+style identity.  Exact
+                    # equivalence requires either the paired composite identity
+                    # or a non-family full/PostScript name from this same record
+                    # group, with style bits agreeing when those tables exist.
+                    composite_match = source_key in combined_aliases
+                    full_name_match = bool(
+                        source_key in full_aliases and source_key not in family_aliases
+                    )
+                    source_style_consistent = bool(
+                        not source_style_details["explicit"]
+                        or (
+                            source_style_details["bold"] == style_details["bold"]
+                            and source_style_details["italic"]
+                            == style_details["italic"]
+                            and (
+                                not source_style_details["regular"]
+                                or style_details["regular"]
+                            )
+                        )
+                    )
+                    verified = bool(
+                        (composite_match or full_name_match)
+                        and source_style_consistent
+                        and flags_consistent
+                    )
+                    pair = {
+                        "platform_id": group_key[0],
+                        "encoding_id": group_key[1],
+                        "language_id": group_key[2],
+                        "family": family,
+                        "subfamily": subfamily,
+                        "family_keys": sorted(family_aliases),
+                        "subfamily_keys": sorted(style_aliases),
+                        "combined_keys": sorted(combined_aliases),
+                        "full_name_keys": sorted(full_aliases),
+                        "style_bold": style_details["bold"],
+                        "style_italic": style_details["italic"],
+                        "style_regular": style_details["regular"],
+                        "style_flags_consistent": flags_consistent,
+                    }
+                    pairs.append(pair)
+                    if verified:
+                        matches.append(copy.deepcopy(pair))
+        evidence.update(
+            {
+                "internal_names": internal_names,
+                "internal_name_keys": internal_keys,
+                "internal_style_signatures": [list(value) for value in internal_styles],
+                "internal_family_style_pairs": pairs,
+                "matched_identity_records": matches,
+                "os2_fs_selection": os2_fs_selection,
+                "head_mac_style": head_mac_style,
+                "font_identity_verified": bool(matches and source_aliases),
+            }
+        )
+    except Exception as exc:
+        evidence["exception"] = "%s: %s" % (exc.__class__.__name__, exc)
+    finally:
+        if font is not None:
+            try:
+                font.close()
+            except (AttributeError, RuntimeError):
+                pass
+    evidence["evidence_sha256"] = _font_evidence_digest(evidence)
+    return evidence
+
+
+def _font_bytes_glyph_coverage(
+    font_bytes: bytes,
+    source_text: str,
+) -> Dict[str, Any]:
+    """Require a real nonempty outline for every source-visible character."""
+
+    required_codepoints = sorted({ord(character) for character in source_text})
+    base = {
+        "font_sha256": hashlib.sha256(font_bytes).hexdigest(),
+        "required_codepoints": required_codepoints,
+        "missing_codepoints": [],
+        "empty_outline_codepoints": [],
+        "nonempty_outline_codepoints": [],
+        "replacement_behavior_verified": False,
+    }
+    if not font_bytes or not source_text or not required_codepoints:
+        base.update(
+            {
+                "glyph_coverage_verified": False,
+                "missing_codepoints": required_codepoints,
+            }
+        )
+        base["coverage_evidence_sha256"] = _font_evidence_digest(base)
+        return base
+    font = None
+    try:
+        from fontTools.pens.boundsPen import BoundsPen
+        from fontTools.ttLib import TTFont
+
+        font = TTFont(
+            BytesIO(font_bytes),
+            lazy=False,
+            recalcBBoxes=False,
+            recalcTimestamp=False,
+        )
+        cmap = dict(font.getBestCmap() or {})
+        glyph_set = font.getGlyphSet()
+        missing: List[int] = []
+        empty_outlines: List[int] = []
+        nonempty_outlines: List[int] = []
+        for codepoint in required_codepoints:
+            glyph_name = cmap.get(codepoint)
+            if (
+                not isinstance(glyph_name, str)
+                or not glyph_name
+                or glyph_name == ".notdef"
+            ):
+                missing.append(codepoint)
+                continue
+            try:
+                if int(font.getGlyphID(glyph_name)) <= 0:
+                    missing.append(codepoint)
+                    continue
+                bounds_pen = BoundsPen(glyph_set)
+                glyph_set[glyph_name].draw(bounds_pen)
+                bounds = bounds_pen.bounds
+                if (
+                    bounds is None
+                    or len(bounds) != 4
+                    or not all(math.isfinite(float(value)) for value in bounds)
+                    or float(bounds[2]) <= float(bounds[0])
+                    or float(bounds[3]) <= float(bounds[1])
+                ):
+                    empty_outlines.append(codepoint)
+                    continue
+                nonempty_outlines.append(codepoint)
+            except Exception:
+                empty_outlines.append(codepoint)
+        base.update(
+            {
+                "glyph_coverage_verified": not missing and not empty_outlines,
+                "missing_codepoints": missing,
+                "empty_outline_codepoints": empty_outlines,
+                "nonempty_outline_codepoints": nonempty_outlines,
+                # A replacement glyph can never satisfy a different source
+                # codepoint; cmap absence remains explicit above.
+                "replacement_behavior_verified": True,
+            }
+        )
+    except Exception as exc:
+        base.update(
+            {
+                "glyph_coverage_verified": False,
+                "missing_codepoints": required_codepoints,
+                "exception": "%s: %s" % (exc.__class__.__name__, exc),
+            }
+        )
+    finally:
+        if font is not None:
+            try:
+                font.close()
+            except (AttributeError, RuntimeError):
+                pass
+    base["coverage_evidence_sha256"] = _font_evidence_digest(base)
+    return base
+
+
+def _no_cost_font_candidate_roots() -> List[Tuple[str, Path]]:
+    """Return deterministic local-only substitute roots with auditable origins."""
+
+    roots: List[Tuple[str, Path]] = []
+    windir = os.environ.get("WINDIR")
+    if windir:
+        roots.append(("installed_no_cost_substitute", Path(windir) / "Fonts"))
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        roots.append(
+            (
+                "installed_no_cost_substitute",
+                Path(local_app_data) / "Microsoft" / "Windows" / "Fonts",
+            )
+        )
+    module_root = Path(_mod_root)
+    for bundled_root in (
+        module_root / "fonts",
+        module_root / "resources" / "fonts",
+        module_root / "lib" / "fonts",
+    ):
+        roots.append(("bundled_no_cost_substitute", bundled_root))
+    return roots
+
+
+_FONT_SCAN_MAX_ROOTS = 8
+_FONT_SCAN_MAX_DIRECTORIES = 2048
+_FONT_SCAN_MAX_FILES = 8192
+_FONT_SCAN_MAX_FILE_BYTES = 64 * 1024 * 1024
+_FONT_SCAN_MAX_TOTAL_BYTES = 512 * 1024 * 1024
+_FONT_SCAN_MAX_SECONDS = 4.0
+_FONT_COVERAGE_CACHE_MAX = 512
+_FONT_COVERAGE_CACHE: Dict[Tuple[str, Tuple[int, ...]], Dict[str, Any]] = {}
+
+
+def _path_is_reparse_point(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        attributes = int(getattr(path.lstat(), "st_file_attributes", 0) or 0)
+        return bool(attributes & int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)))
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return True
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        return os.path.commonpath((str(path), str(root))) == str(root)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _read_stable_font_asset(
+    path: Any,
+    *,
+    approved_root: Optional[Any] = None,
+    max_bytes: int = _FONT_SCAN_MAX_FILE_BYTES,
+) -> Tuple[Path, bytes, str]:
+    """Read one regular non-reparse file and reject containment or TOCTOU drift."""
+
+    raw_path = Path(path)
+    raw_root = Path(approved_root) if approved_root is not None else None
+    # Preserve the resolver's dedicated missing-asset classification.  This
+    # check does not authorize the path: an existing asset must still pass the
+    # raw and canonical reparse, containment, type, size, and stability gates.
+    raw_path.lstat()
+    if _path_is_reparse_point(raw_path):
+        raise ValueError("font asset is a symlink or reparse point")
+    if raw_root is not None and _path_is_reparse_point(raw_root):
+        raise ValueError("approved font root is a symlink or reparse point")
+    resolved = raw_path.resolve(strict=True)
+    root = raw_root.resolve(strict=True) if raw_root is not None else None
+    if root is not None and not _path_is_within(resolved, root):
+        raise ValueError("font asset escaped its approved canonical root")
+    if not resolved.is_file():
+        raise ValueError("font asset is not a regular file")
+    before = resolved.stat()
+    if before.st_size <= 0 or before.st_size > int(max_bytes):
+        raise ValueError("font asset size is outside the bounded policy")
+    with open(resolved, "rb") as font_file:
+        # The pre-read regular-file stat is authoritative for the permitted
+        # length.  Never read a sentinel byte beyond the caller's remaining
+        # aggregate budget; growth is detected by the post-read stat/token.
+        payload = font_file.read(int(max_bytes))
+    after = resolved.stat()
+    before_token = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    after_token = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    if before_token != after_token or len(payload) != after.st_size:
+        raise RuntimeError("font asset changed while it was being read")
+    if not payload or len(payload) > int(max_bytes):
+        raise ValueError("font asset size is outside the bounded policy")
+    return resolved, payload, hashlib.sha256(payload).hexdigest()
+
+
+def _bounded_font_candidates() -> Tuple[List[Tuple[str, Path, Path]], Dict[str, Any]]:
+    """Enumerate only canonical, contained, non-reparse font files within caps."""
+
+    started = time.perf_counter()
+    candidates: List[Tuple[str, Path, Path]] = []
+    seen_paths: set[str] = set()
+    seen_roots: set[str] = set()
+    directory_count = 0
+    file_count = 0
+    outside_rejections = 0
+    reparse_rejections = 0
+    scan_errors = 0
+    capped = False
+
+    for candidate_source, raw_root in list(_no_cost_font_candidate_roots())[
+        :_FONT_SCAN_MAX_ROOTS
+    ]:
+        if time.perf_counter() - started > _FONT_SCAN_MAX_SECONDS:
+            capped = True
+            break
+        root_path = Path(raw_root)
+        try:
+            if _path_is_reparse_point(root_path):
+                reparse_rejections += 1
+                continue
+            root = root_path.resolve(strict=True)
+            if not root.is_dir():
+                continue
+        except (OSError, RuntimeError, TypeError, ValueError):
+            scan_errors += 1
+            continue
+        root_key = os.path.normcase(str(root))
+        if root_key in seen_roots:
+            continue
+        seen_roots.add(root_key)
+        pending = [root]
+        while pending:
+            if (
+                directory_count >= _FONT_SCAN_MAX_DIRECTORIES
+                or file_count >= _FONT_SCAN_MAX_FILES
+                or time.perf_counter() - started > _FONT_SCAN_MAX_SECONDS
+            ):
+                capped = True
+                pending.clear()
+                break
+            directory = pending.pop()
+            directory_count += 1
+            try:
+                with os.scandir(directory) as iterator:
+                    entries = sorted(iterator, key=lambda entry: entry.name.casefold())
+            except (OSError, RuntimeError, TypeError, ValueError):
+                scan_errors += 1
+                continue
+            child_directories: List[Path] = []
+            for entry in entries:
+                if time.perf_counter() - started > _FONT_SCAN_MAX_SECONDS:
+                    capped = True
+                    break
+                entry_path = Path(entry.path)
+                try:
+                    if entry.is_symlink() or _path_is_reparse_point(entry_path):
+                        reparse_rejections += 1
+                        continue
+                    resolved = entry_path.resolve(strict=True)
+                    if not _path_is_within(resolved, root):
+                        outside_rejections += 1
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        child_directories.append(resolved)
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    if file_count >= _FONT_SCAN_MAX_FILES:
+                        capped = True
+                        break
+                    file_count += 1
+                    if resolved.suffix.lower() not in {".ttf", ".otf"}:
+                        continue
+                    path_key = os.path.normcase(str(resolved))
+                    if path_key in seen_paths:
+                        continue
+                    seen_paths.add(path_key)
+                    candidates.append((str(candidate_source), resolved, root))
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    scan_errors += 1
+            pending.extend(reversed(child_directories))
+            if capped:
+                break
+        if capped:
+            break
+
+    return candidates, {
+        "scan_bounded": True,
+        "scan_capped": capped,
+        "scanned_root_count": len(seen_roots),
+        "scanned_directory_count": directory_count,
+        "scanned_file_count": file_count,
+        "outside_root_rejection_count": outside_rejections,
+        "reparse_rejection_count": reparse_rejections,
+        "scan_error_count": scan_errors,
+        "scan_limits": {
+            "max_roots": _FONT_SCAN_MAX_ROOTS,
+            "max_directories": _FONT_SCAN_MAX_DIRECTORIES,
+            "max_files": _FONT_SCAN_MAX_FILES,
+            "max_file_bytes": _FONT_SCAN_MAX_FILE_BYTES,
+            "max_total_bytes": _FONT_SCAN_MAX_TOTAL_BYTES,
+            "max_seconds": _FONT_SCAN_MAX_SECONDS,
+        },
+    }
+
+
+def _select_no_cost_font_substitute(
+    source_text: str,
+    *,
+    exclude_paths: Optional[List[str]] = None,
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Select the first bounded local candidate with nonempty outline coverage."""
+
+    excluded = {
+        os.path.normcase(os.path.abspath(path))
+        for path in list(exclude_paths or [])
+        if isinstance(path, str) and path
+    }
+    candidates, scan_evidence = _bounded_font_candidates()
+
+    attempted: List[Dict[str, Any]] = []
+    total_bytes = 0
+    for candidate_source, candidate_path, approved_root in candidates:
+        if total_bytes >= _FONT_SCAN_MAX_TOTAL_BYTES:
+            scan_evidence["scan_capped"] = True
+            break
+        normalized = os.path.normcase(str(candidate_path))
+        if normalized in excluded:
+            continue
+        record: Dict[str, Any] = {
+            "font_candidate_source": candidate_source,
+            "path": str(candidate_path),
+        }
+        try:
+            remaining_bytes = _FONT_SCAN_MAX_TOTAL_BYTES - total_bytes
+            candidate_size = int(candidate_path.stat().st_size)
+            if candidate_size <= 0 or candidate_size > _FONT_SCAN_MAX_FILE_BYTES:
+                raise ValueError("font asset size is outside the bounded policy")
+            if candidate_size > remaining_bytes:
+                scan_evidence["scan_capped"] = True
+                scan_evidence["cap_rejected_path"] = str(candidate_path)
+                break
+            stable_path, payload, digest = _read_stable_font_asset(
+                candidate_path,
+                approved_root=approved_root,
+                max_bytes=min(_FONT_SCAN_MAX_FILE_BYTES, remaining_bytes),
+            )
+            total_bytes += len(payload)
+            record["path"] = str(stable_path)
+            record["source_font_asset_path"] = str(stable_path)
+            record["source_font_asset_sha256"] = digest
+            record["delivered_font_sha256"] = digest
+            cache_key = (digest, tuple(sorted({ord(value) for value in source_text})))
+            coverage = _FONT_COVERAGE_CACHE.get(cache_key)
+            if coverage is None:
+                coverage = _font_bytes_glyph_coverage(payload, source_text)
+                if len(_FONT_COVERAGE_CACHE) >= _FONT_COVERAGE_CACHE_MAX:
+                    _FONT_COVERAGE_CACHE.pop(next(iter(_FONT_COVERAGE_CACHE)))
+                _FONT_COVERAGE_CACHE[cache_key] = copy.deepcopy(coverage)
+            record.update(coverage)
+            record["font_coverage_evidence"] = copy.deepcopy(coverage)
+        except Exception as exc:
+            record.update(
+                {
+                    "glyph_coverage_verified": False,
+                    "replacement_behavior_verified": False,
+                    "exception": "%s: %s" % (exc.__class__.__name__, exc),
+                }
+            )
+        attempted.append(record)
+        if record.get("glyph_coverage_verified") is True:
+            scan_evidence["scanned_candidate_bytes"] = total_bytes
+            return str(stable_path), {
+                **record,
+                "font_substitution_applied": True,
+                "source_font_equivalence": False,
+                "font_identity_verified": False,
+                "attempted_candidate_count": len(attempted),
+                "attempted_candidates": copy.deepcopy(attempted),
+                **scan_evidence,
+                # Transient immutable handoff.  These private fields are removed
+                # by staging and can never enter persisted/report evidence.
+                "_selected_font_bytes": payload,
+                "_selected_font_path": str(stable_path),
+                "_selected_font_approved_root": str(approved_root),
+            }
+
+    scan_evidence["scanned_candidate_bytes"] = total_bytes
+    return None, {
+        "font_substitution_applied": False,
+        "source_font_equivalence": False,
+        "font_identity_verified": False,
+        "glyph_coverage_verified": False,
+        "replacement_behavior_verified": all(
+            result.get("replacement_behavior_verified") is True
+            for result in attempted
+        ) if attempted else False,
+        "attempted_candidate_count": len(attempted),
+        "attempted_candidates": attempted,
+        **scan_evidence,
+    }
+
+
+def _font_asset_is_read_only(path: Any) -> bool:
+    try:
+        mode = Path(path).stat().st_mode
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+    return not bool(mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+
+
+def _stage_shapestring_font_asset(
+    source_path: Any,
+    font_delivery_evidence: Dict[str, Any],
+    opts: ImportOptions,
+) -> Tuple[str, Dict[str, Any]]:
+    """Copy stable selected bytes into attempt-journaled content-addressed storage."""
+
+    evidence = copy.deepcopy(font_delivery_evidence)
+    payload = evidence.pop("_selected_font_bytes", None)
+    selected_path_value = evidence.pop("_selected_font_path", None)
+    approved_root_value = evidence.pop("_selected_font_approved_root", None)
+    if (
+        not isinstance(payload, bytes)
+        or not payload
+        or not isinstance(selected_path_value, str)
+        or not selected_path_value
+        or not isinstance(approved_root_value, str)
+        or not approved_root_value
+    ):
+        raise RuntimeError("selected font immutable handoff is incomplete")
+    canonical_source = Path(selected_path_value)
+    approved_root = Path(approved_root_value)
+    if (
+        not canonical_source.is_absolute()
+        or not approved_root.is_absolute()
+        or not _path_is_within(canonical_source, approved_root)
+        or os.path.normcase(os.path.abspath(os.fspath(source_path)))
+        != os.path.normcase(str(canonical_source))
+        or evidence.get("source_font_asset_path") != str(canonical_source)
+    ):
+        raise RuntimeError("selected font path/root handoff is invalid")
+    source_sha256 = hashlib.sha256(payload).hexdigest()
+    expected_source_sha256 = str(
+        evidence.get("source_font_asset_sha256")
+        or evidence.get("delivered_font_sha256")
+        or ""
+    )
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", expected_source_sha256) is None
+        or source_sha256 != expected_source_sha256
+    ):
+        raise RuntimeError("selected font bytes changed before attempt staging")
+
+    delivery_root = _shapestring_font_cache_dir() / "delivery-assets"
+    delivery_root.mkdir(parents=True, exist_ok=True)
+    if _path_is_reparse_point(delivery_root):
+        raise RuntimeError("font delivery staging root is a reparse point")
+    canonical_root = delivery_root.resolve(strict=True)
+    suffix = canonical_source.suffix.lower()
+    if suffix not in {".ttf", ".otf"}:
+        suffix = ".ttf"
+    staged_path = canonical_root / (source_sha256 + suffix)
+    if not _path_is_within(staged_path, canonical_root):
+        raise RuntimeError("content-addressed font target escaped staging root")
+
+    replace_required = True
+    if staged_path.exists():
+        try:
+            _existing_path, existing_bytes, existing_sha256 = _read_stable_font_asset(
+                staged_path,
+                approved_root=canonical_root,
+            )
+            replace_required = bool(
+                existing_sha256 != source_sha256 or existing_bytes != payload
+            )
+        except Exception:
+            replace_required = True
+    if replace_required:
+        _journal_attempt_path(opts, staged_path)
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=source_sha256 + ".",
+            suffix=suffix,
+            dir=str(canonical_root),
+        )
+        os.close(fd)
+        temporary_path = Path(temporary_name)
+        try:
+            with open(temporary_path, "wb") as staged_file:
+                staged_file.write(payload)
+                staged_file.flush()
+                os.fsync(staged_file.fileno())
+            if staged_path.exists():
+                try:
+                    os.chmod(staged_path, stat.S_IREAD | stat.S_IWRITE)
+                except OSError:
+                    pass
+            os.replace(temporary_path, staged_path)
+        finally:
+            if temporary_path.exists():
+                try:
+                    temporary_path.unlink()
+                except OSError:
+                    pass
+    elif not _font_asset_is_read_only(staged_path):
+        _journal_attempt_path(opts, staged_path)
+
+    os.chmod(staged_path, stat.S_IREAD)
+    _verified_path, verified_bytes, staged_sha256 = _read_stable_font_asset(
+        staged_path,
+        approved_root=canonical_root,
+    )
+    staged_read_only = _font_asset_is_read_only(staged_path)
+    if (
+        verified_bytes != payload
+        or staged_sha256 != source_sha256
+        or not staged_read_only
+    ):
+        raise RuntimeError("content-addressed staged font verification failed")
+
+    evidence.update(
+        {
+            "source_font_asset_path": str(canonical_source),
+            "source_font_asset_sha256": source_sha256,
+            "staged_font_path": str(staged_path),
+            "staged_font_sha256": staged_sha256,
+            "staged_asset_verified": True,
+            "staged_asset_read_only": True,
+            "delivered_font_sha256": staged_sha256,
+            # Legacy key retained as the actual path handed to ShapeString.
+            "path": str(staged_path),
+        }
+    )
+    return str(staged_path), evidence
+
+
+def _verify_staged_shapestring_font_asset(
+    font_delivery_evidence: Dict[str, Any],
+) -> bool:
+    """Re-read the exact staged asset and bind every use to its declared digest."""
+
+    try:
+        staged_path = Path(font_delivery_evidence["staged_font_path"])
+        expected_sha256 = str(font_delivery_evidence["staged_font_sha256"])
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+            or staged_path.stem != expected_sha256
+            or font_delivery_evidence.get("staged_asset_verified") is not True
+            or font_delivery_evidence.get("staged_asset_read_only") is not True
+        ):
+            return False
+        canonical_root = (
+            _shapestring_font_cache_dir() / "delivery-assets"
+        ).resolve(strict=True)
+        canonical_path, _payload, actual_sha256 = _read_stable_font_asset(
+            staged_path,
+            approved_root=canonical_root,
+        )
+        return bool(
+            str(canonical_path) == str(staged_path.resolve(strict=True))
+            and actual_sha256 == expected_sha256
+            and actual_sha256 == font_delivery_evidence.get("delivered_font_sha256")
+            and _font_asset_is_read_only(canonical_path)
+        )
+    except Exception:
+        return False
 
 
 def _record_shapestring_skip(opts: ImportOptions, reason: str) -> None:
@@ -3139,6 +5158,200 @@ TEXT_ITEM_FALLBACK_LADDERS = {
     "geometry": ("geometry", "glyphs", "3d_text", "text", "labels", "raster"),
     "raster": ("raster",),
 }
+
+
+class _RasterFallbackContext:
+    """Executor-owned immutable handoff proving the exact terminal prefix."""
+
+    __slots__ = ("requested_type", "attempted_types", "proof_chain")
+
+    def __init__(self, requested_type, attempted_types, proof_chain):
+        self.requested_type = requested_type
+        self.attempted_types = tuple(attempted_types)
+        self.proof_chain = tuple(copy.deepcopy(proof_chain))
+
+    def __deepcopy__(self, _memo):
+        return self
+
+
+class _PageRasterFallbackContext:
+    """Executor-owned page Raster authority sealed from one retained v2 page."""
+
+    __slots__ = (
+        "page_number",
+        "source_item_id",
+        "requested_type",
+        "attempted_types",
+        "proof_chain",
+        "observation_sha256",
+    )
+
+    def __init__(
+        self,
+        *,
+        page_number,
+        source_item_id,
+        requested_type,
+        attempted_types,
+        proof_chain,
+        observation_sha256,
+    ):
+        self.page_number = page_number
+        self.source_item_id = source_item_id
+        self.requested_type = requested_type
+        self.attempted_types = tuple(attempted_types)
+        self.proof_chain = tuple(copy.deepcopy(proof_chain))
+        self.observation_sha256 = observation_sha256
+
+    def __deepcopy__(self, _memo):
+        return self
+
+
+def _authorize_page_raster_fallback(
+    opts: ImportOptions,
+    *,
+    page_number: int,
+    requested_type: str,
+) -> Dict[str, Any]:
+    """Seal a complete v2 page ladder before a non-direct page Raster exists."""
+
+    requested = _normalize_requested_text_type(requested_type)
+    scope_id = "p%d:page" % int(page_number)
+    if scope_id not in list(
+        getattr(opts, "text_delivery_obligation_source_item_ids", []) or []
+    ):
+        raise ValueError("page Raster fallback has no independent page obligation")
+    observation = _validated_page_visual_observation(opts, int(page_number))
+    authority = getattr(opts, "_page_visual_authority", None)
+    ladder = list(TEXT_ITEM_FALLBACK_LADDERS[requested])
+    attempted_types: List[str] = []
+    proof_chain: List[Dict[str, Any]] = []
+    for attempted in ladder:
+        attempted_types.append(attempted)
+        if attempted == "raster":
+            break
+        proof = build_page_visual_fallback_proof_v2(
+            observation=observation,
+            authority=authority,
+            requested_type=requested,
+            attempted_type=attempted,
+        )
+        if not page_visual_fallback_proof_v2_verified(
+            proof,
+            observation=observation,
+            authority=authority,
+            expected_requested_type=requested,
+            expected_attempted_type=attempted,
+        ):
+            raise ValueError("page Raster fallback proof could not be verified")
+        proof_chain.append(proof)
+    if attempted_types != ladder or len(proof_chain) != len(ladder) - 1:
+        raise ValueError("page Raster fallback ladder prefix is incomplete")
+    context = _PageRasterFallbackContext(
+        page_number=int(page_number),
+        source_item_id=scope_id,
+        requested_type=requested,
+        attempted_types=attempted_types,
+        proof_chain=proof_chain,
+        observation_sha256=observation["observation_sha256"],
+    )
+    opts._page_raster_fallback_contexts[int(page_number)] = context
+    return {
+        "source_item_id": scope_id,
+        "requested_type": requested,
+        "attempted_types": attempted_types,
+        "proof_chain": copy.deepcopy(proof_chain),
+        "page_visual_observation_sha256": observation["observation_sha256"],
+    }
+
+
+def _validated_page_raster_request_context(
+    opts: ImportOptions,
+    page_number: int,
+) -> Dict[str, Any]:
+    """Accept direct Raster or one fully proven v2 page ladder, never a heuristic."""
+
+    if str(getattr(opts, "import_mode", "") or "").strip().lower() == "raster":
+        return {
+            "direct_requested_raster": True,
+            "page_fallback_authorized": False,
+            "attempted_types": ["raster"],
+            "proof_chain": [],
+        }
+    context = getattr(opts, "_page_raster_fallback_contexts", {}).get(page_number)
+    if not isinstance(context, _PageRasterFallbackContext):
+        raise ValueError("non-direct full-page Raster has no v2 ladder authority")
+    observation = _validated_page_visual_observation(opts, page_number)
+    authority = getattr(opts, "_page_visual_authority", None)
+    ladder = list(TEXT_ITEM_FALLBACK_LADDERS.get(context.requested_type, ()))
+    attempted_types = list(context.attempted_types)
+    proof_chain = [copy.deepcopy(proof) for proof in context.proof_chain]
+    if (
+        context.page_number != page_number
+        or context.source_item_id != "p%d:page" % page_number
+        or context.source_item_id not in list(
+            getattr(opts, "text_delivery_obligation_source_item_ids", []) or []
+        )
+        or attempted_types != ladder
+        or len(proof_chain) != len(ladder) - 1
+        or context.observation_sha256 != observation["observation_sha256"]
+    ):
+        raise ValueError("non-direct full-page Raster ladder authority is invalid")
+    for attempted, proof in zip(ladder[:-1], proof_chain, strict=True):
+        if not page_visual_fallback_proof_v2_verified(
+            proof,
+            observation=observation,
+            authority=authority,
+            expected_requested_type=context.requested_type,
+            expected_attempted_type=attempted,
+        ):
+            raise ValueError("non-direct full-page Raster proof chain is invalid")
+    return {
+        "direct_requested_raster": False,
+        "page_fallback_authorized": True,
+        "source_item_id": context.source_item_id,
+        "requested_type": context.requested_type,
+        "attempted_types": attempted_types,
+        "proof_chain": proof_chain,
+    }
+
+
+def _validated_raster_ladder_context(
+    item: Dict[str, Any],
+    attempted_type: str,
+) -> Dict[str, Any]:
+    """Accept Raster only from the executor's exact ladder prefix."""
+
+    context = item.get("_raster_fallback_context") if isinstance(item, dict) else None
+    requested = item.get("requested_type") if isinstance(item, dict) else None
+    if (
+        attempted_type != "raster"
+        or not isinstance(context, _RasterFallbackContext)
+        or requested not in TEXT_ITEM_FALLBACK_LADDERS
+        or context.requested_type != requested
+    ):
+        raise ValueError("executor-owned raster ladder prefix is invalid")
+    ladder = list(TEXT_ITEM_FALLBACK_LADDERS[requested])
+    try:
+        terminal_index = ladder.index("raster")
+    except ValueError as exc:
+        raise ValueError("executor-owned raster ladder prefix is invalid") from exc
+    expected_prefix = ladder[: terminal_index + 1]
+    attempted_types = list(context.attempted_types)
+    proof_chain = [copy.deepcopy(proof) for proof in context.proof_chain]
+    if (
+        attempted_types != expected_prefix
+        or len(proof_chain) != len(expected_prefix) - 1
+    ):
+        raise ValueError("executor-owned raster ladder prefix is invalid")
+    for prior_type, proof in zip(expected_prefix[:-1], proof_chain, strict=True):
+        _validate_item_impossibility_proof(item, requested, prior_type, proof)
+    return {
+        "requested_type": requested,
+        "attempted_types": attempted_types,
+        "proof_chain": proof_chain,
+        "direct_requested_raster": requested == "raster",
+    }
 
 CLOSED_SVG_ITEM_IMPOSSIBILITY_REASONS = frozenset(
     {
@@ -3260,6 +5473,8 @@ def _bind_page_text_source_ink_evidence(
     page,
     raw_tdict: Dict[str, Any],
     items: List[Dict[str, Any]],
+    *,
+    opts: Optional[ImportOptions] = None,
 ) -> List[Dict[str, Any]]:
     """Bind source items to physical PDF paint evidence without Unicode guesses.
 
@@ -3270,6 +5485,8 @@ def _bind_page_text_source_ink_evidence(
     """
     if not isinstance(raw_tdict, dict) or not isinstance(items, list):
         raise ValueError("source ink binding context is invalid")
+    if opts is not None:
+        _invoke_import_cancellation_checkpoint(opts, "source ink preprocessing")
     bound_items = copy.deepcopy(items)
     blocks = raw_tdict.get("blocks", [])
     if not isinstance(blocks, list):
@@ -3281,6 +5498,8 @@ def _bind_page_text_source_ink_evidence(
         traces = []
     trace_chars: List[Dict[str, Any]] = []
     for trace_index, trace in enumerate(traces):
+        if opts is not None:
+            _invoke_import_cancellation_checkpoint(opts, "source ink trace")
         if not isinstance(trace, dict):
             continue
         trace_font = str(trace.get("font", "") or "")
@@ -3290,6 +5509,10 @@ def _bind_page_text_source_ink_evidence(
         except (TypeError, ValueError):
             continue
         for trace_char_index, record in enumerate(trace.get("chars") or ()):
+            if opts is not None:
+                _invoke_import_cancellation_checkpoint(
+                    opts, "source ink trace character"
+                )
             try:
                 codepoint = int(record[0])
                 glyph_id = int(record[1])
@@ -3358,6 +5581,10 @@ def _bind_page_text_source_ink_evidence(
         font_key = _trace_font_key(source_font)
         candidates = []
         for index, candidate in enumerate(trace_chars):
+            if opts is not None:
+                _invoke_import_cancellation_checkpoint(
+                    opts, "source ink candidate character"
+                )
             if index in claimed_trace_chars:
                 continue
             if (
@@ -3419,7 +5646,7 @@ def _bind_page_text_source_ink_evidence(
             glyph_set = font.getGlyphSet()
             pen = BoundsPen(glyph_set)
             glyph_set[glyph_name].draw(pen)
-            bounds = None if pen.bounds is None else tuple(float(v) for v in pen.bounds)
+            bounds = None if pen.bounds is None else [float(v) for v in pen.bounds]
             advance_width = float(font["hmtx"].metrics[glyph_name][0])
         except (AttributeError, IndexError, KeyError, RuntimeError, TypeError, ValueError):
             return None
@@ -3458,6 +5685,8 @@ def _bind_page_text_source_ink_evidence(
 
     try:
         for item in bound_items:
+            if opts is not None:
+                _invoke_import_cancellation_checkpoint(opts, "source ink item")
             source_text = item.get("text") if isinstance(item, dict) else None
             if not isinstance(source_text, str) or not source_text:
                 continue
@@ -3476,6 +5705,10 @@ def _bind_page_text_source_ink_evidence(
             character_evidence: List[Dict[str, Any]] = []
             resolved = True
             for source_index, raw_char in enumerate(raw_chars):
+                if opts is not None:
+                    _invoke_import_cancellation_checkpoint(
+                        opts, "source ink character"
+                    )
                 if not isinstance(raw_char, dict):
                     resolved = False
                     break
@@ -3484,21 +5717,8 @@ def _bind_page_text_source_ink_evidence(
                     resolved = False
                     break
                 if raw_char.get("synthetic") is True:
-                    synthetic_asset = resolved_font_asset(source_font)
-                    record = {
-                        "authority": "pymupdf_rawdict_synthetic_character",
-                        "character": value,
-                        "synthetic": True,
-                        "glyph_id": None,
-                        "font_asset_binding": (
-                            copy.deepcopy(synthetic_asset[1])
-                            if synthetic_asset is not None
-                            else None
-                        ),
-                        "layout_only_zero_ink": True,
-                        "zero_visible_ink": True,
-                        "physically_resolved": True,
-                    }
+                    resolved = False
+                    break
                 else:
                     record = exact_glyph_record(raw_char, source_font)
                     if record is None:
@@ -3595,6 +5815,231 @@ def _validated_source_ink_evidence(item: Dict[str, Any]) -> Dict[str, Any]:
     return copy.deepcopy(evidence)
 
 
+def _build_source_ink_segments(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a deterministic run manifest for one mixed-ink source item.
+
+    The parent span remains the sole delivery obligation.  Contiguous physical
+    paint runs are child identities only; every child retains the parent's
+    requested representation so ink fidelity can never authorize a rung change.
+    """
+
+    evidence = _validated_source_ink_evidence(item)
+    parent_source_item_id = item.get("source_item_id")
+    requested_type = item.get("requested_type")
+    source_text = item.get("text")
+    characters = evidence.get("characters")
+    if (
+        evidence.get("classification") != "mixed_visible_and_zero_ink"
+        or not isinstance(parent_source_item_id, str)
+        or not parent_source_item_id
+        or requested_type not in TEXT_ITEM_FALLBACK_LADDERS
+        or requested_type == "raster"
+        or not isinstance(source_text, str)
+        or not source_text
+        or not isinstance(characters, list)
+        or not characters
+    ):
+        raise ValueError("source-ink segmentation requires one mixed structural item")
+
+    segments: List[Dict[str, Any]] = []
+    run_start = 0
+    run_zero_ink = bool(characters[0]["zero_visible_ink"])
+    for source_index in range(1, len(characters) + 1):
+        next_zero_ink = (
+            bool(characters[source_index]["zero_visible_ink"])
+            if source_index < len(characters)
+            else not run_zero_ink
+        )
+        if source_index < len(characters) and next_zero_ink == run_zero_ink:
+            continue
+        run_records = characters[run_start:source_index]
+        run_text = "".join(record["character"] for record in run_records)
+        if not run_text:
+            raise ValueError("source-ink segment text is empty")
+        segment_index = len(segments)
+        segments.append(
+            {
+                "child_source_item_id": "%s:seg%d"
+                % (parent_source_item_id, segment_index),
+                "parent_source_item_id": parent_source_item_id,
+                "requested_type": requested_type,
+                "source_index_start": run_start,
+                "source_index_end": source_index,
+                "source_text": run_text,
+                "source_text_sha256": hashlib.sha256(
+                    run_text.encode("utf-8")
+                ).hexdigest(),
+                "physical_role": (
+                    "zero_visible_ink" if run_zero_ink else "visible"
+                ),
+            }
+        )
+        run_start = source_index
+        run_zero_ink = next_zero_ink
+
+    if (
+        len(segments) < 2
+        or "".join(segment["source_text"] for segment in segments) != source_text
+        or segments[0]["source_index_start"] != 0
+        or segments[-1]["source_index_end"] != len(characters)
+        or any(
+            left["source_index_end"] != right["source_index_start"]
+            for left, right in zip(segments, segments[1:], strict=False)
+        )
+    ):
+        raise ValueError("source-ink segment coverage is incomplete")
+
+    manifest: Dict[str, Any] = {
+        "schema": "bcs.freecad_text_source_segments/1.0",
+        "parent_source_item_id": parent_source_item_id,
+        "requested_type": requested_type,
+        "parent_source_ink_evidence_sha256": evidence["evidence_sha256"],
+        "source_text": source_text,
+        "source_text_sha256": hashlib.sha256(source_text.encode("utf-8")).hexdigest(),
+        "segments": segments,
+    }
+    serialized = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    manifest["manifest_sha256"] = hashlib.sha256(serialized).hexdigest()
+    return manifest
+
+
+def _build_source_ink_segment_items(
+    item: Dict[str, Any],
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Materialize source-bound child items for a mixed-ink run manifest."""
+
+    manifest = _build_source_ink_segments(item)
+    parent_evidence = _validated_source_ink_evidence(item)
+    span = item.get("span")
+    span_characters = span.get("chars") if isinstance(span, dict) else None
+    evidence_characters = parent_evidence["characters"]
+    if (
+        not isinstance(span_characters, list)
+        or len(span_characters) != len(evidence_characters)
+        or "".join(str(character.get("c") or "") for character in span_characters)
+        != item.get("text")
+    ):
+        raise ValueError("mixed source item lacks exact raw character geometry")
+
+    children: List[Dict[str, Any]] = []
+    parent_id = manifest["parent_source_item_id"]
+    for segment_index, segment in enumerate(manifest["segments"]):
+        start = segment["source_index_start"]
+        end = segment["source_index_end"]
+        raw_run = copy.deepcopy(span_characters[start:end])
+        evidence_run = copy.deepcopy(evidence_characters[start:end])
+        if not raw_run or not evidence_run or len(raw_run) != len(evidence_run):
+            raise ValueError("mixed source segment is empty or misaligned")
+        try:
+            boxes = [
+                _finite_source_tuple(character.get("bbox"), 4, "segment char bbox")
+                for character in raw_run
+            ]
+            run_bbox = (
+                min(box[0] for box in boxes),
+                min(box[1] for box in boxes),
+                max(box[2] for box in boxes),
+                max(box[3] for box in boxes),
+            )
+            run_origin = _finite_source_tuple(
+                raw_run[0].get("origin"), 2, "segment char origin"
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("mixed source segment geometry is invalid") from exc
+        if run_bbox[2] <= run_bbox[0] or run_bbox[3] <= run_bbox[1]:
+            raise ValueError("mixed source segment bbox is empty")
+
+        for child_index, record in enumerate(evidence_run):
+            record["source_index"] = child_index
+        child_bindings: List[Dict[str, Any]] = []
+        for binding in parent_evidence["font_asset_bindings"]:
+            if any(record.get("font_asset_binding") == binding for record in evidence_run):
+                child_bindings.append(copy.deepcopy(binding))
+        child_glyph_ids = [record["glyph_id"] for record in evidence_run]
+        child_evidence = copy.deepcopy(parent_evidence)
+        child_evidence.update(
+            {
+                "source_item_id": segment["child_source_item_id"],
+                "source_text": segment["source_text"],
+                "source_text_sha256": segment["source_text_sha256"],
+                "classification": (
+                    "zero_visible_ink"
+                    if segment["physical_role"] == "zero_visible_ink"
+                    else "visible_ink"
+                ),
+                "zero_ink_characters_layout_only": bool(
+                    segment["physical_role"] == "zero_visible_ink"
+                    and all(record["layout_only_zero_ink"] for record in evidence_run)
+                ),
+                "font_asset_bindings": child_bindings,
+                "glyph_id_sequence": child_glyph_ids,
+                "characters": evidence_run,
+            }
+        )
+        child_evidence["evidence_sha256"] = _source_ink_evidence_digest(child_evidence)
+
+        child = copy.deepcopy(item)
+        child_span = copy.deepcopy(span)
+        child_span.update(
+            {
+                "text": segment["source_text"],
+                "chars": raw_run,
+                "bbox": run_bbox,
+                "origin": run_origin,
+            }
+        )
+        child.update(
+            {
+                "source_item_id": segment["child_source_item_id"],
+                "parent_source_item_id": parent_id,
+                "source_segment_index": segment_index,
+                "source_segment_physical_role": segment["physical_role"],
+                "source_segment_manifest_sha256": manifest["manifest_sha256"],
+                "text": segment["source_text"],
+                "bbox": run_bbox,
+                "origin": run_origin,
+                "span": child_span,
+                "source_ink_evidence": child_evidence,
+                "source_font_asset_bindings": child_bindings,
+                "source_glyph_id_sequence": child_glyph_ids,
+            }
+        )
+        _validated_source_ink_evidence(child)
+        children.append(child)
+    return manifest, children
+
+
+def _canonical_or_segment_source_id_matches(item: Dict[str, Any]) -> bool:
+    """Validate either a canonical parent id or its exact manifest child id."""
+
+    try:
+        canonical_id = "p%d:b%d:l%d:s%d" % (
+            item["page_number"],
+            item["block_index"],
+            item["line_index"],
+            item["span_index"],
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    source_item_id = item.get("source_item_id")
+    parent_source_item_id = item.get("parent_source_item_id")
+    segment_index = item.get("source_segment_index")
+    if parent_source_item_id is None and segment_index is None:
+        return source_item_id == canonical_id
+    return bool(
+        parent_source_item_id == canonical_id
+        and type(segment_index) is int
+        and segment_index >= 0
+        and source_item_id == "%s:seg%d" % (canonical_id, segment_index)
+    )
+
+
 def _source_ink_delivery_binding_fields(
     item: Dict[str, Any],
     evidence: Dict[str, Any],
@@ -3616,94 +6061,21 @@ def _source_ink_delivery_binding_fields(
 
 
 def _mixed_source_ink_requires_fallback(evidence: Dict[str, Any]) -> bool:
-    """Return true only for zero-ink glyphs that are not font-declared layout."""
+    """Compatibility predicate: mixed physical ink never authorizes fallback."""
 
-    return bool(
-        isinstance(evidence, dict)
-        and evidence.get("classification") == "mixed_visible_and_zero_ink"
-        and evidence.get("zero_ink_characters_layout_only") is not True
-    )
+    del evidence
+    return False
 
 
 def _raise_mixed_source_ink_impossible(
     item: Dict[str, Any],
     attempted_type: str,
 ) -> None:
-    """Prove one structural rung cannot exactly express mixed painting state."""
+    """Reject the retired mixed-ink fallback authority."""
 
-    evidence = _validated_source_ink_evidence(item)
-    requested_type = item.get("requested_type")
-    source_item_id = item.get("source_item_id")
-    if (
-        evidence.get("classification") != "mixed_visible_and_zero_ink"
-        or requested_type not in TEXT_ITEM_FALLBACK_LADDERS
-        or attempted_type not in TEXT_ITEM_FALLBACK_LADDERS[requested_type]
-        or attempted_type == "raster"
-    ):
-        raise ValueError("mixed source-ink impossibility context is invalid")
-    evidence_sha256 = evidence["evidence_sha256"]
-    reason_code = "mixed_source_ink_not_exactly_representable"
-    zero_indexes = [
-        index
-        for index, record in enumerate(evidence["characters"])
-        if record["zero_visible_ink"]
-    ]
-    visible_indexes = [
-        index
-        for index, record in enumerate(evidence["characters"])
-        if not record["zero_visible_ink"]
-    ]
-    source_result = {
-        "source": "physical_source_ink_evidence",
-        "outcome": "proven_impossible",
-        "reason_code": reason_code,
-        "pdf_sha256": item["pdf_sha256"],
-        "page_number": item["page_number"],
-        "source_item_id": source_item_id,
-        "source_ink_evidence_sha256": evidence_sha256,
-    }
-    proof = {
-        "item_specific_proven_impossible": True,
-        "importer_identity": FREECAD_TEXT_IMPORTER_IDENTITY,
-        "pdf_sha256": item["pdf_sha256"],
-        "page_number": item["page_number"],
-        "source_item_id": source_item_id,
-        "requested_type": requested_type,
-        "attempted_type": attempted_type,
-        "reason_code": reason_code,
-        "font_identity": copy.deepcopy(item["font_identity"]),
-        "source_ink_evidence_sha256": evidence_sha256,
-        "evidence": {
-            "classification": "mixed_visible_and_zero_ink",
-            "source_text_sha256": evidence["source_text_sha256"],
-            "source_ink_evidence_sha256": evidence_sha256,
-            "zero_character_indexes": zero_indexes,
-            "visible_character_indexes": visible_indexes,
-        },
-        "attempted_source_results": [source_result],
-        "attempted_sources_complete": True,
-        "created_entity_ids": [],
-        "removed_entity_ids": [],
-        "cleanup_complete": True,
-    }
-    attempt = {
-        "source_item_id": source_item_id,
-        "requested_type": requested_type,
-        "attempted_type": attempted_type,
-        "final_type": None,
-        "outcome": "proven_impossible",
-        "reason": reason_code,
-        "reason_code": reason_code,
-        "created_entity_ids": [],
-        "removed_entity_ids": [],
-        "cleanup_complete": True,
-        "proof": proof,
-    }
-    raise TextItemImpossible(
-        "%s cannot exactly express mixed physical ink for %s"
-        % (attempted_type, source_item_id),
-        attempt=attempt,
-        proof=proof,
+    del item, attempted_type
+    raise ValueError(
+        "mixed source ink must be delivered as same-representation segments"
     )
 
 
@@ -3903,72 +6275,13 @@ def _validate_item_impossibility_proof(
         raise ValueError("attempted representation is not a fallible ladder rung")
 
     reason_code = proof.get("reason_code")
-    if reason_code == "mixed_source_ink_not_exactly_representable":
-        source_evidence = _validated_source_ink_evidence(item)
-        source_evidence_sha256 = source_evidence.get("evidence_sha256")
-        proof_evidence = proof.get("evidence")
-        attempted_source_results = proof.get("attempted_source_results")
-        zero_indexes = [
-            index
-            for index, record in enumerate(source_evidence["characters"])
-            if record["zero_visible_ink"]
-        ]
-        visible_indexes = [
-            index
-            for index, record in enumerate(source_evidence["characters"])
-            if not record["zero_visible_ink"]
-        ]
-        if (
-            source_evidence.get("classification")
-            != "mixed_visible_and_zero_ink"
-            or proof.get("source_ink_evidence_sha256") != source_evidence_sha256
-            or proof.get("font_identity") != item.get("font_identity")
-            or not isinstance(proof_evidence, dict)
-            or proof_evidence.get("classification")
-            != "mixed_visible_and_zero_ink"
-            or proof_evidence.get("source_text_sha256")
-            != source_evidence.get("source_text_sha256")
-            or proof_evidence.get("source_ink_evidence_sha256")
-            != source_evidence_sha256
-            or proof_evidence.get("zero_character_indexes") != zero_indexes
-            or proof_evidence.get("visible_character_indexes") != visible_indexes
-            or not zero_indexes
-            or not visible_indexes
-            or not isinstance(attempted_source_results, list)
-            or len(attempted_source_results) != 1
-        ):
-            raise ValueError("mixed source-ink impossibility evidence is invalid")
-        [source_result] = attempted_source_results
-        if (
-            not isinstance(source_result, dict)
-            or source_result.get("source") != "physical_source_ink_evidence"
-            or source_result.get("outcome") != "proven_impossible"
-            or source_result.get("reason_code") != reason_code
-            or source_result.get("pdf_sha256") != pdf_sha256
-            or source_result.get("page_number") != page_number
-            or source_result.get("source_item_id") != source_item_id
-            or source_result.get("source_ink_evidence_sha256")
-            != source_evidence_sha256
-            or proof.get("attempted_sources_complete") is not True
-        ):
-            raise ValueError("mixed source-ink source result is invalid")
-        created_ids = _validated_entity_ids(
-            proof.get("created_entity_ids"),
-            field_name="created_entity_ids",
-            allow_empty=True,
+    if reason_code in {
+        "mixed_source_ink_not_exactly_representable",
+        "exact_font_unavailable",
+    }:
+        raise ValueError(
+            "%s is fidelity evidence, not fallback authority" % reason_code
         )
-        removed_ids = _validated_entity_ids(
-            proof.get("removed_entity_ids"),
-            field_name="removed_entity_ids",
-            allow_empty=True,
-        )
-        if (
-            proof.get("cleanup_complete") is not True
-            or set(created_ids) != set(removed_ids)
-        ):
-            raise ValueError("mixed source-ink proof cleanup is incomplete")
-        return dict(proof)
-
     if attempted in {"glyphs", "geometry"}:
         if reason_code not in CLOSED_SVG_ITEM_IMPOSSIBILITY_REASONS:
             raise ValueError("SVG impossibility reason is not a closed predicate")
@@ -4006,79 +6319,7 @@ def _validate_item_impossibility_proof(
             raise ValueError("proof cleanup did not remove exactly the owned entities")
         return dict(proof)
 
-    if attempted != "3d_text":
-        raise ValueError("representation has no closed impossibility predicate")
-    if reason_code != "exact_font_unavailable":
-        raise ValueError("proof reason is not the closed exact-font predicate")
-
-    font_identity = proof.get("font_identity")
-    item_font_identity = item.get("font_identity")
-    if (
-        not isinstance(font_identity, dict)
-        or not isinstance(item_font_identity, dict)
-        or font_identity != item_font_identity
-    ):
-        raise ValueError("proof font identity does not exactly match")
-    raw_name = font_identity.get("raw_name")
-    normalized_key = font_identity.get("normalized_key")
-    if (
-        not isinstance(raw_name, str)
-        or not raw_name.strip()
-        or raw_name != raw_name.strip()
-        or not isinstance(normalized_key, str)
-        or not normalized_key
-        or normalized_key != normalized_key.strip()
-        or normalized_key != _canonical_font_identity(raw_name)["normalized_key"]
-    ):
-        raise ValueError("proof font identity lacks an exact normalized binding")
-
-    evidence = proof.get("evidence")
-    if (
-        not isinstance(evidence, dict)
-        or not evidence
-        or evidence.get("normalized_key") != normalized_key
-    ):
-        raise ValueError("proof evidence must be a nonempty dictionary")
-
-    attempted_source_results = proof.get("attempted_source_results")
-    if (
-        not isinstance(attempted_source_results, list)
-        or len(attempted_source_results) != 2
-        or [
-            result.get("source") if isinstance(result, dict) else None
-            for result in attempted_source_results
-        ] != ["embedded_font", "system_font"]
-        or any(
-            not isinstance(result, dict)
-            or result.get("outcome") != "not_found"
-            or result.get("font_identity") != font_identity
-            or result.get("pdf_sha256") != pdf_sha256
-            or result.get("page_number") != page_number
-            or result.get("staging_complete") is not True
-            for result in attempted_source_results
-        )
-        or proof.get("attempted_sources_complete") is not True
-    ):
-        raise ValueError(
-            "proof must contain exact embedded/system font not-found results"
-        )
-
-    created_ids = _validated_entity_ids(
-        proof.get("created_entity_ids"),
-        field_name="created_entity_ids",
-        allow_empty=True,
-    )
-    removed_ids = _validated_entity_ids(
-        proof.get("removed_entity_ids"),
-        field_name="removed_entity_ids",
-        allow_empty=True,
-    )
-    if proof.get("cleanup_complete") is not True:
-        raise ValueError("proof cleanup is incomplete")
-    if set(created_ids) != set(removed_ids):
-        raise ValueError("proof cleanup did not remove exactly the owned entities")
-
-    return dict(proof)
+    raise ValueError("representation has no closed impossibility predicate")
 
 
 def _record_text_mode_fallback(
@@ -4090,6 +6331,7 @@ def _record_text_mode_fallback(
     count: int,
     source_item_id: str,
     proof: Dict[str, Any],
+    event_metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Record an evidence-backed item- or page-scoped representation fallback."""
     requested = str(requested or "").strip().lower()
@@ -4097,22 +6339,47 @@ def _record_text_mode_fallback(
     reason = str(reason or "").strip()
     source_item_id = str(source_item_id or "").strip()
     proof = dict(proof or {})
-    evidence = str(proof.get("evidence") or "").strip()
+    event_metadata = dict(event_metadata or {})
+    page_scoped = bool(
+        proof.get("page_specific_proven_impossible") is True
+        and re.fullmatch(r"p[1-9][0-9]*:page", source_item_id) is not None
+    )
+    proof_has_authority_evidence = bool(
+        str(proof.get("evidence") or "").strip()
+        or (
+            page_scoped
+            and proof.get("schema") == PAGE_VISUAL_FALLBACK_PROOF_V2_SCHEMA
+            and isinstance(proof.get("proof_sha256"), str)
+        )
+    )
+    if page_scoped:
+        expected_metadata_fields = {
+            "attempted_types",
+            "proof_chain",
+            "transition_chain",
+            "created_entity_ids",
+            "removed_entity_ids",
+            "cleanup_complete",
+        }
+        if set(event_metadata) != expected_metadata_fields:
+            raise ValueError("page fallback event metadata is incomplete")
+        metadata_source = event_metadata
+    else:
+        if event_metadata:
+            raise ValueError("item fallback metadata must remain proof-bound")
+        metadata_source = proof
     attempted_types = [
         str(value or "").strip().lower()
-        for value in list(proof.get("attempted_types") or [])
+        for value in list(metadata_source.get("attempted_types") or [])
         if str(value or "").strip()
     ]
     scope_is_valid = bool(
         proof.get("item_specific_proven_impossible") is True
-        or (
-            proof.get("page_specific_proven_impossible") is True
-            and re.fullmatch(r"p[1-9][0-9]*:page", source_item_id) is not None
-        )
+        or page_scoped
     )
     if (
         not scope_is_valid
-        or not evidence
+        or not proof_has_authority_evidence
         or requested not in attempted_types
     ):
         raise ValueError(
@@ -4138,6 +6405,11 @@ def _record_text_mode_fallback(
             and event.get("reason") == reason
             and event.get("proof") == proof
         ):
+            if page_scoped and any(
+                event.get(field_name) != event_metadata.get(field_name)
+                for field_name in event_metadata
+            ):
+                raise ValueError("conflicting page fallback event metadata")
             source_ids = list(event.get("source_item_ids") or [])
             if source_item_id not in source_ids:
                 source_ids.append(source_item_id)
@@ -4147,16 +6419,16 @@ def _record_text_mode_fallback(
                 event["count"] = prior_count + count
             event["source_item_ids"] = source_ids
             return
-    events.append(
-        {
-            "requested": requested,
-            "delivered": delivered,
-            "reason": reason,
-            "count": count,
-            "source_item_ids": [source_item_id],
-            "proof": proof,
-        }
-    )
+    event = {
+        "requested": requested,
+        "delivered": delivered,
+        "reason": reason,
+        "count": count,
+        "source_item_ids": [source_item_id],
+        "proof": proof,
+    }
+    event.update(copy.deepcopy(event_metadata))
+    events.append(event)
 
 
 def _record_explicit_page_raster_delivery(
@@ -4164,6 +6436,7 @@ def _record_explicit_page_raster_delivery(
     *,
     page_num: int,
     raster_result: Dict[str, Any],
+    pdf_sha256: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Record one directly requested, verified full-page Raster delivery."""
 
@@ -4181,9 +6454,25 @@ def _record_explicit_page_raster_delivery(
         allow_empty=False,
     )
     raster_evidence = dict(raster_result.get("evidence") or {})
-    if not raster_evidence:
-        raise ValueError("verified page Raster evidence is required")
+    digest = (
+        pdf_sha256.strip().lower()
+        if isinstance(pdf_sha256, str)
+        else str(getattr(opts, "_pdf_sha256", "") or "").strip().lower()
+    )
+    raster_asset_sha256 = raster_evidence.get("source_asset_sha256")
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or raster_evidence.get("pdf_sha256") != digest
+        or raster_evidence.get("source_page_number") != page_number
+        or raster_evidence.get("host_entity_type") != "Image::ImagePlane"
+        or not isinstance(raster_asset_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", raster_asset_sha256) is None
+        or raster_evidence.get("raster_content_verified") is not True
+        or raster_evidence.get("raster_file_included") is not True
+    ):
+        raise ValueError("verified page Raster evidence is invalid")
     source_item_id = "p%d:page" % page_number
+    _register_text_delivery_obligations(opts, [source_item_id])
     attempt = {
         "source_item_id": source_item_id,
         "requested_type": "raster",
@@ -4195,6 +6484,10 @@ def _record_explicit_page_raster_delivery(
         "support_entity_ids": [],
         "removed_entity_ids": [],
         "cleanup_complete": True,
+        "record_verified": True,
+        "type_verified": True,
+        "visual_verified": True,
+        "ownership_verified": True,
         "delivery_count": len(raster_ids),
         "evidence": raster_evidence,
     }
@@ -4228,6 +6521,7 @@ def _record_no_source_text_page_fallback(
             opts,
             page_num=page_num,
             raster_result=raster_result,
+            pdf_sha256=pdf_sha256,
         )
 
     page_number = page_num
@@ -4243,15 +6537,50 @@ def _record_no_source_text_page_fallback(
         raise ValueError("no-source page fallback context is invalid")
 
     source_scope_id = "p%d:page" % page_number
+    authority = getattr(opts, "_page_visual_authority", None)
+    if authority is None:
+        raise ValueError("page visual source authority is required")
+    source_bytes = _validated_pdf_source_bytes(opts)
+    if (
+        digest != str(getattr(opts, "_pdf_sha256", "") or "")
+        or hashlib.sha256(source_bytes).hexdigest() != digest
+    ):
+        raise ValueError("page visual authority source bytes do not match the PDF digest")
+    try:
+        page_source_observation = authority.observation(
+            page_number,
+            source_scope_id,
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "page visual authority does not cover the selected page"
+        ) from exc
+    retained_observation = getattr(
+        opts,
+        "page_visual_source_observations",
+        {},
+    ).get(source_scope_id)
+    if (
+        getattr(authority, "pdf_sha256", None) != digest
+        or retained_observation != page_source_observation
+        or not page_visual_source_observation_v2_verified(
+            retained_observation,
+            authority,
+        )
+    ):
+        raise ValueError("page visual authority observation is invalid")
+
+    # The live raw dictionary remains a conservative extraction consistency
+    # check. It can reject a fallback, but it can never authorize one.
     try:
         canonical_source_items = list(
             _iter_text_source_items(raw_tdict, page_number, digest, requested)
         )
-        raw_dictionary_sha256 = raw_text_dictionary_digest(raw_tdict)
     except (TypeError, ValueError) as exc:
         raise ValueError("no-source page fallback source text is invalid") from exc
     if canonical_source_items:
         raise ValueError("no-source page fallback found canonical source text")
+    _register_text_delivery_obligations(opts, [source_scope_id])
 
     raster_ids = _validated_entity_ids(
         raster_result.get("created_entity_ids"),
@@ -4264,6 +6593,7 @@ def _record_no_source_text_page_fallback(
         raise ValueError("page raster PDF binding is invalid")
     if (
         raster_evidence.get("host_entity_type") != "Image::ImagePlane"
+        or raster_evidence.get("source_page_number") != page_number
         or not isinstance(raster_asset_sha256, str)
         or re.fullmatch(r"[0-9a-f]{64}", raster_asset_sha256) is None
         or raster_evidence.get("raster_content_verified") is not True
@@ -4271,32 +6601,6 @@ def _record_no_source_text_page_fallback(
     ):
         raise ValueError("verified page raster evidence is invalid")
 
-    blocks = list(raw_tdict.get("blocks") or [])
-    source_observation = {
-        "text_dictionary_present": True,
-        "canonical_source_item_count": 0,
-        "source_item_ids": [],
-        "source_scope": "page_visual",
-        "raw_text_dictionary_sha256": raw_dictionary_sha256,
-        "raw_text_block_count": sum(
-            1
-            for block in blocks
-            if isinstance(block, dict) and block.get("type") == 0
-        ),
-        "visible_source_text_found": False,
-    }
-    source_result = {
-        "source": "pymupdf_raw_text_dictionary",
-        "outcome": "no_canonical_text_source_items",
-        "importer_identity": FREECAD_TEXT_IMPORTER_IDENTITY,
-        "pdf_sha256": digest,
-        "page_number": page_number,
-        "source_item_id": source_scope_id,
-        "source_item_ids": [],
-        "canonical_source_item_count": 0,
-        "raw_text_dictionary_sha256": raw_dictionary_sha256,
-        "visible_source_text_found": False,
-    }
     ladder = list(TEXT_ITEM_FALLBACK_LADDERS[requested])
     attempted_types: List[str] = []
     proof_chain: List[Dict[str, Any]] = []
@@ -4325,11 +6629,10 @@ def _record_no_source_text_page_fallback(
     staged_opts.page_visual_source_observations = copy.deepcopy(
         prior_source_observations
     )
-    staged_opts.page_visual_source_observations[source_scope_id] = {
-        "pdf_sha256": digest,
-        "page_number": page_number,
-        "raw_text_dictionary_sha256": raw_dictionary_sha256,
-    }
+    staged_opts._page_visual_authority = authority
+    staged_opts._page_visual_session_anchor = copy.deepcopy(
+        getattr(opts, "_page_visual_session_anchor", None)
+    )
 
     try:
         for index, attempted_type in enumerate(ladder):
@@ -4337,33 +6640,18 @@ def _record_no_source_text_page_fallback(
             if attempted_type == "raster":
                 break
             following_type = ladder[index + 1]
-            proof = {
-                "schema": PAGE_VISUAL_FALLBACK_PROOF_SCHEMA,
-                "page_specific_proven_impossible": True,
-                "importer_identity": FREECAD_TEXT_IMPORTER_IDENTITY,
-                "pdf_sha256": digest,
-                "page_number": page_number,
-                "source_item_id": source_scope_id,
-                "requested_type": requested,
-                "attempted_type": attempted_type,
-                "reason_code": PAGE_VISUAL_REASON_CODE,
-                "evidence": copy.deepcopy(source_observation),
-                "attempted_types": list(attempted_types),
-                "attempted_source_results": [copy.deepcopy(source_result)],
-                "attempted_sources_complete": True,
-                "created_entity_ids": [],
-                "removed_entity_ids": [],
-                "cleanup_complete": True,
-            }
-            proof["proof_sha256"] = page_visual_proof_digest(proof)
-            if not page_visual_fallback_proof_verified(
+            proof = build_page_visual_fallback_proof_v2(
+                observation=page_source_observation,
+                authority=authority,
+                requested_type=requested,
+                attempted_type=attempted_type,
+            )
+            if not page_visual_fallback_proof_v2_verified(
                 proof,
-                expected_pdf_sha256=digest,
-                expected_page_number=page_number,
-                expected_source_scope_id=source_scope_id,
+                observation=page_source_observation,
+                authority=authority,
                 expected_requested_type=requested,
                 expected_attempted_type=attempted_type,
-                expected_raw_text_dictionary_sha256=raw_dictionary_sha256,
             ):
                 raise ValueError("page visual fallback proof could not be sealed")
             attempt = {
@@ -4372,13 +6660,24 @@ def _record_no_source_text_page_fallback(
                 "attempted_type": attempted_type,
                 "final_type": None,
                 "outcome": "proven_impossible",
-                "reason": PAGE_VISUAL_REASON_CODE,
-                "reason_code": PAGE_VISUAL_REASON_CODE,
+                "reason": proof["reason_code"],
+                "reason_code": proof["reason_code"],
                 "transition_from": attempted_type,
                 "transition_to": following_type,
                 "created_entity_ids": [],
                 "removed_entity_ids": [],
                 "cleanup_complete": True,
+                "evidence": {
+                    "page_visual_importer_identity": (
+                        FREECAD_TEXT_IMPORTER_IDENTITY
+                    ),
+                    "page_visual_observation_sha256": proof[
+                        "observation_sha256"
+                    ],
+                    "page_visual_session_anchor_sha256": proof[
+                        "session_anchor_sha256"
+                    ],
+                },
                 "proof": proof,
             }
             _append_text_item_attempt(staged_opts, attempt)
@@ -4391,7 +6690,13 @@ def _record_no_source_text_page_fallback(
                 "source_pdf_sha256": digest,
                 "source_page_number": page_number,
                 "page_visual_scope_id": source_scope_id,
-                "page_visual_raw_text_dictionary_sha256": raw_dictionary_sha256,
+                "page_visual_importer_identity": FREECAD_TEXT_IMPORTER_IDENTITY,
+                "page_visual_observation_sha256": page_source_observation[
+                    "observation_sha256"
+                ],
+                "page_visual_session_anchor_sha256": proof_chain[-1][
+                    "session_anchor_sha256"
+                ],
                 "page_visual_fallback_proof": copy.deepcopy(proof_chain[-1]),
             }
         )
@@ -4407,6 +6712,10 @@ def _record_no_source_text_page_fallback(
             "support_entity_ids": [],
             "removed_entity_ids": [],
             "cleanup_complete": True,
+            "record_verified": True,
+            "type_verified": True,
+            "visual_verified": True,
+            "ownership_verified": True,
             "delivery_count": len(raster_ids),
             "attempted_types": list(attempted_types),
             "proof_chain": [copy.deepcopy(proof) for proof in proof_chain],
@@ -4416,8 +6725,16 @@ def _record_no_source_text_page_fallback(
         attempts.append(verified_attempt)
 
         fallback_proof = copy.deepcopy(proof_chain[-1])
-        fallback_proof.update(
-            {
+        _record_text_mode_fallback(
+            staged_opts,
+            requested=requested,
+            delivered="raster",
+            reason="proof_gated:%s:%s"
+            % (requested, fallback_proof["reason_code"]),
+            count=1,
+            source_item_id=source_scope_id,
+            proof=fallback_proof,
+            event_metadata={
                 "attempted_types": list(attempted_types),
                 "proof_chain": [copy.deepcopy(proof) for proof in proof_chain],
                 "transition_chain": [
@@ -4435,17 +6752,7 @@ def _record_no_source_text_page_fallback(
                     for entity_id in list(attempt.get("removed_entity_ids") or [])
                 ],
                 "cleanup_complete": True,
-            }
-        )
-        fallback_proof["proof_sha256"] = page_visual_proof_digest(fallback_proof)
-        _record_text_mode_fallback(
-            staged_opts,
-            requested=requested,
-            delivered="raster",
-            reason="proof_gated:%s:%s" % (requested, PAGE_VISUAL_REASON_CODE),
-            count=1,
-            source_item_id=source_scope_id,
-            proof=fallback_proof,
+            },
         )
         _record_text_delivery(staged_opts, "raster_text_patch", len(raster_ids))
 
@@ -4739,6 +7046,10 @@ def _run_text_item_fallback_ladder(
     attempted_types: List[str] = []
     validated_proofs: List[Dict[str, Any]] = []
     for attempted_mode in TEXT_ITEM_FALLBACK_LADDERS[requested_mode]:
+        _invoke_import_cancellation_checkpoint(
+            opts,
+            "text fallback: %s" % attempted_mode,
+        )
         attempted_types.append(attempted_mode)
         deliverer = deliverers.get(attempted_mode)
         if not callable(deliverer):
@@ -4754,8 +7065,15 @@ def _run_text_item_fallback_ladder(
                 failed,
             )
 
+        delivery_item = copy.deepcopy(bound_item)
+        if attempted_mode == "raster":
+            delivery_item["_raster_fallback_context"] = _RasterFallbackContext(
+                requested_mode,
+                attempted_types,
+                validated_proofs,
+            )
         try:
-            result = deliverer(copy.deepcopy(bound_item), attempted_mode, opts)
+            result = deliverer(delivery_item, attempted_mode, opts)
         except TextItemImpossible as impossible:
             try:
                 proof = _validate_item_impossibility_proof(
@@ -4919,6 +7237,15 @@ def _host_object_id(obj) -> str:
     return str(getattr(obj, "Name", "") or getattr(obj, "Label", "") or "")
 
 
+def _host_object_persistent_name(obj) -> str:
+    """Return the immutable FreeCAD document name used by FCStd ObjectData."""
+
+    try:
+        return str(getattr(obj, "Name", "") or "")
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return ""
+
+
 def _document_objects(doc) -> List[Any]:
     try:
         return list(getattr(doc, "Objects", []) or [])
@@ -5014,6 +7341,16 @@ def _host_image_content_snapshot(image_file: str) -> Dict[str, Any]:
     except (OSError, RuntimeError, TypeError, ValueError):
         pass
     return snapshot
+
+
+def _host_property_type_id(obj: Any, property_name: str) -> str:
+    """Return the host's persisted property type without guessing from its value."""
+
+    try:
+        getter = getattr(obj, "getTypeIdOfProperty", None)
+        return str(getter(property_name) or "") if callable(getter) else ""
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return ""
 
 
 def _finite_host_number(value: Any) -> Optional[str]:
@@ -5344,8 +7681,31 @@ def _host_shape_geometry_fingerprint(shape: Any) -> Dict[str, Any]:
     }
 
 
-def _host_shape_content_snapshot(obj, type_id: str) -> Dict[str, Any]:
+def _host_shape_content_snapshot(
+    obj,
+    type_id: str,
+    *,
+    shape_evidence_mode: str = "sampled",
+) -> Dict[str, Any]:
     """Capture meaningful persisted topology and geometry, not just non-nullness."""
+
+    if shape_evidence_mode not in {"sampled", "cheap"}:
+        raise ValueError("unsupported shape evidence mode: %s" % shape_evidence_mode)
+
+    if shape_evidence_mode == "cheap":
+        try:
+            source_ink_classification = str(
+                getattr(obj, "PDFSourceInkClassification", "") or ""
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            source_ink_classification = ""
+        zero_visible_ink = source_ink_classification == "zero_visible_ink"
+        return {
+            "shape_nonempty": not zero_visible_ink,
+            "shape_structure_verified": False,
+            "shape_digest": "",
+            "shape_snapshot_method": "fcstd_archive_pending",
+        }
 
     shape_nonempty = _has_nonempty_host_geometry(obj, type_id)
     topology_counts: Dict[str, int] = {}
@@ -5416,14 +7776,22 @@ def _host_shape_content_snapshot(obj, type_id: str) -> Dict[str, Any]:
         type(count) is int and count > 0 for count in topology_counts.values()
     )
     geometry_fingerprint = (
-        _host_shape_geometry_fingerprint(shape) if shape is not None else {}
+        _host_shape_geometry_fingerprint(shape)
+        if shape_evidence_mode == "sampled" and shape is not None
+        else {}
     )
     digest_payload = {
+        "method": (
+            "sampled_geometry_tolerant"
+            if shape_evidence_mode == "sampled"
+            else "cheap_topology_metrics_bounds"
+        ),
         "topology_counts": topology_counts,
         "metrics": metrics,
         "bounds": bounds,
-        "geometry": geometry_fingerprint,
     }
+    if shape_evidence_mode == "sampled":
+        digest_payload["geometry"] = geometry_fingerprint
     shape_digest = ""
     if shape_nonempty and meaningful_topology:
         shape_digest = hashlib.sha256(
@@ -5433,7 +7801,7 @@ def _host_shape_content_snapshot(obj, type_id: str) -> Dict[str, Any]:
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
-    return {
+    snapshot: Dict[str, Any] = {
         "shape_nonempty": bool(shape_nonempty),
         "shape_is_null": shape_is_null,
         "shape_structure_verified": bool(
@@ -5443,27 +7811,37 @@ def _host_shape_content_snapshot(obj, type_id: str) -> Dict[str, Any]:
         "shape_metrics": metrics,
         "shape_bounds": bounds,
         "shape_digest": shape_digest,
-        "shape_fingerprint_schema": geometry_fingerprint.get("schema", ""),
-        "shape_fingerprint_quantum": geometry_fingerprint.get("quantum", ""),
-        "shape_fingerprint_vertex_count": geometry_fingerprint.get(
-            "vertex_count", 0
-        ),
-        "shape_fingerprint_edge_count": geometry_fingerprint.get("edge_count", 0),
-        "shape_fingerprint_sampled_edge_count": geometry_fingerprint.get(
-            "sampled_edge_count", 0
-        ),
-        "shape_fingerprint_geometry": geometry_fingerprint.get(
-            "public_geometry", {}
-        ),
-        "_shape_comparison_geometry": geometry_fingerprint.get(
-            "comparison_geometry", {}
-        ),
-        "shape_fingerprint_verified": bool(
-            geometry_fingerprint.get("canonical_geometry_present")
-            and geometry_fingerprint.get("invalid_vertex_count") == 0
-            and geometry_fingerprint.get("invalid_edge_count") == 0
-        ),
     }
+    if shape_evidence_mode == "cheap":
+        snapshot["shape_snapshot_method"] = "cheap_topology_metrics_bounds"
+    else:
+        snapshot.update(
+            {
+                "shape_fingerprint_schema": geometry_fingerprint.get("schema", ""),
+                "shape_fingerprint_quantum": geometry_fingerprint.get("quantum", ""),
+                "shape_fingerprint_vertex_count": geometry_fingerprint.get(
+                    "vertex_count", 0
+                ),
+                "shape_fingerprint_edge_count": geometry_fingerprint.get(
+                    "edge_count", 0
+                ),
+                "shape_fingerprint_sampled_edge_count": geometry_fingerprint.get(
+                    "sampled_edge_count", 0
+                ),
+                "shape_fingerprint_geometry": geometry_fingerprint.get(
+                    "public_geometry", {}
+                ),
+                "_shape_comparison_geometry": geometry_fingerprint.get(
+                    "comparison_geometry", {}
+                ),
+                "shape_fingerprint_verified": bool(
+                    geometry_fingerprint.get("canonical_geometry_present")
+                    and geometry_fingerprint.get("invalid_vertex_count") == 0
+                    and geometry_fingerprint.get("invalid_edge_count") == 0
+                ),
+            }
+        )
+    return snapshot
 
 
 def _host_view_style_snapshot(obj) -> Dict[str, Any]:
@@ -5511,10 +7889,76 @@ def _host_view_style_snapshot(obj) -> Dict[str, Any]:
     return snapshot
 
 
+def _host_font_delivery_snapshot(obj: Any) -> Optional[Dict[str, Any]]:
+    property_names = {
+        "source_font_equivalence": "PDFSourceFontEquivalence",
+        "font_substitution_applied": "PDFFontSubstitutionApplied",
+        "font_identity_verified": "PDFFontIdentityVerified",
+        "glyph_coverage_verified": "PDFFontGlyphCoverageVerified",
+        "delivered_font_sha256": "PDFDeliveredFontSHA256",
+        "font_candidate_source": "PDFFontCandidateSource",
+        "delivered_font_path": "PDFDeliveredFontPath",
+        "source_font_asset_path": "PDFSourceFontAssetPath",
+        "source_font_asset_sha256": "PDFSourceFontAssetSHA256",
+        "staged_font_path": "PDFStagedFontPath",
+        "staged_font_sha256": "PDFStagedFontSHA256",
+        "staged_asset_verified": "PDFStagedFontVerified",
+        "staged_asset_read_only": "PDFStagedFontReadOnly",
+        "font_internal_identity_sha256": "PDFFontInternalIdentitySHA256",
+        "font_coverage_evidence_sha256": "PDFFontCoverageEvidenceSHA256",
+        "source_font_identity_json": "PDFSourceFontIdentityJSON",
+    }
+    if not any(hasattr(obj, property_name) for property_name in property_names.values()):
+        return None
+    boolean_fields = {
+        "source_font_equivalence",
+        "font_substitution_applied",
+        "font_identity_verified",
+        "glyph_coverage_verified",
+        "staged_asset_verified",
+        "staged_asset_read_only",
+    }
+    snapshot: Dict[str, Any] = {}
+    for content_name, property_name in property_names.items():
+        try:
+            value = getattr(obj, property_name)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            value = None
+        snapshot[content_name] = (
+            value if content_name in boolean_fields and type(value) is bool
+            else str(value or "") if content_name not in boolean_fields
+            else None
+        )
+
+    staged_path = snapshot.get("staged_font_path")
+    declared_sha256 = snapshot.get("staged_font_sha256")
+    try:
+        _canonical_path, _payload, actual_sha256 = _read_stable_font_asset(
+            staged_path
+        )
+        snapshot["staged_asset_digest_matches"] = bool(
+            re.fullmatch(r"[0-9a-f]{64}", str(declared_sha256 or ""))
+            and actual_sha256 == declared_sha256
+            and actual_sha256 == snapshot.get("delivered_font_sha256")
+            and _font_asset_is_read_only(staged_path)
+        )
+        snapshot["staged_asset_actual_sha256"] = actual_sha256
+    except Exception as exc:
+        snapshot["staged_asset_digest_matches"] = False
+        snapshot["staged_asset_actual_sha256"] = ""
+        snapshot["staged_asset_verification_error"] = "%s: %s" % (
+            exc.__class__.__name__,
+            exc,
+        )
+    return snapshot
+
+
 def _host_object_content_snapshot(
     obj,
     type_id: str,
     representation: str,
+    *,
+    shape_evidence_mode: str = "sampled",
 ) -> Dict[str, Any]:
     """Capture persisted content that metadata-only delivery cannot imitate."""
 
@@ -5536,7 +7980,13 @@ def _host_object_content_snapshot(
     if type(text_visibility) is bool:
         content["text_visibility"] = text_visibility
     if type_id.startswith(("Part::", "PartDesign::", "Sketcher::")):
-        content.update(_host_shape_content_snapshot(obj, type_id))
+        content.update(
+            _host_shape_content_snapshot(
+                obj,
+                type_id,
+                shape_evidence_mode=shape_evidence_mode,
+            )
+        )
     if representation in {"labels", "text"}:
         try:
             proxy_type = str(getattr(getattr(obj, "Proxy", None), "Type", "") or "")
@@ -5566,11 +8016,22 @@ def _host_object_content_snapshot(
             content["font_size"] = None
     if representation == "3d_text":
         content["string"] = _host_object_text_values(obj, "String")
+        font_delivery = _host_font_delivery_snapshot(obj)
+        if font_delivery is not None:
+            content["font_delivery"] = font_delivery
         try:
             base = getattr(obj, "Base", None)
         except (AttributeError, RuntimeError, TypeError, ValueError):
             base = None
-        content["base_entity_id"] = _host_object_id(base) if base is not None else ""
+        content["base_entity_id"] = (
+            (
+                _host_object_persistent_name(base)
+                if shape_evidence_mode == "cheap"
+                else _host_object_id(base)
+            )
+            if base is not None
+            else ""
+        )
     if representation in {"glyphs", "geometry"}:
         try:
             content["source_text"] = str(obj.PDFSourceText)
@@ -5582,15 +8043,18 @@ def _host_object_content_snapshot(
         except (AttributeError, RuntimeError, TypeError, ValueError):
             image_file = ""
         image_snapshot = _host_image_content_snapshot(image_file)
-        if image_snapshot.get("image_bytes", 0) <= 0:
-            try:
-                included_file = str(getattr(obj, "PDFRasterFile", "") or "")
-            except (AttributeError, RuntimeError, TypeError, ValueError):
-                included_file = ""
-            included_snapshot = _host_image_content_snapshot(included_file)
-            if included_snapshot.get("image_bytes", 0) > 0:
-                image_snapshot = included_snapshot
+        try:
+            included_file = str(getattr(obj, "PDFRasterFile", "") or "")
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            included_file = ""
+        included_snapshot = _host_image_content_snapshot(included_file)
         content.update(image_snapshot)
+        content["image_file_property_type"] = _host_property_type_id(
+            obj, "ImageFile"
+        )
+        content["included_file_property_type"] = _host_property_type_id(
+            obj, "PDFRasterFile"
+        )
         for property_name, content_name in (
             ("PDFSourceSHA256", "pdf_source_sha256"),
             ("PDFRasterSHA256", "declared_raster_sha256"),
@@ -5599,6 +8063,210 @@ def _host_object_content_snapshot(
                 content[content_name] = str(getattr(obj, property_name, "") or "")
             except (AttributeError, RuntimeError, TypeError, ValueError):
                 content[content_name] = ""
+        if included_file:
+            content.update(
+                {
+                    "included_image_file": included_snapshot.get("image_file", ""),
+                    "included_image_sha256": included_snapshot.get(
+                        "image_sha256", ""
+                    ),
+                    "included_image_bytes": int(
+                        included_snapshot.get("image_bytes", 0) or 0
+                    ),
+                }
+            )
+        for property_name, content_name, minimum in (
+            ("PDFImagePageNumber", "embedded_image_page_number", 1),
+            ("PDFImageSourceXRef", "embedded_image_source_xref", 0),
+            ("PDFImageOccurrenceIndex", "image_occurrence_index", 0),
+        ):
+            try:
+                value = getattr(obj, property_name)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                continue
+            if type(value) is int and value >= minimum:
+                content[content_name] = value
+        for property_name, content_name in (
+            ("PDFImageOccurrenceJSON", "image_occurrence_json"),
+            (
+                "PDFImageOccurrenceEvidenceSHA256",
+                "image_occurrence_evidence_sha256",
+            ),
+        ):
+            try:
+                value = str(getattr(obj, property_name, "") or "")
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                value = ""
+            if value:
+                content[content_name] = value
+        try:
+            source_has_mask = getattr(obj, "PDFImageSourceHasMask")
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            source_has_mask = None
+        if type(source_has_mask) is bool:
+            content["image_source_has_mask"] = source_has_mask
+
+        for property_name, content_name in (
+            ("XSize", "raster_x_size"),
+            ("YSize", "raster_y_size"),
+        ):
+            try:
+                token = _finite_host_number(getattr(obj, property_name))
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                token = None
+            if token is not None:
+                content[content_name] = token
+        anchor = _host_anchor_xyz(obj)
+        if anchor is not None:
+            anchor_tokens = [_finite_host_number(value) for value in anchor]
+            if all(value is not None for value in anchor_tokens):
+                content["raster_anchor_xyz"] = anchor_tokens
+
+        occurrence_json = str(content.get("image_occurrence_json") or "")
+        occurrence_digest = str(
+            content.get("image_occurrence_evidence_sha256") or ""
+        )
+        if occurrence_json or occurrence_digest:
+            content["image_occurrence_binding_verified"] = bool(
+                occurrence_json
+                and re.fullmatch(r"[0-9a-f]{64}", occurrence_digest)
+                and hashlib.sha256(occurrence_json.encode("utf-8")).hexdigest()
+                == occurrence_digest
+            )
+        if included_file or content.get("declared_raster_sha256"):
+            image_sha256 = str(content.get("image_sha256") or "")
+            included_sha256 = str(content.get("included_image_sha256") or "")
+            declared_sha256 = str(content.get("declared_raster_sha256") or "")
+            content["raster_asset_binding_verified"] = bool(
+                re.fullmatch(r"[0-9a-f]{64}", declared_sha256)
+                and image_sha256 == declared_sha256
+                and included_sha256 == declared_sha256
+                and int(content.get("image_bytes") or 0) > 0
+                and int(content.get("included_image_bytes") or 0) > 0
+                and content.get("included_file_property_type")
+                == "App::PropertyFileIncluded"
+            )
+        content.update(_host_page_text_suppression_snapshot(obj))
+    return content
+
+
+def _host_page_text_suppression_snapshot(obj) -> Dict[str, Any]:
+    """Read and independently verify persisted page text-suppression metadata."""
+
+    declarations = (
+        ("PDFTextSuppressionSchema", "text_suppression_schema", "App::PropertyString"),
+        ("PDFTextSuppressionMethod", "text_suppression_method", "App::PropertyString"),
+        ("PDFTextSuppressionEvidenceJSON", "text_suppression_evidence_json", "App::PropertyString"),
+        ("PDFTextSuppressionEvidenceSHA256", "text_suppression_evidence_sha256", "App::PropertyString"),
+        ("PDFTextSuppressionSourceItemIDsJSON", "text_suppression_source_item_ids_json", "App::PropertyString"),
+        ("PDFTextSuppressionSourceItemIDsSHA256", "text_suppression_source_item_ids_sha256", "App::PropertyString"),
+        ("PDFTextSuppressionSourceItemCount", "text_suppression_source_item_count", "App::PropertyInteger"),
+        ("PDFTextSuppressionDeliveredItemIDsJSON", "text_suppression_delivered_item_ids_json", "App::PropertyString"),
+        ("PDFTextSuppressionDeliveredItemIDsSHA256", "text_suppression_delivered_item_ids_sha256", "App::PropertyString"),
+        ("PDFTextSuppressionDeliveryBound", "text_suppression_delivery_bound", "App::PropertyBool"),
+        ("PDFTextSuppressionVerified", "text_suppression_verified", "App::PropertyBool"),
+    )
+    properties = set(getattr(obj, "PropertiesList", []) or [])
+    content: Dict[str, Any] = {}
+    variant_present = "PDFRasterContentVariant" in properties
+    if variant_present:
+        try:
+            content["raster_content_variant"] = str(
+                getattr(obj, "PDFRasterContentVariant", "") or ""
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            content["raster_content_variant"] = ""
+        content["raster_content_variant_property_verified"] = bool(
+            _host_property_type_id(obj, "PDFRasterContentVariant")
+            == "App::PropertyString"
+            and content["raster_content_variant"]
+            in {
+                "full_page_original",
+                "text_suppressed_page_background",
+                "original_page_no_canonical_text",
+            }
+        )
+    present = [name for name, _content_name, _kind in declarations if name in properties]
+    if not present:
+        return content
+
+    property_types_verified = len(present) == len(declarations)
+    for property_name, content_name, expected_type in declarations:
+        if property_name not in properties:
+            property_types_verified = False
+            continue
+        try:
+            value = getattr(obj, property_name)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            value = None
+        if expected_type == "App::PropertyString":
+            content[content_name] = str(value or "")
+        elif expected_type == "App::PropertyInteger":
+            content[content_name] = value if type(value) is int else None
+        else:
+            content[content_name] = value if type(value) is bool else None
+        property_types_verified = bool(
+            property_types_verified
+            and _host_property_type_id(obj, property_name) == expected_type
+        )
+    content["text_suppression_property_types_verified"] = property_types_verified
+
+    evidence_json = str(content.get("text_suppression_evidence_json") or "")
+    source_ids_json = str(content.get("text_suppression_source_item_ids_json") or "")
+    delivered_ids_json = str(content.get("text_suppression_delivered_item_ids_json") or "")
+    try:
+        evidence = json.loads(evidence_json)
+        source_ids = json.loads(source_ids_json)
+        delivered_ids = json.loads(delivered_ids_json)
+        canonical_evidence_json = _canonical_page_manifest_json(evidence)
+        canonical_source_ids_json = _canonical_page_manifest_json(source_ids)
+        canonical_delivered_ids_json = _canonical_page_manifest_json(delivered_ids)
+    except (TypeError, ValueError, OverflowError, json.JSONDecodeError):
+        evidence = None
+        source_ids = None
+        delivered_ids = None
+        canonical_evidence_json = ""
+        canonical_source_ids_json = ""
+        canonical_delivered_ids_json = ""
+
+    evidence_digest = str(content.get("text_suppression_evidence_sha256") or "")
+    source_ids_digest = str(content.get("text_suppression_source_item_ids_sha256") or "")
+    delivered_ids_digest = str(content.get("text_suppression_delivered_item_ids_sha256") or "")
+    variant = str(content.get("raster_content_variant") or "")
+    content["page_text_suppression_binding_verified"] = bool(
+        content.get("raster_content_variant_property_verified") is True
+        and property_types_verified
+        and isinstance(evidence, dict)
+        and isinstance(source_ids, list)
+        and isinstance(delivered_ids, list)
+        and all(isinstance(value, str) and value for value in source_ids)
+        and all(isinstance(value, str) and value for value in delivered_ids)
+        and len(set(source_ids)) == len(source_ids)
+        and delivered_ids == source_ids
+        and evidence_json == canonical_evidence_json
+        and source_ids_json == canonical_source_ids_json
+        and delivered_ids_json == canonical_delivered_ids_json
+        and variant in {"text_suppressed_page_background", "original_page_no_canonical_text"}
+        and evidence.get("schema") == content.get("text_suppression_schema")
+        and evidence.get("text_suppression_method") == content.get("text_suppression_method")
+        and evidence.get("raster_content_variant") == variant
+        and evidence.get("verified") is True
+        and evidence.get("source_text_item_ids") == source_ids
+        and evidence.get("source_text_item_count") == content.get("text_suppression_source_item_count") == len(source_ids)
+        and evidence.get("delivered_source_text_item_ids") == delivered_ids
+        and evidence.get("delivery_source_item_ids_bound") is True
+        and content.get("text_suppression_delivery_bound") is True
+        and content.get("text_suppression_verified") is True
+        and re.fullmatch(r"[0-9a-f]{64}", evidence_digest) is not None
+        and evidence.get("evidence_sha256") == evidence_digest
+        and _page_text_suppression_evidence_digest(evidence) == evidence_digest
+        and re.fullmatch(r"[0-9a-f]{64}", source_ids_digest) is not None
+        and evidence.get("source_text_item_ids_sha256") == source_ids_digest
+        and _page_manifest_digest(source_ids) == source_ids_digest
+        and re.fullmatch(r"[0-9a-f]{64}", delivered_ids_digest) is not None
+        and evidence.get("delivered_source_text_item_ids_sha256") == delivered_ids_digest
+        and _page_manifest_digest(delivered_ids) == delivered_ids_digest
+    )
     return content
 
 
@@ -5640,8 +8308,37 @@ def _host_object_category(obj, type_id: str, representation: str) -> str:
     return "unclassified"
 
 
-def _build_host_object_inventory(objects: List[Any]) -> Dict[str, Any]:
+def _host_object_category_for_inventory(
+    obj,
+    type_id: str,
+    representation: str,
+    shape_evidence_mode: str,
+) -> str:
+    if shape_evidence_mode != "cheap":
+        return _host_object_category(obj, type_id, representation)
+    if _is_host_container(obj, type_id):
+        return "containers"
+    if type_id.startswith("Image::"):
+        return "images"
+    if representation in _STRUCTURAL_TEXT_REPRESENTATIONS:
+        return "text_representation_objects"
+    if type_id.startswith(("Part::", "PartDesign::", "Sketcher::")):
+        # This is an obligation, not an assumption of success: the streamed
+        # FCStd manifest must later bind it to a nonempty exact Shape member.
+        return "vector_primitives"
+    return "unclassified"
+
+
+def _build_host_object_inventory(
+    objects: List[Any],
+    *,
+    shape_evidence_mode: str = "sampled",
+    opts: Optional[ImportOptions] = None,
+) -> Dict[str, Any]:
     """Inventory actual FreeCAD objects without treating containers as geometry."""
+
+    if shape_evidence_mode not in {"sampled", "cheap"}:
+        raise ValueError("unsupported shape evidence mode: %s" % shape_evidence_mode)
 
     categories: Dict[str, List[str]] = {
         "containers": [],
@@ -5654,12 +8351,25 @@ def _build_host_object_inventory(objects: List[Any]) -> Dict[str, Any]:
     type_counts: Dict[str, int] = {}
     entity_ids: List[str] = []
     for host_obj in list(objects or []):
-        entity_id = _host_object_id(host_obj)
+        if opts is not None:
+            _invoke_import_cancellation_checkpoint(
+                opts, "persistence inventory object"
+            )
+        entity_id = (
+            _host_object_persistent_name(host_obj)
+            if shape_evidence_mode == "cheap"
+            else _host_object_id(host_obj)
+        )
         type_id = _host_object_type_id(host_obj)
         representation = _host_object_representation(host_obj)
         source_item_id = _host_object_source_item_id(host_obj)
         parent_source_item_id = _host_object_parent_source_item_id(host_obj)
-        category = _host_object_category(host_obj, type_id, representation)
+        category = _host_object_category_for_inventory(
+            host_obj,
+            type_id,
+            representation,
+            shape_evidence_mode,
+        )
         records.append(
             {
                 "entity_id": entity_id,
@@ -5669,7 +8379,10 @@ def _build_host_object_inventory(objects: List[Any]) -> Dict[str, Any]:
                 "parent_source_item_id": parent_source_item_id,
                 "category": category,
                 "content": _host_object_content_snapshot(
-                    host_obj, type_id, representation
+                    host_obj,
+                    type_id,
+                    representation,
+                    shape_evidence_mode=shape_evidence_mode,
                 ),
             }
         )
@@ -5684,6 +8397,7 @@ def _build_host_object_inventory(objects: List[Any]) -> Dict[str, Any]:
     counts.update({key: len(value) for key, value in categories.items()})
     return {
         "schema": "bcs.freecad_host_object_inventory/1.1",
+        "shape_evidence_mode": shape_evidence_mode,
         "verified": unique_nonempty_ids,
         "entity_ids": entity_ids,
         "type_counts": type_counts,
@@ -5693,25 +8407,659 @@ def _build_host_object_inventory(objects: List[Any]) -> Dict[str, Any]:
     }
 
 
+_FCSTD_ARCHIVE_EVIDENCE_SCHEMA = "bcs.freecad_fcstd_shape_archive/1.1"
+_FCSTD_ARCHIVE_EVIDENCE_METHOD = "fcstd_brep_archive_sha256"
+_FCSTD_MAX_ARCHIVE_ENTRIES = 1_000_000
+_FCSTD_MAX_DOCUMENT_XML_BYTES = 256 * 1024 * 1024
+_FCSTD_MAX_SHAPE_ENTRY_BYTES = 16 * 1024 * 1024 * 1024
+_FCSTD_MAX_EXPECTED_SHAPE_BYTES = 128 * 1024 * 1024 * 1024
+_FCSTD_RASTER_ARCHIVE_EVIDENCE_SCHEMA = "bcs.freecad_fcstd_raster_archive/1.0"
+_FCSTD_RASTER_ARCHIVE_EVIDENCE_METHOD = "fcstd_property_file_included_sha256"
+_FCSTD_MAX_RASTER_ENTRY_BYTES = 16 * 1024 * 1024 * 1024
+_FCSTD_MAX_EXPECTED_RASTER_BYTES = 128 * 1024 * 1024 * 1024
+_FCSTD_HASH_CHUNK_BYTES = 1024 * 1024
+_FCSTD_SUPPORTED_COMPRESSION = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+
+
+def _raster_persistence_module():
+    """Load the standalone FCStd raster verifier in package and legacy modes."""
+
+    try:
+        import PDFRasterPersistence as persistence
+    except ImportError:
+        from . import PDFRasterPersistence as persistence
+    return persistence
+
+
+def _inventory_required_included_rasters(
+    inventory: Any,
+) -> Dict[str, Dict[str, Any]]:
+    return _raster_persistence_module().required_included_rasters(inventory)
+
+
+def _read_fcstd_raster_archive_evidence(
+    fcstd_path: Any,
+    inventory: Any,
+    *,
+    opts: Optional[ImportOptions] = None,
+    full_document_object_count: Optional[int] = None,
+) -> Dict[str, Any]:
+    cancel_check = None
+    if opts is not None:
+        cancel_check = lambda: _invoke_import_cancellation_checkpoint(
+            opts,
+            "persistence raster archive evidence",
+        )
+    return _raster_persistence_module().read_archive_evidence(
+        fcstd_path,
+        inventory,
+        cancel_check=cancel_check,
+        full_document_object_count=full_document_object_count,
+    )
+
+
+def _bind_fcstd_raster_archive_evidence(
+    inventory: Dict[str, Any],
+    evidence: Dict[str, Any],
+) -> bool:
+    return bool(
+        _raster_persistence_module().bind_archive_evidence(inventory, evidence)
+    )
+
+
+class _FCStdArchiveEvidenceError(ValueError):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = str(reason)
+
+
+def _fcstd_archive_failure(reason: str) -> Dict[str, Any]:
+    return {
+        "schema": _FCSTD_ARCHIVE_EVIDENCE_SCHEMA,
+        "method": _FCSTD_ARCHIVE_EVIDENCE_METHOD,
+        "verified": False,
+        "reason": str(reason),
+    }
+
+
+def _fcstd_archive_evidence_digest(evidence: Any) -> str:
+    """Digest the complete public archive manifest, excluding only itself."""
+
+    if not isinstance(evidence, dict):
+        return ""
+    payload = {
+        key: value for key, value in evidence.items() if key != "evidence_digest"
+    }
+    try:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _host_inventory_digest(inventory: Any) -> str:
+    """Digest one canonical inventory without embedding a second copy."""
+
+    if not isinstance(inventory, dict):
+        return ""
+    payload = {
+        key: value for key, value in inventory.items() if key != "inventory_digest"
+    }
+    try:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_fcstd_entry_name(
+    value: Any,
+    *,
+    allow_directory: bool,
+) -> str:
+    """Validate a ZIP member path without ever extracting it."""
+
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise _FCStdArchiveEvidenceError("unsafe_archive_entry_name")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise _FCStdArchiveEvidenceError("unsafe_archive_entry_name")
+    if "\\" in value or ":" in value or value.startswith("/"):
+        raise _FCStdArchiveEvidenceError("unsafe_archive_entry_name")
+    is_directory = value.endswith("/")
+    if is_directory and not allow_directory:
+        raise _FCStdArchiveEvidenceError("unsafe_archive_entry_name")
+    candidate = value[:-1] if is_directory else value
+    if not candidate or "//" in candidate:
+        raise _FCStdArchiveEvidenceError("unsafe_archive_entry_name")
+    parts = candidate.split("/")
+    if any(not part or part in {".", ".."} for part in parts):
+        raise _FCStdArchiveEvidenceError("unsafe_archive_entry_name")
+    normalized = PurePosixPath(candidate).as_posix()
+    if normalized != candidate or PurePosixPath(candidate).is_absolute():
+        raise _FCStdArchiveEvidenceError("unsafe_archive_entry_name")
+    return value
+
+
+def _zip_info_is_symlink(info: zipfile.ZipInfo) -> bool:
+    return ((int(info.external_attr) >> 16) & 0o170000) == 0o120000
+
+
+def _read_zip_member(
+    archive: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    *,
+    maximum_bytes: int,
+    capture: bool,
+    opts: Optional[ImportOptions] = None,
+    stage: str = "persistence shape archive member",
+) -> Tuple[str, int, bytes]:
+    """Stream a member through ZipFile so EOF performs its CRC check."""
+
+    declared_size = int(info.file_size)
+    if declared_size < 0 or declared_size > maximum_bytes:
+        raise _FCStdArchiveEvidenceError("archive_entry_size_invalid")
+    digest = hashlib.sha256()
+    observed_size = 0
+    chunks: List[bytes] = []
+    with archive.open(info, "r") as stream:
+        while True:
+            if opts is not None:
+                _invoke_import_cancellation_checkpoint(opts, stage)
+            chunk = stream.read(_FCSTD_HASH_CHUNK_BYTES)
+            if not chunk:
+                break
+            observed_size += len(chunk)
+            if observed_size > maximum_bytes:
+                raise _FCStdArchiveEvidenceError("archive_entry_size_invalid")
+            digest.update(chunk)
+            if capture:
+                chunks.append(chunk)
+    if observed_size != declared_size:
+        raise _FCStdArchiveEvidenceError("archive_entry_size_mismatch")
+    return digest.hexdigest(), observed_size, b"".join(chunks) if capture else b""
+
+
+def _hash_file_sha256(
+    path: Path,
+    *,
+    opts: Optional[ImportOptions] = None,
+    stage: str = "persistence archive hash",
+) -> Tuple[str, int]:
+    digest = hashlib.sha256()
+    observed_size = 0
+    with path.open("rb") as stream:
+        while True:
+            if opts is not None:
+                _invoke_import_cancellation_checkpoint(opts, stage)
+            chunk = stream.read(_FCSTD_HASH_CHUNK_BYTES)
+            if not chunk:
+                break
+            observed_size += len(chunk)
+            digest.update(chunk)
+    return digest.hexdigest(), observed_size
+
+
+def _xml_local_name(tag: Any) -> str:
+    token = str(tag or "")
+    return token.rsplit("}", 1)[-1]
+
+
+def _inventory_required_shape_entity_ids(inventory: Any) -> List[str]:
+    """Derive archive obligations from host facts, never from supplied proof fields."""
+
+    if not isinstance(inventory, dict):
+        return []
+    required: List[str] = []
+    for record in list(inventory.get("objects") or []):
+        if not isinstance(record, dict):
+            continue
+        type_id = str(record.get("type_id") or "")
+        content = record.get("content")
+        if (
+            type_id.startswith(("Part::", "PartDesign::", "Sketcher::"))
+            and isinstance(content, dict)
+            and content.get("shape_nonempty") is True
+        ):
+            required.append(str(record.get("entity_id") or ""))
+    return required
+
+
+def _inventory_zero_ink_shape_entity_ids(inventory: Any) -> List[str]:
+    """Return empty Part shapes that are intentional, source-bound zero ink."""
+
+    if not isinstance(inventory, dict):
+        return []
+    required: List[str] = []
+    for record in list(inventory.get("objects") or []):
+        if not isinstance(record, dict):
+            continue
+        type_id = str(record.get("type_id") or "")
+        representation = str(record.get("representation") or "")
+        content = record.get("content")
+        if (
+            type_id.startswith(("Part::", "PartDesign::", "Sketcher::"))
+            and representation in {"3d_text", "glyphs", "geometry"}
+            and isinstance(content, dict)
+            and content.get("shape_nonempty") is False
+            and content.get("source_ink_classification") == "zero_visible_ink"
+        ):
+            required.append(str(record.get("entity_id") or ""))
+    return required
+
+
+def _read_fcstd_shape_archive_evidence(
+    fcstd_path: Any,
+    expected_shape_entity_ids: List[str],
+    *,
+    expected_zero_ink_shape_entity_ids: Optional[List[str]] = None,
+    opts: Optional[ImportOptions] = None,
+) -> Dict[str, Any]:
+    """Build exact persisted-shape evidence directly from a saved FCStd archive."""
+
+    try:
+        path = Path(fcstd_path)
+        expected_ids = [str(value or "") for value in expected_shape_entity_ids]
+        zero_ink_ids = [
+            str(value or "")
+            for value in list(expected_zero_ink_shape_entity_ids or [])
+        ]
+        if (
+            any(not entity_id for entity_id in expected_ids)
+            or len(expected_ids) != len(set(expected_ids))
+            or any(not entity_id for entity_id in zero_ink_ids)
+            or len(zero_ink_ids) != len(set(zero_ink_ids))
+            or set(expected_ids).intersection(zero_ink_ids)
+        ):
+            raise _FCStdArchiveEvidenceError("expected_shape_ids_invalid")
+        all_expected_ids = expected_ids + zero_ink_ids
+        zero_ink_id_set = set(zero_ink_ids)
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise _FCStdArchiveEvidenceError("fcstd_file_missing_or_empty")
+        initial_fcstd_digest, initial_fcstd_size = _hash_file_sha256(
+            path,
+            opts=opts,
+            stage="persistence shape archive hash",
+        )
+        if initial_fcstd_size <= 0:
+            raise _FCStdArchiveEvidenceError("fcstd_file_missing_or_empty")
+
+        with zipfile.ZipFile(path, "r") as archive:
+            infos = list(archive.infolist())
+            if not infos or len(infos) > _FCSTD_MAX_ARCHIVE_ENTRIES:
+                raise _FCStdArchiveEvidenceError("archive_entry_count_invalid")
+            info_by_name: Dict[str, zipfile.ZipInfo] = {}
+            canonical_keys = set()
+            for info in infos:
+                if opts is not None:
+                    _invoke_import_cancellation_checkpoint(
+                        opts, "persistence shape archive entries"
+                    )
+                canonical_name = _canonical_fcstd_entry_name(
+                    info.filename,
+                    allow_directory=True,
+                )
+                canonical_key = canonical_name.casefold()
+                if canonical_key in canonical_keys:
+                    raise _FCStdArchiveEvidenceError("duplicate_archive_entry")
+                canonical_keys.add(canonical_key)
+                info_by_name[canonical_name] = info
+                if int(info.flag_bits) & 0x1:
+                    raise _FCStdArchiveEvidenceError("encrypted_archive_entry")
+                if _zip_info_is_symlink(info):
+                    raise _FCStdArchiveEvidenceError("symlink_archive_entry")
+                if not info.is_dir() and info.compress_type not in (
+                    _FCSTD_SUPPORTED_COMPRESSION
+                ):
+                    raise _FCStdArchiveEvidenceError(
+                        "unsupported_archive_compression"
+                    )
+
+            document_info = info_by_name.get("Document.xml")
+            if document_info is None:
+                raise _FCStdArchiveEvidenceError("document_xml_missing")
+            if document_info.is_dir():
+                raise _FCStdArchiveEvidenceError("document_xml_missing")
+            try:
+                document_digest, document_size, document_xml = _read_zip_member(
+                    archive,
+                    document_info,
+                    maximum_bytes=_FCSTD_MAX_DOCUMENT_XML_BYTES,
+                    capture=True,
+                    opts=opts,
+                    stage="persistence shape document XML",
+                )
+            except (zipfile.BadZipFile, zlib.error) as exc:
+                raise _FCStdArchiveEvidenceError(
+                    "document_xml_crc_or_read_error"
+                ) from exc
+            if document_size <= 0:
+                raise _FCStdArchiveEvidenceError("document_xml_empty")
+            if re.search(br"<!\s*(?:DOCTYPE|ENTITY)\b", document_xml, re.IGNORECASE):
+                raise _FCStdArchiveEvidenceError(
+                    "document_xml_unsafe_declaration"
+                )
+            try:
+                root = ElementTree.fromstring(document_xml)
+            except ElementTree.ParseError as exc:
+                raise _FCStdArchiveEvidenceError("document_xml_malformed") from exc
+            if _xml_local_name(root.tag) != "Document":
+                raise _FCStdArchiveEvidenceError("document_xml_root_invalid")
+            object_data_nodes = [
+                child
+                for child in list(root)
+                if _xml_local_name(child.tag) == "ObjectData"
+            ]
+            if len(object_data_nodes) != 1:
+                raise _FCStdArchiveEvidenceError(
+                    "document_xml_object_data_invalid"
+                )
+
+            object_names = set()
+            shape_mapping: Dict[str, str] = {}
+            mapped_entries = set()
+            object_nodes = [
+                child
+                for child in list(object_data_nodes[0])
+                if _xml_local_name(child.tag) == "Object"
+            ]
+            for object_node in object_nodes:
+                if opts is not None:
+                    _invoke_import_cancellation_checkpoint(
+                        opts, "persistence shape document objects"
+                    )
+                object_name = str(object_node.attrib.get("name") or "")
+                if not object_name:
+                    raise _FCStdArchiveEvidenceError(
+                        "document_object_name_missing"
+                    )
+                if object_name in object_names:
+                    raise _FCStdArchiveEvidenceError(
+                        "duplicate_document_object_name"
+                    )
+                object_names.add(object_name)
+                properties_nodes = [
+                    child
+                    for child in list(object_node)
+                    if _xml_local_name(child.tag) == "Properties"
+                ]
+                shape_properties = []
+                for properties_node in properties_nodes:
+                    shape_properties.extend(
+                        child
+                        for child in list(properties_node)
+                        if _xml_local_name(child.tag) == "Property"
+                        and child.attrib.get("name") == "Shape"
+                    )
+                if len(shape_properties) > 1:
+                    raise _FCStdArchiveEvidenceError(
+                        "duplicate_shape_property"
+                    )
+                if not shape_properties:
+                    continue
+                part_nodes = [
+                    child
+                    for child in list(shape_properties[0])
+                    if _xml_local_name(child.tag) == "Part"
+                ]
+                if len(part_nodes) != 1:
+                    raise _FCStdArchiveEvidenceError("shape_mapping_invalid")
+                entry_name = _canonical_fcstd_entry_name(
+                    part_nodes[0].attrib.get("file"),
+                    allow_directory=False,
+                )
+                if entry_name in mapped_entries:
+                    raise _FCStdArchiveEvidenceError(
+                        "duplicate_shape_entry_mapping"
+                    )
+                mapped_entries.add(entry_name)
+                shape_mapping[object_name] = entry_name
+
+            missing_mappings = [
+                entity_id
+                for entity_id in all_expected_ids
+                if entity_id not in shape_mapping
+            ]
+            if missing_mappings:
+                raise _FCStdArchiveEvidenceError("expected_shape_unmapped")
+            for entry_name in shape_mapping.values():
+                info = info_by_name.get(entry_name)
+                if info is None:
+                    raise _FCStdArchiveEvidenceError("shape_entry_missing")
+                if info.is_dir():
+                    raise _FCStdArchiveEvidenceError("shape_entry_empty")
+                if int(info.file_size) > _FCSTD_MAX_SHAPE_ENTRY_BYTES:
+                    raise _FCStdArchiveEvidenceError("shape_entry_size_invalid")
+
+            shape_entries: List[Dict[str, Any]] = []
+            total_expected_shape_bytes = 0
+            for entity_id in sorted(all_expected_ids):
+                if opts is not None:
+                    _invoke_import_cancellation_checkpoint(
+                        opts, "persistence shape archive obligations"
+                    )
+                entry_name = shape_mapping[entity_id]
+                info = info_by_name[entry_name]
+                zero_visible_ink = entity_id in zero_ink_id_set
+                if zero_visible_ink and int(info.file_size) != 0:
+                    raise _FCStdArchiveEvidenceError(
+                        "zero_ink_shape_entry_nonempty"
+                    )
+                if not zero_visible_ink and int(info.file_size) <= 0:
+                    raise _FCStdArchiveEvidenceError("shape_entry_empty")
+                try:
+                    entry_digest, entry_size, _unused = _read_zip_member(
+                        archive,
+                        info,
+                        maximum_bytes=_FCSTD_MAX_SHAPE_ENTRY_BYTES,
+                        capture=False,
+                        opts=opts,
+                        stage="persistence shape archive payload",
+                    )
+                except (zipfile.BadZipFile, zlib.error) as exc:
+                    raise _FCStdArchiveEvidenceError(
+                        "shape_entry_crc_or_read_error"
+                    ) from exc
+                total_expected_shape_bytes += entry_size
+                if total_expected_shape_bytes > _FCSTD_MAX_EXPECTED_SHAPE_BYTES:
+                    raise _FCStdArchiveEvidenceError(
+                        "expected_shape_bytes_limit_exceeded"
+                    )
+                shape_entries.append(
+                    {
+                        "entity_id": entity_id,
+                        "entry_name": entry_name,
+                        "sha256": entry_digest,
+                        "bytes": entry_size,
+                        "compression_method": int(info.compress_type),
+                        "crc32": int(info.CRC),
+                        "zero_visible_ink": zero_visible_ink,
+                    }
+                )
+
+        fcstd_digest, fcstd_size = _hash_file_sha256(
+            path,
+            opts=opts,
+            stage="persistence shape archive rehash",
+        )
+        if fcstd_size <= 0:
+            raise _FCStdArchiveEvidenceError("fcstd_file_missing_or_empty")
+        if (
+            fcstd_digest != initial_fcstd_digest
+            or fcstd_size != initial_fcstd_size
+        ):
+            raise _FCStdArchiveEvidenceError(
+                "fcstd_archive_changed_during_evidence"
+            )
+        evidence: Dict[str, Any] = {
+            "schema": _FCSTD_ARCHIVE_EVIDENCE_SCHEMA,
+            "method": _FCSTD_ARCHIVE_EVIDENCE_METHOD,
+            "verified": True,
+            "fcstd_sha256": fcstd_digest,
+            "fcstd_bytes": fcstd_size,
+            "document_xml_sha256": document_digest,
+            "document_xml_bytes": document_size,
+            "archive_entry_count": len(infos),
+            "document_object_count": len(object_names),
+            "shape_mapping_count": len(shape_mapping),
+            "expected_shape_count": len(all_expected_ids),
+            "expected_nonempty_shape_count": len(expected_ids),
+            "expected_zero_ink_shape_count": len(zero_ink_ids),
+            "shape_entries": shape_entries,
+        }
+        evidence["evidence_digest"] = _fcstd_archive_evidence_digest(evidence)
+        return evidence
+    except ImportCancelled:
+        raise
+    except _FCStdArchiveEvidenceError as exc:
+        return _fcstd_archive_failure(exc.reason)
+    except zipfile.BadZipFile:
+        return _fcstd_archive_failure("fcstd_archive_invalid")
+    except (
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        NotImplementedError,
+        zlib.error,
+    ):
+        return _fcstd_archive_failure("fcstd_archive_read_error")
+
+
+def _bind_fcstd_shape_archive_evidence(
+    inventory: Dict[str, Any],
+    evidence: Dict[str, Any],
+) -> bool:
+    """Bind one persisted FCStd manifest into every required shape record."""
+
+    if (
+        not isinstance(inventory, dict)
+        or not isinstance(evidence, dict)
+        or evidence.get("verified") is not True
+        or evidence.get("schema") != _FCSTD_ARCHIVE_EVIDENCE_SCHEMA
+        or evidence.get("method") != _FCSTD_ARCHIVE_EVIDENCE_METHOD
+        or evidence.get("evidence_digest")
+        != _fcstd_archive_evidence_digest(evidence)
+    ):
+        return False
+    required_nonempty_ids = _inventory_required_shape_entity_ids(inventory)
+    required_zero_ink_ids = _inventory_zero_ink_shape_entity_ids(inventory)
+    required_ids = required_nonempty_ids + required_zero_ink_ids
+    if (
+        any(not entity_id for entity_id in required_ids)
+        or len(required_ids) != len(set(required_ids))
+    ):
+        return False
+    entries = evidence.get("shape_entries")
+    if not isinstance(entries, list):
+        return False
+    entry_by_id = {
+        str(entry.get("entity_id") or ""): entry
+        for entry in entries
+        if isinstance(entry, dict)
+    }
+    if (
+        len(entry_by_id) != len(entries)
+        or set(entry_by_id) != set(required_ids)
+        or evidence.get("expected_shape_count") != len(required_ids)
+        or evidence.get("expected_nonempty_shape_count")
+        != len(required_nonempty_ids)
+        or evidence.get("expected_zero_ink_shape_count")
+        != len(required_zero_ink_ids)
+        or any(
+            entry_by_id[entity_id].get("zero_visible_ink") is not False
+            for entity_id in required_nonempty_ids
+        )
+        or any(
+            entry_by_id[entity_id].get("zero_visible_ink") is not True
+            for entity_id in required_zero_ink_ids
+        )
+    ):
+        return False
+    record_by_id = {
+        str(record.get("entity_id") or ""): record
+        for record in list(inventory.get("objects") or [])
+        if isinstance(record, dict)
+    }
+    if any(entity_id not in record_by_id for entity_id in required_ids):
+        return False
+    inventory["shape_archive_evidence"] = dict(evidence)
+    for entity_id in required_ids:
+        content = record_by_id[entity_id].get("content")
+        entry = entry_by_id[entity_id]
+        if not isinstance(content, dict):
+            return False
+        zero_visible_ink = entry["zero_visible_ink"] is True
+        content.update(
+            {
+                "shape_persistence_method": _FCSTD_ARCHIVE_EVIDENCE_METHOD,
+                "shape_archive_schema": _FCSTD_ARCHIVE_EVIDENCE_SCHEMA,
+                "shape_snapshot_method": _FCSTD_ARCHIVE_EVIDENCE_METHOD,
+                "shape_nonempty": not zero_visible_ink,
+                "shape_structure_verified": not zero_visible_ink,
+                "shape_digest": "" if zero_visible_ink else entry["sha256"],
+            }
+        )
+    inventory["inventory_digest"] = _host_inventory_digest(inventory)
+    return bool(inventory["inventory_digest"])
+
+
 def _crosscheck_host_object_inventory(
     expected_inventory: Dict[str, Any],
     actual_objects: List[Any],
+    *,
+    shape_evidence_mode: str = "sampled",
+    archive_evidence: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Cross-check saved/reopened identities, types, representations, and counts."""
 
+    actual_object_list = list(actual_objects or [])
+    actual_inventory = _build_host_object_inventory(
+        actual_object_list,
+        shape_evidence_mode=shape_evidence_mode,
+    )
+    archive_bound = True
+    if shape_evidence_mode == "cheap":
+        archive_bound = bool(
+            isinstance(archive_evidence, dict)
+            and _bind_fcstd_shape_archive_evidence(
+                expected_inventory,
+                archive_evidence,
+            )
+            and _bind_fcstd_shape_archive_evidence(
+                actual_inventory,
+                archive_evidence,
+            )
+        )
+    elif archive_evidence is not None:
+        archive_bound = False
     expected_records = [
         dict(record)
         for record in (expected_inventory.get("objects") or [])
         if isinstance(record, dict)
     ]
     expected_ids = [str(record.get("entity_id") or "") for record in expected_records]
-    actual_by_id: Dict[str, Any] = {}
+    actual_records = [
+        dict(record)
+        for record in (actual_inventory.get("objects") or [])
+        if isinstance(record, dict)
+    ]
+    actual_by_id: Dict[str, Dict[str, Any]] = {}
     duplicate_actual_ids: List[str] = []
-    for host_obj in list(actual_objects or []):
-        entity_id = _host_object_id(host_obj)
+    for record in actual_records:
+        entity_id = str(record.get("entity_id") or "")
         if entity_id in actual_by_id:
             duplicate_actual_ids.append(entity_id)
-        actual_by_id[entity_id] = host_obj
+        actual_by_id[entity_id] = record
 
     expected_id_set = set(expected_ids)
     unexpected = [
@@ -5721,25 +9069,21 @@ def _crosscheck_host_object_inventory(
     missing: List[str] = []
     mismatches: List[Dict[str, Any]] = []
     geometry_comparisons: List[Dict[str, Any]] = []
-    matched_objects: List[Any] = []
     for expected in expected_records:
         entity_id = str(expected.get("entity_id") or "")
         actual = actual_by_id.get(entity_id)
         if actual is None:
             missing.append(entity_id)
             continue
-        matched_objects.append(actual)
-        actual_type = _host_object_type_id(actual)
-        actual_representation = _host_object_representation(actual)
+        actual_type = str(actual.get("type_id") or "")
+        actual_representation = str(actual.get("representation") or "")
         expected_type = str(expected.get("type_id") or "")
         expected_representation = str(expected.get("representation") or "")
-        actual_source_id = _host_object_source_item_id(actual)
+        actual_source_id = str(actual.get("source_item_id") or "")
         expected_source_id = str(expected.get("source_item_id") or "")
-        actual_parent_source_id = _host_object_parent_source_item_id(actual)
+        actual_parent_source_id = str(actual.get("parent_source_item_id") or "")
         expected_parent_source_id = str(expected.get("parent_source_item_id") or "")
-        actual_content = _host_object_content_snapshot(
-            actual, actual_type, actual_representation
-        )
+        actual_content = actual.get("content")
         expected_content = expected.get("content")
         if (
             actual_type != expected_type
@@ -5780,7 +9124,6 @@ def _crosscheck_host_object_inventory(
                 }
             )
 
-    actual_inventory = _build_host_object_inventory(list(actual_objects or []))
     expected_counts = dict(expected_inventory.get("counts") or {})
     actual_counts = dict(actual_inventory.get("counts") or {})
     counts_match = expected_counts == actual_counts
@@ -5793,8 +9136,11 @@ def _crosscheck_host_object_inventory(
         and actual_inventory.get("verified") is True
         and set(actual_inventory.get("entity_ids") or []) == expected_id_set
         and counts_match
+        and archive_bound
+        and expected_inventory.get("shape_evidence_mode", "sampled")
+        == shape_evidence_mode
     )
-    return {
+    result = {
         "required": True,
         "method": "document_object_identity_type_crosscheck",
         "verified": verified,
@@ -5810,30 +9156,147 @@ def _crosscheck_host_object_inventory(
         "expected_objects": expected_records,
         "actual_objects": list(actual_inventory.get("objects") or []),
     }
+    if shape_evidence_mode == "cheap":
+        result["shape_archive_evidence"] = (
+            dict(archive_evidence) if isinstance(archive_evidence, dict) else {}
+        )
+    return result
+
+
+def _compact_crosscheck_host_object_inventory(
+    expected_inventory: Dict[str, Any],
+    actual_objects: List[Any],
+    archive_evidence: Dict[str, Any],
+    raster_archive_evidence: Optional[Dict[str, Any]] = None,
+    *,
+    opts: Optional[ImportOptions] = None,
+) -> Dict[str, Any]:
+    """Compare reopened metadata without serializing a second inventory."""
+
+    actual_inventory = _build_host_object_inventory(
+        list(actual_objects or []),
+        shape_evidence_mode="cheap",
+        opts=opts,
+    )
+    shape_archive_bound = _bind_fcstd_shape_archive_evidence(
+        actual_inventory,
+        archive_evidence,
+    )
+    try:
+        raster_required = bool(
+            _inventory_required_included_rasters(expected_inventory)
+            or _inventory_required_included_rasters(actual_inventory)
+        )
+    except (RuntimeError, TypeError, ValueError):
+        raster_required = True
+    raster_archive_bound = bool(
+        isinstance(raster_archive_evidence, dict)
+        and _bind_fcstd_raster_archive_evidence(
+            actual_inventory,
+            raster_archive_evidence,
+        )
+    )
+    if raster_archive_evidence is None and not raster_required:
+        raster_archive_bound = True
+    expected_records = list(expected_inventory.get("objects") or [])
+    actual_records = list(actual_inventory.get("objects") or [])
+    expected_by_id = {
+        record.get("entity_id"): record
+        for record in expected_records
+        if isinstance(record, dict) and isinstance(record.get("entity_id"), str)
+    }
+    actual_by_id: Dict[str, Dict[str, Any]] = {}
+    duplicate_actual_ids: List[str] = []
+    for record in actual_records:
+        if not isinstance(record, dict):
+            continue
+        entity_id = str(record.get("entity_id") or "")
+        if entity_id in actual_by_id:
+            duplicate_actual_ids.append(entity_id)
+        actual_by_id[entity_id] = record
+    missing = [entity_id for entity_id in expected_by_id if entity_id not in actual_by_id]
+    unexpected = [entity_id for entity_id in actual_by_id if entity_id not in expected_by_id]
+    mismatches = [
+        {"entity_id": entity_id, "reason": "persisted_metadata_mismatch"}
+        for entity_id in expected_by_id.keys() & actual_by_id.keys()
+        if expected_by_id[entity_id] != actual_by_id[entity_id]
+    ]
+    expected_counts = dict(expected_inventory.get("counts") or {})
+    actual_counts = dict(actual_inventory.get("counts") or {})
+    inventory_digest = str(expected_inventory.get("inventory_digest") or "")
+    reopened_digest = str(actual_inventory.get("inventory_digest") or "")
+    verified = bool(
+        shape_archive_bound
+        and raster_archive_bound
+        and inventory_digest
+        and inventory_digest == _host_inventory_digest(expected_inventory)
+        and reopened_digest == inventory_digest
+        and len(expected_by_id) == len(expected_records)
+        and len(actual_by_id) == len(actual_records)
+        and not duplicate_actual_ids
+        and not missing
+        and not unexpected
+        and not mismatches
+        and expected_counts == actual_counts
+    )
+    return {
+        "schema": "bcs.freecad_save_reopen_inventory/1.0",
+        "required": True,
+        "verified": verified,
+        "inventory_digest": inventory_digest,
+        "reopened_inventory_digest": reopened_digest,
+        "shape_archive_evidence_digest": str(
+            archive_evidence.get("evidence_digest") or ""
+        ),
+        "raster_archive_evidence_digest": str(
+            (raster_archive_evidence or {}).get("evidence_digest") or ""
+        ),
+        "missing_entity_ids": missing,
+        "duplicate_actual_entity_ids": duplicate_actual_ids,
+        "unexpected_entity_ids": unexpected,
+        "mismatched_entities": mismatches,
+        "expected_counts": expected_counts,
+        "actual_counts": actual_counts,
+        "counts_match": expected_counts == actual_counts,
+    }
 
 
 def _save_reopen_host_object_inventory(
     fc_doc,
     inventory: Dict[str, Any],
     baseline_entity_names: Optional[set] = None,
+    *,
+    opts: Optional[ImportOptions] = None,
 ) -> Dict[str, Any]:
-    """Save a temporary FCStd copy, reopen it, and verify imported host objects."""
+    """Verify cheap live facts against exact persisted FCStd archive entries."""
 
+    if opts is not None:
+        _invoke_import_cancellation_checkpoint(opts, "persistence save setup")
+    phase_timings_ms = {
+        "save_ms": 0.0,
+        "archive_hash_ms": 0.0,
+        "open_ms": 0.0,
+        "cheap_inventory_ms": 0.0,
+        "close_ms": 0.0,
+    }
     failure = {
+        "schema": "bcs.freecad_save_reopen_inventory/1.0",
         "required": True,
-        "method": "temporary_fcstd_save_copy_reopen",
+        "method": "temporary_fcstd_save_copy_archive_reopen",
         "verified": False,
-        "expected_entity_ids": list(inventory.get("entity_ids") or []),
         "missing_entity_ids": [],
         "duplicate_actual_entity_ids": [],
         "unexpected_entity_ids": [],
         "mismatched_entities": [],
-        "geometry_comparisons": [],
         "expected_counts": dict(inventory.get("counts") or {}),
         "actual_counts": {},
         "counts_match": False,
-        "expected_objects": list(inventory.get("objects") or []),
-        "actual_objects": [],
+        "inventory_digest": "",
+        "reopened_inventory_digest": "",
+        "shape_archive_evidence_digest": "",
+        "raster_archive_evidence_digest": "",
+        "archive_unchanged_after_open": False,
+        "phase_timings_ms": phase_timings_ms,
     }
     if FreeCAD is None:
         failure["error"] = "freecad_runtime_unavailable"
@@ -5847,55 +9310,237 @@ def _save_reopen_host_object_inventory(
     os.close(descriptor)
     try:
         os.remove(temp_path)
-    except OSError:
-        pass
+    except OSError as exc:
+        raise ImportCleanupError(
+            "temporary FCStd placeholder cleanup failed",
+            details={"retryable": True, "path": temp_path, "errors": [str(exc)]},
+        ) from exc
+    if Path(temp_path).exists():
+        raise ImportCleanupError(
+            "temporary FCStd placeholder still exists after cleanup",
+            details={"retryable": True, "path": temp_path},
+        )
     reopened = None
     original_name = str(getattr(fc_doc, "Name", "") or "")
     try:
+        if opts is not None:
+            _invoke_import_cancellation_checkpoint(opts, "persistence save")
+        save_started = time.perf_counter()
         save_result = save_copy(temp_path)
+        phase_timings_ms["save_ms"] = (
+            time.perf_counter() - save_started
+        ) * 1000.0
         if save_result is False or not Path(temp_path).is_file():
             raise RuntimeError("temporary FCStd saveCopy did not create a file")
+        if opts is not None:
+            _invoke_import_cancellation_checkpoint(
+                opts, "persistence archive evidence"
+            )
+        archive_started = time.perf_counter()
+        archive_evidence = _read_fcstd_shape_archive_evidence(
+            temp_path,
+            _inventory_required_shape_entity_ids(inventory),
+            expected_zero_ink_shape_entity_ids=(
+                _inventory_zero_ink_shape_entity_ids(inventory)
+            ),
+            opts=opts,
+        )
+        phase_timings_ms["archive_hash_ms"] = (
+            time.perf_counter() - archive_started
+        ) * 1000.0
+        failure["shape_archive_evidence_digest"] = str(
+            archive_evidence.get("evidence_digest") or ""
+        )
+        if archive_evidence.get("verified") is not True:
+            failure["reason"] = str(
+                archive_evidence.get("reason") or "fcstd_archive_evidence_failed"
+            )
+            return failure
+        if not _bind_fcstd_shape_archive_evidence(inventory, archive_evidence):
+            failure["reason"] = "fcstd_archive_binding_failed"
+            return failure
+        raster_archive_started = time.perf_counter()
+        raster_archive_evidence = _read_fcstd_raster_archive_evidence(
+            temp_path,
+            inventory,
+            opts=opts,
+            full_document_object_count=len(_document_objects(fc_doc)),
+        )
+        phase_timings_ms["archive_hash_ms"] += (
+            time.perf_counter() - raster_archive_started
+        ) * 1000.0
+        failure["raster_archive_evidence_digest"] = str(
+            raster_archive_evidence.get("evidence_digest") or ""
+        )
+        if raster_archive_evidence.get("verified") is not True:
+            failure["reason"] = str(
+                raster_archive_evidence.get("reason")
+                or "fcstd_raster_archive_evidence_failed"
+            )
+            return failure
+        if not _bind_fcstd_raster_archive_evidence(
+            inventory,
+            raster_archive_evidence,
+        ):
+            failure["reason"] = "fcstd_raster_archive_binding_failed"
+            return failure
+        failure["inventory_digest"] = str(inventory.get("inventory_digest") or "")
         open_document = getattr(FreeCAD, "openDocument", None)
         if not callable(open_document):
             raise RuntimeError("FreeCAD.openDocument is unavailable")
+        if opts is not None:
+            _invoke_import_cancellation_checkpoint(opts, "persistence reopen")
+        open_started = time.perf_counter()
         try:
-            reopened = open_document(temp_path, True)
+            reopened = open_document(temp_path, True, True)
         except TypeError:
-            reopened = open_document(temp_path)
+            try:
+                reopened = open_document(temp_path, True)
+            except TypeError:
+                reopened = open_document(temp_path)
+        phase_timings_ms["open_ms"] = (
+            time.perf_counter() - open_started
+        ) * 1000.0
+        cheap_inventory_started = time.perf_counter()
         reopened_objects = _document_objects(reopened)
         ignored_names = set(baseline_entity_names or set())
         if ignored_names:
-            reopened_objects = [
-                host_obj
-                for host_obj in reopened_objects
-                if _host_object_id(host_obj) not in ignored_names
-            ]
-        result = _crosscheck_host_object_inventory(inventory, reopened_objects)
-        result["method"] = "temporary_fcstd_save_copy_reopen"
+            retained_objects = []
+            for host_obj in reopened_objects:
+                if opts is not None:
+                    _invoke_import_cancellation_checkpoint(
+                        opts, "persistence reopened object filter"
+                    )
+                if _host_object_persistent_name(host_obj) not in ignored_names:
+                    retained_objects.append(host_obj)
+            reopened_objects = retained_objects
+        result = _compact_crosscheck_host_object_inventory(
+            inventory,
+            reopened_objects,
+            archive_evidence,
+            raster_archive_evidence,
+            opts=opts,
+        )
+        phase_timings_ms["cheap_inventory_ms"] = (
+            time.perf_counter() - cheap_inventory_started
+        ) * 1000.0
+        post_open_hash_started = time.perf_counter()
+        post_open_digest, post_open_size = _hash_file_sha256(
+            Path(temp_path),
+            opts=opts,
+            stage="persistence post-open archive hash",
+        )
+        phase_timings_ms["archive_hash_ms"] += (
+            time.perf_counter() - post_open_hash_started
+        ) * 1000.0
+        archive_unchanged = bool(
+            post_open_digest == archive_evidence.get("fcstd_sha256")
+            and post_open_size == archive_evidence.get("fcstd_bytes")
+            and post_open_digest == raster_archive_evidence.get("fcstd_sha256")
+            and post_open_size == raster_archive_evidence.get("fcstd_bytes")
+        )
+        if not archive_unchanged:
+            result["verified"] = False
+            result["reason"] = "fcstd_archive_changed_after_open"
+        result["method"] = "temporary_fcstd_save_copy_archive_reopen"
+        result["archive_unchanged_after_open"] = archive_unchanged
+        result["phase_timings_ms"] = phase_timings_ms
         return result
-    except (OSError, RuntimeError, TypeError, ValueError, AttributeError) as exc:
-        failure["error"] = "%s: %s" % (exc.__class__.__name__, exc)
+    except ImportCancelled:
+        raise
+    except (
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        AttributeError,
+        zipfile.BadZipFile,
+    ) as exc:
+        failure["reason"] = "save_reopen_runtime_error"
+        failure["error_type"] = exc.__class__.__name__
         return failure
     finally:
-        if reopened is not None:
-            reopened_name = str(getattr(reopened, "Name", "") or "")
-            close_document = getattr(FreeCAD, "closeDocument", None)
-            if reopened_name and callable(close_document):
-                try:
-                    close_document(reopened_name)
-                except (RuntimeError, TypeError, ValueError, AttributeError):
-                    pass
+        primary_error = sys.exc_info()[1]
+        finalization_errors: List[str] = []
         if original_name:
             set_active = getattr(FreeCAD, "setActiveDocument", None)
             if callable(set_active):
                 try:
                     set_active(original_name)
-                except (RuntimeError, TypeError, ValueError, AttributeError):
-                    pass
+                except (RuntimeError, TypeError, ValueError, AttributeError) as exc:
+                    finalization_errors.append("restore_active_document: %s" % exc)
+        if reopened is not None:
+            reopened_name = str(getattr(reopened, "Name", "") or "")
+            close_document = getattr(FreeCAD, "closeDocument", None)
+            if reopened_name and callable(close_document):
+                close_started = time.perf_counter()
+                try:
+                    close_document(reopened_name)
+                except (RuntimeError, TypeError, ValueError, AttributeError) as exc:
+                    finalization_errors.append("close_reopened_document: %s" % exc)
+                phase_timings_ms["close_ms"] = (
+                    time.perf_counter() - close_started
+                ) * 1000.0
         try:
-            os.remove(temp_path)
-        except OSError:
-            pass
+            if Path(temp_path).exists():
+                os.remove(temp_path)
+        except OSError as exc:
+            finalization_errors.append("remove_temporary_fcstd: %s" % exc)
+        if Path(temp_path).exists():
+            finalization_errors.append("temporary FCStd still exists after cleanup")
+        if finalization_errors:
+            cleanup_error = ImportCleanupError(
+                "temporary persistence evidence cleanup failed",
+                details={
+                    "retryable": True,
+                    "path": temp_path,
+                    "errors": finalization_errors,
+                },
+            )
+            if primary_error is not None:
+                try:
+                    primary_error.add_note(str(cleanup_error))
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    pass
+                try:
+                    setattr(primary_error, "cleanup_error", cleanup_error)
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    pass
+            else:
+                raise cleanup_error
+
+
+def _build_persistence_host_evidence(
+    fc_doc,
+    imported_objects: List[Any],
+    baseline_entity_names: Optional[set] = None,
+    *,
+    opts: Optional[ImportOptions] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Build cheap live evidence and verify the exact persisted FCStd archive."""
+
+    live_objects = list(imported_objects or [])
+    if opts is not None:
+        _invoke_import_cancellation_checkpoint(opts, "persistence evidence")
+    inventory = _build_host_object_inventory(
+        live_objects,
+        shape_evidence_mode="cheap",
+        opts=opts,
+    )
+    if opts is None:
+        save_reopen = _save_reopen_host_object_inventory(
+            fc_doc,
+            inventory,
+            baseline_entity_names,
+        )
+    else:
+        save_reopen = _save_reopen_host_object_inventory(
+            fc_doc,
+            inventory,
+            baseline_entity_names,
+            opts=opts,
+        )
+    return inventory, save_reopen
 
 
 def _structural_text_delivery_count(
@@ -6061,7 +9706,13 @@ def _zero_visible_ink_shape_evidence(shape) -> Dict[str, Any]:
     }
 
 
-def _annotate_text_host_object(obj, source_item_id: str, representation: str) -> None:
+def _annotate_text_host_object(
+    obj,
+    source_item_id: str,
+    representation: str,
+    *,
+    parent_source_item_id: Optional[str] = None,
+) -> None:
     """Persist stable source identity and requested representation on a host object."""
     properties = set(getattr(obj, "PropertiesList", []) or [])
     add_property = getattr(obj, "addProperty", None)
@@ -6073,6 +9724,16 @@ def _annotate_text_host_object(obj, source_item_id: str, representation: str) ->
             add_property("App::PropertyString", name, "PDF Import")
             properties.add(name)
         setattr(obj, name, str(value))
+    if parent_source_item_id is not None:
+        if (
+            not isinstance(parent_source_item_id, str)
+            or not parent_source_item_id
+            or parent_source_item_id == source_item_id
+        ):
+            raise ValueError("text segment parent identity is invalid")
+        if "PDFParentSourceItemId" not in properties and callable(add_property):
+            add_property("App::PropertyString", "PDFParentSourceItemId", "PDF Import")
+        obj.PDFParentSourceItemId = parent_source_item_id
 
 
 def _format_color_metadata(
@@ -6113,6 +9774,146 @@ def _persist_text_style_metadata(
             properties.add(property_name)
         setattr(obj, property_name, property_value)
     return color_metadata
+
+
+def _persist_font_delivery_metadata(
+    obj,
+    *,
+    source_font_equivalence: bool,
+    font_substitution_applied: bool,
+    font_identity_verified: bool,
+    glyph_coverage_verified: bool,
+    delivered_font_sha256: str,
+    font_candidate_source: str,
+    delivered_font_path: str,
+    source_font_asset_path: str,
+    source_font_asset_sha256: str,
+    staged_font_path: str,
+    staged_font_sha256: str,
+    staged_asset_verified: bool,
+    staged_asset_read_only: bool,
+    font_internal_identity_sha256: str,
+    font_coverage_evidence_sha256: str,
+    source_font_identity: Dict[str, str],
+) -> None:
+    """Persist and reread the exact 3D font-delivery decision on every host."""
+
+    if (
+        type(source_font_equivalence) is not bool
+        or type(font_substitution_applied) is not bool
+        or type(font_identity_verified) is not bool
+        or type(glyph_coverage_verified) is not bool
+        or re.fullmatch(r"[0-9a-f]{64}", delivered_font_sha256) is None
+        or not isinstance(font_candidate_source, str)
+        or not font_candidate_source
+        or not isinstance(delivered_font_path, str)
+        or not delivered_font_path
+        or not isinstance(source_font_asset_path, str)
+        or not source_font_asset_path
+        or re.fullmatch(r"[0-9a-f]{64}", source_font_asset_sha256) is None
+        or not isinstance(staged_font_path, str)
+        or not staged_font_path
+        or re.fullmatch(r"[0-9a-f]{64}", staged_font_sha256) is None
+        or type(staged_asset_verified) is not bool
+        or type(staged_asset_read_only) is not bool
+        or re.fullmatch(r"[0-9a-f]{64}", font_internal_identity_sha256) is None
+        or re.fullmatch(r"[0-9a-f]{64}", font_coverage_evidence_sha256) is None
+        or not isinstance(source_font_identity, dict)
+        or not source_font_identity.get("raw_name")
+        or not source_font_identity.get("normalized_key")
+    ):
+        raise ValueError("3D font delivery metadata is invalid")
+    source_identity_json = json.dumps(
+        source_font_identity,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    properties = set(getattr(obj, "PropertiesList", []) or [])
+    add_property = getattr(obj, "addProperty", None)
+    metadata = (
+        ("App::PropertyBool", "PDFSourceFontEquivalence", source_font_equivalence),
+        ("App::PropertyBool", "PDFFontSubstitutionApplied", font_substitution_applied),
+        ("App::PropertyBool", "PDFFontIdentityVerified", font_identity_verified),
+        ("App::PropertyBool", "PDFFontGlyphCoverageVerified", glyph_coverage_verified),
+        ("App::PropertyString", "PDFDeliveredFontSHA256", delivered_font_sha256),
+        ("App::PropertyString", "PDFFontCandidateSource", font_candidate_source),
+        ("App::PropertyString", "PDFDeliveredFontPath", delivered_font_path),
+        ("App::PropertyString", "PDFSourceFontAssetPath", source_font_asset_path),
+        ("App::PropertyString", "PDFSourceFontAssetSHA256", source_font_asset_sha256),
+        ("App::PropertyString", "PDFStagedFontPath", staged_font_path),
+        ("App::PropertyString", "PDFStagedFontSHA256", staged_font_sha256),
+        ("App::PropertyBool", "PDFStagedFontVerified", staged_asset_verified),
+        ("App::PropertyBool", "PDFStagedFontReadOnly", staged_asset_read_only),
+        (
+            "App::PropertyString",
+            "PDFFontInternalIdentitySHA256",
+            font_internal_identity_sha256,
+        ),
+        (
+            "App::PropertyString",
+            "PDFFontCoverageEvidenceSHA256",
+            font_coverage_evidence_sha256,
+        ),
+        ("App::PropertyString", "PDFSourceFontIdentityJSON", source_identity_json),
+    )
+    for property_kind, property_name, property_value in metadata:
+        if property_name not in properties and callable(add_property):
+            add_property(property_kind, property_name, "PDF Import")
+            properties.add(property_name)
+        setattr(obj, property_name, property_value)
+
+
+def _host_font_delivery_metadata_matches(
+    host_obj: Any,
+    evidence: Dict[str, Any],
+    source_font_identity: Dict[str, str],
+) -> bool:
+    try:
+        expected_identity_json = json.dumps(
+            source_font_identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        return bool(
+            getattr(host_obj, "PDFSourceFontEquivalence", None)
+            is evidence["source_font_equivalence"]
+            and getattr(host_obj, "PDFFontSubstitutionApplied", None)
+            is evidence["font_substitution_applied"]
+            and getattr(host_obj, "PDFFontIdentityVerified", None)
+            is evidence["font_identity_verified"]
+            and getattr(host_obj, "PDFFontGlyphCoverageVerified", None)
+            is evidence["glyph_coverage_verified"]
+            and getattr(host_obj, "PDFDeliveredFontSHA256", None)
+            == evidence["delivered_font_sha256"]
+            and getattr(host_obj, "PDFFontCandidateSource", None)
+            == evidence["font_candidate_source"]
+            and getattr(host_obj, "PDFDeliveredFontPath", None)
+            == evidence["staged_font_path"]
+            and getattr(host_obj, "PDFSourceFontAssetPath", None)
+            == evidence["source_font_asset_path"]
+            and getattr(host_obj, "PDFSourceFontAssetSHA256", None)
+            == evidence["source_font_asset_sha256"]
+            and getattr(host_obj, "PDFStagedFontPath", None)
+            == evidence["staged_font_path"]
+            and getattr(host_obj, "PDFStagedFontSHA256", None)
+            == evidence["staged_font_sha256"]
+            and getattr(host_obj, "PDFStagedFontVerified", None)
+            is evidence["staged_asset_verified"]
+            and getattr(host_obj, "PDFStagedFontReadOnly", None)
+            is evidence["staged_asset_read_only"]
+            and getattr(host_obj, "PDFFontInternalIdentitySHA256", None)
+            == evidence["font_internal_identity_sha256"]
+            and getattr(host_obj, "PDFFontCoverageEvidenceSHA256", None)
+            == evidence["font_coverage_evidence_sha256"]
+            and getattr(host_obj, "PDFSourceFontIdentityJSON", None)
+            == expected_identity_json
+        )
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        return False
 
 
 def _make_shapestring_host(doc, source_text: str, font_path: str):
@@ -6260,8 +10061,31 @@ def _create_verified_text3d_entity(
         pass
     if callable(configure_host):
         configure_host(calibrated_support)
+
+    # The extrusion depends on the calibrated clone.  Configure both first,
+    # then let FreeCAD recompute the dependency pair in one ordered pass.  A
+    # separate pass for each object performs the same work with one additional
+    # document traversal per source span on dense pages.
+    extrusion = doc.addObject("Part::Extrusion", "PDF_3D_Text")
+    if extrusion is None:
+        raise RuntimeError("Part::Extrusion factory returned no host object")
+    if id(extrusion) in protected_baseline_ids:
+        raise RuntimeError(
+            "Part::Extrusion factory returned a pre-existing baseline object"
+        )
+    if extrusion is shape_string or extrusion is calibrated_support:
+        raise RuntimeError("Part::Extrusion factory returned an existing support object")
+    extrusion.Base = calibrated_support
     try:
-        doc.recompute([calibrated_support])
+        extrusion.DirMode = "Custom"
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+    extrusion.Dir = Vector(0.0, 0.0, float(depth))
+    extrusion.Solid = True
+    if callable(configure_host):
+        configure_host(extrusion)
+    try:
+        doc.recompute([calibrated_support, extrusion])
     except TypeError:
         doc.recompute()
 
@@ -6288,29 +10112,6 @@ def _create_verified_text3d_entity(
             "(target %.6g, actual %s)"
             % (target_advance_fc, verified_advance)
         )
-
-    extrusion = doc.addObject("Part::Extrusion", "PDF_3D_Text")
-    if extrusion is None:
-        raise RuntimeError("Part::Extrusion factory returned no host object")
-    if id(extrusion) in protected_baseline_ids:
-        raise RuntimeError(
-            "Part::Extrusion factory returned a pre-existing baseline object"
-        )
-    if extrusion is shape_string or extrusion is calibrated_support:
-        raise RuntimeError("Part::Extrusion factory returned an existing support object")
-    extrusion.Base = calibrated_support
-    try:
-        extrusion.DirMode = "Custom"
-    except (AttributeError, RuntimeError, TypeError, ValueError):
-        pass
-    extrusion.Dir = Vector(0.0, 0.0, float(depth))
-    extrusion.Solid = True
-    if callable(configure_host):
-        configure_host(extrusion)
-    try:
-        doc.recompute([extrusion])
-    except TypeError:
-        doc.recompute()
 
     shape = getattr(extrusion, "Shape", None)
     solids = list(getattr(shape, "Solids", []) or []) if shape is not None else []
@@ -6407,6 +10208,182 @@ def _rotation_matches(actual: float, expected: float, tolerance: float = 1e-6) -
     return math.isfinite(difference) and abs(difference) <= float(tolerance)
 
 
+def _deliver_mixed_source_ink_segments(
+    item: Dict[str, Any],
+    attempted_type: str,
+    opts: ImportOptions,
+    *,
+    deliver_child,
+    text_group,
+) -> Dict[str, Any]:
+    """Deliver all contiguous mixed-ink children on one representation rung."""
+
+    manifest, children = _build_source_ink_segment_items(item)
+    parent_id = manifest["parent_source_item_id"]
+    child_results: List[Dict[str, Any]] = []
+    created_ids: List[str] = []
+    delivery_ids: List[str] = []
+    support_ids: List[str] = []
+
+    def append_unique(target: List[str], values) -> None:
+        for value in list(values or []):
+            if isinstance(value, str) and value and value not in target:
+                target.append(value)
+
+    doc = _text_host_document(None, text_group)
+    baseline_object_ids: set[int] = set()
+    baseline_snapshot_valid = doc is None
+    current_child: Optional[Dict[str, Any]] = None
+    raw_created_count = 0
+    raw_delivery_count = 0
+    raw_support_count = 0
+
+    try:
+        if doc is not None:
+            baseline_object_ids = {
+                id(host_obj) for host_obj in list(getattr(doc, "Objects", []) or [])
+            }
+            baseline_snapshot_valid = True
+        for child in children:
+            current_child = child
+            result = deliver_child(copy.deepcopy(child))
+            normalized = _normalize_verified_text_item_result(
+                child,
+                item["requested_type"],
+                attempted_type,
+                result,
+            )
+            child_results.append(normalized)
+            raw_created_count += len(normalized["created_entity_ids"])
+            raw_delivery_count += len(normalized["delivery_entity_ids"])
+            raw_support_count += len(normalized["support_entity_ids"])
+            append_unique(created_ids, normalized["created_entity_ids"])
+            append_unique(delivery_ids, normalized["delivery_entity_ids"])
+            append_unique(support_ids, normalized["support_entity_ids"])
+
+        if (
+            len(child_results) != len(children)
+            or not created_ids
+            or not delivery_ids
+            or raw_created_count != len(created_ids)
+            or raw_delivery_count != len(delivery_ids)
+            or raw_support_count != len(support_ids)
+            or set(delivery_ids).intersection(support_ids)
+            or set(delivery_ids).union(support_ids) != set(created_ids)
+        ):
+            raise ValueError("segmented delivery ownership is incomplete")
+    except Exception as failure:
+        failed_attempt = dict(getattr(failure, "attempt", {}) or {})
+        append_unique(created_ids, failed_attempt.get("created_entity_ids"))
+        removed_ids: List[str] = []
+        append_unique(removed_ids, failed_attempt.get("removed_entity_ids"))
+        owned: List[Any] = []
+        cleanup_error = ""
+        if doc is not None and baseline_snapshot_valid:
+            try:
+                owned = [
+                    host_obj
+                    for host_obj in list(getattr(doc, "Objects", []) or [])
+                    if id(host_obj) not in baseline_object_ids
+                ]
+                append_unique(
+                    created_ids,
+                    [_host_object_id(host_obj) for host_obj in owned],
+                )
+            except Exception as exc:
+                cleanup_error = "%s: %s" % (exc.__class__.__name__, exc)
+        elif doc is not None:
+            cleanup_error = "segmented baseline snapshot is unavailable"
+        helper_complete = not owned and not cleanup_error
+        if doc is not None and owned:
+            try:
+                helper_removed, helper_complete = _remove_owned_text_objects(
+                    doc, text_group, owned
+                )
+                append_unique(removed_ids, helper_removed)
+            except Exception as exc:
+                cleanup_error = "%s: %s" % (exc.__class__.__name__, exc)
+                helper_complete = False
+        still_live = False
+        if doc is not None and baseline_snapshot_valid:
+            try:
+                still_live = any(
+                    id(host_obj) not in baseline_object_ids
+                    for host_obj in list(getattr(doc, "Objects", []) or [])
+                )
+            except Exception as exc:
+                cleanup_error = cleanup_error or "%s: %s" % (
+                    exc.__class__.__name__,
+                    exc,
+                )
+                still_live = True
+        cleanup_complete = bool(
+            helper_complete
+            and failed_attempt.get("cleanup_complete", True) is True
+            and set(created_ids) == set(removed_ids)
+            and not still_live
+            and not cleanup_error
+        )
+        failure_evidence = {
+            "source_segment_manifest": manifest,
+            "failed_child_source_item_id": (
+                failed_attempt.get("source_item_id")
+                or (current_child or {}).get("source_item_id")
+            ),
+            "failed_child_attempt": failed_attempt,
+            "exception": "%s: %s" % (failure.__class__.__name__, failure),
+        }
+        if cleanup_error:
+            failure_evidence["cleanup_error"] = cleanup_error
+        attempt = {
+            "source_item_id": parent_id,
+            "requested_type": item["requested_type"],
+            "attempted_type": attempted_type,
+            "final_type": None,
+            "outcome": "failed",
+            "reason": "source_segment_delivery_failed",
+            "created_entity_ids": created_ids,
+            "removed_entity_ids": removed_ids,
+            "cleanup_complete": cleanup_complete,
+            "evidence": failure_evidence,
+        }
+        raise TextRepresentationFailure(
+            "%s segmented delivery failed for %s" % (attempted_type, parent_id),
+            attempt,
+        ) from failure
+
+    parent_evidence = _validated_source_ink_evidence(item)
+    child_ids = [child["source_item_id"] for child in children]
+    delivery_count = sum(
+        int(result.get("delivery_count") or len(result["delivery_entity_ids"]))
+        for result in child_results
+    )
+    return {
+        "source_item_id": parent_id,
+        "requested_type": item["requested_type"],
+        "attempted_type": attempted_type,
+        "final_type": attempted_type,
+        "outcome": "verified",
+        "created_entity_ids": created_ids,
+        "delivery_entity_ids": delivery_ids,
+        "support_entity_ids": support_ids,
+        "removed_entity_ids": [],
+        "cleanup_complete": True,
+        "delivery_count": delivery_count,
+        "evidence": {
+            "source_text": item["text"],
+            "source_text_preserved": True,
+            "source_item_id_verified": True,
+            "source_ink_evidence": parent_evidence,
+            "source_segment_ink_evidence_persisted": True,
+            "source_segment_manifest": manifest,
+            "child_source_item_ids": child_ids,
+            "segment_deliveries": child_results,
+            **_source_ink_delivery_binding_fields(item, parent_evidence),
+        },
+    }
+
+
 def _deliver_text_item_native(
     item: Dict[str, Any],
     attempted_type: str,
@@ -6427,6 +10404,28 @@ def _deliver_text_item_native(
     doc = _text_host_document(None, text_group)
     baseline_objects: set = set()
     owned: List[Any] = []
+
+    raw_source_ink = bound_item.get("source_ink_evidence")
+    if (
+        bound_item.get("parent_source_item_id") is None
+        and isinstance(raw_source_ink, dict)
+        and raw_source_ink.get("classification")
+        == "mixed_visible_and_zero_ink"
+    ):
+        return _deliver_mixed_source_ink_segments(
+            bound_item,
+            attempted_type,
+            opts,
+            deliver_child=lambda child: _deliver_text_item_native(
+                child,
+                attempted_type,
+                opts,
+                text_group=text_group,
+                page_h=page_h,
+                scale=scale,
+            ),
+            text_group=text_group,
+        )
 
     def fail(reason: str, evidence: Optional[Dict[str, Any]] = None):
         if doc is not None and baseline_objects:
@@ -6475,7 +10474,6 @@ def _deliver_text_item_native(
             bound_item.get("line_index"),
             bound_item.get("span_index"),
         )
-        expected_source_id = "p%d:b%d:l%d:s%d" % ((page_number,) + indices)
         source_text = bound_item.get("text")
         span = bound_item.get("span")
         pdf_sha256 = bound_item.get("pdf_sha256")
@@ -6494,7 +10492,7 @@ def _deliver_text_item_native(
             or type(page_number) is not int
             or page_number <= 0
             or any(type(index) is not int or index < 0 for index in indices)
-            or source_item_id != expected_source_id
+            or not _canonical_or_segment_source_id_matches(bound_item)
             or not isinstance(pdf_sha256, str)
             or re.fullmatch(r"[0-9a-f]{64}", pdf_sha256) is None
             or not isinstance(source_text, str)
@@ -6601,7 +10599,12 @@ def _deliver_text_item_native(
             raise RuntimeError("native text factory returned no new host object")
         owned.append(host_obj)
         text_group.addObject(host_obj)
-        _annotate_text_host_object(host_obj, source_item_id, attempted_type)
+        _annotate_text_host_object(
+            host_obj,
+            source_item_id,
+            attempted_type,
+            parent_source_item_id=bound_item.get("parent_source_item_id"),
+        )
         if source_ink_evidence is not None:
             _persist_source_ink_evidence(host_obj, source_ink_evidence)
 
@@ -6756,6 +10759,8 @@ def _deliver_text_item_native(
                 and actual_custom_text_values != [source_text]
             )
             or getattr(host_obj, "PDFSourceItemId", None) != source_item_id
+            or getattr(host_obj, "PDFParentSourceItemId", None)
+            != bound_item.get("parent_source_item_id")
             or getattr(host_obj, "PDFRepresentation", None) != attempted_type
             or actual_anchor is None
             or any(
@@ -6802,6 +10807,7 @@ def _deliver_text_item_native(
         "source_text": source_text,
         "source_text_preserved": True,
         "source_item_id_verified": True,
+        "parent_source_item_id": bound_item.get("parent_source_item_id"),
         "expected_anchor_xyz": expected_anchor,
         "verified_anchor_xyz": tuple(actual_anchor),
         "rotation_deg": float(actual_rotation),
@@ -6856,8 +10862,135 @@ def _raster_asset_dir() -> Path:
         return Path(tempfile.gettempdir()) / "bc_fc_pdf_raster_cache"
 
 
-def _save_pixmap_atomic(pix, image_path: Path) -> None:
-    """Publish a complete raster atomically so concurrent imports cannot tear it."""
+def _publish_prepared_raster_target(
+    temporary_path: Path,
+    target: Path,
+    payload_sha256: str,
+    opts: Optional[ImportOptions],
+) -> bool:
+    """Atomically publish a shared immutable blob without ever replacing bytes.
+
+    The unique temporary path is attempt-owned.  Once the content-addressed
+    target has been created, however, it is shared cache state: a concurrent or
+    later successful attempt may already depend on it.  The final target must
+    therefore never enter an attempt rollback journal.
+    """
+
+    temporary_path = Path(temporary_path).resolve()
+    target = Path(target).resolve()
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", payload_sha256) is None
+        or not temporary_path.is_file()
+        or temporary_path.stat().st_size <= 0
+        or _path_sha256(temporary_path) != payload_sha256
+    ):
+        raise ImportLifecycleError("prepared raster asset is invalid")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload_size = temporary_path.stat().st_size
+    if target.exists():
+        if (
+            not target.is_file()
+            or target.stat().st_size != payload_size
+            or _path_sha256(target) != payload_sha256
+        ):
+            raise ImportLifecycleError(
+                "content-addressed raster target is corrupt: %s" % target
+            )
+        return False
+
+    try:
+        os.link(str(temporary_path), str(target))
+        published = True
+    except FileExistsError:
+        published = False
+    if (
+        not target.is_file()
+        or target.stat().st_size != payload_size
+        or _path_sha256(target) != payload_sha256
+    ):
+        raise ImportLifecycleError("content-addressed raster publication failed")
+    if published:
+        try:
+            target.chmod(stat.S_IREAD)
+        except OSError:
+            # Content addressing plus create-if-absent remains authoritative on
+            # filesystems that cannot expose a stable read-only mode.
+            pass
+    return published
+
+
+def _persist_content_addressed_pixmap(
+    pix,
+    opts: ImportOptions,
+    *,
+    asset_kind: str,
+) -> Tuple[Path, Dict[str, Any]]:
+    """Save exact PNG bytes once, name them by their real SHA-256, and verify."""
+
+    kind = str(asset_kind or "").strip().lower()
+    if re.fullmatch(r"[a-z0-9][a-z0-9_]{0,31}", kind) is None:
+        raise ValueError("raster asset kind is invalid")
+    asset_dir = _raster_asset_dir().resolve()
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=kind + ".",
+        suffix=".png",
+        dir=str(asset_dir),
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name).resolve()
+    _journal_new_attempt_path(opts, temporary_path)
+    try:
+        pix.save(str(temporary_path))
+        if not temporary_path.is_file() or temporary_path.stat().st_size <= 0:
+            raise RuntimeError("raster renderer produced an empty temporary asset")
+        payload_sha256 = _path_sha256(temporary_path)
+        target = (asset_dir / ("%s_%s.png" % (kind, payload_sha256))).resolve()
+        published = _publish_prepared_raster_target(
+            temporary_path,
+            target,
+            payload_sha256,
+            opts,
+        )
+        if _path_sha256(target) != payload_sha256:
+            raise ImportLifecycleError("published raster SHA-256 changed")
+        return target, {
+            "source_asset_path": str(target),
+            "source_asset_sha256": payload_sha256,
+            "source_asset_bytes": int(target.stat().st_size),
+            "asset_content_addressed": True,
+            "asset_atomic_create_if_absent": True,
+            "asset_never_overwritten": True,
+            "asset_published_by_attempt": published,
+        }
+    finally:
+        if temporary_path.exists():
+            try:
+                temporary_path.chmod(stat.S_IREAD | stat.S_IWRITE)
+                temporary_path.unlink()
+            except OSError as exc:
+                raise ImportCleanupError(
+                    "temporary raster asset cleanup failed",
+                    details={
+                        "retryable": True,
+                        "path": str(temporary_path),
+                        "errors": [str(exc)],
+                    },
+                ) from exc
+        if temporary_path.exists():
+            raise ImportCleanupError(
+                "temporary raster asset still exists after cleanup",
+                details={"retryable": True, "path": str(temporary_path)},
+            )
+        _forget_attempt_path(opts, temporary_path)
+
+
+def _save_pixmap_atomic(
+    pix,
+    image_path: Path,
+    opts: Optional[ImportOptions] = None,
+) -> None:
+    """Create one exact target atomically; existing bytes are never replaced."""
     image_path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(
         prefix=image_path.stem + ".",
@@ -6865,27 +10998,79 @@ def _save_pixmap_atomic(pix, image_path: Path) -> None:
         dir=str(image_path.parent),
     )
     os.close(fd)
-    temporary_path = Path(temporary_name)
+    temporary_path = Path(temporary_name).resolve()
+    if opts is not None:
+        _journal_new_attempt_path(opts, temporary_path)
     try:
         pix.save(str(temporary_path))
         if not temporary_path.is_file() or temporary_path.stat().st_size <= 0:
             raise RuntimeError("raster renderer produced an empty temporary asset")
-        for attempt_index in range(8):
-            try:
-                os.replace(str(temporary_path), str(image_path))
-                break
-            except PermissionError:
-                if attempt_index >= 7:
-                    raise
-                # Windows can briefly deny replacement while another importer
-                # publishes the same content-addressed key. Keep retries bounded.
-                time.sleep(0.005 * (attempt_index + 1))
+        payload_sha256 = _path_sha256(temporary_path)
+        _publish_prepared_raster_target(
+            temporary_path,
+            Path(image_path),
+            payload_sha256,
+            opts,
+        )
     finally:
-        try:
-            if temporary_path.exists():
+        if temporary_path.exists():
+            try:
+                temporary_path.chmod(stat.S_IREAD | stat.S_IWRITE)
                 temporary_path.unlink()
-        except OSError:
-            pass
+            except OSError as exc:
+                raise ImportCleanupError(
+                    "temporary raster asset cleanup failed",
+                    details={
+                        "retryable": True,
+                        "path": str(temporary_path),
+                        "errors": [str(exc)],
+                    },
+                ) from exc
+            if temporary_path.exists():
+                raise ImportCleanupError(
+                    "temporary raster asset still exists after cleanup",
+                    details={"retryable": True, "path": str(temporary_path)},
+                )
+        if opts is not None:
+            _forget_attempt_path(opts, temporary_path)
+
+
+def _persist_embedded_image_asset(
+    pix,
+    opts: ImportOptions,
+    *,
+    page_number: int,
+    xref: int,
+) -> Tuple[Path, Dict[str, Any]]:
+    """Atomically publish one PDF-bound, content-addressed embedded image."""
+
+    pdf_sha256 = str(getattr(opts, "_pdf_sha256", "") or "").strip().lower()
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", pdf_sha256) is None
+        or type(page_number) is not int
+        or page_number <= 0
+        or type(xref) is not int
+        or xref < 0
+    ):
+        raise ValueError("embedded image source identity is invalid")
+
+    if hashlib.sha256(_validated_pdf_source_bytes(opts)).hexdigest() != pdf_sha256:
+        raise ValueError("embedded image PDF bytes do not match the attempt")
+    target, evidence = _persist_content_addressed_pixmap(
+        pix,
+        opts,
+        asset_kind="embedded",
+    )
+    evidence.update(
+        {
+            "pdf_sha256": pdf_sha256,
+            "page_number": page_number,
+            "source_xref": xref,
+            "asset_atomic_publish": True,
+            "asset_shared_immutable": True,
+        }
+    )
+    return target, evidence
 
 
 def _path_sha256(path: Path) -> str:
@@ -6907,6 +11092,12 @@ def _raster_file_evidence(host_obj, source_asset_path: Path) -> Dict[str, Any]:
         "source_asset_path": str(source_path),
         "source_asset_sha256": source_sha256,
     }
+    included_property_type = _host_property_type_id(host_obj, "PDFRasterFile")
+    if included_property_type != "App::PropertyFileIncluded":
+        raise RuntimeError(
+            "PDFRasterFile is not an App::PropertyFileIncluded property"
+        )
+    evidence["included_file_property_type"] = included_property_type
     for property_name, evidence_name in (
         ("ImageFile", "image_file_path"),
         ("PDFRasterFile", "included_file_path"),
@@ -6921,6 +11112,1309 @@ def _raster_file_evidence(host_obj, source_asset_path: Path) -> Dict[str, Any]:
         evidence[evidence_name + "_sha256"] = actual_sha256
     evidence["raster_content_verified"] = True
     return evidence
+
+
+def _bind_embedded_image_host_asset(
+    host_obj,
+    source_asset_path: Path,
+    *,
+    pdf_sha256: str,
+    page_number: int,
+    xref: int,
+) -> Dict[str, Any]:
+    """Embed and bind exact extracted bytes to one ImagePlane host object."""
+
+    digest = str(pdf_sha256 or "").strip().lower()
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or type(page_number) is not int
+        or page_number <= 0
+        or type(xref) is not int
+        or xref < 0
+    ):
+        raise ValueError("embedded image host source identity is invalid")
+    asset_path = Path(source_asset_path).resolve()
+    if not asset_path.is_file() or asset_path.stat().st_size <= 0:
+        raise RuntimeError("embedded image asset is unavailable")
+
+    add_property = getattr(host_obj, "addProperty", None)
+    if not callable(add_property):
+        raise RuntimeError("ImagePlane cannot embed its extracted image asset")
+    properties = set(getattr(host_obj, "PropertiesList", []) or [])
+    declarations = (
+        ("App::PropertyFileIncluded", "PDFRasterFile"),
+        ("App::PropertyString", "PDFSourceSHA256"),
+        ("App::PropertyString", "PDFRasterSHA256"),
+        ("App::PropertyInteger", "PDFImagePageNumber"),
+        ("App::PropertyInteger", "PDFImageSourceXRef"),
+    )
+    for property_type, property_name in declarations:
+        if property_name not in properties:
+            add_property(property_type, property_name, "PDF Import")
+            properties.add(property_name)
+
+    asset_sha256 = _path_sha256(asset_path)
+    host_obj.ImageFile = str(asset_path)
+    host_obj.PDFRasterFile = str(asset_path)
+    host_obj.PDFSourceSHA256 = digest
+    host_obj.PDFRasterSHA256 = asset_sha256
+    host_obj.PDFImagePageNumber = page_number
+    host_obj.PDFImageSourceXRef = xref
+    evidence = _raster_file_evidence(host_obj, asset_path)
+    if (
+        evidence.get("source_asset_sha256") != asset_sha256
+        or str(getattr(host_obj, "PDFSourceSHA256", "")) != digest
+        or str(getattr(host_obj, "PDFRasterSHA256", "")) != asset_sha256
+        or int(getattr(host_obj, "PDFImagePageNumber", 0) or 0) != page_number
+        or int(getattr(host_obj, "PDFImageSourceXRef", 0) or 0) != xref
+    ):
+        raise RuntimeError("embedded image host asset binding could not be verified")
+    evidence.update(
+        {
+            "pdf_sha256": digest,
+            "page_number": page_number,
+            "source_xref": xref,
+            "included_asset_verified": True,
+        }
+    )
+    return evidence
+
+
+def _create_bound_embedded_image_plane(
+    *,
+    fc_doc,
+    image_group,
+    image_path: Path,
+    image_asset_evidence: Dict[str, Any],
+    page_number: int,
+    xref: int,
+    x_size: float,
+    y_size: float,
+    placement,
+):
+    """Create one ImagePlane, removing that exact object if binding fails."""
+
+    image_plane = None
+    added_to_group = False
+    try:
+        image_plane = fc_doc.addObject("Image::ImagePlane", "Image")
+        image_plane.XSize = x_size
+        image_plane.YSize = y_size
+        image_plane.Placement = placement
+        host_asset_evidence = _bind_embedded_image_host_asset(
+            image_plane,
+            image_path,
+            pdf_sha256=image_asset_evidence["pdf_sha256"],
+            page_number=page_number,
+            xref=xref,
+        )
+        if (
+            host_asset_evidence.get("source_asset_sha256")
+            != image_asset_evidence.get("source_asset_sha256")
+        ):
+            raise RuntimeError("embedded image host bytes changed before placement")
+        image_group.addObject(image_plane)
+        added_to_group = True
+        return image_plane, host_asset_evidence
+    except BaseException as failure:
+        cleanup_errors: List[str] = []
+        if image_plane is not None:
+            if added_to_group or image_plane in list(
+                getattr(image_group, "Group", []) or []
+            ):
+                try:
+                    image_group.removeObject(image_plane)
+                except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                    cleanup_errors.append("remove image from group: %s" % exc)
+            object_name = str(getattr(image_plane, "Name", "") or "")
+            try:
+                current = fc_doc.getObject(object_name) if object_name else None
+            except (AttributeError, RuntimeError, TypeError) as exc:
+                current = None
+                cleanup_errors.append("find image object: %s" % exc)
+            if current is image_plane:
+                try:
+                    fc_doc.removeObject(object_name)
+                except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                    cleanup_errors.append("remove image object: %s" % exc)
+            try:
+                still_live = bool(
+                    object_name and fc_doc.getObject(object_name) is image_plane
+                )
+            except (AttributeError, RuntimeError, TypeError) as exc:
+                still_live = True
+                cleanup_errors.append("verify image cleanup: %s" % exc)
+            if still_live:
+                cleanup_errors.append("exact ImagePlane remains after cleanup")
+        if cleanup_errors:
+            raise ImportCleanupError(
+                "embedded image placement cleanup failed",
+                details={
+                    "retryable": True,
+                    "entity_id": str(getattr(image_plane, "Name", "") or ""),
+                    "errors": cleanup_errors,
+                },
+            ) from failure
+        raise
+
+
+def _validated_page_visual_observation(
+    opts: ImportOptions,
+    page_number: int,
+) -> Dict[str, Any]:
+    """Return the exact retained v2 observation for one selected page."""
+
+    if type(page_number) is not int or page_number <= 0:
+        raise ValueError("source page number is invalid")
+    authority = getattr(opts, "_page_visual_authority", None)
+    scope_id = "p%d:page" % page_number
+    retained = getattr(opts, "page_visual_source_observations", {}).get(scope_id)
+    if authority is None:
+        raise ValueError("page visual source authority is unavailable")
+    try:
+        authoritative = authority.observation(page_number, scope_id)
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError("page visual authority does not cover the source page") from exc
+    if (
+        retained != authoritative
+        or not page_visual_source_observation_v2_verified(retained, authority)
+        or retained.get("pdf_sha256") != getattr(opts, "_pdf_sha256", None)
+    ):
+        raise ValueError("page visual source observation is invalid")
+    return copy.deepcopy(retained)
+
+
+def _validated_live_source_page(
+    page,
+    opts: ImportOptions,
+    page_number: int,
+    *,
+    document=None,
+) -> Dict[str, Any]:
+    """Reject a live page unless its parent retains the exact attempt bytes."""
+
+    source_bytes = _validated_pdf_source_bytes(opts)
+    parent = getattr(page, "parent", None)
+    if document is not None and parent is not document:
+        raise ValueError("live page does not belong to the supplied document")
+    parent_stream = getattr(parent, "stream", None)
+    page_index = getattr(page, "number", None)
+    if (
+        parent is None
+        or not isinstance(parent_stream, (bytes, bytearray, memoryview))
+        or bytes(parent_stream) != source_bytes
+        or hashlib.sha256(bytes(parent_stream)).hexdigest() != opts._pdf_sha256
+        or type(page_index) is not int
+        or page_index != page_number - 1
+    ):
+        raise ValueError("live page is not from the retained exact PDF bytes")
+    return _validated_page_visual_observation(opts, page_number)
+
+
+def _quad_points(quad) -> Tuple[Tuple[float, float], ...]:
+    return tuple(
+        (float(point.x), float(point.y))
+        for point in (quad.ul, quad.ur, quad.lr, quad.ll)
+    )
+
+
+def _canonical_page_manifest_value(value: Any) -> Any:
+    """Project PyMuPDF page structures into deterministic finite JSON."""
+
+    if value is None or type(value) in {bool, int, str}:
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("page manifest contains a non-finite number")
+        rounded = round(float(value), 9)
+        return 0.0 if rounded == 0.0 else rounded
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        payload = bytes(value)
+        return {
+            "byte_count": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    if isinstance(value, dict):
+        normalized: Dict[str, Any] = {}
+        for key, child in value.items():
+            normalized_key = str(key)
+            if normalized_key in normalized:
+                raise ValueError("page manifest keys are ambiguous")
+            normalized[normalized_key] = _canonical_page_manifest_value(child)
+        return normalized
+    if isinstance(value, (list, tuple)):
+        return [_canonical_page_manifest_value(child) for child in value]
+    try:
+        children = list(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("page manifest contains an unsupported value") from exc
+    return [_canonical_page_manifest_value(child) for child in children]
+
+
+def _page_manifest_digest(value: Any) -> str:
+    payload = _canonical_page_manifest_value(value)
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_page_manifest_json(value: Any) -> str:
+    return json.dumps(
+        _canonical_page_manifest_value(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _page_text_suppression_evidence_digest(evidence: Any) -> str:
+    """Digest one complete suppression proof, excluding only its own digest."""
+
+    if not isinstance(evidence, dict):
+        return ""
+    payload = {
+        key: value for key, value in evidence.items() if key != "evidence_sha256"
+    }
+    try:
+        return _page_manifest_digest(payload)
+    except (TypeError, ValueError, OverflowError):
+        return ""
+
+
+def _rawdict_printable_character_count(raw: Any) -> int:
+    if not isinstance(raw, dict) or not isinstance(raw.get("blocks"), list):
+        raise ValueError("page text dictionary is invalid")
+    count = 0
+    for block in raw["blocks"]:
+        if not isinstance(block, dict) or block.get("type") != 0:
+            continue
+        lines = block.get("lines")
+        if not isinstance(lines, list):
+            raise ValueError("page text lines are invalid")
+        for line in lines:
+            if not isinstance(line, dict) or not isinstance(line.get("spans"), list):
+                raise ValueError("page text spans are invalid")
+            for span in line["spans"]:
+                if not isinstance(span, dict):
+                    raise ValueError("page text span is invalid")
+                count += sum(1 for character in _raw_span_text(span) if not character.isspace())
+    return count
+
+
+def _page_nontext_bbox_manifest(page) -> List[Any]:
+    try:
+        bbox_log = page.get_bboxlog()
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("page non-text paint manifest is unavailable") from exc
+    if not isinstance(bbox_log, list):
+        raise ValueError("page non-text paint manifest is invalid")
+    return [
+        entry
+        for entry in bbox_log
+        if isinstance(entry, (list, tuple))
+        and entry
+        and "text" not in str(entry[0]).strip().lower()
+    ]
+
+
+def _page_drawing_manifest(page) -> List[Dict[str, Any]]:
+    try:
+        drawings = page.get_drawings()
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("page drawing manifest is unavailable") from exc
+    if not isinstance(drawings, list):
+        raise ValueError("page drawing manifest is invalid")
+    normalized: List[Dict[str, Any]] = []
+    for drawing in drawings:
+        if not isinstance(drawing, dict):
+            raise ValueError("page drawing entry is invalid")
+        normalized.append(
+            {key: value for key, value in drawing.items() if str(key) != "seqno"}
+        )
+    return normalized
+
+
+def _page_image_manifest(page) -> List[Dict[str, Any]]:
+    try:
+        images = page.get_image_info(xrefs=True)
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("page image manifest is unavailable") from exc
+    if not isinstance(images, list) or any(not isinstance(image, dict) for image in images):
+        raise ValueError("page image manifest is invalid")
+    return images
+
+
+def _page_annotation_manifest(page) -> List[Dict[str, Any]]:
+    """Capture every non-Redact annotation without retaining host objects."""
+
+    try:
+        annotations = list(page.annots() or ())
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("page annotation manifest is unavailable") from exc
+    redact_type = getattr(fitz, "PDF_ANNOT_REDACT", 12)
+    manifest: List[Dict[str, Any]] = []
+    for annotation in annotations:
+        annotation_type = getattr(annotation, "type", None)
+        code = annotation_type[0] if isinstance(annotation_type, tuple) else None
+        label = annotation_type[1] if isinstance(annotation_type, tuple) else ""
+        if code == redact_type or str(label).strip().lower() == "redact":
+            continue
+        try:
+            manifest.append(
+                {
+                    "xref": int(getattr(annotation, "xref", 0) or 0),
+                    "type": annotation_type,
+                    "rect": tuple(float(value) for value in annotation.rect),
+                    "flags": int(getattr(annotation, "flags", 0) or 0),
+                    "opacity": float(getattr(annotation, "opacity", 0.0) or 0.0),
+                    "info": dict(getattr(annotation, "info", {}) or {}),
+                    "colors": dict(getattr(annotation, "colors", {}) or {}),
+                    "border": dict(getattr(annotation, "border", {}) or {}),
+                    "vertices": list(getattr(annotation, "vertices", []) or []),
+                }
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            raise ValueError("page annotation entry is invalid") from exc
+    return manifest
+
+
+def _later_nontext_occlusions(page, text_rects: List[Any]) -> List[Dict[str, Any]]:
+    """Find paint after text that a structural overlay would incorrectly cover."""
+
+    try:
+        bbox_log = page.get_bboxlog()
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("page paint-order manifest is unavailable") from exc
+    if not isinstance(bbox_log, list):
+        raise ValueError("page paint-order manifest is invalid")
+    occlusions: List[Dict[str, Any]] = []
+    for text_index, text_rect_value in enumerate(text_rects):
+        text_rect = fitz.Rect(text_rect_value)
+        source_text_indexes = [
+            index
+            for index, entry in enumerate(bbox_log)
+            if isinstance(entry, (list, tuple))
+            and len(entry) >= 2
+            and "text" in str(entry[0]).strip().lower()
+            and _rectangles_overlap_with_area(entry[1], text_rect)
+        ]
+        if not source_text_indexes:
+            raise ValueError("canonical text has no matching paint-order entry")
+        first_text_index = min(source_text_indexes)
+        for paint_index, entry in enumerate(bbox_log):
+            if (
+                paint_index <= first_text_index
+                or not isinstance(entry, (list, tuple))
+                or len(entry) < 2
+                or "text" in str(entry[0]).strip().lower()
+                or not _rectangles_overlap_with_area(entry[1], text_rect)
+            ):
+                continue
+            occlusions.append(
+                {
+                    "text_region_index": text_index,
+                    "text_paint_index": first_text_index,
+                    "later_paint_index": paint_index,
+                    "later_paint_type": str(entry[0]),
+                }
+            )
+    return occlusions
+
+
+def _reject_unsafe_page_text_suppression_state(page) -> None:
+    """Reject source state that text-only redaction cannot isolate safely."""
+
+    try:
+        annotations = list(page.annots() or ())
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("page annotation state is unavailable") from exc
+    redact_type = getattr(fitz, "PDF_ANNOT_REDACT", 12)
+    for annotation in annotations:
+        annotation_type = getattr(annotation, "type", None)
+        code = annotation_type[0] if isinstance(annotation_type, tuple) else None
+        label = annotation_type[1] if isinstance(annotation_type, tuple) else ""
+        if code == redact_type or str(label).strip().lower() == "redact":
+            raise ValueError("page has a pre-existing Redact annotation")
+
+    try:
+        traces = page.get_texttrace()
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("page text render-mode evidence is unavailable") from exc
+    if not isinstance(traces, list):
+        raise ValueError("page text render-mode evidence is invalid")
+    unsupported = sorted(
+        {
+            int(trace.get("type"))
+            for trace in traces
+            if isinstance(trace, dict)
+            and type(trace.get("type")) is int
+            and int(trace["type"]) not in {0, 1, 2}
+        }
+    )
+    if unsupported:
+        raise ValueError(
+            "page uses invisible or clipping text render mode(s): %s"
+            % ", ".join(str(value) for value in unsupported)
+        )
+
+
+def _validated_text_only_redaction_actions() -> Tuple[int, int, int]:
+    """Return the exact PyMuPDF actions required for text-only redaction."""
+
+    required = (
+        ("PDF_REDACT_IMAGE_NONE", 0),
+        ("PDF_REDACT_LINE_ART_NONE", 0),
+        ("PDF_REDACT_TEXT_REMOVE", 0),
+    )
+    actions: List[int] = []
+    for name, expected in required:
+        value = getattr(fitz, name, None)
+        if type(value) is not int or value != expected:
+            raise ValueError(
+                "PyMuPDF text-only redaction action %s is unavailable or incompatible"
+                % name
+            )
+        actions.append(value)
+    return actions[0], actions[1], actions[2]
+
+
+def _text_delta_complement_pixmap(
+    original,
+    redacted,
+    *,
+    page_rect,
+    delivered_dpi: int,
+    text_rects: List[Any],
+) -> Tuple[Any, Dict[str, Any]]:
+    """Keep exact original pixels except where verified text redaction changed them."""
+
+    width = int(getattr(original, "width", 0) or 0)
+    height = int(getattr(original, "height", 0) or 0)
+    original_samples = bytes(getattr(original, "samples", b""))
+    redacted_samples = bytes(getattr(redacted, "samples", b""))
+    if (
+        width <= 0
+        or height <= 0
+        or int(getattr(original, "n", 0) or 0) != 4
+        or int(getattr(redacted, "n", 0) or 0) != 4
+        or not bool(getattr(original, "alpha", False))
+        or not bool(getattr(redacted, "alpha", False))
+        or int(getattr(redacted, "width", 0) or 0) != width
+        or int(getattr(redacted, "height", 0) or 0) != height
+        or len(original_samples) != width * height * 4
+        or len(redacted_samples) != len(original_samples)
+    ):
+        raise ValueError("page text suppression requires compatible RGBA pixmaps")
+    if type(delivered_dpi) is not int or delivered_dpi < 72 or not text_rects:
+        raise ValueError("page text suppression mask authority is invalid")
+
+    zoom = delivered_dpi / 72.0
+    margin_pixels = 2
+    row_intervals: Dict[int, List[Tuple[int, int]]] = {}
+    for value in text_rects:
+        rect = fitz.Rect(value) & fitz.Rect(page_rect)
+        if rect.is_empty or rect.width <= 0.0 or rect.height <= 0.0:
+            raise ValueError("canonical text region is empty")
+        x0 = max(0, int(math.floor((rect.x0 - page_rect.x0) * zoom)) - margin_pixels)
+        y0 = max(0, int(math.floor((rect.y0 - page_rect.y0) * zoom)) - margin_pixels)
+        x1 = min(width, int(math.ceil((rect.x1 - page_rect.x0) * zoom)) + margin_pixels)
+        y1 = min(height, int(math.ceil((rect.y1 - page_rect.y0) * zoom)) + margin_pixels)
+        if x1 <= x0 or y1 <= y0:
+            raise ValueError("canonical text pixel region is empty")
+        for row in range(y0, y1):
+            row_intervals.setdefault(row, []).append((x0, x1))
+    for row, intervals in row_intervals.items():
+        merged: List[Tuple[int, int]] = []
+        for start, end in sorted(intervals):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        row_intervals[row] = merged
+
+    output = bytearray(original_samples)
+    changed = 0
+    outside = 0
+    for y_value in range(height):
+        intervals = row_intervals.get(y_value, ())
+        row_start = y_value * width * 4
+        cursor = 0
+        for start, end in intervals:
+            gap_start = row_start + cursor * 4
+            gap_end = row_start + start * 4
+            if original_samples[gap_start:gap_end] != redacted_samples[gap_start:gap_end]:
+                outside += sum(
+                    1
+                    for offset in range(gap_start, gap_end, 4)
+                    if original_samples[offset : offset + 4]
+                    != redacted_samples[offset : offset + 4]
+                )
+            for x_value in range(start, end):
+                offset = row_start + x_value * 4
+                if (
+                    original_samples[offset : offset + 4]
+                    == redacted_samples[offset : offset + 4]
+                ):
+                    continue
+                output[offset : offset + 4] = b"\x00\x00\x00\x00"
+                changed += 1
+            cursor = end
+        gap_start = row_start + cursor * 4
+        gap_end = row_start + width * 4
+        if original_samples[gap_start:gap_end] != redacted_samples[gap_start:gap_end]:
+            outside += sum(
+                1
+                for offset in range(gap_start, gap_end, 4)
+                if original_samples[offset : offset + 4]
+                != redacted_samples[offset : offset + 4]
+            )
+    if changed <= 0:
+        raise ValueError("canonical page text changed no rendered pixels")
+    if outside:
+        raise ValueError(
+            "text-only redaction changed %d pixel(s) outside canonical text regions"
+            % outside
+        )
+    background = fitz.Pixmap(fitz.csRGB, width, height, bytes(output), True)
+    background_samples = bytes(background.samples)
+    if background_samples != bytes(output):
+        raise ValueError("text-suppressed page background samples changed")
+    return background, {
+        "original_samples_sha256": hashlib.sha256(original_samples).hexdigest(),
+        "redacted_samples_sha256": hashlib.sha256(redacted_samples).hexdigest(),
+        "background_samples_sha256": hashlib.sha256(background_samples).hexdigest(),
+        "changed_pixel_count": changed,
+        "unchanged_pixel_count": width * height - changed,
+        "changed_pixels_outside_text_regions": outside,
+        "changed_pixel_region_margin_pixels": margin_pixels,
+        "changed_pixels_within_text_regions": True,
+        "unchanged_pixels_preserved": True,
+        "changed_pixels_transparent": True,
+    }
+
+
+def _render_text_suppressed_page_background(
+    page,
+    opts: ImportOptions,
+    *,
+    page_number: int,
+    delivered_dpi: int,
+) -> Tuple[Any, Dict[str, Any]]:
+    """Render one exact Raster page background with canonical text paint punched out."""
+
+    if type(page_number) is not int or page_number <= 0:
+        raise ValueError("page number is invalid")
+    if type(delivered_dpi) is not int or delivered_dpi < 72:
+        raise ValueError("delivered page Raster DPI is invalid")
+    observation = _validated_live_source_page(
+        page,
+        opts,
+        page_number,
+        document=getattr(page, "parent", None),
+    )
+    raw = page.get_text("rawdict", sort=False)
+    source_items = list(
+        _iter_text_source_items(
+            raw,
+            page_number,
+            str(getattr(opts, "_pdf_sha256", "") or ""),
+            str(getattr(opts, "text_mode", "") or ""),
+        )
+    )
+    printable_count = _rawdict_printable_character_count(raw)
+    item_printable_count = sum(
+        sum(1 for character in str(item.get("text") or "") if not character.isspace())
+        for item in source_items
+    )
+    if not source_items and printable_count == 0 and item_printable_count == 0:
+        matrix = fitz.Matrix(delivered_dpi / 72.0, delivered_dpi / 72.0)
+        original = page.get_pixmap(matrix=matrix, alpha=True)
+        samples = bytes(getattr(original, "samples", b""))
+        if (
+            not samples
+            or int(getattr(original, "n", 0) or 0) != 4
+            or not bool(getattr(original, "alpha", False))
+        ):
+            raise ValueError("zero-text page did not render as exact RGBA")
+        nontext_digest = _page_manifest_digest(_page_nontext_bbox_manifest(page))
+        drawing_digest = _page_manifest_digest(_page_drawing_manifest(page))
+        image_digest = _page_manifest_digest(_page_image_manifest(page))
+        annotation_digest = _page_manifest_digest(_page_annotation_manifest(page))
+        samples_digest = hashlib.sha256(samples).hexdigest()
+        evidence = {
+            "schema": "bcs.freecad_page_text_suppression/1.0",
+            "verified": True,
+            "pdf_sha256": str(getattr(opts, "_pdf_sha256", "") or ""),
+            "page_number": page_number,
+            "page_visual_scope_id": "p%d:page" % page_number,
+            "page_visual_observation_sha256": observation["observation_sha256"],
+            "text_suppression_method": "none_no_canonical_text",
+            "redaction_method": "none_no_canonical_text",
+            "raster_content_variant": "original_page_no_canonical_text",
+            "source_text_item_ids": [],
+            "source_text_item_ids_sha256": _page_manifest_digest([]),
+            "source_text_item_count": 0,
+            "source_printable_character_count": 0,
+            "redaction_quad_count": 0,
+            "redaction_quads_sha256": _page_manifest_digest([]),
+            "rotated_text_item_count": 0,
+            "remaining_printable_character_count": 0,
+            "nontext_paint_before_sha256": nontext_digest,
+            "nontext_paint_after_sha256": nontext_digest,
+            "drawings_before_sha256": drawing_digest,
+            "drawings_after_sha256": drawing_digest,
+            "images_before_sha256": image_digest,
+            "images_after_sha256": image_digest,
+            "annotations_before_sha256": annotation_digest,
+            "annotations_after_sha256": annotation_digest,
+            "graphics_preserved": True,
+            "images_preserved": True,
+            "annotations_preserved": True,
+            "nontext_paint_preserved": True,
+            "underlay_structure_preserved": True,
+            "later_nontext_occlusion_count": 0,
+            "later_nontext_occlusion_verified": True,
+            "delivered_dpi": delivered_dpi,
+            "original_samples_sha256": samples_digest,
+            "redacted_samples_sha256": samples_digest,
+            "background_samples_sha256": samples_digest,
+            "changed_pixel_count": 0,
+            "unchanged_pixel_count": int(original.width) * int(original.height),
+            "changed_pixels_outside_text_regions": 0,
+            "changed_pixel_region_margin_pixels": 0,
+            "changed_pixels_within_text_regions": True,
+            "unchanged_pixels_preserved": True,
+            "changed_pixels_transparent": True,
+        }
+        evidence["evidence_sha256"] = _page_text_suppression_evidence_digest(evidence)
+        if not evidence["evidence_sha256"]:
+            raise ValueError("zero-text page evidence is not canonical")
+        return original, evidence
+    if not source_items or printable_count <= 0 or item_printable_count != printable_count:
+        raise ValueError("canonical page text regions are incomplete or ambiguous")
+    _reject_unsafe_page_text_suppression_state(page)
+
+    text_quads: List[Any] = []
+    text_rects: List[Any] = []
+    source_item_ids: List[str] = []
+    rotated_count = 0
+    for item in source_items:
+        block = raw["blocks"][item["block_index"]]
+        line = block["lines"][item["line_index"]]
+        span = line["spans"][item["span_index"]]
+        quad = fitz.recover_quad(line["dir"], span)
+        rect = quad.rect & page.rect
+        source_item_id = item.get("source_item_id")
+        if (
+            not isinstance(source_item_id, str)
+            or not source_item_id
+            or rect.is_empty
+            or rect.width <= 0.0
+            or rect.height <= 0.0
+        ):
+            raise ValueError("canonical page text region is invalid")
+        text_quads.append(quad)
+        text_rects.append(rect)
+        source_item_ids.append(source_item_id)
+        if abs(float(item.get("rotation_deg") or 0.0)) > 1e-7:
+            rotated_count += 1
+
+    before_nontext_digest = _page_manifest_digest(_page_nontext_bbox_manifest(page))
+    before_drawing_digest = _page_manifest_digest(_page_drawing_manifest(page))
+    before_image_digest = _page_manifest_digest(_page_image_manifest(page))
+    before_annotation_digest = _page_manifest_digest(_page_annotation_manifest(page))
+    later_occlusions = _later_nontext_occlusions(page, text_rects)
+    if later_occlusions:
+        raise ValueError(
+            "later non-text paint occludes %d canonical text region(s)"
+            % len({item["text_region_index"] for item in later_occlusions})
+        )
+    matrix = fitz.Matrix(delivered_dpi / 72.0, delivered_dpi / 72.0)
+    original = page.get_pixmap(matrix=matrix, alpha=True)
+    for quad in text_quads:
+        page.add_redact_annot(quad, fill=False, cross_out=False)
+    image_action, graphics_action, text_action = (
+        _validated_text_only_redaction_actions()
+    )
+    applied = page.apply_redactions(
+        images=image_action,
+        graphics=graphics_action,
+        text=text_action,
+    )
+    if applied is not True:
+        raise ValueError("all-text page redaction was not applied")
+    remaining_printable = _rawdict_printable_character_count(
+        page.get_text("rawdict", sort=False)
+    )
+    if remaining_printable != 0:
+        raise ValueError("canonical text remains after page text-only redaction")
+
+    after_nontext_digest = _page_manifest_digest(_page_nontext_bbox_manifest(page))
+    after_drawing_digest = _page_manifest_digest(_page_drawing_manifest(page))
+    after_image_digest = _page_manifest_digest(_page_image_manifest(page))
+    after_annotation_digest = _page_manifest_digest(_page_annotation_manifest(page))
+    graphics_preserved = before_drawing_digest == after_drawing_digest
+    images_preserved = before_image_digest == after_image_digest
+    nontext_paint_preserved = before_nontext_digest == after_nontext_digest
+    annotations_preserved = before_annotation_digest == after_annotation_digest
+    if (
+        not graphics_preserved
+        or not images_preserved
+        or not nontext_paint_preserved
+        or not annotations_preserved
+    ):
+        raise ValueError("page text redaction changed non-text source content")
+    redacted = page.get_pixmap(matrix=matrix, alpha=True)
+    background, delta_evidence = _text_delta_complement_pixmap(
+        original,
+        redacted,
+        page_rect=page.rect,
+        delivered_dpi=delivered_dpi,
+        text_rects=text_rects,
+    )
+    quad_points = [_quad_points(quad) for quad in text_quads]
+    evidence = {
+        "schema": "bcs.freecad_page_text_suppression/1.0",
+        "verified": True,
+        "pdf_sha256": str(getattr(opts, "_pdf_sha256", "") or ""),
+        "page_number": page_number,
+        "page_visual_scope_id": "p%d:page" % page_number,
+        "page_visual_observation_sha256": observation["observation_sha256"],
+        "text_suppression_method": (
+            "exact_source_original_with_all_text_delta_transparent"
+        ),
+        "redaction_method": "exact_span_quads_text_only_redaction",
+        "redaction_image_action": "PDF_REDACT_IMAGE_NONE",
+        "redaction_graphics_action": "PDF_REDACT_LINE_ART_NONE",
+        "redaction_text_action": "PDF_REDACT_TEXT_REMOVE",
+        "raster_content_variant": "text_suppressed_page_background",
+        "source_text_item_ids": source_item_ids,
+        "source_text_item_ids_sha256": _page_manifest_digest(source_item_ids),
+        "source_text_item_count": len(source_items),
+        "source_printable_character_count": printable_count,
+        "redaction_quad_count": len(text_quads),
+        "redaction_quads_sha256": _page_manifest_digest(quad_points),
+        "rotated_text_item_count": rotated_count,
+        "remaining_printable_character_count": remaining_printable,
+        "nontext_paint_before_sha256": before_nontext_digest,
+        "nontext_paint_after_sha256": after_nontext_digest,
+        "drawings_before_sha256": before_drawing_digest,
+        "drawings_after_sha256": after_drawing_digest,
+        "images_before_sha256": before_image_digest,
+        "images_after_sha256": after_image_digest,
+        "annotations_before_sha256": before_annotation_digest,
+        "annotations_after_sha256": after_annotation_digest,
+        "graphics_preserved": graphics_preserved,
+        "images_preserved": images_preserved,
+        "annotations_preserved": annotations_preserved,
+        "nontext_paint_preserved": nontext_paint_preserved,
+        "underlay_structure_preserved": True,
+        "later_nontext_occlusion_count": 0,
+        "later_nontext_occlusion_verified": True,
+        "delivered_dpi": delivered_dpi,
+        **delta_evidence,
+    }
+    evidence["evidence_sha256"] = _page_text_suppression_evidence_digest(evidence)
+    if not evidence["evidence_sha256"]:
+        raise ValueError("page text suppression evidence is not canonical")
+    return background, evidence
+
+
+def _rectangles_overlap_with_area(left, right) -> bool:
+    overlap = fitz.Rect(left) & fitz.Rect(right)
+    return bool(not overlap.is_empty and overlap.width > 1e-7 and overlap.height > 1e-7)
+
+
+def _resolve_raster_dpi_for_rect(
+    rect,
+    opts: ImportOptions,
+    *,
+    requested_dpi: Optional[int] = None,
+) -> Tuple[int, int, int, bool]:
+    """Resolve requested/delivered DPI without silently weakening user policy."""
+
+    requested = max(
+        72,
+        int(
+            requested_dpi
+            if requested_dpi is not None
+            else (getattr(opts, "raster_dpi", 200) or 200)
+        ),
+    )
+    budget = _raster_pixel_budget()
+    area = max(1.0, float(rect.width) * float(rect.height))
+    pixels = area * ((requested / 72.0) ** 2)
+    delivered = requested
+    if pixels > budget:
+        delivered = max(
+            72,
+            min(requested, int(math.floor(math.sqrt(budget / area) * 72.0))),
+        )
+    degraded = delivered != requested
+    if (
+        degraded
+        and bool(getattr(opts, "raster_dpi_user_set", False))
+        and not bool(getattr(opts, "allow_raster_dpi_degradation", False))
+    ):
+        raise RuntimeError(
+            "explicit raster DPI %d exceeds the %d pixel safety budget"
+            % (requested, budget)
+        )
+    return requested, delivered, budget, degraded
+
+
+def _transparent_pixmap_delta(original, redacted):
+    """Keep original RGBA only where redaction changed a pixel."""
+
+    width = int(getattr(original, "width", 0) or 0)
+    height = int(getattr(original, "height", 0) or 0)
+    original_samples = bytes(getattr(original, "samples", b""))
+    redacted_samples = bytes(getattr(redacted, "samples", b""))
+    if (
+        width <= 0
+        or height <= 0
+        or int(getattr(original, "n", 0) or 0) != 4
+        or int(getattr(redacted, "n", 0) or 0) != 4
+        or not bool(getattr(original, "alpha", False))
+        or not bool(getattr(redacted, "alpha", False))
+        or int(getattr(redacted, "width", 0) or 0) != width
+        or int(getattr(redacted, "height", 0) or 0) != height
+        or len(original_samples) != width * height * 4
+        or len(redacted_samples) != len(original_samples)
+    ):
+        raise ValueError("raster isolation samples are incompatible RGBA pixmaps")
+    output = bytearray(len(original_samples))
+    changed = 0
+    unchanged = 0
+    for offset in range(0, len(original_samples), 4):
+        original_pixel = original_samples[offset : offset + 4]
+        redacted_pixel = redacted_samples[offset : offset + 4]
+        if original_pixel == redacted_pixel:
+            unchanged += 1
+            continue
+        output[offset : offset + 4] = original_pixel
+        changed += 1
+    if changed <= 0:
+        raise ValueError("redaction changed no source pixels")
+    isolated = fitz.Pixmap(fitz.csRGB, width, height, bytes(output), True)
+    isolated_samples = bytes(isolated.samples)
+    if any(isolated_samples[offset + 3] != 0 for offset in range(0, len(output), 4) if output[offset : offset + 4] == b"\x00\x00\x00\x00"):
+        raise ValueError("unchanged raster pixels are not transparent")
+    return isolated, {
+        "original_samples_sha256": hashlib.sha256(original_samples).hexdigest(),
+        "redacted_samples_sha256": hashlib.sha256(redacted_samples).hexdigest(),
+        "isolated_samples_sha256": hashlib.sha256(isolated_samples).hexdigest(),
+        "changed_pixel_count": changed,
+        "unchanged_pixel_count": unchanged,
+        "unchanged_pixels_transparent": True,
+        "transparent_alpha_preserved": True,
+    }
+
+
+def _exact_source_text_item_and_quad(
+    page,
+    item: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Any, int]:
+    """Re-extract one canonical span and prove no other text intersects its quad."""
+
+    raw = page.get_text("rawdict", sort=False)
+    requested = item.get("requested_type")
+    candidates = list(
+        _iter_text_source_items(
+            raw,
+            int(item.get("page_number")),
+            str(item.get("pdf_sha256")),
+            str(requested),
+        )
+    )
+    exact = next(
+        (candidate for candidate in candidates if candidate["source_item_id"] == item.get("source_item_id")),
+        None,
+    )
+    identity_fields = (
+        "importer_identity",
+        "pdf_sha256",
+        "page_number",
+        "source_item_id",
+        "requested_type",
+        "text",
+        "font_identity",
+        "bbox",
+        "origin",
+        "line_direction",
+        "rotation_deg",
+        "span",
+        "block_index",
+        "line_index",
+        "span_index",
+    )
+    if exact is None or any(exact.get(field) != item.get(field) for field in identity_fields):
+        raise ValueError("canonical source text item changed on the exact source pass")
+    block = raw["blocks"][exact["block_index"]]
+    line = block["lines"][exact["line_index"]]
+    span = line["spans"][exact["span_index"]]
+    quad = fitz.recover_quad(line["dir"], span)
+    target_rect = quad.rect
+    intersections = sum(
+        1
+        for candidate in candidates
+        if candidate["source_item_id"] != exact["source_item_id"]
+        and _rectangles_overlap_with_area(candidate["bbox"], target_rect)
+    )
+    return exact, quad, intersections
+
+
+def _render_isolated_text_item_pixmap(
+    item: Dict[str, Any],
+    opts: ImportOptions,
+) -> Tuple[Any, Any, Dict[str, Any]]:
+    """Render only one exact source span using an original/redacted delta."""
+
+    page_number = int(item["page_number"])
+    observation = _validated_page_visual_observation(opts, page_number)
+    with _open_pdf_source_attempt(opts) as source_document:
+        source_page = source_document.load_page(page_number - 1)
+        exact, quad, intersections = _exact_source_text_item_and_quad(source_page, item)
+        if intersections:
+            raise ValueError(
+                "target text quad intersects %d other canonical text item(s)" % intersections
+            )
+        clip = quad.rect & source_page.rect
+        if clip.is_empty or clip.width <= 0.0 or clip.height <= 0.0:
+            raise ValueError("source item raster clip is empty")
+        requested_dpi, delivered_dpi, pixel_budget, degraded = (
+            _resolve_raster_dpi_for_rect(clip, opts)
+        )
+        matrix = fitz.Matrix(delivered_dpi / 72.0, delivered_dpi / 72.0)
+        original = source_page.get_pixmap(matrix=matrix, clip=clip, alpha=True)
+        source_page.add_redact_annot(quad, fill=False)
+        applied = source_page.apply_redactions(images=0, graphics=0, text=0)
+        if applied is not True:
+            raise ValueError("exact target text redaction was not applied")
+        redacted = source_page.get_pixmap(matrix=matrix, clip=clip, alpha=True)
+        isolated, delta_evidence = _transparent_pixmap_delta(original, redacted)
+    evidence = {
+        "isolation_method": "exact_source_original_minus_target_redacted",
+        "source_quad": _quad_points(quad),
+        "source_clip": (float(clip.x0), float(clip.y0), float(clip.x1), float(clip.y1)),
+        "source_line_direction": tuple(exact["line_direction"]),
+        "source_rotation_deg": float(exact["rotation_deg"]),
+        "other_text_intersection_count": intersections,
+        "requested_dpi": requested_dpi,
+        "delivered_dpi": delivered_dpi,
+        "dpi": delivered_dpi,
+        "dpi_degraded": degraded,
+        "pixel_budget": pixel_budget,
+        "page_visual_scope_id": "p%d:page" % page_number,
+        "page_visual_observation_sha256": observation["observation_sha256"],
+        "page_visual_session_anchor_sha256": getattr(
+            opts, "_page_visual_session_anchor", {}
+        ).get("session_anchor_sha256"),
+        "source_page_observation_verified": True,
+        **delta_evidence,
+    }
+    return isolated, clip, evidence
+
+
+def _source_image_occurrences(page) -> List[Dict[str, Any]]:
+    """Return one strict record per displayed image occurrence, never per xref."""
+
+    raw_occurrences = page.get_image_info(xrefs=True)
+    if not isinstance(raw_occurrences, list):
+        raise ValueError("image occurrence extractor returned no list")
+    occurrences: List[Dict[str, Any]] = []
+    for index, raw in enumerate(raw_occurrences):
+        if not isinstance(raw, dict):
+            raise ValueError("image occurrence is not a dictionary")
+        bbox = _finite_source_tuple(raw.get("bbox"), 4, "image.bbox")
+        transform = _finite_source_tuple(raw.get("transform"), 6, "image.transform")
+        width = raw.get("width")
+        height = raw.get("height")
+        xref = raw.get("xref", 0)
+        number = raw.get("number")
+        digest_value = raw.get("digest")
+        if isinstance(digest_value, (bytes, bytearray, memoryview)):
+            image_digest = bytes(digest_value).hex()
+        elif isinstance(digest_value, str):
+            image_digest = digest_value.strip().lower()
+        else:
+            image_digest = ""
+        if (
+            bbox[2] <= bbox[0]
+            or bbox[3] <= bbox[1]
+            or type(width) is not int
+            or width <= 0
+            or type(height) is not int
+            or height <= 0
+            or type(xref) is not int
+            or xref < 0
+            or type(number) is not int
+            or not image_digest
+        ):
+            raise ValueError("displayed image occurrence identity is invalid")
+        occurrences.append(
+            {
+                "source_occurrence_index": index,
+                "source_number": number,
+                "source_xref": xref,
+                "source_bbox": bbox,
+                "source_transform": transform,
+                "source_width": width,
+                "source_height": height,
+                "source_colorspace": int(raw.get("colorspace", 0) or 0),
+                "source_bpc": int(raw.get("bpc", 0) or 0),
+                "source_xres": int(raw.get("xres", 0) or 0),
+                "source_yres": int(raw.get("yres", 0) or 0),
+                "source_encoded_size": int(raw.get("size", 0) or 0),
+                "source_image_digest": image_digest,
+                "source_has_mask": bool(raw.get("has-mask", False)),
+            }
+        )
+    return occurrences
+
+
+def _render_isolated_image_occurrence_pixmap(
+    opts: ImportOptions,
+    *,
+    page_number: int,
+    occurrence: Dict[str, Any],
+) -> Tuple[Any, Any, Dict[str, Any]]:
+    """Capture one image occurrence's exact page appearance as transparent RGBA."""
+
+    observation = _validated_page_visual_observation(opts, page_number)
+    occurrence_index = occurrence.get("source_occurrence_index")
+    if type(occurrence_index) is not int or occurrence_index < 0:
+        raise ValueError("source image occurrence index is invalid")
+    with _open_pdf_source_attempt(opts) as source_document:
+        page = source_document.load_page(page_number - 1)
+        fresh_occurrences = _source_image_occurrences(page)
+        if occurrence_index >= len(fresh_occurrences):
+            raise ValueError("source image occurrence is absent on the exact pass")
+        exact = fresh_occurrences[occurrence_index]
+        if exact != occurrence:
+            raise ValueError("source image occurrence changed on the exact pass")
+        target_rect = fitz.Rect(exact["source_bbox"])
+        overlapping = [
+            candidate["source_occurrence_index"]
+            for candidate in fresh_occurrences
+            if candidate["source_occurrence_index"] != occurrence_index
+            and _rectangles_overlap_with_area(candidate["source_bbox"], target_rect)
+        ]
+        if overlapping:
+            raise ValueError(
+                "image occurrence isolation is ambiguous with occurrences %s"
+                % overlapping
+            )
+        clip = target_rect & page.rect
+        if clip.is_empty or clip.width <= 0.0 or clip.height <= 0.0:
+            raise ValueError("image occurrence clip is empty")
+        requested_dpi, delivered_dpi, pixel_budget, degraded = (
+            _resolve_raster_dpi_for_rect(clip, opts)
+        )
+        matrix = fitz.Matrix(delivered_dpi / 72.0, delivered_dpi / 72.0)
+        original = page.get_pixmap(matrix=matrix, clip=clip, alpha=True)
+        page.add_redact_annot(target_rect, fill=False)
+        applied = page.apply_redactions(images=1, graphics=0, text=1)
+        if applied is not True:
+            raise ValueError("exact image occurrence redaction was not applied")
+        redacted = page.get_pixmap(matrix=matrix, clip=clip, alpha=True)
+        isolated, delta_evidence = _transparent_pixmap_delta(original, redacted)
+    evidence = {
+        **copy.deepcopy(occurrence),
+        "isolation_method": "exact_source_original_minus_image_redacted",
+        "source_clip": (float(clip.x0), float(clip.y0), float(clip.x1), float(clip.y1)),
+        "overlapping_image_occurrence_indexes": [],
+        "requested_dpi": requested_dpi,
+        "delivered_dpi": delivered_dpi,
+        "dpi": delivered_dpi,
+        "dpi_degraded": degraded,
+        "pixel_budget": pixel_budget,
+        "page_visual_scope_id": "p%d:page" % page_number,
+        "page_visual_observation_sha256": observation["observation_sha256"],
+        "source_page_observation_verified": True,
+        "ctm_preserved_by_page_render_delta": True,
+        "clip_preserved_by_page_render_delta": True,
+        "mask_alpha_opacity_preserved_by_page_render_delta": True,
+        **delta_evidence,
+    }
+    return isolated, clip, evidence
+
+
+def _bind_embedded_occurrence_host_evidence(
+    host_obj,
+    evidence: Dict[str, Any],
+) -> str:
+    """Persist the exact occurrence CTM/isolation binding on its ImagePlane."""
+
+    canonical = {
+        key: copy.deepcopy(evidence[key])
+        for key in (
+            "source_occurrence_index",
+            "source_number",
+            "source_xref",
+            "source_bbox",
+            "source_transform",
+            "source_width",
+            "source_height",
+            "source_image_digest",
+            "source_has_mask",
+            "source_clip",
+            "original_samples_sha256",
+            "redacted_samples_sha256",
+            "isolated_samples_sha256",
+            "page_visual_observation_sha256",
+        )
+    }
+    encoded = json.dumps(
+        canonical,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    add_property = getattr(host_obj, "addProperty", None)
+    if not callable(add_property):
+        raise RuntimeError("ImagePlane cannot persist occurrence evidence")
+    properties = set(getattr(host_obj, "PropertiesList", []) or [])
+    for property_type, property_name in (
+        ("App::PropertyInteger", "PDFImageOccurrenceIndex"),
+        ("App::PropertyString", "PDFImageOccurrenceJSON"),
+        ("App::PropertyString", "PDFImageOccurrenceEvidenceSHA256"),
+        ("App::PropertyBool", "PDFImageSourceHasMask"),
+    ):
+        if property_name not in properties:
+            add_property(property_type, property_name, "PDF Import")
+            properties.add(property_name)
+    host_obj.PDFImageOccurrenceIndex = int(evidence["source_occurrence_index"])
+    host_obj.PDFImageOccurrenceJSON = encoded
+    host_obj.PDFImageOccurrenceEvidenceSHA256 = digest
+    host_obj.PDFImageSourceHasMask = bool(evidence["source_has_mask"])
+    if (
+        int(getattr(host_obj, "PDFImageOccurrenceIndex", -1))
+        != evidence["source_occurrence_index"]
+        or str(getattr(host_obj, "PDFImageOccurrenceJSON", "")) != encoded
+        or str(getattr(host_obj, "PDFImageOccurrenceEvidenceSHA256", "")) != digest
+        or bool(getattr(host_obj, "PDFImageSourceHasMask", False))
+        is not bool(evidence["source_has_mask"])
+    ):
+        raise RuntimeError("embedded image occurrence host binding failed")
+    return digest
+
+
+def _import_embedded_image_occurrences(
+    *,
+    opts: ImportOptions,
+    page_number: int,
+    page_h: float,
+    scale: float,
+    fc_doc,
+    image_group,
+) -> Dict[str, Any]:
+    """Import every displayed image occurrence once with full visual CTM fidelity."""
+
+    observation = _validated_page_visual_observation(opts, int(page_number))
+    with _open_pdf_source_attempt(opts) as source_document:
+        source_page = source_document.load_page(int(page_number) - 1)
+        occurrences = _source_image_occurrences(source_page)
+    displayed_count = observation.get("images", {}).get("displayed_count")
+    if type(displayed_count) is not int or displayed_count != len(occurrences):
+        raise ImportLifecycleError("v2 image occurrence count does not match exact source")
+
+    results: List[Dict[str, Any]] = []
+    for occurrence in occurrences:
+        _invoke_import_cancellation_checkpoint(opts, "embedded image occurrence")
+        pix, clip, isolation_evidence = _render_isolated_image_occurrence_pixmap(
+            opts,
+            page_number=int(page_number),
+            occurrence=occurrence,
+        )
+        image_path, asset_evidence = _persist_content_addressed_pixmap(
+            pix,
+            opts,
+            asset_kind="embedded",
+        )
+        image_asset_evidence = {
+            **asset_evidence,
+            "pdf_sha256": str(opts._pdf_sha256),
+            "page_number": int(page_number),
+            "source_xref": int(occurrence["source_xref"]),
+        }
+        transformed = [
+            _to_fc(point, float(page_h), opts, float(scale))
+            for point in (
+                (clip.x0, clip.y0),
+                (clip.x0, clip.y1),
+                (clip.x1, clip.y0),
+                (clip.x1, clip.y1),
+            )
+        ]
+        xs = [float(point.x) for point in transformed]
+        ys = [float(point.y) for point in transformed]
+        x_size = max(xs) - min(xs)
+        y_size = max(ys) - min(ys)
+        if x_size <= 0.0 or y_size <= 0.0:
+            raise ImportLifecycleError("embedded image occurrence placement has no area")
+        host_obj = None
+        try:
+            host_obj, host_asset_evidence = _create_bound_embedded_image_plane(
+                fc_doc=fc_doc,
+                image_group=image_group,
+                image_path=image_path,
+                image_asset_evidence=image_asset_evidence,
+                page_number=int(page_number),
+                xref=int(occurrence["source_xref"]),
+                x_size=x_size,
+                y_size=y_size,
+                placement=Placement(
+                    _v(min(xs), min(ys), 0),
+                    Rotation(),
+                ),
+            )
+            occurrence_evidence_sha256 = _bind_embedded_occurrence_host_evidence(
+                host_obj,
+                isolation_evidence,
+            )
+            actual_anchor = _host_anchor_xyz(host_obj)
+            if (
+                actual_anchor is None
+                or abs(actual_anchor[2]) > 1e-7
+                or not math.isclose(float(host_obj.XSize), x_size, abs_tol=1e-7)
+                or not math.isclose(float(host_obj.YSize), y_size, abs_tol=1e-7)
+            ):
+                raise RuntimeError("embedded image occurrence placement is invalid")
+        except BaseException:
+            if host_obj is not None:
+                _remove_owned_text_objects(fc_doc, image_group, [host_obj])
+            raise
+        results.append(
+            {
+                **isolation_evidence,
+                **asset_evidence,
+                **host_asset_evidence,
+                "occurrence_evidence_sha256": occurrence_evidence_sha256,
+                "entity_id": _host_object_id(host_obj),
+                "x_size": float(x_size),
+                "y_size": float(y_size),
+                "anchor_xyz": tuple(actual_anchor),
+                "raster_file_included": True,
+                "raster_file_included_property_bound": True,
+            }
+        )
+    return {
+        "count": len(results),
+        "occurrences": results,
+        "page_visual_classification": observation.get("classification"),
+        "image_only_single_occurrence_reused": bool(
+            observation.get("classification") == "image_only" and len(results) == 1
+        ),
+    }
 
 
 def _deliver_text_item_raster(
@@ -7023,6 +12517,22 @@ def _deliver_text_item_raster(
         )
 
     try:
+        ladder_context = _validated_raster_ladder_context(bound_item, attempted_type)
+    except ValueError as exc:
+        fail(
+            "invalid_raster_ladder_prefix",
+            {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+        )
+
+    try:
+        _validated_live_source_page(page, opts, int(page_number))
+    except ValueError as exc:
+        fail(
+            "raster_source_page_identity_mismatch",
+            {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+        )
+
+    try:
         source_ink_evidence = _validated_source_ink_evidence(bound_item)
     except ValueError as exc:
         fail(
@@ -7034,48 +12544,26 @@ def _deliver_text_item_raster(
         )
 
     try:
-        dpi = max(72, int(getattr(opts, "raster_dpi", 200) or 200))
-        clip = fitz.Rect(*bbox)
-        page_rect = page.rect
-        clip &= fitz.Rect(
-            float(page_rect.x0),
-            float(page_rect.y0),
-            float(page_rect.x1),
-            float(page_rect.y1),
+        pix, clip, isolation_evidence = _render_isolated_text_item_pixmap(
+            bound_item,
+            opts,
         )
-        if clip.is_empty or clip.width <= 0.0 or clip.height <= 0.0:
-            raise ValueError("source item raster clip is empty")
-        zoom = dpi / 72.0
-        pix = page.get_pixmap(
-            matrix=fitz.Matrix(zoom, zoom),
-            clip=clip,
-            alpha=True,
+        image_path, asset_evidence = _persist_content_addressed_pixmap(
+            pix,
+            opts,
+            asset_kind="text",
         )
-        if int(getattr(pix, "width", 0) or 0) <= 0 or int(
-            getattr(pix, "height", 0) or 0
-        ) <= 0:
-            raise RuntimeError("source item raster contains no pixels")
-        cache_key = hashlib.sha256(
-            (
-                "%s|%d|%s|%.9g,%.9g,%.9g,%.9g|%d"
-                % (
-                    bound_item.get("pdf_sha256"),
-                    page_number,
-                    source_item_id,
-                    clip.x0,
-                    clip.y0,
-                    clip.x1,
-                    clip.y1,
-                    dpi,
-                )
-            ).encode("utf-8")
-        ).hexdigest()
-        asset_dir = _raster_asset_dir()
-        image_path = asset_dir / ("text_%s.png" % cache_key)
-        _save_pixmap_atomic(pix, image_path)
-        if not image_path.is_file() or image_path.stat().st_size <= 0:
-            raise RuntimeError("source item raster was not persisted")
-        raster_sha256 = _path_sha256(image_path)
+        raster_sha256 = asset_evidence["source_asset_sha256"]
+    except ValueError as exc:
+        if "intersects" in str(exc) or "canonical source text item changed" in str(exc):
+            fail(
+                "raster_item_isolation_unproven",
+                {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+            )
+        fail(
+            "raster_text_render_failed",
+            {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
+        )
     except Exception as exc:
         fail(
             "raster_text_render_failed",
@@ -7096,7 +12584,7 @@ def _deliver_text_item_raster(
         ys = [float(point.y) for point in transformed]
         expected_width = max(xs) - min(xs)
         expected_height = max(ys) - min(ys)
-        expected_anchor = (min(xs), min(ys), -0.05)
+        expected_anchor = (min(xs), min(ys), 0.0)
         if expected_width <= 0.0 or expected_height <= 0.0:
             raise ValueError("source item raster placement has no area")
         host_obj = fc_doc.addObject("Image::ImagePlane", "PDF_Text_Raster")
@@ -7181,10 +12669,11 @@ def _deliver_text_item_raster(
             "host_entity_type": "Image::ImagePlane",
             "raster_file": str(image_path),
             "raster_file_included": True,
+            "raster_file_included_property_bound": True,
             "pdf_sha256": pdf_sha256,
             "pixel_width": int(pix.width),
             "pixel_height": int(pix.height),
-            "dpi": dpi,
+            "dpi": int(isolation_evidence["delivered_dpi"]),
             "source_bbox": bbox,
             "expected_anchor_xyz": expected_anchor,
             "verified_anchor_xyz": tuple(actual_anchor),
@@ -7193,7 +12682,10 @@ def _deliver_text_item_raster(
             "source_text": source_text,
             "source_ink_evidence": copy.deepcopy(source_ink_evidence),
             "source_ink_evidence_persisted": True,
+            "raster_ladder_context": copy.deepcopy(ladder_context),
+            **isolation_evidence,
             **_source_ink_delivery_binding_fields(bound_item, source_ink_evidence),
+            **asset_evidence,
             **raster_file_evidence,
         },
     }
@@ -7222,7 +12714,30 @@ def _deliver_text_item_3d(
     creation_started = False
     ownership_collection_failed = False
     ownership_collection_error = ""
+    latest_current_objects: Optional[List[Any]] = None
     source_ink_evidence: Optional[Dict[str, Any]] = None
+
+    raw_source_ink = bound_item.get("source_ink_evidence")
+    if (
+        bound_item.get("parent_source_item_id") is None
+        and isinstance(raw_source_ink, dict)
+        and raw_source_ink.get("classification")
+        == "mixed_visible_and_zero_ink"
+    ):
+        return _deliver_mixed_source_ink_segments(
+            bound_item,
+            attempted_type,
+            opts,
+            deliver_child=lambda child: _deliver_text_item_3d(
+                child,
+                attempted_type,
+                opts,
+                text_group=text_group,
+                page_h=page_h,
+                scale=scale,
+            ),
+            text_group=text_group,
+        )
 
     def add_owned(obj) -> None:
         if obj is not None and baseline_valid and id(obj) in baseline_objects:
@@ -7232,6 +12747,7 @@ def _deliver_text_item_3d(
 
     def collect_owned() -> Optional[str]:
         nonlocal ownership_collection_failed, ownership_collection_error
+        nonlocal latest_current_objects
         if doc is None:
             return None
         if not baseline_valid:
@@ -7240,6 +12756,7 @@ def _deliver_text_item_3d(
             return ownership_collection_error or "prior ownership collection failed"
         try:
             current_objects = list(getattr(doc, "Objects", []) or [])
+            latest_current_objects = current_objects
         except Exception as exc:
             error = "%s: %s" % (exc.__class__.__name__, exc)
             if creation_started:
@@ -7368,9 +12885,6 @@ def _deliver_text_item_3d(
         block_index = bound_item.get("block_index")
         line_index = bound_item.get("line_index")
         span_index = bound_item.get("span_index")
-        expected_source_id = "p%d:b%d:l%d:s%d" % (
-            page_number, block_index, line_index, span_index
-        )
         pdf_sha256 = bound_item.get("pdf_sha256")
         source_text = bound_item.get("text")
         font_identity = bound_item.get("font_identity")
@@ -7383,7 +12897,7 @@ def _deliver_text_item_3d(
                 type(index) is not int or index < 0
                 for index in (block_index, line_index, span_index)
             )
-            or source_item_id != expected_source_id
+            or not _canonical_or_segment_source_id_matches(bound_item)
             or not isinstance(pdf_sha256, str)
             or re.fullmatch(r"[0-9a-f]{64}", pdf_sha256) is None
             or not isinstance(source_text, str)
@@ -7505,7 +13019,12 @@ def _deliver_text_item_3d(
                 add_property("App::PropertyString", "String", "PDF Import")
             host_obj.String = source_text
             host_obj.Placement = placement
-            _annotate_text_host_object(host_obj, source_item_id, "3d_text")
+            _annotate_text_host_object(
+                host_obj,
+                source_item_id,
+                "3d_text",
+                parent_source_item_id=bound_item.get("parent_source_item_id"),
+            )
             _persist_text_style_metadata(
                 host_obj,
                 font_name=normalized_font,
@@ -7534,6 +13053,8 @@ def _deliver_text_item_3d(
                 or str(getattr(host_obj, "TypeId", "") or "") != "Part::Feature"
                 or getattr(host_obj, "String", None) != source_text
                 or getattr(host_obj, "PDFSourceItemId", None) != source_item_id
+                or getattr(host_obj, "PDFParentSourceItemId", None)
+                != bound_item.get("parent_source_item_id")
                 or getattr(host_obj, "PDFRepresentation", None) != "3d_text"
                 or getattr(host_obj, "PDFTextVisibility", None) is not False
                 or getattr(host_obj, "PDFSourceInkClassification", None)
@@ -7610,72 +13131,235 @@ def _deliver_text_item_3d(
             {"attempted_source_results": source_results},
         )
 
-    exhaustive_absence = bool(
-        font_path is None
-        and len(source_results) == 2
-        and [result.get("source") for result in source_results]
-        == ["embedded_font", "system_font"]
-        and all(result.get("outcome") == "not_found" for result in source_results)
-    )
-    if exhaustive_absence:
-        attempt = {
-            "source_item_id": source_item_id,
-            "requested_type": requested_type,
-            "attempted_type": "3d_text",
-            "final_type": None,
-            "outcome": "proven_impossible",
-            "reason_code": "exact_font_unavailable",
-            "created_entity_ids": [],
-            "removed_entity_ids": [],
-            "cleanup_complete": True,
-        }
-        proof = {
-            "item_specific_proven_impossible": True,
-            "importer_identity": FREECAD_TEXT_IMPORTER_IDENTITY,
-            "pdf_sha256": pdf_sha256,
-            "page_number": page_number,
-            "source_item_id": source_item_id,
-            "requested_type": requested_type,
-            "attempted_type": "3d_text",
-            "reason_code": "exact_font_unavailable",
-            "font_identity": dict(font_identity),
-            "evidence": {
-                "normalized_key": font_identity["normalized_key"],
-                "exact_sources": ["embedded_font", "system_font"],
-                "exhaustive": True,
-            },
-            "attempted_source_results": source_results,
-            "attempted_sources_complete": True,
-            "created_entity_ids": [],
-            "removed_entity_ids": [],
-            "cleanup_complete": True,
-        }
-        raise TextItemImpossible(
-            "Exact source font is unavailable for %s" % source_item_id,
-            attempt=attempt,
-            proof=proof,
-        )
-
+    font_delivery_evidence: Optional[Dict[str, Any]] = None
     found_results = [
         result for result in source_results if result.get("outcome") == "found"
     ]
     if (
-        not isinstance(font_path, str)
-        or not font_path
-        or font_path != font_path.strip()
-        or len(found_results) != 1
-        or source_results[-1] is not found_results[0]
-        or found_results[0].get("path") != font_path
-        or any(
-            result.get("outcome") not in {"not_found", "found"}
+        any(
+            result.get("outcome") not in {"not_found", "found", "invalid"}
             for result in source_results
         )
+        or len(found_results) > 1
+        or (
+            found_results
+            and (
+                not isinstance(font_path, str)
+                or not font_path
+                or font_path != font_path.strip()
+                or source_results[-1] is not found_results[0]
+                or found_results[0].get("path") != font_path
+            )
+        )
+        or (not found_results and font_path is not None)
     ):
         terminal_failure(
             "exact_font_resolution_invalid",
             {"attempted_source_results": source_results},
         )
-    font_source_result = copy.deepcopy(found_results[0])
+
+    exact_rejection: Optional[Dict[str, Any]] = None
+    font_source_result: Dict[str, Any]
+    if found_results:
+        font_source_result = copy.deepcopy(found_results[0])
+        try:
+            approved_root_value = font_source_result.get("approved_font_root")
+            if (
+                not isinstance(approved_root_value, str)
+                or not approved_root_value
+                or not Path(approved_root_value).is_absolute()
+            ):
+                raise RuntimeError("exact font approved root is missing")
+            exact_path, exact_font_bytes, exact_sha256 = _read_stable_font_asset(
+                font_path,
+                approved_root=approved_root_value,
+            )
+            declared_sha256 = str(font_source_result.get("sha256") or "")
+            if (
+                re.fullmatch(r"[0-9a-f]{64}", declared_sha256) is None
+                or declared_sha256 != exact_sha256
+            ):
+                raise RuntimeError("exact font digest does not match source evidence")
+            internal_identity = _font_internal_identity_evidence(
+                exact_font_bytes,
+                font_identity,
+            )
+            exact_source = str(font_source_result.get("source") or "")
+            identity_verified = bool(
+                internal_identity.get("font_identity_verified") is True
+            )
+            if not identity_verified:
+                raise RuntimeError("exact font internal identity is not verified")
+            exact_coverage = _font_bytes_glyph_coverage(
+                exact_font_bytes,
+                source_text,
+            )
+            if exact_coverage.get("glyph_coverage_verified") is not True:
+                exact_rejection = {
+                    "reason": "exact_font_glyph_coverage_invalid",
+                    "path": str(exact_path),
+                    "sha256": exact_sha256,
+                    "glyph_coverage": exact_coverage,
+                }
+            else:
+                font_path = str(exact_path)
+                font_delivery_evidence = {
+                    "source_font_equivalence": True,
+                    "font_substitution_applied": False,
+                    "font_identity_verified": True,
+                    **copy.deepcopy(exact_coverage),
+                    "font_candidate_source": exact_source,
+                    "source_font_asset_path": str(exact_path),
+                    "source_font_asset_sha256": exact_sha256,
+                    "delivered_font_sha256": exact_sha256,
+                    "font_internal_identity_evidence": internal_identity,
+                    "font_internal_identity_sha256": internal_identity[
+                        "evidence_sha256"
+                    ],
+                    "font_coverage_evidence_sha256": exact_coverage[
+                        "coverage_evidence_sha256"
+                    ],
+                    "font_coverage_evidence": copy.deepcopy(exact_coverage),
+                    "_selected_font_bytes": exact_font_bytes,
+                    "_selected_font_path": str(exact_path),
+                    "_selected_font_approved_root": str(
+                        Path(approved_root_value).resolve(strict=True)
+                    ),
+                    "path": str(exact_path),
+                }
+        except Exception as exc:
+            exact_rejection = {
+                "reason": "exact_font_asset_invalid",
+                "path": str(font_path or ""),
+                "exception": "%s: %s" % (exc.__class__.__name__, exc),
+            }
+    elif any(result.get("outcome") == "invalid" for result in source_results):
+        exact_rejection = {
+            "reason": "exact_font_source_invalid",
+            "attempted_source_results": copy.deepcopy(source_results),
+        }
+
+    if font_delivery_evidence is None:
+        exact_path_to_exclude = (
+            str(font_path)
+            if isinstance(font_path, str) and font_path
+            else ""
+        )
+        substitute_path, substitute_evidence = _select_no_cost_font_substitute(
+            source_text,
+            exclude_paths=[exact_path_to_exclude] if exact_path_to_exclude else None,
+        )
+        if (
+            substitute_path is None
+            or substitute_evidence.get("glyph_coverage_verified") is not True
+        ):
+            terminal_failure(
+                "no_cost_font_substitute_unavailable",
+                {
+                    "attempted_source_results": source_results,
+                    "exact_font_rejection": exact_rejection,
+                    "font_substitution_evidence": substitute_evidence,
+                },
+            )
+        try:
+            candidate_path_value = substitute_evidence.get("_selected_font_path")
+            candidate_bytes = substitute_evidence.get("_selected_font_bytes")
+            approved_root_value = substitute_evidence.get(
+                "_selected_font_approved_root"
+            )
+            if (
+                not isinstance(candidate_path_value, str)
+                or not candidate_path_value
+                or not isinstance(candidate_bytes, bytes)
+                or not candidate_bytes
+                or not isinstance(approved_root_value, str)
+                or not approved_root_value
+            ):
+                raise RuntimeError("substitute immutable selection is incomplete")
+            candidate_path = Path(candidate_path_value)
+            if (
+                str(candidate_path) != str(substitute_path)
+                or not candidate_path.is_absolute()
+                or not Path(approved_root_value).is_absolute()
+                or not _path_is_within(candidate_path, Path(approved_root_value))
+            ):
+                raise RuntimeError("substitute path/root selection is invalid")
+            candidate_sha256 = hashlib.sha256(candidate_bytes).hexdigest()
+            if candidate_sha256 != substitute_evidence.get(
+                "source_font_asset_sha256"
+            ):
+                raise RuntimeError("substitute font changed after bounded selection")
+            internal_identity = _font_internal_identity_evidence(
+                candidate_bytes,
+                font_identity,
+            )
+            coverage_sha256 = substitute_evidence.get(
+                "coverage_evidence_sha256"
+            )
+            coverage_evidence = substitute_evidence.get("font_coverage_evidence")
+            if (
+                re.fullmatch(r"[0-9a-f]{64}", str(coverage_sha256 or "")) is None
+                or not isinstance(coverage_evidence, dict)
+                or coverage_evidence.get("coverage_evidence_sha256")
+                != coverage_sha256
+                or _font_evidence_digest(coverage_evidence) != coverage_sha256
+            ):
+                raise RuntimeError("substitute glyph coverage evidence is incomplete")
+        except Exception as exc:
+            terminal_failure(
+                "no_cost_font_substitute_invalid",
+                {
+                    "attempted_source_results": source_results,
+                    "exact_font_rejection": exact_rejection,
+                    "font_substitution_evidence": substitute_evidence,
+                    "exception": "%s: %s" % (exc.__class__.__name__, exc),
+                },
+            )
+        font_path = str(candidate_path)
+        font_delivery_evidence = {
+            **copy.deepcopy(substitute_evidence),
+            "source_font_equivalence": False,
+            "font_substitution_applied": True,
+            "font_identity_verified": False,
+            "source_font_asset_path": str(candidate_path),
+            "source_font_asset_sha256": candidate_sha256,
+            "delivered_font_sha256": candidate_sha256,
+            "font_internal_identity_evidence": internal_identity,
+            "font_internal_identity_sha256": internal_identity["evidence_sha256"],
+            "font_coverage_evidence": copy.deepcopy(coverage_evidence),
+            "font_coverage_evidence_sha256": coverage_sha256,
+            "exact_font_rejection": exact_rejection,
+            "path": str(candidate_path),
+        }
+        font_source_result = {
+            "source": font_delivery_evidence["font_candidate_source"],
+            "outcome": "found",
+            "font_identity": dict(font_identity),
+            "path": str(candidate_path),
+            "sha256": candidate_sha256,
+            "pdf_sha256": pdf_sha256,
+            "page_number": page_number,
+            "staging_complete": True,
+        }
+
+    try:
+        font_path, font_delivery_evidence = _stage_shapestring_font_asset(
+            font_path,
+            font_delivery_evidence,
+            opts,
+        )
+        if not _verify_staged_shapestring_font_asset(font_delivery_evidence):
+            raise RuntimeError("staged font failed pre-ShapeString digest verification")
+    except Exception as exc:
+        terminal_failure(
+            "font_asset_staging_failed",
+            {
+                "attempted_source_results": source_results,
+                "exact_font_rejection": exact_rejection,
+                "font_delivery_evidence": font_delivery_evidence,
+                "exception": "%s: %s" % (exc.__class__.__name__, exc),
+            },
+        )
 
     if (
         Draft is None
@@ -7758,9 +13442,6 @@ def _deliver_text_item_3d(
         if shape_string is None:
             raise RuntimeError("Draft ShapeString returned no host object")
         add_owned(shape_string)
-        collection_error = collect_owned()
-        if collection_error:
-            raise RuntimeError("owned object collection failed: %s" % collection_error)
     except Exception as exc:
         terminal_failure(
             "shapestring_creation_failed",
@@ -7768,6 +13449,15 @@ def _deliver_text_item_3d(
                 "attempted_source_results": source_results,
                 "font_path": font_path,
                 "exception": "%s: %s" % (exc.__class__.__name__, exc),
+            },
+        )
+    if not _verify_staged_shapestring_font_asset(font_delivery_evidence):
+        terminal_failure(
+            "staged_font_digest_changed",
+            {
+                "attempted_source_results": source_results,
+                "font_delivery_evidence": font_delivery_evidence,
+                "verification_point": "after_shapestring_creation",
             },
         )
 
@@ -7784,7 +13474,12 @@ def _deliver_text_item_3d(
             # page-end document recompute has nothing left to re-execute.
             nonlocal stage
             stage = "host_annotation"
-            _annotate_text_host_object(host_obj, source_item_id, "3d_text")
+            _annotate_text_host_object(
+                host_obj,
+                source_item_id,
+                "3d_text",
+                parent_source_item_id=bound_item.get("parent_source_item_id"),
+            )
             _persist_source_ink_evidence(host_obj, source_ink_evidence)
             stage = "source_color"
             _persist_text_style_metadata(
@@ -7793,6 +13488,50 @@ def _deliver_text_item_3d(
                 font_size=font_size_fc,
                 source_color=source_color,
             )
+            if font_delivery_evidence is not None:
+                _persist_font_delivery_metadata(
+                    host_obj,
+                    source_font_equivalence=font_delivery_evidence[
+                        "source_font_equivalence"
+                    ],
+                    font_substitution_applied=font_delivery_evidence[
+                        "font_substitution_applied"
+                    ],
+                    font_identity_verified=font_delivery_evidence[
+                        "font_identity_verified"
+                    ],
+                    glyph_coverage_verified=font_delivery_evidence[
+                        "glyph_coverage_verified"
+                    ],
+                    delivered_font_sha256=font_delivery_evidence[
+                        "delivered_font_sha256"
+                    ],
+                    font_candidate_source=font_delivery_evidence[
+                        "font_candidate_source"
+                    ],
+                    delivered_font_path=font_delivery_evidence["staged_font_path"],
+                    source_font_asset_path=font_delivery_evidence[
+                        "source_font_asset_path"
+                    ],
+                    source_font_asset_sha256=font_delivery_evidence[
+                        "source_font_asset_sha256"
+                    ],
+                    staged_font_path=font_delivery_evidence["staged_font_path"],
+                    staged_font_sha256=font_delivery_evidence["staged_font_sha256"],
+                    staged_asset_verified=font_delivery_evidence[
+                        "staged_asset_verified"
+                    ],
+                    staged_asset_read_only=font_delivery_evidence[
+                        "staged_asset_read_only"
+                    ],
+                    font_internal_identity_sha256=font_delivery_evidence[
+                        "font_internal_identity_sha256"
+                    ],
+                    font_coverage_evidence_sha256=font_delivery_evidence[
+                        "font_coverage_evidence_sha256"
+                    ],
+                    source_font_identity=font_identity,
+                )
             _apply_text_color(host_obj, source_color)
             stage = "calibration_extrusion"
 
@@ -7864,6 +13603,8 @@ def _deliver_text_item_3d(
         source_text_preserved = getattr(shape_string, "String", None) == source_text
         source_item_id_verified = all(
             getattr(host_obj, "PDFSourceItemId", None) == source_item_id
+            and getattr(host_obj, "PDFParentSourceItemId", None)
+            == bound_item.get("parent_source_item_id")
             and getattr(host_obj, "PDFRepresentation", None) == "3d_text"
             for host_obj in required_objects
         )
@@ -7872,6 +13613,14 @@ def _deliver_text_item_3d(
             == source_ink_evidence["classification"]
             and getattr(host_obj, "PDFSourceInkEvidenceSHA256", None)
             == source_ink_evidence["evidence_sha256"]
+            for host_obj in required_objects
+        )
+        font_delivery_metadata_persisted = all(
+            _host_font_delivery_metadata_matches(
+                host_obj,
+                font_delivery_evidence,
+                font_identity,
+            )
             for host_obj in required_objects
         )
         verified_rotation_deg = _host_text_rotation_deg(shape_string)
@@ -7898,7 +13647,9 @@ def _deliver_text_item_3d(
         shape = getattr(extrusion, "Shape", None)
         solids = list(getattr(shape, "Solids", []) or []) if shape is not None else []
         volume = float(getattr(shape, "Volume", 0.0) or 0.0) if shape is not None else 0.0
-        live_objects = list(getattr(doc, "Objects", []) or [])
+        if latest_current_objects is None:
+            raise RuntimeError("owned object collection did not retain its live snapshot")
+        live_objects = latest_current_objects
         if (
             not ids_complete
             or not created_ids
@@ -7907,6 +13658,7 @@ def _deliver_text_item_3d(
             or not source_text_preserved
             or not source_item_id_verified
             or not source_ink_evidence_persisted
+            or not font_delivery_metadata_persisted
             or str(getattr(extrusion, "TypeId", "") or "") != "Part::Extrusion"
             or shape is None
             or bool(getattr(shape, "isNull", lambda: True)())
@@ -7934,6 +13686,16 @@ def _deliver_text_item_3d(
             },
         )
 
+    if not _verify_staged_shapestring_font_asset(font_delivery_evidence):
+        terminal_failure(
+            "staged_font_digest_changed",
+            {
+                "attempted_source_results": source_results,
+                "font_delivery_evidence": font_delivery_evidence,
+                "verification_point": "after_host_persistence",
+            },
+        )
+
     return {
         "source_item_id": source_item_id,
         "requested_type": requested_type,
@@ -7945,6 +13707,7 @@ def _deliver_text_item_3d(
         "support_entity_ids": required_ids[:2],
         "removed_entity_ids": [],
         "cleanup_complete": True,
+        "delivery_count": 1,
         "evidence": {
             "source_text": source_text,
             "source_text_preserved": True,
@@ -7962,6 +13725,7 @@ def _deliver_text_item_3d(
             "verified_advance": float(verified_advance_fc),
             "font_path": font_path,
             "font_source_result": font_source_result,
+            **(copy.deepcopy(font_delivery_evidence) if font_delivery_evidence else {}),
             "nominal_height": float(font_size_fc),
             "horizontal_scale": float(horizontal_scale),
             "extrusion_depth": float(depth),
@@ -8909,7 +14673,16 @@ def _render_canonical_text_items(
     items = list(
         _iter_text_source_items(source_dict, int(page_num), pdf_sha256, requested)
     )
-    items = _bind_page_text_source_ink_evidence(page, source_dict, items)
+    items = _bind_page_text_source_ink_evidence(
+        page,
+        source_dict,
+        items,
+        opts=opts,
+    )
+    _register_text_delivery_obligations(
+        opts,
+        [str(item["source_item_id"]) for item in items],
+    )
 
     font_stage_complete = False
     svg_render_cache: Dict[str, Any] = {
@@ -9013,6 +14786,7 @@ def _render_canonical_text_items(
         "raster": "raster_text_patch",
     }
     for item in items:
+        _invoke_import_cancellation_checkpoint(opts, "text item")
         result = _run_text_item_fallback_ladder(item, requested, deliverers, opts)
         results.append(result)
         source_item_id = str(result["source_item_id"])
@@ -9101,6 +14875,260 @@ def _preprocess_text_blocks(tdict: dict) -> dict:
     return tdict
 
 
+def _bind_page_text_suppression_delivery_evidence(
+    raster_result: Any,
+    text_entity_info: Any,
+    *,
+    page_number: int,
+) -> Dict[str, Any]:
+    """Bind a page background suppression proof to the text IDs it delivered."""
+
+    if type(page_number) is not int or page_number <= 0:
+        raise ImportLifecycleError("page Raster text-suppression page is invalid")
+    raster_evidence = (
+        raster_result.get("evidence") if isinstance(raster_result, dict) else None
+    )
+    suppression_evidence = (
+        raster_evidence.get("page_text_suppression")
+        if isinstance(raster_evidence, dict)
+        else None
+    )
+    if (
+        not isinstance(suppression_evidence, dict)
+        or suppression_evidence.get("verified") is not True
+        or suppression_evidence.get("page_number") != page_number
+    ):
+        raise ImportLifecycleError(
+            "page %d Raster text-suppression evidence is invalid" % page_number
+        )
+    variant = suppression_evidence.get("raster_content_variant")
+    if (
+        variant not in {
+            "text_suppressed_page_background",
+            "original_page_no_canonical_text",
+        }
+        or raster_evidence.get("raster_content_variant") != variant
+    ):
+        raise ImportLifecycleError(
+            "page %d Raster text-suppression variant is invalid" % page_number
+        )
+    stored_digest = suppression_evidence.get("evidence_sha256")
+    canonical_digest = _page_text_suppression_evidence_digest(suppression_evidence)
+    if (
+        not isinstance(stored_digest, str)
+        or not stored_digest
+        or stored_digest != canonical_digest
+        or raster_evidence.get("page_text_suppression_evidence_sha256")
+        != stored_digest
+    ):
+        raise ImportLifecycleError(
+            "page %d Raster text-suppression evidence digest is stale or invalid"
+            % page_number
+        )
+    suppressed_source_ids = suppression_evidence.get("source_text_item_ids")
+    delivered_source_ids = (
+        text_entity_info.get("source_item_ids")
+        if isinstance(text_entity_info, dict)
+        else None
+    )
+    for source_ids in (suppressed_source_ids, delivered_source_ids):
+        if (
+            not isinstance(source_ids, list)
+            or any(not isinstance(value, str) or not value for value in source_ids)
+            or len(set(source_ids)) != len(source_ids)
+        ):
+            raise ImportLifecycleError(
+                "page %d Raster text source IDs are invalid" % page_number
+            )
+    if (
+        suppression_evidence.get("source_text_item_count")
+        != len(suppressed_source_ids)
+        or delivered_source_ids != suppressed_source_ids
+    ):
+        raise ImportLifecycleError(
+            "page %d Raster text suppression does not exactly match the delivered "
+            "structural text source IDs" % page_number
+        )
+    suppression_evidence["delivered_source_text_item_ids"] = list(
+        delivered_source_ids
+    )
+    suppression_evidence["delivered_source_text_item_ids_sha256"] = (
+        _page_manifest_digest(delivered_source_ids)
+    )
+    suppression_evidence["delivery_source_item_ids_bound"] = True
+    bound_digest = _page_text_suppression_evidence_digest(suppression_evidence)
+    if not bound_digest:
+        raise ImportLifecycleError(
+            "page %d Raster text-suppression delivery binding is not canonical"
+            % page_number
+        )
+    suppression_evidence["evidence_sha256"] = bound_digest
+    raster_evidence["page_text_suppression_evidence_sha256"] = bound_digest
+    if (
+        _page_text_suppression_evidence_digest(suppression_evidence)
+        != bound_digest
+    ):
+        raise ImportLifecycleError(
+            "page %d Raster text-suppression delivery digest could not be verified"
+            % page_number
+        )
+    return suppression_evidence
+
+
+def _persist_page_text_suppression_host_binding(
+    fc_doc,
+    raster_result: Any,
+    suppression_evidence: Any,
+    *,
+    page_number: int,
+) -> Dict[str, Any]:
+    """Persist and reread the delivery-bound suppression proof on its ImagePlane."""
+
+    if (
+        not isinstance(raster_result, dict)
+        or not isinstance(suppression_evidence, dict)
+        or type(page_number) is not int
+        or page_number <= 0
+    ):
+        raise ImportLifecycleError("page Raster text-suppression host binding is invalid")
+    entity_ids = raster_result.get("created_entity_ids")
+    if (
+        not isinstance(entity_ids, list)
+        or len(entity_ids) != 1
+        or not isinstance(entity_ids[0], str)
+        or not entity_ids[0]
+    ):
+        raise ImportLifecycleError(
+            "page %d Raster text-suppression host identity is invalid" % page_number
+        )
+    entity_id = entity_ids[0]
+    try:
+        host_obj = fc_doc.getObject(entity_id)
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        raise ImportLifecycleError(
+            "page %d Raster text-suppression host is unavailable" % page_number
+        ) from exc
+    if (
+        host_obj is None
+        or _host_object_id(host_obj) != entity_id
+        or str(getattr(host_obj, "TypeId", "") or "") != "Image::ImagePlane"
+        or str(getattr(host_obj, "PDFSourceItemId", "") or "")
+        != "p%d:page" % page_number
+        or str(getattr(host_obj, "PDFRepresentation", "") or "") != "raster"
+    ):
+        raise ImportLifecycleError(
+            "page %d Raster text-suppression host does not match its delivery"
+            % page_number
+        )
+
+    source_ids = suppression_evidence.get("source_text_item_ids")
+    delivered_ids = suppression_evidence.get("delivered_source_text_item_ids")
+    evidence_digest = suppression_evidence.get("evidence_sha256")
+    if (
+        not isinstance(source_ids, list)
+        or not isinstance(delivered_ids, list)
+        or source_ids != delivered_ids
+        or suppression_evidence.get("delivery_source_item_ids_bound") is not True
+        or evidence_digest
+        != _page_text_suppression_evidence_digest(suppression_evidence)
+    ):
+        raise ImportLifecycleError(
+            "page %d Raster text-suppression delivery proof is invalid" % page_number
+        )
+
+    evidence_json = _canonical_page_manifest_json(suppression_evidence)
+    source_ids_json = _canonical_page_manifest_json(source_ids)
+    delivered_ids_json = _canonical_page_manifest_json(delivered_ids)
+    expected = {
+        "PDFRasterContentVariant": suppression_evidence["raster_content_variant"],
+        "PDFTextSuppressionSchema": suppression_evidence["schema"],
+        "PDFTextSuppressionMethod": suppression_evidence["text_suppression_method"],
+        "PDFTextSuppressionEvidenceJSON": evidence_json,
+        "PDFTextSuppressionEvidenceSHA256": evidence_digest,
+        "PDFTextSuppressionSourceItemIDsJSON": source_ids_json,
+        "PDFTextSuppressionSourceItemIDsSHA256": suppression_evidence[
+            "source_text_item_ids_sha256"
+        ],
+        "PDFTextSuppressionSourceItemCount": len(source_ids),
+        "PDFTextSuppressionDeliveredItemIDsJSON": delivered_ids_json,
+        "PDFTextSuppressionDeliveredItemIDsSHA256": suppression_evidence[
+            "delivered_source_text_item_ids_sha256"
+        ],
+        "PDFTextSuppressionDeliveryBound": True,
+        "PDFTextSuppressionVerified": True,
+    }
+    property_types = {
+        name: (
+            "App::PropertyInteger"
+            if name == "PDFTextSuppressionSourceItemCount"
+            else (
+                "App::PropertyBool"
+                if name
+                in {"PDFTextSuppressionDeliveryBound", "PDFTextSuppressionVerified"}
+                else "App::PropertyString"
+            )
+        )
+        for name in expected
+    }
+    add_property = getattr(host_obj, "addProperty", None)
+    if not callable(add_property):
+        raise ImportLifecycleError(
+            "page %d Raster host cannot persist text-suppression evidence"
+            % page_number
+        )
+    properties = set(getattr(host_obj, "PropertiesList", []) or [])
+    try:
+        for property_name, property_type in property_types.items():
+            if property_name not in properties:
+                add_property(property_type, property_name, "PDF Import")
+                properties.add(property_name)
+        for property_name, value in expected.items():
+            setattr(host_obj, property_name, value)
+        fc_doc.recompute()
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        raise ImportLifecycleError(
+            "page %d Raster text-suppression host properties could not be written"
+            % page_number
+        ) from exc
+
+    for property_name, expected_value in expected.items():
+        try:
+            actual_value = getattr(host_obj, property_name)
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            raise ImportLifecycleError(
+                "page %d Raster text-suppression host property is unreadable"
+                % page_number
+            ) from exc
+        if (
+            actual_value != expected_value
+            or _host_property_type_id(host_obj, property_name)
+            != property_types[property_name]
+        ):
+            raise ImportLifecycleError(
+                "page %d Raster text-suppression host property did not persist"
+                % page_number
+            )
+    snapshot = _host_page_text_suppression_snapshot(host_obj)
+    if snapshot.get("page_text_suppression_binding_verified") is not True:
+        raise ImportLifecycleError(
+            "page %d Raster text-suppression host reread could not be verified"
+            % page_number
+        )
+    raster_evidence = raster_result.get("evidence")
+    if not isinstance(raster_evidence, dict):
+        raise ImportLifecycleError(
+            "page %d Raster evidence disappeared during host binding" % page_number
+        )
+    raster_evidence.update(
+        {
+            "page_text_suppression_host_entity_id": entity_id,
+            "page_text_suppression_host_binding_verified": True,
+            "page_text_suppression_host_snapshot": copy.deepcopy(snapshot),
+        }
+    )
+    return snapshot
+
+
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -9108,72 +15136,124 @@ def _preprocess_text_blocks(tdict: dict) -> dict:
 # ──────────────────────────────────────────────────────────────────────
 def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
                            opts: ImportOptions, scale: float,
-                           parent, fc_doc):
+                           parent, fc_doc, *,
+                           suppress_structural_text: bool = False):
     """Render, persist, place, and reread one verified full-page ImagePlane."""
-    del pdf_doc, page_h
-    dpi = opts.raster_dpi or 200
+    del page_h
+    if type(suppress_structural_text) is not bool:
+        raise ValueError("page Raster text-suppression policy must be boolean")
+    try:
+        raster_request_context = _validated_page_raster_request_context(
+            opts,
+            int(page_num),
+        )
+        observation = _validated_live_source_page(
+            page,
+            opts,
+            int(page_num),
+            document=pdf_doc,
+        )
+        source_bytes = _validated_pdf_source_bytes(opts)
+        digest = hashlib.sha256(source_bytes).hexdigest()
+    except (TypeError, ValueError) as exc:
+        raise ImportLifecycleError("full-page Raster source identity is invalid") from exc
 
-    # Adaptive DPI: scale with page physical size so the image is always
-    # readable without wasting memory on large sheets.
-    #   A4 / Letter   (≤ 700 cm²)  → 200 DPI (default)
-    #   A3 / Tabloid  (700–2000 cm²) → 300 DPI (maps need more detail)
-    #   A2 and larger (> 2000 cm²) → 150 DPI (save memory, still readable)
-    if not opts.raster_dpi_user_set:   # only adjust when user hasn't explicitly set a value
-        w_cm = page.rect.width  * MM_PER_PT / 10.0
-        h_cm = page.rect.height * MM_PER_PT / 10.0
+    requested_dpi = max(72, int(getattr(opts, "raster_dpi", 200) or 200))
+    adaptive_dpi = requested_dpi
+    if not bool(getattr(opts, "raster_dpi_user_set", False)):
+        w_cm = float(page.rect.width) * MM_PER_PT / 10.0
+        h_cm = float(page.rect.height) * MM_PER_PT / 10.0
         area_cm2 = w_cm * h_cm
         if area_cm2 > 2000:
-            dpi = 150
+            adaptive_dpi = 150
         elif area_cm2 > 700:
-            dpi = 300
-
-    dpi, pixel_budget, was_capped = _cap_raster_dpi(page, dpi)
-    if was_capped:
-        _warn(
-            f"Page {page_num}: raster DPI capped to {dpi} "
-            f"({pixel_budget:,} pixel budget)"
+            adaptive_dpi = 300
+    requested_dpi, delivered_dpi, pixel_budget, dpi_degraded = (
+        _resolve_raster_dpi_for_rect(
+            page.rect,
+            opts,
+            requested_dpi=adaptive_dpi,
         )
+    )
 
+    candidates = [delivered_dpi]
+    explicit_strict = bool(
+        getattr(opts, "raster_dpi_user_set", False)
+        and not getattr(opts, "allow_raster_dpi_degradation", False)
+    )
+    if not explicit_strict:
+        for candidate in (max(96, delivered_dpi // 2), 96):
+            if candidate not in candidates:
+                candidates.append(candidate)
     pix = None
+    text_suppression_evidence = None
     last_error = None
-    retry_dpis = []
-    for candidate in (dpi, max(96, dpi // 2), 96):
-        if candidate not in retry_dpis:
-            retry_dpis.append(candidate)
-    for candidate in retry_dpis:
-        try:
-            zoom = candidate / 72.0
-            mat = fitz.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=mat)
-            dpi = candidate
-            break
-        except (RuntimeError, MemoryError, ValueError, OverflowError) as e:
-            last_error = e
-            _warn(
-                f"Page {page_num}: raster render failed at {candidate} DPI: {e}"
-            )
+    attempted_dpis: List[int] = []
+    for candidate in candidates:
+        with _open_pdf_source_attempt(opts) as source_document:
+            source_page = source_document.load_page(int(page_num) - 1)
+            attempted_dpis.append(candidate)
+            _invoke_import_cancellation_checkpoint(opts, "raster render retry")
+            try:
+                if suppress_structural_text:
+                    pix, text_suppression_evidence = (
+                        _render_text_suppressed_page_background(
+                            source_page,
+                            opts,
+                            page_number=int(page_num),
+                            delivered_dpi=int(candidate),
+                        )
+                    )
+                else:
+                    zoom = candidate / 72.0
+                    pix = source_page.get_pixmap(
+                        matrix=fitz.Matrix(zoom, zoom),
+                        alpha=True,
+                    )
+                delivered_dpi = candidate
+                break
+            except ValueError as exc:
+                if suppress_structural_text:
+                    raise ImportLifecycleError(
+                        "page %d text-suppressed Raster background is not provable: %s"
+                        % (int(page_num), exc)
+                    ) from exc
+                last_error = exc
+            except (RuntimeError, MemoryError, OverflowError) as exc:
+                last_error = exc
+                if explicit_strict:
+                    break
+                _warn(
+                    "Page %d: raster render failed at %d DPI: %s"
+                    % (page_num, candidate, exc)
+                )
     if pix is None:
         raise RuntimeError(
-            "Raster render failed after retries: %s" % (last_error or "unknown error")
+            "Raster render failed at required DPI: %s" % (last_error or "unknown error")
         )
-
-    digest = str(getattr(opts, "_pdf_sha256", "") or "").strip().lower()
-    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
-        digest = hashlib.sha256(
-            ("page=%d|dpi=%d|w=%.9g|h=%.9g" % (
-                page_num, dpi, float(page.rect.width), float(page.rect.height)
-            )).encode("utf-8")
-        ).hexdigest()
-    asset_dir = _raster_asset_dir()
-    asset_dir.mkdir(parents=True, exist_ok=True)
-    img_path = asset_dir / ("page_%s_p%d_%ddpi.png" % (digest, page_num, dpi))
+    dpi_degraded = delivered_dpi != requested_dpi
+    if dpi_degraded and explicit_strict:
+        raise RuntimeError("explicit raster DPI was not delivered exactly")
     try:
-        _save_pixmap_atomic(pix, img_path)
+        img_path, asset_evidence = _persist_content_addressed_pixmap(
+            pix,
+            opts,
+            asset_kind="page",
+        )
     except (RuntimeError, OSError, ValueError, TypeError) as exc:
         raise RuntimeError("Raster asset could not be persisted: %s" % exc) from exc
-    if not img_path.is_file() or img_path.stat().st_size <= 0:
-        raise RuntimeError("Raster asset was not persisted")
-    raster_sha256 = _path_sha256(img_path)
+    raster_sha256 = asset_evidence["source_asset_sha256"]
+    raster_content_variant = (
+        str(text_suppression_evidence.get("raster_content_variant") or "")
+        if suppress_structural_text and isinstance(text_suppression_evidence, dict)
+        else "full_page_original"
+    )
+    if raster_content_variant not in {
+        "full_page_original",
+        "text_suppressed_page_background",
+        "original_page_no_canonical_text",
+    }:
+        raise RuntimeError("full-page Raster content variant is invalid")
 
     # Match the vector/text transform exactly: PDF page units multiplied by the
     # effective import scale (MM_PER_PT when scale_to_mm is enabled, plus any
@@ -9190,7 +15270,7 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
         ip.ImageFile = str(img_path)
         ip.XSize = w_units
         ip.YSize = h_units
-        ip.Placement = Placement(_v(0, 0, -0.1), Rotation())  # slightly behind vectors
+        ip.Placement = Placement(_v(0, 0, 0), Rotation())
         add_property = getattr(ip, "addProperty", None)
         if not callable(add_property):
             raise RuntimeError("ImagePlane cannot embed its raster asset")
@@ -9203,6 +15283,13 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
         if "PDFRasterSHA256" not in set(getattr(ip, "PropertiesList", []) or []):
             add_property("App::PropertyString", "PDFRasterSHA256", "PDF Import")
         ip.PDFRasterSHA256 = raster_sha256
+        if "PDFRasterContentVariant" not in set(
+            getattr(ip, "PropertiesList", []) or []
+        ):
+            add_property(
+                "App::PropertyString", "PDFRasterContentVariant", "PDF Import"
+            )
+        ip.PDFRasterContentVariant = raster_content_variant
         _annotate_text_host_object(ip, "p%d:page" % int(page_num), "raster")
         parent.addObject(ip)
         fc_doc.recompute()
@@ -9217,12 +15304,16 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
             or str(getattr(ip, "PDFSourceSHA256", "")) != digest
             or str(getattr(ip, "PDFRasterSHA256", ""))
             != raster_file_evidence["source_asset_sha256"]
+            or str(getattr(ip, "PDFRasterContentVariant", ""))
+            != raster_content_variant
+            or _host_property_type_id(ip, "PDFRasterContentVariant")
+            != "App::PropertyString"
             or not math.isclose(float(ip.XSize), float(w_units), abs_tol=1e-7)
             or not math.isclose(float(ip.YSize), float(h_units), abs_tol=1e-7)
             or anchor is None
             or any(
                 abs(anchor[index] - expected) > 1e-7
-                for index, expected in enumerate((0.0, 0.0, -0.1))
+                for index, expected in enumerate((0.0, 0.0, 0.0))
             )
             or getattr(ip, "PDFSourceItemId", None) != "p%d:page" % int(page_num)
             or getattr(ip, "PDFRepresentation", None) != "raster"
@@ -9237,7 +15328,7 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
         raise RuntimeError("Raster placement failed: %s" % exc) from exc
 
     _msg(
-        f"Placed page {page_num} as {dpi} DPI raster "
+        f"Placed page {page_num} as {delivered_dpi} DPI raster "
         f"({w_units:.0f} x {h_units:.0f} model units)"
     )
     return {
@@ -9246,14 +15337,32 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
         "created_entity_ids": [entity_id],
         "evidence": {
             "host_entity_type": "Image::ImagePlane",
+            "source_page_number": int(page_num),
             "raster_file": str(img_path),
             "raster_file_included": True,
+            "raster_file_included_property_bound": True,
             "pdf_sha256": digest,
-            "dpi": int(dpi),
+            "dpi": int(delivered_dpi),
+            "requested_dpi": int(requested_dpi),
+            "delivered_dpi": int(delivered_dpi),
+            "dpi_degraded": bool(dpi_degraded),
+            "raster_render_attempted_dpis": attempted_dpis,
+            "pixel_budget": int(pixel_budget),
             "pixel_width": int(getattr(pix, "width", 0) or 0),
             "pixel_height": int(getattr(pix, "height", 0) or 0),
             "x_size": float(w_units),
             "y_size": float(h_units),
+            "raster_content_variant": raster_content_variant,
+            "page_text_suppression": copy.deepcopy(text_suppression_evidence),
+            "page_text_suppression_evidence_sha256": (
+                text_suppression_evidence.get("evidence_sha256")
+                if isinstance(text_suppression_evidence, dict)
+                else None
+            ),
+            **copy.deepcopy(raster_request_context),
+            "source_page_observation_verified": True,
+            "page_visual_observation_sha256": observation["observation_sha256"],
+            **asset_evidence,
             **raster_file_evidence,
         },
     }
@@ -9349,8 +15458,6 @@ def _autofit_import_view(fc_doc) -> None:
                 pass
 
         try:
-            view.setCameraType("Orthographic")
-            view.viewTop()
             view.fitAll()
         except (AttributeError, RuntimeError):
             pass
@@ -9465,97 +15572,55 @@ def _memoized_wirestrings(func):
 # ──────────────────────────────────────────────────────────────────────
 # Page importer
 # ──────────────────────────────────────────────────────────────────────
+def _raise_if_import_cancelled(progress, phase: str) -> None:
+    """Raise the only cancellation signal; never authorize partial delivery."""
+
+    if progress is None:
+        return
+    try:
+        cancelled = progress.wasCanceled()
+    except (AttributeError, RuntimeError, TypeError):
+        cancelled = False
+    if not cancelled:
+        return
+    _warn("Import cancelled by user")
+    try:
+        progress.close()
+    except (AttributeError, RuntimeError, TypeError):
+        pass
+    raise ImportCancelled("PDF import cancelled during %s" % str(phase or "page import"))
+
+
+def _invoke_import_cancellation_checkpoint(
+    opts: ImportOptions,
+    phase: str,
+) -> None:
+    """Run the active GUI checkpoint or a deterministic injected callback."""
+
+    checkpoint = getattr(opts, "_import_cancellation_checkpoint", None)
+    if callable(checkpoint):
+        checkpoint(str(phase or "import"))
+        return
+    callback = getattr(opts, "_import_cancellation_callback", None)
+    if not callable(callback):
+        return
+    cancelled = callback(str(phase or "import"))
+    if cancelled is True:
+        raise ImportCancelled(
+            "PDF import cancelled during %s" % str(phase or "import")
+        )
+
+
 @_memoized_wirestrings
 def import_pdf_page(pdf_path: str, page_num: int = 1,
                     opts: Optional[ImportOptions] = None,
                     autofit: bool = True):
-    """Import a single PDF page into the active FreeCAD document."""
+    """Import exactly one page through the common atomic acceptance pipeline."""
+
     if opts is None:
         opts = ImportOptions(ignore_images=not IMAGE_WB)
-    _reset_import_run_state(opts)
-    fc_doc = _ensure_doc()  # Store reference — don't rely on ActiveDocument later
-    baseline_objects = _document_objects(fc_doc)
-    baseline_object_ids = {id(host_obj) for host_obj in baseline_objects}
-    baseline_object_names = {_host_object_id(host_obj) for host_obj in baseline_objects}
-
-    # Validate PDF before opening
-    from pdfcadcore.fitz_loader import PdfOpenError, safe_open
-
-    try:
-        pdf_doc = safe_open(pdf_path)
-    except PdfOpenError:
-        raise
-    transaction_open = False
-    try:
-        fc_doc.openTransaction("Import PDF Page")
-        transaction_open = True
-        try:
-            result = _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc)
-            fc_doc.commitTransaction()
-            transaction_open = False
-        except Exception as failure:
-            created_objects = [
-                host_obj
-                for host_obj in _document_objects(fc_doc)
-                if id(host_obj) not in baseline_object_ids
-                and _host_object_id(host_obj) not in baseline_object_names
-            ]
-            created_ids = [_host_object_id(host_obj) for host_obj in created_objects]
-            abort_errors: List[str] = []
-            if transaction_open:
-                try:
-                    fc_doc.abortTransaction()
-                except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
-                    abort_errors.append("abortTransaction: %s" % exc)
-                transaction_open = False
-            removed_by_abort = [
-                entity_id
-                for host_obj, entity_id in zip(
-                    created_objects, created_ids, strict=False
-                )
-                if entity_id and fc_doc.getObject(entity_id) is not host_obj
-            ]
-            cleanup = _remove_post_baseline_document_objects(
-                fc_doc, baseline_object_ids, baseline_object_names
-            )
-            rollback_created = list(dict.fromkeys(
-                created_ids + list(cleanup.get("created_entity_ids") or [])
-            ))
-            rollback_removed = list(dict.fromkeys(
-                removed_by_abort + list(cleanup.get("removed_entity_ids") or [])
-            ))
-            cleanup_errors = abort_errors + list(cleanup.get("cleanup_errors") or [])
-            live_ids = list(cleanup.get("live_post_baseline_entity_ids") or [])
-            rollback = {
-                "created_entity_ids": rollback_created,
-                "removed_entity_ids": rollback_removed,
-                "live_post_baseline_entity_ids": live_ids,
-                "cleanup_errors": cleanup_errors,
-                "cleanup_complete": bool(
-                    not cleanup_errors
-                    and not live_ids
-                    and set(rollback_created).issubset(set(rollback_removed))
-                ),
-            }
-            if isinstance(failure, TextRepresentationFailure):
-                failure.attempt["created_entity_ids"] = list(rollback_created)
-                failure.attempt["removed_entity_ids"] = list(rollback_removed)
-                failure.attempt["cleanup_complete"] = rollback["cleanup_complete"]
-                failure.attempt["rollback"] = rollback
-            if not rollback["cleanup_complete"] and not isinstance(
-                failure, TextRepresentationFailure
-            ):
-                raise RuntimeError(
-                    "Page import failed and rollback was incomplete: %s" % rollback
-                ) from failure
-            raise
-    finally:
-        pdf_doc.close()
-
-    if autofit:
-        _autofit_import_view(fc_doc)
-
-    return result
+    opts.pages = [page_num]
+    return import_pdf(pdf_path, opts, autofit=autofit)
 
 
 def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
@@ -9648,25 +15713,35 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         except (AttributeError, RuntimeError, TypeError):
             progress = None
 
-    def _progress_check_cancel():
-        """Check if user cancelled; closes dialog and returns True if cancelled."""
-        if progress and progress.wasCanceled():
-            _warn("Import cancelled by user")
-            progress.close()
-            return True
-        return False
+    last_event_pump = [0.0]
+
+    def _page_cancellation_checkpoint(phase):
+        now = time.perf_counter()
+        force_event_pump = str(phase or "").startswith("before ")
+        if QtWidgets is not None and (
+            force_event_pump or now - last_event_pump[0] >= 0.025
+        ):
+            try:
+                QtWidgets.QApplication.processEvents()
+                last_event_pump[0] = now
+            except (AttributeError, RuntimeError, TypeError):
+                pass
+        _raise_if_import_cancelled(progress, str(phase or "page import"))
+        callback = getattr(opts, "_import_cancellation_callback", None)
+        if callable(callback) and callback(str(phase or "page import")) is True:
+            raise ImportCancelled(
+                "PDF import cancelled during %s" % str(phase or "page import")
+            )
+
+    opts._import_cancellation_checkpoint = _page_cancellation_checkpoint
 
     def _progress_update(value, label):
         """Update progress dialog value and label, process events."""
-        if not progress:
-            return
-        elapsed = time.time() - _import_start
-        progress.setValue(value)
-        progress.setLabelText(f"{label}  [{elapsed:.1f}s]")
-        try:
-            QtWidgets.QApplication.processEvents()
-        except (AttributeError, RuntimeError):
-            pass
+        if progress:
+            elapsed = time.time() - _import_start
+            progress.setValue(value)
+            progress.setLabelText(f"{label}  [{elapsed:.1f}s]")
+        _invoke_import_cancellation_checkpoint(opts, str(label or "page progress"))
 
     # ── Vector drawings ──
     try:
@@ -9720,25 +15795,23 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
 
         _flood_reason = ""  # human-readable explanation for the log
 
-        if n_drawings < 5 and n_text_blocks == 0:
-            # Scanned / pure raster page — no usable vector content
-            effective_mode = "raster"
-            _flood_reason = "scanned/raster page (no usable vector content)"
-
-        elif n_drawings < 5 and n_text_blocks is not None and n_text_blocks > 0:
-            # Text-only or text-dominant page. Preserve editable text; if a
-            # raster image is present, keep it as a background.
-            effective_mode = "hybrid" if n_images > 0 else "vector"
-            _flood_reason = "text-only page — preserving editable text"
+        sparse_mode = _auto_sparse_page_mode(n_drawings, n_text_blocks, n_images)
+        if sparse_mode:
+            # Sparse pages are not proof that a complete-page Raster is needed.
+            # Genuine image occurrences are imported below; drawing-only and
+            # blank pages simply have no fabricated text/raster obligation.
+            effective_mode = sparse_mode
+            _flood_reason = (
+                "sparse image page — preserving exact image occurrences"
+                if n_images > 0
+                else "sparse vector/textless page — no page Raster fallback"
+            )
 
         elif glyph_flood:
             # Vectorized text/map-art flood: huge counts of tiny filled groups.
             # Preserve only a raster appearance by default; if substantial
             # stroked vectors exist, keep a hybrid overlay.
-            if vg_stats.get("stroke_ratio", 0.0) <= AUTO_GLYPH_STROKE_SPARSE_RATIO:
-                effective_mode = "raster"
-            else:
-                effective_mode = "hybrid"
+            effective_mode = "hybrid" if n_images > 0 else "vector"
             _flood_reason = (
                 f"vector glyph flood — "
                 f"{n_drawings} groups, "
@@ -9752,10 +15825,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             # (garden beds, terrain fills, tree canopies, etc.) with few strokes.
             # Importing as vectors creates unusable geometry — use raster instead.
             # If a meaningful stroke layer exists, hybrid preserves those lines.
-            if vg_stats.get("stroke_ratio", 0.0) > AUTO_GLYPH_STROKE_SPARSE_RATIO:
-                effective_mode = "hybrid"
-            else:
-                effective_mode = "raster"
+            effective_mode = "hybrid" if n_images > 0 else "vector"
             _flood_reason = (
                 f"fill-art flood — "
                 f"{n_drawings} groups, "
@@ -9768,7 +15838,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
               and vg_stats.get("stroke_ratio", 1.0) <= 0.35):
             # GIS / topo PDF: dense imagery with sparse linework (low stroke ratio).
             # Garden/CAD maps with many strokes + tiled photos must stay vector/hybrid.
-            effective_mode = "raster"
+            effective_mode = "hybrid"
             _flood_reason = (
                 f"GIS/topo map — {n_drawings} vector groups over "
                 f"{n_images} embedded images "
@@ -9806,8 +15876,12 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         n_text_blocks,
         opts,
     )
-    if prior_effective_mode == "raster" and (
-        effective_mode != prior_effective_mode or auto_raster_text_overlay
+    if (
+        str(getattr(opts, "import_mode", "") or "").strip().lower() == "auto"
+        and prior_effective_mode == "raster"
+        and (
+            effective_mode != prior_effective_mode or auto_raster_text_overlay
+        )
     ):
         opts.auto_resolved_mode = effective_mode
         opts.auto_reason = (
@@ -9815,11 +15889,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             + "; requested text representation contract retained"
         )
 
-    if _progress_check_cancel():
-        if progress:
-            progress.close()
-        fc_doc.recompute()
-        return top_group, None
+    _raise_if_import_cancelled(progress, "page analysis")
 
     placed_full_page_raster_background = False
     full_page_raster_result = None
@@ -9831,12 +15901,13 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         _progress_update(5, f"Rendering raster image at {opts.raster_dpi} DPI...")
         full_page_raster_result = _import_page_as_raster(
             pdf_doc, page, page_num, page_h, opts, scale,
-            top_group or fc_doc, fc_doc)
+            top_group or fc_doc, fc_doc,
+            suppress_structural_text=auto_raster_text_overlay,
+        )
         if auto_raster_text_overlay:
             placed_full_page_raster_background = True
             drawings = []
             n_drawings = 0
-            effective_mode = "raster_text_overlay"
             _msg(
                 f"Page {page_num}: raster background placed; rendering requested "
                 f"{opts.text_mode} text representation"
@@ -9852,10 +15923,17 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     opts,
                     page_num=int(page_num),
                     raster_result=full_page_raster_result,
+                    pdf_sha256=hashlib.sha256(
+                        _validated_pdf_source_bytes(opts)
+                    ).hexdigest(),
                 )
             if progress:
                 progress.setValue(100)
                 progress.close()
+            _invoke_import_cancellation_checkpoint(
+                opts,
+                "before page persistence",
+            )
             fc_doc.recompute()
             _msg(f"Page {page_num}: imported as raster image")
             return top_group, text_entity_info
@@ -9867,38 +15945,6 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             "images without a complete-page masking raster"
         )
         # Fall through to vector import; embedded images are imported below.
-
-    # ── Legacy raster fallback (vectors mode, backwards compat) ──
-    if effective_mode == "vector" and opts.raster_fallback and n_drawings < 5:
-        tdict = page.get_text("dict")
-        n_text = sum(1 for b in tdict.get("blocks", []) if b.get("type") == 0)
-        if n_text == 0:
-            _msg(f"Page {page_num}: appears to be scanned/raster — "
-                 f"rendering at {opts.raster_dpi} DPI")
-            _progress_update(5, f"Rendering raster image at {opts.raster_dpi} DPI...")
-            _record_raster_page(
-                opts,
-                "legacy_vector_raster_fallback: scanned/raster page"
-            )
-            full_page_raster_result = _import_page_as_raster(
-                pdf_doc, page, page_num, page_h, opts, scale,
-                top_group or fc_doc, fc_doc)
-            if _raster_page_requires_text_contract_probe(opts):
-                placed_full_page_raster_background = True
-                drawings = []
-                n_drawings = 0
-                effective_mode = "raster_text_overlay"
-                _msg(
-                    f"Page {page_num}: page Raster placed provisionally; "
-                    f"proving requested {opts.text_mode} representation contract"
-                )
-            else:
-                if progress:
-                    progress.setValue(100)
-                    progress.close()
-                fc_doc.recompute()
-                _msg(f"Page {page_num}: imported as raster image")
-                return top_group, None
 
     # ── Hatch detection ──
     hatch_indices = set()
@@ -10025,6 +16071,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
     _progress_update(10, f"Processing geometry... 0/{n_drawings}")
 
     for pg_idx, path_group in enumerate(drawings):
+        _invoke_import_cancellation_checkpoint(opts, "geometry group")
         # Throttled progress updates — every 500 on heavy pages, 100 otherwise.
         # Each processEvents() call allocates Qt timers; doing it 19k× is
         # what exhausts Windows GDI handles.
@@ -10033,14 +16080,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             _progress_update(
                 geo_pct,
                 f"Processing geometry... {pg_idx}/{n_drawings}")
-            if progress.wasCanceled():
-                _warn("Import cancelled by user")
-                # Flush any pending batches before returning
-                if _batch_size:
-                    _flush_batch(force=True)
-                progress.close()
-                fc_doc.recompute()
-                return top_group, None
+            _raise_if_import_cancelled(progress, "geometry")
 
         items = path_group.get("items", [])
         if not items:
@@ -10093,6 +16133,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             current_pt = None
 
         for item in items:
+            _invoke_import_cancellation_checkpoint(opts, "geometry item")
             kind = item[0]
             data = item[1:]
 
@@ -10329,9 +16370,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     _progress_update(
                         80 + int(5 * _flush_idx / max(n_style_keys, 1)),
                         f"Building compound {_flush_idx}/{n_style_keys}...")
-                if _progress_check_cancel():
-                    fc_doc.recompute()
-                    return top_group, None
+                _raise_if_import_cancelled(progress, "geometry batch publication")
                 _flush_batch(_fk, force=True)
         if opts.verbose:
             total_batches = sum(_batch_idx.values())
@@ -10344,13 +16383,15 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
     if opts.import_text and opts.text_mode != "none":
         _progress_update(86, "Importing text...")
 
-        if _progress_check_cancel():
-            fc_doc.recompute()
-            return top_group, None
+        _raise_if_import_cancelled(progress, "text")
         text_group = _make_group(top_group or fc_doc, "Text", fc_doc)
         try:
             raw_tdict = page.get_text("rawdict")
         except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
+            _register_text_delivery_obligations(
+                opts,
+                ["p%d:page" % int(page_num)],
+            )
             attempt = {
                 "source_item_id": "p%d:page" % int(page_num),
                 "requested_type": str(opts.text_mode),
@@ -10371,10 +16412,9 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 attempt,
             ) from exc
 
-        pdf_sha256 = str(getattr(opts, "_pdf_sha256", "") or "")
-        if re.fullmatch(r"[0-9a-f]{64}", pdf_sha256) is None:
-            pdf_sha256 = _pdf_file_sha256(pdf_path)
-            opts._pdf_sha256 = pdf_sha256
+        pdf_sha256 = hashlib.sha256(
+            _validated_pdf_source_bytes(opts)
+        ).hexdigest()
         text_entity_info = _render_canonical_text_items(
             pdf_doc=pdf_doc,
             page=page,
@@ -10389,45 +16429,23 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             pdf_sha256=pdf_sha256,
             raw_tdict=raw_tdict,
         )
+        if placed_full_page_raster_background:
+            suppression_evidence = _bind_page_text_suppression_delivery_evidence(
+                full_page_raster_result,
+                text_entity_info,
+                page_number=int(page_num),
+            )
+            _persist_page_text_suppression_host_binding(
+                fc_doc,
+                full_page_raster_result,
+                suppression_evidence,
+                page_number=int(page_num),
+            )
         if int(text_entity_info.get("source_item_count", 0) or 0) <= 0:
-            if full_page_raster_result is None:
-                full_page_raster_result = _import_page_as_raster(
-                    pdf_doc,
-                    page,
-                    page_num,
-                    page_h,
-                    opts,
-                    scale,
-                    text_group,
-                    fc_doc,
-                )
-                placed_full_page_raster_background = True
-            try:
-                text_entity_info = _record_no_source_text_page_fallback(
-                    opts,
-                    page_num=int(page_num),
-                    pdf_sha256=pdf_sha256,
-                    raw_tdict=raw_tdict,
-                    raster_result=full_page_raster_result,
-                )
-            except Exception as exc:
-                raise TextRepresentationFailure(
-                    "No-source text page fallback could not be verified: %s" % exc,
-                    {
-                        "source_item_id": "p%d:page" % int(page_num),
-                        "requested_type": str(opts.text_mode or ""),
-                        "attempted_type": "raster",
-                        "final_type": None,
-                        "outcome": "failed",
-                        "reason": "invalid_no_source_text_page_fallback",
-                        "created_entity_ids": [],
-                        "removed_entity_ids": [],
-                        "cleanup_complete": True,
-                        "evidence": {
-                            "exception": "%s: %s" % (exc.__class__.__name__, exc)
-                        },
-                    },
-                ) from exc
+            _msg(
+                "Page %d: no canonical source text items; text obligation set is empty"
+                % int(page_num)
+            )
         obj_count += int(text_entity_info.get("count", 0) or 0)
         _progress_update(
             89,
@@ -10440,6 +16458,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         try:
             hatch_group = _make_group(top_group or fc_doc, "Hatching", fc_doc)
             for _pg_idx, path_group in enumerate(hatch_drawings):
+                _invoke_import_cancellation_checkpoint(opts, "hatch group")
                 items = path_group.get("items", [])
                 if not items:
                     continue
@@ -10448,6 +16467,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 current_pt = None
                 sub_edges = []
                 for item in items:
+                    _invoke_import_cancellation_checkpoint(opts, "hatch item")
                     kind = item[0]
                     data = item[1:]
                     if kind == "m":
@@ -10506,64 +16526,16 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
 
     # ── Embedded images ──
     if not opts.ignore_images and not placed_full_page_raster_background:
-        try:
-            img_group = _make_group(top_group or fc_doc, "Images", fc_doc)
-            imglist = page.get_images(full=True)
-            seen_xrefs = set()
-            for img_info in imglist:
-                xref = img_info[0]
-                if xref in seen_xrefs:
-                    continue
-                seen_xrefs.add(xref)
-                rects = page.get_image_rects(xref)
-                if not rects:
-                    continue
-                try:
-                    pix = fitz.Pixmap(pdf_doc, xref)
-                    # Convert any non-plain-RGB source to RGB before saving PNG.
-                    # This handles CMYK / DeviceN / grayscale / alpha safely.
-                    cs = getattr(pix, "colorspace", None)
-                    cs_n = None
-                    try:
-                        cs_n = int(getattr(cs, "n", 0)) if cs is not None else None
-                    except (TypeError, ValueError):
-                        cs_n = None
-                    needs_rgb = (
-                        pix.alpha
-                        or pix.n != 3
-                        or (cs_n is not None and cs_n != 3)
-                    )
-                    if needs_rgb:
-                        pix = fitz.Pixmap(fitz.csRGB, pix)
-                    tmpdir = os.path.join(
-                        FreeCAD.getUserAppDataDir(),
-                        "Mod", "PDFVectorImporter", "temp")
-                    os.makedirs(tmpdir, exist_ok=True)
-                    img_path = os.path.join(tmpdir, f"img_p{page_num}_x{xref}.png")
-                    pix.save(img_path)
-                except (RuntimeError, OSError, ValueError, TypeError) as e:
-                    _warn(f"Image xref {xref} extract failed: {e}")
-                    continue
-                for r in rects:
-                    pt0 = _to_fc((r.x0, r.y0), page_h, opts, scale)
-                    pt1 = _to_fc((r.x1, r.y1), page_h, opts, scale)
-                    w = abs(pt1.x - pt0.x)
-                    h = abs(pt1.y - pt0.y)
-                    try:
-                        ip = fc_doc.addObject(
-                            "Image::ImagePlane", "Image")
-                        ip.ImageFile = img_path
-                        ip.XSize = w
-                        ip.YSize = h
-                        ip.Placement = Placement(
-                            _v(min(pt0.x, pt1.x), min(pt0.y, pt1.y), 0),
-                            Rotation())
-                        img_group.addObject(ip)
-                        obj_count += 1
-                    except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as e:
-                        _warn(f"Image placement failed: {e}")
-        except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as e:
-            _warn(f"Image import failed: {e}")
+        img_group = _make_group(top_group or fc_doc, "Images", fc_doc)
+        embedded_result = _import_embedded_image_occurrences(
+            opts=opts,
+            page_number=int(page_num),
+            page_h=float(page_h),
+            scale=float(scale),
+            fc_doc=fc_doc,
+            image_group=img_group,
+        )
+        obj_count += int(embedded_result.get("count", 0) or 0)
 
     # ── Final cleanup / placement ──
     _progress_update(96, "Placing objects in document...")
@@ -10583,6 +16555,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         progress.setValue(100)
         progress.close()
 
+    _invoke_import_cancellation_checkpoint(opts, "before page persistence")
     fc_doc.recompute()
     elapsed_total = time.time() - _import_start
     _msg(f"Page {page_num}: {obj_count} objects created in {elapsed_total:.1f}s")
@@ -10623,11 +16596,20 @@ def _page_stack_step(page_height: float, arrangement: str, gap_ratio: float) -> 
 
 def _reset_import_run_state(opts: ImportOptions) -> None:
     """Clear output evidence from a prior run while preserving user choices."""
+    path_cleanup = _rollback_attempt_paths(opts)
+    if path_cleanup.get("cleanup_complete") is not True:
+        raise ImportCleanupError(
+            "prior import publication cleanup is incomplete",
+            details={"retryable": True, "path_cleanup": path_cleanup},
+        )
+    _dispose_pdf_source_attempt(opts)
     opts.phase_timings_ms.clear()
     opts.shapestring_skips.clear()
     opts.text_mode_fallbacks.clear()
     opts.text_delivered_counts.clear()
     opts.text_delivery_attempts.clear()
+    opts.text_delivery_obligation_source_item_ids.clear()
+    opts.page_visual_source_observations.clear()
     opts.raster_page_count = 0
     opts.raster_fallback_reasons.clear()
     opts.auto_resolved_mode = None
@@ -10644,7 +16626,12 @@ def _reset_import_run_state(opts: ImportOptions) -> None:
     opts._model3d_intent_feasible = False
     opts._model3d_text_evidence = []
     opts._bootstrap_text_items = []
-    opts._pdf_sha256 = ""
+    opts._source_provenance_objects = []
+    opts._import_session_id = ""
+    opts._provenance_page = 0
+    opts._live_import_report = None
+    opts._atomic_import_active = False
+    opts._import_cancellation_checkpoint = None
 
 
 def _remove_post_baseline_document_objects(
@@ -10707,75 +16694,197 @@ def _remove_post_baseline_document_objects(
     }
 
 
+def _rollback_import_attempt(
+    fc_doc,
+    opts: ImportOptions,
+    baseline_object_ids: set,
+    baseline_object_names: set,
+    *,
+    transaction_open: bool,
+) -> Dict[str, Any]:
+    """Abort one transaction and verify all model/file effects are gone."""
+
+    created_before_abort = [
+        _host_object_id(host_obj)
+        for host_obj in _document_objects(fc_doc)
+        if id(host_obj) not in baseline_object_ids
+        and _host_object_id(host_obj) not in baseline_object_names
+    ]
+    errors: List[str] = []
+    if transaction_open:
+        try:
+            fc_doc.abortTransaction()
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            errors.append("abortTransaction: %s" % exc)
+    remaining_after_abort = [
+        host_obj
+        for host_obj in _document_objects(fc_doc)
+        if id(host_obj) not in baseline_object_ids
+        and _host_object_id(host_obj) not in baseline_object_names
+    ]
+    if remaining_after_abort:
+        object_cleanup = _remove_post_baseline_document_objects(
+            fc_doc,
+            baseline_object_ids,
+            baseline_object_names,
+        )
+    else:
+        object_cleanup = {
+            "created_entity_ids": list(created_before_abort),
+            "removed_entity_ids": list(created_before_abort),
+            "live_post_baseline_entity_ids": [],
+            "cleanup_errors": [],
+            "cleanup_complete": True,
+        }
+    path_cleanup = _rollback_attempt_paths(opts)
+    errors.extend(list(object_cleanup.get("cleanup_errors") or []))
+    errors.extend(list(path_cleanup.get("cleanup_errors") or []))
+    created_ids = list(
+        dict.fromkeys(
+            created_before_abort
+            + list(object_cleanup.get("created_entity_ids") or [])
+        )
+    )
+    removed_ids = list(object_cleanup.get("removed_entity_ids") or [])
+    live_ids = list(object_cleanup.get("live_post_baseline_entity_ids") or [])
+    complete = bool(
+        not errors
+        and not live_ids
+        and object_cleanup.get("cleanup_complete") is True
+        and path_cleanup.get("cleanup_complete") is True
+    )
+    return {
+        "created_entity_ids": created_ids,
+        "removed_entity_ids": removed_ids,
+        "live_post_baseline_entity_ids": live_ids,
+        "object_cleanup": object_cleanup,
+        "path_cleanup": path_cleanup,
+        "cleanup_errors": errors,
+        "cleanup_complete": complete,
+    }
+
+
+def _raise_incomplete_rollback(rollback: Dict[str, Any], failure: BaseException) -> None:
+    if rollback.get("cleanup_complete") is True:
+        return
+    raise ImportCleanupError(
+        "Import failed and rollback cleanup is incomplete",
+        details={"retryable": True, "rollback": rollback},
+    ) from failure
+
+
 @_memoized_wirestrings
-def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
-    """Import one or more pages from a PDF file."""
+def import_pdf(
+    pdf_path: str,
+    opts: Optional[ImportOptions] = None,
+    *,
+    autofit: bool = True,
+):
+    """Atomically import selected pages and return exact ``True`` or ``False``."""
+
     if opts is None:
         opts = ImportOptions(ignore_images=not IMAGE_WB)
-    fc_doc = _ensure_doc()
+    fc_doc, document_created_by_attempt = _ensure_doc_with_ownership()
+    attempt_accepted = False
     t_import_start = time.perf_counter()
-    _reset_import_run_state(opts)
-    baseline_objects = _document_objects(fc_doc)
-    baseline_object_ids = {id(host_obj) for host_obj in baseline_objects}
-    baseline_object_names = {_host_object_id(host_obj) for host_obj in baseline_objects}
+    baseline_objects: List[Any] = []
+    baseline_object_ids: set = set()
+    baseline_object_names: set = set()
+    pdf_doc_for_import = None
+    transaction_open = False
+    imported_count = 0
+    total_pages = 0
     try:
-        opts._pdf_sha256 = _pdf_file_sha256(pdf_path)
-    except OSError as exc:
-        _err("Cannot read PDF for source identity: %s" % exc)
-        return
+        # Ownership starts at acquisition, so even baseline/default setup
+        # failures cannot leak an attempt-created document.
+        baseline_objects = _document_objects(fc_doc)
+        baseline_object_ids = {id(host_obj) for host_obj in baseline_objects}
+        baseline_object_names = {
+            _host_object_id(host_obj) for host_obj in baseline_objects
+        }
+        from pdfcadcore.fitz_loader import PdfOpenError
 
-    # Reset ID counter once at the start of a multi-page import
-    try:
-        from pdfcadcore.primitives import reset_ids
-        reset_ids()
-    except ImportError:
-        pass
+        _reset_import_run_state(opts)
+        opts._atomic_import_active = True
+        try:
+            _initialize_pdf_source_attempt(pdf_path, opts)
+        except OSError as exc:
+            raise PdfOpenError(
+                "empty_file",
+                "Cannot read PDF source: %s" % exc,
+            ) from exc
 
-    # Clean up temp raster images from previous imports
-    cleanup_temp_files()
+        try:
+            from pdfcadcore.primitives import reset_ids
 
-    # Open PDF once to gather page count and heights (avoids triple-open + handle leaks)
-    _unit_scale = (MM_PER_PT if opts.scale_to_mm else 1.0) * opts.user_scale
-    page_height_scaled = 792 * _unit_scale  # default: US Letter height in points
-    page_heights_scaled: Dict[int, float] = {}
-    model3d_text_evidence: List[str] = []
-    t_phase = time.perf_counter()
-    try:
-        from pdfcadcore.fitz_loader import PdfOpenError, safe_open
+            reset_ids()
+        except ImportError:
+            pass
+        cleanup_temp_files()
 
-        with safe_open(pdf_path) as pdoc:
-            total_pages = len(pdoc)
-            # Default to all pages when no explicit page list is provided
-            pages = opts.pages or list(range(1, total_pages + 1))
-            if total_pages > 0:
-                page_height_scaled = pdoc.load_page(0).rect.height * _unit_scale
-            for p in pages:
-                if 1 <= p <= total_pages:
-                    try:
-                        _page_for_meta = pdoc.load_page(p - 1)
-                        page_heights_scaled[p] = _page_for_meta.rect.height * _unit_scale
-                        try:
-                            page_text = _page_for_meta.get_text("text") or ""
-                            model3d_text_evidence.append(page_text)
-                            for line in page_text.splitlines():
-                                line = line.strip()
-                                if line:
-                                    opts._bootstrap_text_items.append(
-                                        {"text": line, "page": p}
-                                    )
-                        except (RuntimeError, ValueError, AttributeError):
-                            pass
-                    except (ValueError, RuntimeError):
-                        pass
-        opts.phase_timings_ms["open_pdf_ms"] = (time.perf_counter() - t_phase) * 1000.0
+        unit_scale = (MM_PER_PT if opts.scale_to_mm else 1.0) * opts.user_scale
+        page_height_scaled = 792 * unit_scale
+        page_heights_scaled: Dict[int, float] = {}
+        model3d_text_evidence: List[str] = []
+        open_started = time.perf_counter()
+        with _open_pdf_source_attempt(opts) as metadata_doc:
+            total_pages = len(metadata_doc)
+            if total_pages <= 0:
+                raise PdfOpenError("empty_file", "PDF contains no pages")
+            requested_pages = getattr(opts, "pages", None)
+            if requested_pages is None or requested_pages == []:
+                pages = list(range(1, total_pages + 1))
+            elif not isinstance(requested_pages, (list, tuple)):
+                raise ValueError("selected pages must be a list of exact integers")
+            else:
+                pages = list(requested_pages)
+            if (
+                not pages
+                or any(type(page) is not int for page in pages)
+                or len(pages) != len(set(pages))
+                or any(page < 1 or page > total_pages for page in pages)
+            ):
+                raise ValueError(
+                    "selected pages must be unique exact integers in range 1..%d"
+                    % total_pages
+                )
+            opts.pages = list(pages)
+            page_height_scaled = metadata_doc.load_page(0).rect.height * unit_scale
+            for page_number in pages:
+                metadata_page = metadata_doc.load_page(page_number - 1)
+                page_heights_scaled[page_number] = (
+                    metadata_page.rect.height * unit_scale
+                )
+                try:
+                    page_text = metadata_page.get_text("text") or ""
+                except (RuntimeError, ValueError, AttributeError) as exc:
+                    raise ImportLifecycleError(
+                        "metadata text extraction failed on page %d" % page_number
+                    ) from exc
+                model3d_text_evidence.append(page_text)
+                for line in page_text.splitlines():
+                    line = line.strip()
+                    if line:
+                        opts._bootstrap_text_items.append(
+                            {"text": line, "page": page_number}
+                        )
+        _capture_page_visual_runtime_authority(opts, list(pages))
+        _validated_pdf_source_snapshot_path(opts)
+        opts.phase_timings_ms["open_pdf_ms"] = (
+            time.perf_counter() - open_started
+        ) * 1000.0
+
         try:
             from pdfcadcore.model3d_intent import analyze_model3d_intent
 
-            intent = analyze_model3d_intent(model3d_text_evidence, host_supports_3d=True)
+            intent = analyze_model3d_intent(
+                model3d_text_evidence,
+                host_supports_3d=True,
+            )
             opts._model3d_intent = intent.to_dict()
             opts._model3d_intent_feasible = bool(intent.feasible)
             opts._model3d_text_evidence = list(model3d_text_evidence)
-        except (ImportError, RuntimeError, TypeError, ValueError, AttributeError):
+        except ImportError:
             opts._model3d_intent = {
                 "feasible": False,
                 "plates": [],
@@ -10783,223 +16892,178 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                 "skipped_reason": "3D intent analysis unavailable",
             }
             opts._model3d_intent_feasible = False
-    except PdfOpenError as e:
-        _err(str(e))
-        return
-    except (RuntimeError, OSError) as e:
-        _err(f"Cannot open PDF: {e}")
-        return
 
-    try:
-        pdf_doc_for_import = safe_open(pdf_path)
-    except PdfOpenError as e:
-        _err(str(e))
-        return
-    except (RuntimeError, OSError) as e:
-        _err(f"Cannot open PDF: {e}")
-        return
-
-    # Wrap entire import in a FreeCAD transaction so Ctrl+Z undoes it in one step
-    fc_doc.openTransaction("Import PDF")
-    t_phase = time.perf_counter()
-    try:
-        imported_count = 0
+        pdf_doc_for_import = _open_pdf_source_attempt(opts)
+        fc_doc.openTransaction("Import PDF")
+        transaction_open = True
+        pages_started = time.perf_counter()
         running_stack_offset = 0.0
-        page_arrangement = _normalize_page_arrangement(getattr(opts, "page_arrangement", "spread"))
-        page_gap_ratio = _normalize_page_gap_ratio(getattr(opts, "page_gap_ratio", 0.20))
+        page_arrangement = _normalize_page_arrangement(
+            getattr(opts, "page_arrangement", "spread")
+        )
+        page_gap_ratio = _normalize_page_gap_ratio(
+            getattr(opts, "page_gap_ratio", 0.20)
+        )
         first_page = True
         all_text_entity_info = None
-        for p in pages:
-            if p < 1 or p > total_pages:
-                _warn(f"Skipping out-of-range page {p} (PDF has {total_pages} pages)")
-                continue
-            try:
-                _msg(f"Importing page {p}/{total_pages} ({imported_count+1} of {len(pages)})...")
+        for page_number in pages:
+            _msg(
+                "Importing page %d/%d (%d of %d)..."
+                % (page_number, total_pages, imported_count + 1, len(pages))
+            )
+            with _verified_pdf_snapshot_consumer(
+                opts,
+                "page %d import" % page_number,
+            ) as snapshot_path:
                 _, page_text_info = _import_pdf_page_inner(
                     pdf_doc_for_import,
-                    pdf_path,
-                    p,
+                    snapshot_path,
+                    page_number,
                     opts,
                     fc_doc,
                 )
-                if page_text_info:
-                    if all_text_entity_info is None:
-                        all_text_entity_info = page_text_info.copy()
-                    else:
-                        all_text_entity_info["count"] += page_text_info.get("count", 0)
-                        examples = page_text_info.get("examples", [])
-                        if examples and len(all_text_entity_info["examples"]) < 3:
-                            all_text_entity_info["examples"].extend(
-                                examples[:3 - len(all_text_entity_info["examples"])]
-                            )
-                curr_page_height = page_heights_scaled.get(p, page_height_scaled)
-                # Offset each page group downward so they don't overlap.
-                # FreeCAD may rename the group (e.g., PDF_Page_2 → PDF_Page_2001)
-                # so we search for the most recently created matching group.
-                if len(pages) > 1 and not first_page:
-                    running_stack_offset += _page_stack_step(
-                        curr_page_height,
-                        page_arrangement,
-                        page_gap_ratio,
-                    )
-                    y_shift = -running_stack_offset
-                    grp = None
-                    for obj in reversed(fc_doc.Objects):
-                        if (obj.Name.startswith(f"PDF_Page_{p}") and
-                                obj.isDerivedFrom("App::DocumentObjectGroup")):
-                            grp = obj
-                            break
-                    if grp and hasattr(grp, "Group"):
-                        _msg(f"Offsetting {grp.Name} by Y={y_shift:.1f}")
-                        for child in grp.Group:
-                            try:
-                                if hasattr(child, "Placement"):
-                                    child.Placement.Base.y += y_shift
-                                if hasattr(child, "Group"):
-                                    for sub in child.Group:
-                                        if hasattr(sub, "Placement"):
-                                            sub.Placement.Base.y += y_shift
-                            except (AttributeError, RuntimeError):
-                                pass
-                first_page = False
-                imported_count += 1
-            except TextRepresentationFailure:
-                raise
-            except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as e:
-                _err(f"Failed to import page {p}: {e}\n{traceback.format_exc()}")
-                raise
-        fc_doc.commitTransaction()
-        opts.phase_timings_ms["pages_import_ms"] = (time.perf_counter() - t_phase) * 1000.0
-    except TextRepresentationFailure as failure:
-        fc_doc.abortTransaction()
-        rollback = _remove_post_baseline_document_objects(
-            fc_doc, baseline_object_ids, baseline_object_names
-        )
-        report_extra = dict(getattr(opts, "_report_extra", {}) or {})
-        report_extra["rollback"] = rollback
-        opts._report_extra = report_extra
-        elapsed_ms = (time.perf_counter() - t_import_start) * 1000.0
+            if page_text_info:
+                if all_text_entity_info is None:
+                    all_text_entity_info = page_text_info.copy()
+                else:
+                    all_text_entity_info["count"] += page_text_info.get("count", 0)
+                    examples = page_text_info.get("examples", [])
+                    if examples and len(all_text_entity_info["examples"]) < 3:
+                        all_text_entity_info["examples"].extend(
+                            examples[: 3 - len(all_text_entity_info["examples"])]
+                        )
+            current_height = page_heights_scaled.get(
+                page_number,
+                page_height_scaled,
+            )
+            if len(pages) > 1 and not first_page:
+                running_stack_offset += _page_stack_step(
+                    current_height,
+                    page_arrangement,
+                    page_gap_ratio,
+                )
+                y_shift = -running_stack_offset
+                group = None
+                for host_obj in reversed(fc_doc.Objects):
+                    if (
+                        host_obj.Name.startswith("PDF_Page_%d" % page_number)
+                        and host_obj.isDerivedFrom("App::DocumentObjectGroup")
+                    ):
+                        group = host_obj
+                        break
+                if group and hasattr(group, "Group"):
+                    for child in group.Group:
+                        if hasattr(child, "Placement"):
+                            child.Placement.Base.y += y_shift
+                        if hasattr(child, "Group"):
+                            for nested in child.Group:
+                                if hasattr(nested, "Placement"):
+                                    nested.Placement.Base.y += y_shift
+            first_page = False
+            imported_count += 1
+        if imported_count != len(pages):
+            raise ImportLifecycleError("not every selected page completed")
         opts.phase_timings_ms["pages_import_ms"] = (
-            time.perf_counter() - t_phase
+            time.perf_counter() - pages_started
         ) * 1000.0
+
+        postprocess_started = time.perf_counter()
+        fc_doc.recompute()
         try:
-            failure_report = _write_terminal_representation_failure_report(
-                pdf_path=pdf_path,
-                opts=opts,
-                total_pages=total_pages,
-                pages_imported=imported_count,
-                elapsed_ms=elapsed_ms,
-                failure=failure,
-            )
-            _err(
-                f"Import stopped because requested {opts.text_mode} could not be "
-                f"delivered. Failure report: {failure_report}"
-            )
-        except (OSError, RuntimeError, TypeError, ValueError, ImportError) as report_error:
-            _err(f"Terminal import failure report could not be written: {report_error}")
-        if not rollback["cleanup_complete"]:
-            failure.attempt["cleanup_complete"] = False
-            failure.attempt["rollback"] = rollback
-        raise
-    except Exception as failure:
-        fc_doc.abortTransaction()
-        rollback = _remove_post_baseline_document_objects(
-            fc_doc, baseline_object_ids, baseline_object_names
-        )
-        if not rollback["cleanup_complete"]:
-            raise RuntimeError(
-                "Import failed and rollback was incomplete: %s" % rollback
-            ) from failure
-        raise
-    finally:
-        try:
-            pdf_doc_for_import.close()
-        except (RuntimeError, AttributeError):
+            from pdfcadcore.resolved_scale import probe_page_scale
+
+            with _open_pdf_source_attempt(opts) as scale_doc:
+                for page_number in pages:
+                    _merge_page_scale_into_opts(
+                        opts,
+                        probe_page_scale(
+                            scale_doc.load_page(page_number - 1),
+                            page_number,
+                        ),
+                    )
+        except ImportError:
             pass
 
-    t_phase = time.perf_counter()
-    fc_doc.recompute()
-    _autofit_import_view(fc_doc)
-    opts.phase_timings_ms["postprocess_ms"] = (time.perf_counter() - t_phase) * 1000.0
-
-    if opts.import_mode == "auto" and opts.auto_resolved_mode:
-        _msg(
-            f"Auto mode summary: {opts.auto_resolved_mode}"
-            + (f" — {opts.auto_reason}" if opts.auto_reason else "")
-        )
-
-    # Round 5: merge per-page title-block scale into import_report (LC parity).
-    try:
-        from pdfcadcore.fitz_loader import safe_open as _scale_safe_open
-        from pdfcadcore.resolved_scale import probe_page_scale
-
-        with _scale_safe_open(pdf_path) as scale_doc:
-            for p in pages:
-                if p < 1 or p > total_pages:
-                    continue
-                _merge_page_scale_into_opts(
-                    opts,
-                    probe_page_scale(scale_doc.load_page(p - 1), p),
-                )
-    except ImportError:
-        pass
-    except (RuntimeError, OSError, ValueError, TypeError) as e:
-        if opts.verbose:
-            _warn(f"Scale detection pass skipped: {e}")
-
-    try:
-        report_path = opts.import_report_path or _default_import_report_path(pdf_path)
-        fallback_used, fallback_reason = _report_fallback_state(opts)
-        elapsed_ms = (time.perf_counter() - t_import_start) * 1000.0
-        opts.phase_timings_ms["total_ms"] = elapsed_ms
-
-        # Add text entity info to extra
-        if not hasattr(opts, '_report_extra'):
+        if not hasattr(opts, "_report_extra"):
             opts._report_extra = {}
         if all_text_entity_info:
-            opts._report_extra['actual_text_entity_types'] = all_text_entity_info
+            opts._report_extra["actual_text_entity_types"] = all_text_entity_info
         opts._report_extra["result_status"] = "success"
         opts._report_extra.pop("terminal_failure", None)
 
         if bool(getattr(opts, "model3d_semantic", False)):
-            intent = getattr(opts, "_model3d_intent", None) or {}
-            members = intent.get("members") if isinstance(intent, dict) else []
+            intent_payload = getattr(opts, "_model3d_intent", None) or {}
+            members = (
+                intent_payload.get("members")
+                if isinstance(intent_payload, dict)
+                else []
+            )
             if members:
-                try:
-                    from pdfcadcore.semantic_members import create_semantic_members
+                from pdfcadcore.semantic_members import create_semantic_members
 
-                    semantic_report = create_semantic_members(
-                        list(members),
-                        doc=fc_doc,
-                    )
-                    if not hasattr(opts, "_report_extra"):
-                        opts._report_extra = {}
-                    model3d_extra = dict(
-                        getattr(opts, "_report_extra", {}).get("model_3d") or {}
-                    )
-                    model3d_extra["semantic_members"] = semantic_report
-                    opts._report_extra["model_3d"] = model3d_extra
-                except (ImportError, RuntimeError, TypeError, ValueError) as e:
-                    if opts.verbose:
-                        _warn(f"Semantic member generation skipped: {e}")
+                semantic_report = create_semantic_members(
+                    list(members),
+                    doc=fc_doc,
+                )
+                model3d_extra = dict(
+                    getattr(opts, "_report_extra", {}).get("model_3d") or {}
+                )
+                model3d_extra["semantic_members"] = semantic_report
+                opts._report_extra["model_3d"] = model3d_extra
+        fc_doc.recompute()
+        opts.phase_timings_ms["postprocess_ms"] = (
+            time.perf_counter() - postprocess_started
+        ) * 1000.0
 
+        pdf_doc_for_import.close()
+        pdf_doc_for_import = None
         imported_objects = _post_baseline_document_objects(
             _document_objects(fc_doc),
             baseline_object_ids,
             baseline_object_names,
         )
-        host_inventory = _build_host_object_inventory(imported_objects)
+        _invoke_import_cancellation_checkpoint(opts, "before persistence")
+        persistence_started = time.perf_counter()
+        try:
+            host_inventory, save_reopen_inventory = _build_persistence_host_evidence(
+                fc_doc,
+                imported_objects,
+                baseline_object_names,
+                opts=opts,
+            )
+        finally:
+            opts.phase_timings_ms["persistence_evidence_ms"] = (
+                time.perf_counter() - persistence_started
+            ) * 1000.0
+        if host_inventory.get("verified") is not True:
+            raise ImportLifecycleError("live host inventory verification failed")
+        if save_reopen_inventory.get("verified") is not True:
+            raise ImportLifecycleError("save/reopen host inventory verification failed")
         opts._report_extra["actual_host_object_inventory"] = host_inventory
-        opts._report_extra["save_reopen_inventory"] = _save_reopen_host_object_inventory(
-            fc_doc,
-            host_inventory,
-            baseline_object_names,
-        )
+        opts._report_extra["save_reopen_inventory"] = save_reopen_inventory
         inventory_counts = dict(host_inventory.get("counts") or {})
 
-        write_import_report(
+        report_path = opts.import_report_path or _default_import_report_path(pdf_path)
+        report_target = Path(_journal_attempt_path(opts, report_path))
+        bootstrap_target = Path(
+            _journal_attempt_path(
+                opts,
+                report_target.with_name("parts_bootstrap.json"),
+            )
+        )
+        provenance_target = Path(
+            _journal_attempt_path(
+                opts,
+                report_target.with_name("source_provenance.json"),
+            )
+        )
+        fallback_used, fallback_reason = _report_fallback_state(opts)
+        elapsed_ms = (time.perf_counter() - t_import_start) * 1000.0
+        opts.phase_timings_ms["total_ms"] = elapsed_ms
+        _invoke_import_cancellation_checkpoint(opts, "before report")
+        written_report = write_import_report(
             pdf_path=pdf_path,
-            output_path=report_path,
+            output_path=str(report_target),
             opts=opts,
             pages_imported=imported_count,
             total_pages=total_pages,
@@ -11013,9 +17077,93 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             fallback_used=fallback_used,
             fallback_reason=fallback_reason,
         )
-        if opts.verbose:
-            _msg(f"Import report: {report_path}")
-    except (OSError, RuntimeError, TypeError, ValueError, ImportError) as e:
-        _warn(f"Import report write failed: {e}")
-
-    return True
+        if Path(written_report).resolve() != report_target.resolve():
+            raise ImportLifecycleError("report writer returned an unexpected path")
+        if not report_target.is_file() or report_target.stat().st_size <= 0:
+            raise ImportLifecycleError("import report publication is missing or empty")
+        if not bootstrap_target.is_file() or bootstrap_target.stat().st_size <= 0:
+            raise ImportLifecycleError("parts bootstrap publication is missing or empty")
+        if (
+            list(getattr(opts, "_source_provenance_objects", []) or [])
+            and (
+                not provenance_target.is_file()
+                or provenance_target.stat().st_size <= 0
+            )
+        ):
+            raise ImportLifecycleError(
+                "source provenance publication is missing or empty"
+            )
+        _validated_pdf_source_snapshot_path(opts)
+        _invoke_import_cancellation_checkpoint(opts, "before live gate")
+        _require_live_import_contract_ready(opts)
+        _dispose_pdf_source_attempt(opts)
+        _invoke_import_cancellation_checkpoint(opts, "before commit")
+        fc_doc.commitTransaction()
+        transaction_open = False
+        _accept_attempt_paths(opts)
+        attempt_accepted = True
+        if autofit:
+            try:
+                _autofit_import_view(fc_doc)
+            except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                _warn("Import succeeded, but view autofit failed: %s" % exc)
+        if opts.import_mode == "auto" and opts.auto_resolved_mode:
+            try:
+                _msg(
+                    "Auto mode summary: %s%s"
+                    % (
+                        opts.auto_resolved_mode,
+                        " — %s" % opts.auto_reason if opts.auto_reason else "",
+                    )
+                )
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                pass
+        return True
+    except ImportCancelled as failure:
+        rollback = _rollback_import_attempt(
+            fc_doc,
+            opts,
+            baseline_object_ids,
+            baseline_object_names,
+            transaction_open=transaction_open,
+        )
+        transaction_open = False
+        _raise_incomplete_rollback(rollback, failure)
+        return False
+    except BaseException as failure:
+        rollback = _rollback_import_attempt(
+            fc_doc,
+            opts,
+            baseline_object_ids,
+            baseline_object_names,
+            transaction_open=transaction_open,
+        )
+        transaction_open = False
+        if isinstance(failure, TextRepresentationFailure):
+            failure.attempt["created_entity_ids"] = list(
+                rollback.get("created_entity_ids") or []
+            )
+            failure.attempt["removed_entity_ids"] = list(
+                rollback.get("removed_entity_ids") or []
+            )
+            failure.attempt["cleanup_complete"] = rollback["cleanup_complete"]
+            failure.attempt["rollback"] = rollback
+        _raise_incomplete_rollback(rollback, failure)
+        raise
+    finally:
+        opts._atomic_import_active = False
+        try:
+            if pdf_doc_for_import is not None:
+                pdf_doc_for_import.close()
+        finally:
+            try:
+                _dispose_pdf_source_attempt(opts)
+            finally:
+                try:
+                    if not attempt_accepted:
+                        _close_attempt_created_document(
+                            fc_doc,
+                            document_created_by_attempt,
+                        )
+                finally:
+                    opts._import_cancellation_checkpoint = None

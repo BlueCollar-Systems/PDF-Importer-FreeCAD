@@ -339,7 +339,7 @@ def _canonical_3d_item(
             "synthetic": False,
             "glyph_id": index + 1,
             "glyph_name": "glyph%05d" % (index + 1),
-            "glyph_bounds": (0.0, 0.0, 500.0, 700.0),
+            "glyph_bounds": [0.0, 0.0, 500.0, 700.0],
             "advance_width": 600.0,
             "layout_only_zero_ink": False,
             "font_asset_binding": dict(binding),
@@ -376,16 +376,117 @@ def _canonical_3d_item(
     return item
 
 
-def _found_font_resolution(item, path="C:/fonts/arial.ttf"):
+def _found_font_resolution(item, path=None):
+    if path is None:
+        import io
+        import re
+        import tempfile
+
+        from fontTools.fontBuilder import FontBuilder
+        from fontTools.pens.ttGlyphPen import TTGlyphPen
+
+        raw_font_name = str(item["font_identity"]["raw_name"] or "").strip()
+        source_name = re.sub(r"^[A-Z]{6}\+", "", raw_font_name)
+        style_match = re.search(
+            r"(?:[-_ ]?)(BoldItalic|BoldOblique|Bold|Italic|Oblique|Regular)$",
+            source_name,
+            flags=re.IGNORECASE,
+        )
+        style_name = style_match.group(1) if style_match else "Regular"
+        family_name = (
+            source_name[: style_match.start()].rstrip("-_ ")
+            if style_match
+            else source_name[:-2] if source_name.endswith("MT") else source_name
+        )
+        if not family_name:
+            family_name = "FreeCAD Representation Test"
+        full_name = (
+            family_name
+            if style_name.casefold() == "regular"
+            else "%s %s" % (family_name, style_name)
+        )
+        postscript_name = re.sub(r"[^A-Za-z0-9-]", "", source_name)
+        if not postscript_name:
+            postscript_name = re.sub(r"[^A-Za-z0-9]", "", family_name) + "-Regular"
+
+        codepoints = sorted({ord(character) for character in item["text"]})
+        glyph_names = ["uni%04X" % codepoint for codepoint in codepoints]
+        glyph_order = [".notdef", *glyph_names]
+        builder = FontBuilder(1000, isTTF=True)
+        builder.setupGlyphOrder(glyph_order)
+        builder.setupCharacterMap(
+            {
+                codepoint: glyph_name
+                for codepoint, glyph_name in zip(
+                    codepoints,
+                    glyph_names,
+                    strict=True,
+                )
+            }
+        )
+        builder.setupHorizontalMetrics({name: (600, 0) for name in glyph_order})
+        builder.setupHorizontalHeader(ascent=800, descent=-200)
+        builder.setupNameTable(
+            {
+                "familyName": family_name,
+                "styleName": style_name,
+                "uniqueFontIdentifier": postscript_name,
+                "fullName": full_name,
+                "psName": postscript_name,
+            }
+        )
+        builder.setupOS2(
+            sTypoAscender=800,
+            sTypoDescender=-200,
+            usWinAscent=800,
+            usWinDescent=200,
+        )
+        style_key = style_name.casefold()
+        is_bold = "bold" in style_key
+        is_italic = "italic" in style_key or "oblique" in style_key
+        builder.font["OS/2"].fsSelection = (
+            (0x20 if is_bold else 0)
+            | (0x01 if is_italic else 0)
+            | (0 if is_bold or is_italic else 0x40)
+        )
+        builder.font["head"].macStyle = (
+            (0x01 if is_bold else 0) | (0x02 if is_italic else 0)
+        )
+        builder.setupPost()
+        glyphs = {}
+        for glyph_name in glyph_order:
+            pen = TTGlyphPen(None)
+            if glyph_name != ".notdef":
+                pen.moveTo((100, 0))
+                pen.lineTo((100, 700))
+                pen.lineTo((500, 700))
+                pen.lineTo((500, 0))
+                pen.closePath()
+            glyphs[glyph_name] = pen.glyph()
+        builder.setupGlyf(glyphs)
+        builder.setupMaxp()
+        output = io.BytesIO()
+        builder.font.save(output)
+        payload = output.getvalue()
+        digest = hashlib.sha256(payload).hexdigest()
+        font_root = Path(tempfile.gettempdir()) / "bcs-freecad-representation-fonts"
+        font_root.mkdir(parents=True, exist_ok=True)
+        test_path = font_root / (digest + ".ttf")
+        if not test_path.exists() or test_path.read_bytes() != payload:
+            test_path.write_bytes(payload)
+        path = str(test_path)
+    payload = Path(path).read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
     return path, [{
         "source": "embedded_font",
         "outcome": "found",
         "font_identity": dict(item["font_identity"]),
         "path": path,
-        "sha256": "b" * 64,
+        "sha256": digest,
         "pdf_sha256": item["pdf_sha256"],
         "page_number": item["page_number"],
         "staging_complete": True,
+        "approved_font_root": str(Path(path).resolve().parent),
     }]
 
 
@@ -635,18 +736,50 @@ def test_partial_label_failure_rolls_back_instead_of_silently_dropping_text(monk
     assert opts.text_delivery_attempts[-1]["attempted_type"] == "labels"
 
 
-def test_missing_exact_font_is_explicit_failure_not_labels(monkeypatch):
+def test_missing_exact_font_uses_same_rung_3d_substitute_not_labels(
+    monkeypatch,
+    tmp_path,
+):
     document, draft, group = _install_host(monkeypatch)
-    monkeypatch.setattr(core, "_resolve_shapestring_font_path", lambda *args: None)
+    item = _canonical_3d_item("TEXT", font="MissingSourceFont-Regular")
+    fixture_path, _fixture_evidence = _found_font_resolution(item)
+    candidate_root = tmp_path / "approved-fonts"
+    candidate_root.mkdir()
+    candidate = candidate_root / "covering.ttf"
+    candidate.write_bytes(Path(fixture_path).read_bytes())
+    monkeypatch.setattr(
+        core,
+        "_resolve_shapestring_font_path_with_evidence",
+        lambda *_args, **_kwargs: _absent_font_resolution(item),
+    )
+    monkeypatch.setattr(
+        core,
+        "_no_cost_font_candidate_roots",
+        lambda: [("installed_no_cost_substitute", candidate_root)],
+    )
+    monkeypatch.setattr(
+        core,
+        "_shapestring_font_cache_dir",
+        lambda: tmp_path / "font-stage",
+    )
     opts = core.ImportOptions(text_mode="3d_text")
 
-    with pytest.raises(RuntimeError, match="exact source font"):
-        core._render_text_spans_3d(_tdict("TEXT"), group, 100.0, opts, 1.0)
+    result = core._deliver_text_item_3d(
+        item,
+        "3d_text",
+        opts,
+        text_group=group,
+        page_h=100.0,
+        scale=1.0,
+    )
 
-    assert document.Objects == []
-    assert draft.calls == []
+    assert result["outcome"] == "verified"
+    assert result["final_type"] == "3d_text"
+    assert result["evidence"]["font_substitution_applied"] is True
+    assert result["evidence"]["source_font_equivalence"] is False
+    assert len(document.Objects) == 3
+    assert len(draft.calls) == 1
     assert draft.label_calls == []
-    assert opts.text_delivered_counts == {}
 
 
 @pytest.mark.parametrize(
@@ -866,7 +999,7 @@ def test_source_items_reject_oversized_transform_tuples(field_name, oversized):
         list(core._iter_text_source_items(tdict, 1, "a" * 64, "3d_text"))
 
 
-def test_exact_font_exhaustion_raises_fully_bound_text_item_impossible(
+def test_exact_font_exhaustion_without_a_covering_substitute_is_terminal_not_fallback(
     monkeypatch, tmp_path
 ):
     import PDFEmbeddedFonts as embedded
@@ -874,6 +1007,11 @@ def test_exact_font_exhaustion_raises_fully_bound_text_item_impossible(
     item = _canonical_3d_item(font="ABCDEF+Siwa-Regular")
     opts = core.ImportOptions(text_mode="3d_text")
     monkeypatch.setenv("WINDIR", str(tmp_path))
+    monkeypatch.setattr(
+        core,
+        "_no_cost_font_candidate_roots",
+        lambda: [("installed_no_cost_substitute", tmp_path)],
+    )
 
     def stage_exact_nonembedded_font(*_args, failures):
         failures.append({
@@ -898,7 +1036,7 @@ def test_exact_font_exhaustion_raises_fully_bound_text_item_impossible(
         page_number=item["page_number"],
     )
 
-    with pytest.raises(core.TextItemImpossible) as raised:
+    with pytest.raises(core.TextRepresentationFailure) as raised:
         core._deliver_text_item_3d(
             item,
             "3d_text",
@@ -908,19 +1046,16 @@ def test_exact_font_exhaustion_raises_fully_bound_text_item_impossible(
             scale=1.0,
         )
 
-    impossible = raised.value
-    proof = impossible.proof
-    attempt = impossible.attempt
-    assert proof["item_specific_proven_impossible"] is True
-    assert proof["importer_identity"] == core.FREECAD_TEXT_IMPORTER_IDENTITY
-    assert proof["pdf_sha256"] == item["pdf_sha256"]
-    assert proof["page_number"] == item["page_number"]
-    assert proof["source_item_id"] == item["source_item_id"]
-    assert proof["requested_type"] == "3d_text"
-    assert proof["attempted_type"] == "3d_text"
-    assert proof["reason_code"] == "exact_font_unavailable"
-    assert proof["font_identity"] == item["font_identity"]
-    assert [result["source"] for result in proof["attempted_source_results"]] == [
+    attempt = raised.value.attempt
+    assert attempt["source_item_id"] == item["source_item_id"]
+    assert attempt["requested_type"] == "3d_text"
+    assert attempt["attempted_type"] == "3d_text"
+    assert attempt["outcome"] == "failed"
+    assert attempt["reason"] == "no_cost_font_substitute_unavailable"
+    assert [
+        result["source"]
+        for result in attempt["evidence"]["attempted_source_results"]
+    ] == [
         "embedded_font",
         "system_font",
     ]
@@ -930,26 +1065,14 @@ def test_exact_font_exhaustion_raises_fully_bound_text_item_impossible(
         and result["pdf_sha256"] == item["pdf_sha256"]
         and result["page_number"] == item["page_number"]
         and result["staging_complete"] is True
-        for result in proof["attempted_source_results"]
+        for result in attempt["evidence"]["attempted_source_results"]
     )
-    assert proof["attempted_sources_complete"] is True
-    assert proof["created_entity_ids"] == []
-    assert proof["removed_entity_ids"] == []
-    assert proof["cleanup_complete"] is True
-    assert attempt == {
-        "source_item_id": item["source_item_id"],
-        "requested_type": "3d_text",
-        "attempted_type": "3d_text",
-        "final_type": None,
-        "outcome": "proven_impossible",
-        "reason_code": "exact_font_unavailable",
-        "created_entity_ids": [],
-        "removed_entity_ids": [],
-        "cleanup_complete": True,
-    }
-    assert core._validate_item_impossibility_proof(
-        item, "3d_text", "3d_text", proof
-    ) == proof
+    assert attempt["evidence"]["font_substitution_evidence"][
+        "glyph_coverage_verified"
+    ] is False
+    assert attempt["created_entity_ids"] == []
+    assert attempt["removed_entity_ids"] == []
+    assert attempt["cleanup_complete"] is True
 
 
 def test_later_3d_rung_success_preserves_original_requested_type(monkeypatch):
@@ -1240,7 +1363,10 @@ def test_collection_error_after_creation_is_incomplete_and_detects_unknown_objec
     assert document.removed == []
 
 
-def test_prior_verified_item_is_not_removed_when_later_item_is_impossible(monkeypatch):
+def test_prior_verified_item_is_not_removed_when_later_item_has_no_substitute(
+    monkeypatch,
+    tmp_path,
+):
     document, _draft, group = _install_host(monkeypatch)
     first = _canonical_3d_item("FIRST", span_index=0)
     second = _canonical_3d_item("SECOND", "Siwa-Regular", span_index=1)
@@ -1251,6 +1377,8 @@ def test_prior_verified_item_is_not_removed_when_later_item_is_impossible(monkey
         return _absent_font_resolution(second)
 
     monkeypatch.setattr(core, "_resolve_shapestring_font_path_with_evidence", resolve)
+    monkeypatch.setenv("WINDIR", str(tmp_path))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LocalAppData"))
     opts = core.ImportOptions(text_mode="3d_text")
 
     verified = core._deliver_text_item_3d(
@@ -1261,7 +1389,7 @@ def test_prior_verified_item_is_not_removed_when_later_item_is_impossible(monkey
         page_h=100.0,
         scale=1.0,
     )
-    with pytest.raises(core.TextItemImpossible):
+    with pytest.raises(core.TextRepresentationFailure) as raised:
         core._deliver_text_item_3d(
             second,
             "3d_text",
@@ -1270,6 +1398,8 @@ def test_prior_verified_item_is_not_removed_when_later_item_is_impossible(monkey
             page_h=100.0,
             scale=1.0,
         )
+
+    assert raised.value.attempt["reason"] == "no_cost_font_substitute_unavailable"
 
     live_ids = {obj.Name for obj in document.Objects}
     assert set(verified["created_entity_ids"]) == live_ids
@@ -1407,7 +1537,8 @@ def test_verified_item_3d_result_has_complete_ids_and_evidence(monkeypatch):
     assert evidence["verified_anchor_xyz"] == pytest.approx((10.0, 50.0, 0.0))
     assert evidence["target_advance"] > 0.0
     assert evidence["verified_advance"] == pytest.approx(evidence["target_advance"])
-    assert evidence["font_path"] == resolution[0]
+    assert evidence["font_path"] == evidence["staged_font_path"]
+    assert evidence["source_font_asset_path"] == str(Path(resolution[0]).resolve())
     assert evidence["font_source_result"] == resolution[1][0]
     assert evidence["source_ink_evidence"] == item["source_ink_evidence"]
     assert evidence["source_ink_evidence_persisted"] is True

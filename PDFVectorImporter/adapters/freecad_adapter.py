@@ -9,7 +9,7 @@ Purpose:
   and writes a result JSON file.
 
 Typical use:
-python adapters/freecad_adapter.py --config qa_config.json --test-id FC-GEO-001 --input "C:/path/to/your-drawing.pdf" --mode vector --dry-run
+python adapters/freecad_adapter.py --config qa_config.json --test-id FC-GEO-001 --input "C:/path/to/your-drawing.pdf" --mode vector --text-mode 3d_text --dry-run
 """
 from __future__ import annotations
 
@@ -22,6 +22,26 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+
+
+CANONICAL_TEXT_MODES = (
+    "text",
+    "labels",
+    "glyphs",
+    "3d_text",
+    "geometry",
+    "raster",
+)
+
+
+def _require_text_mode(value: object) -> str:
+    """Validate exact QA intent without aliases, trimming, or defaults."""
+
+    if type(value) is not str or value not in CANONICAL_TEXT_MODES:
+        raise ValueError(
+            "text_mode must be one of: %s" % ", ".join(CANONICAL_TEXT_MODES)
+        )
+    return value
 
 
 def load_json(path: Optional[str]) -> dict:
@@ -43,6 +63,7 @@ def normalize_path(value: Optional[str], base_dir: Optional[str] = None) -> Opti
 
 def build_payload(args: argparse.Namespace, cfg: dict, result_path: str, config_dir: Optional[str]) -> dict:
     freecad_cfg = cfg.get("freecad", {})
+    text_mode = _require_text_mode(getattr(args, "text_mode", None))
     return {
         "adapter": "freecad",
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -50,6 +71,7 @@ def build_payload(args: argparse.Namespace, cfg: dict, result_path: str, config_
         "platform": "FC",
         "input_pdf": normalize_path(args.input, config_dir),
         "mode": args.mode,
+        "text_mode": text_mode,
         "page_range": args.page_range,
         "output_dir": normalize_path(args.output_dir, config_dir) if args.output_dir else None,
         "result_json": result_path,
@@ -92,6 +114,12 @@ def main() -> int:
     parser.add_argument("--mode", default="auto",
                         choices=["auto", "vector", "raster", "hybrid"],
                         help="Import mode (auto|vector|raster|hybrid)")
+    parser.add_argument(
+        "--text-mode",
+        required=True,
+        choices=CANONICAL_TEXT_MODES,
+        help="Exact text representation request",
+    )
     parser.add_argument("--page-range", default="1", help="Page range string")
     parser.add_argument("--output-dir", help="Optional output directory")
     parser.add_argument("--notes", help="Optional notes")

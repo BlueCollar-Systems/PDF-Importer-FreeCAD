@@ -19,10 +19,12 @@ class EmbeddedFontInventoryError(RuntimeError):
 
 def normalize_font_key(name: str) -> str:
     raw = str(name or "").strip()
-    if "+" in raw:
-        prefix, remainder = raw.split("+", 1)
-        if len(prefix) == 6 and prefix.isupper():
-            raw = remainder
+    # ISO 32000 subset tags are exactly six ASCII uppercase letters.  Methods
+    # such as ``str.isupper`` also accept digits and non-ASCII uppercase text,
+    # which would silently erase a real portion of an unrelated font name.
+    subset_match = re.match(r"^[A-Z]{6}\+(.+)$", raw)
+    if subset_match is not None:
+        raw = subset_match.group(1)
     return re.sub(r"[^a-z0-9]", "", raw.lower())
 
 
@@ -32,6 +34,56 @@ def _finite_number(value: Any, default: float) -> float:
     except (TypeError, ValueError):
         return float(default)
     return number if math.isfinite(number) else float(default)
+
+
+def _cff_name_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        for encoding in ("utf-8", "latin-1"):
+            try:
+                return value.decode(encoding).strip()
+            except UnicodeDecodeError:
+                continue
+        return ""
+    return str(value or "").strip()
+
+
+def _fallback_font_family_and_style(name: Any) -> Tuple[str, str]:
+    raw_name = _cff_name_text(name) or "Embedded PDF Font"
+    subset_match = re.match(r"^[A-Z]{6}\+(.+)$", raw_name)
+    if subset_match is not None:
+        raw_name = subset_match.group(1)
+    style_match = re.match(
+        r"^(.*?)(?:[-_\s]*)(BoldItalic|BoldOblique|SemiBold|DemiBold|"
+        r"ExtraBold|Regular|Roman|Normal|Book|Italic|Oblique|Bold|Light|"
+        r"Medium|Black)$",
+        raw_name,
+        flags=re.IGNORECASE,
+    )
+    style_names = {
+        "bolditalic": "Bold Italic",
+        "boldoblique": "Bold Oblique",
+        "semibold": "SemiBold",
+        "demibold": "DemiBold",
+        "extrabold": "ExtraBold",
+        "regular": "Regular",
+        "roman": "Roman",
+        "normal": "Normal",
+        "book": "Book",
+        "italic": "Italic",
+        "oblique": "Oblique",
+        "bold": "Bold",
+        "light": "Light",
+        "medium": "Medium",
+        "black": "Black",
+    }
+    if style_match is None or not style_match.group(1).strip("-_ "):
+        family_source = raw_name
+        style = "Regular"
+    else:
+        family_source = style_match.group(1).strip("-_ ")
+        style = style_names[style_match.group(2).casefold()]
+    family = re.sub(r"[-_]+", " ", family_source).strip()
+    return family or "Embedded PDF Font", style
 
 
 def convert_cff_to_otf(cff_bytes: bytes, family_hint: str = "Embedded PDF Font") -> bytes:
@@ -92,13 +144,17 @@ def convert_cff_to_otf(cff_bytes: bytes, family_hint: str = "Embedded PDF Font")
         if len(unicode_text) == 1:
             cmap.setdefault(ord(unicode_text), glyph_name)
 
-    raw_family = str(family_hint or "Embedded PDF Font").strip()
-    if "+" in raw_family:
-        prefix, remainder = raw_family.split("+", 1)
-        if len(prefix) == 6 and prefix.isupper():
-            raw_family = remainder
-    family = re.sub(r"[-_]+", " ", raw_family).strip() or "Embedded PDF Font"
-    ps_name = re.sub(r"[^A-Za-z0-9-]", "", raw_family.replace(" ", "-"))
+    fallback_family, fallback_style = _fallback_font_family_and_style(family_hint)
+    family = _cff_name_text(getattr(top, "FamilyName", "")) or fallback_family
+    style = _cff_name_text(getattr(top, "Weight", "")) or fallback_style
+    full_name = _cff_name_text(getattr(top, "FullName", ""))
+    if not full_name:
+        full_name = "%s %s" % (family, style)
+    font_names = list(getattr(cff, "fontNames", []) or [])
+    raw_ps_name = _cff_name_text(font_names[0]) if font_names else ""
+    if not raw_ps_name:
+        raw_ps_name = "%s-%s" % (family, style)
+    ps_name = re.sub(r"[^A-Za-z0-9-]", "", raw_ps_name.replace(" ", "-"))
     ps_name = ps_name or "EmbeddedPDFFont-Regular"
 
     bbox = list(getattr(top, "FontBBox", []) or [0, -200, units_per_em, units_per_em])
@@ -119,9 +175,9 @@ def convert_cff_to_otf(cff_bytes: bytes, family_hint: str = "Embedded PDF Font")
     builder.setupNameTable(
         {
             "familyName": family,
-            "styleName": "Regular",
+            "styleName": style,
             "uniqueFontIdentifier": ps_name,
-            "fullName": family,
+            "fullName": full_name,
             "psName": ps_name,
         }
     )
@@ -131,10 +187,25 @@ def convert_cff_to_otf(cff_bytes: bytes, family_hint: str = "Embedded PDF Font")
         usWinAscent=max(0, ascent),
         usWinDescent=max(0, -descent),
     )
+    style_key = style.casefold()
+    is_bold = "bold" in style_key
+    is_italic = (
+        "italic" in style_key
+        or "oblique" in style_key
+        or _finite_number(getattr(top, "ItalicAngle", 0.0), 0.0) != 0.0
+    )
+    builder.font["OS/2"].fsSelection = (
+        (0x20 if is_bold else 0)
+        | (0x01 if is_italic else 0)
+        | (0 if is_bold or is_italic else 0x40)
+    )
+    builder.font["head"].macStyle = (
+        (0x01 if is_bold else 0) | (0x02 if is_italic else 0)
+    )
     builder.setupPost()
     builder.setupCFF(
         ps_name,
-        {"FullName": family, "FamilyName": family, "Weight": "Regular"},
+        {"FullName": full_name, "FamilyName": family, "Weight": style},
         char_strings,
         {},
     )

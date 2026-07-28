@@ -21,6 +21,28 @@ from pathlib import Path
 from typing import List, Optional, Set
 
 
+CANONICAL_TEXT_MODES = (
+    "text",
+    "labels",
+    "glyphs",
+    "3d_text",
+    "geometry",
+    "raster",
+)
+
+
+def _require_payload_text_mode(payload: dict) -> str:
+    """Return an exact canonical request; never infer or normalize QA intent."""
+
+    value = payload.get("text_mode") if isinstance(payload, dict) else None
+    if type(value) is not str or value not in CANONICAL_TEXT_MODES:
+        raise ValueError(
+            "payload text_mode must be one of: %s"
+            % ", ".join(CANONICAL_TEXT_MODES)
+        )
+    return value
+
+
 def resolve_path(value: Optional[str], base_dir: Optional[str] = None) -> Optional[str]:
     if value is None:
         return None
@@ -37,18 +59,10 @@ def parse_pages(spec: Optional[str], pdf_path: str):
         return [1]
 
     if s.lower() == "all":
-        try:
-            try:
-                import pymupdf as fitz  # type: ignore  # PyMuPDF >= 1.24 preferred name
-            except ImportError:
-                import fitz  # type: ignore  # Legacy fallback
-
-            doc = fitz.open(pdf_path)
-            total = len(doc)
-            doc.close()
-            return list(range(1, total + 1))
-        except (ImportError, OSError, RuntimeError):
-            return [1]
+        # Core binds the source bytes exactly once, then resolves this sentinel
+        # against that immutable attempt.  The harness must not race it by
+        # opening the mutable display/original path first.
+        return None
 
     pages: Set[int] = set()
     for part in [p.strip() for p in s.replace(";", ",").split(",") if p.strip()]:
@@ -64,6 +78,30 @@ def parse_pages(spec: Optional[str], pdf_path: str):
             if n > 0:
                 pages.add(n)
     return sorted(pages) if pages else [1]
+
+
+def _require_exact_core_success(result):
+    """Accept only Core's exact public success value."""
+
+    if result is not True:
+        raise RuntimeError("core.import_pdf must return exact True for success")
+    return True
+
+
+def _result_exit_code(result) -> int:
+    """Return zero only for the harness's literal persisted PASS state."""
+
+    return 0 if isinstance(result, dict) and result.get("status") == "PASS" else 1
+
+
+def _harness_exception_message(exc: Exception) -> str:
+    """Preserve typed PDF-open reasons while reporting every ordinary failure."""
+
+    error_type = exc.__class__.__name__
+    reason = getattr(exc, "reason", None)
+    if error_type == "PdfOpenError" and isinstance(reason, str) and reason:
+        return f"{error_type}[{reason}]: {exc}"
+    return f"{error_type}: {exc}"
 
 
 def setup_import_paths(payload: dict, payload_dir: str) -> None:
@@ -168,10 +206,9 @@ def _run_cmd(cmd: List[str], timeout_s: int = 300) -> dict:
 
 def ensure_pymupdf(mod_dir: Optional[str]) -> dict:
     try:
-        try:
-            import pymupdf as fitz  # type: ignore  # noqa: F401  # PyMuPDF >= 1.24 preferred name
-        except ImportError:
-            import fitz  # type: ignore  # noqa: F401  # Legacy fallback
+        from pdfcadcore.fitz_loader import import_fitz
+
+        import_fitz()
         return {"status": "available", "installed_now": False}
     except ImportError as first_exc:
         if not mod_dir:
@@ -189,10 +226,7 @@ def ensure_pymupdf(mod_dir: Optional[str]) -> dict:
 
         # Try once more in case it already exists in bundled lib.
         try:
-            try:
-                import pymupdf as fitz  # type: ignore  # noqa: F401  # PyMuPDF >= 1.24 preferred name
-            except ImportError:
-                import fitz  # type: ignore  # noqa: F401  # Legacy fallback
+            import_fitz(prefer_lib_dir=str(lib_dir))
             return {"status": "available_from_lib_dir", "installed_now": False, "lib_dir": str(lib_dir)}
         except ImportError:
             pass
@@ -253,10 +287,7 @@ def ensure_pymupdf(mod_dir: Optional[str]) -> dict:
                 sys.path.insert(0, str(lib_dir))
 
             try:
-                try:
-                    import pymupdf as fitz  # type: ignore  # noqa: F401  # PyMuPDF >= 1.24 preferred name
-                except ImportError:
-                    import fitz  # type: ignore  # noqa: F401  # Legacy fallback
+                import_fitz(prefer_lib_dir=str(lib_dir))
                 return {
                     "status": "installed_to_lib_dir",
                     "installed_now": True,
@@ -312,8 +343,12 @@ def count_doc_objects(doc) -> dict:
     return out
 
 
-def _build_import_options(core, cfg_obj, pages):
+def _build_import_options(core, cfg_obj, pages, *, text_mode: str):
     """Map the canonical shared config onto FreeCAD's host option names."""
+
+    text_mode = _require_payload_text_mode({"text_mode": text_mode})
+    cfg_obj.text_mode = text_mode
+    cfg_obj.import_text = True
 
     return core.ImportOptions(
         pages=pages,
@@ -323,8 +358,8 @@ def _build_import_options(core, cfg_obj, pages):
         join_tol=float(cfg_obj.join_tol),
         curve_step_mm=float(cfg_obj.curve_step_mm),
         make_faces=bool(cfg_obj.make_faces),
-        import_text=bool(cfg_obj.import_text),
-        text_mode=str(cfg_obj.text_mode),
+        import_text=True,
+        text_mode=text_mode,
         strict_text_fidelity=bool(cfg_obj.strict_text_fidelity),
         hatch_mode=str(cfg_obj.hatch_mode),
         group_by_color=bool(cfg_obj.group_by_color),
@@ -375,6 +410,7 @@ def main() -> int:
             raise FileNotFoundError(f"Input PDF not found: {input_pdf}")
 
         pages = parse_pages(payload.get("page_range"), input_pdf)
+        text_mode = _require_payload_text_mode(payload)
         mode_name = (payload.get("mode") or "auto").strip().lower()
         if mode_name not in ("auto", "vector", "raster", "hybrid"):
             mode_name = "auto"
@@ -403,29 +439,36 @@ def main() -> int:
                 f"Attempts: {cfg_errors}"
             )
         cfg_obj = getattr(ImportConfig, mode_name)()
-        opts = _build_import_options(core, cfg_obj, pages)
+        opts = _build_import_options(
+            core,
+            cfg_obj,
+            pages,
+            text_mode=text_mode,
+        )
 
         doc = FreeCAD.ActiveDocument or FreeCAD.newDocument("BC_QA")
         before = count_doc_objects(doc)
 
         ok = core.import_pdf(input_pdf, opts)
+        _require_exact_core_success(ok)
         doc.recompute()
 
         after = count_doc_objects(doc)
         delta = {k: after.get(k, 0) - before.get(k, 0) for k in after.keys()}
 
-        result["status"] = "PASS" if ok is not False else "FAIL"
-        result["message"] = "Import completed." if ok is not False else "core.import_pdf returned False."
+        result["status"] = "PASS"
+        result["message"] = "Import completed."
         result["input_pdf"] = input_pdf
         result["mode"] = payload.get("mode")
+        result["text_mode"] = text_mode
         result["page_range"] = payload.get("page_range")
-        result["pages"] = pages
+        result["pages"] = list(getattr(opts, "pages", None) or [])
         result["counts_before"] = before
         result["counts_after"] = after
         result["counts_delta"] = delta
-    except (RuntimeError, OSError, ValueError, TypeError, AttributeError, ImportError) as exc:
+    except Exception as exc:
         result["status"] = "FAIL"
-        result["message"] = f"{exc.__class__.__name__}: {exc}"
+        result["message"] = _harness_exception_message(exc)
         result["traceback"] = traceback.format_exc()
     finally:
         finish = time.time()
@@ -434,7 +477,7 @@ def main() -> int:
         with open(result_path, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2)
 
-    return 0
+    return _result_exit_code(result)
 
 
 if __name__ == "__main__":
@@ -442,4 +485,4 @@ if __name__ == "__main__":
 elif os.environ.get("BC_PDF_QA_PAYLOAD"):
     # FreeCADCmd may execute script files with a non-"__main__" module name.
     # In that case still run the harness when payload is explicitly provided.
-    main()
+    raise SystemExit(main())

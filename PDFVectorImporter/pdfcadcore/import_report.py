@@ -10,10 +10,20 @@ import hashlib
 import json
 import math
 import re
+import stat
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .item_impossibility import (
+    EVIDENCE_KEY as ITEM_IMPOSSIBILITY_EVIDENCE_KEY,
+    item_representation_impossibility_proof_verified,
+)
+from .page_visual import (
+    page_visual_fallback_proof_v2_verified,
+    page_visual_source_observation_v2_verified,
+)
 from .preflight_copy import SCALE_CROSSCHECK_BANNER
+from .text_delivery_report import resolve_text_representation_delivery
 
 SCHEMA = "bcs.import_report/1.1"
 SCALE_TRUST_CONFIDENCE = 0.70
@@ -504,6 +514,8 @@ _FREECAD_SHAPE_FINGERPRINT_TOLERANCE = 1e-7
 _FREECAD_RAW_SHAPE_GEOMETRY_SCHEMA = "bcs.freecad_raw_shape_geometry/1.0"
 _FREECAD_SHAPE_GEOMETRY_SCHEMA = "bcs.freecad_shape_geometry_digest/1.0"
 _FREECAD_SHAPE_COMPARISON_SCHEMA = "bcs.freecad_shape_persistence_comparison/1.1"
+_FREECAD_FCSTD_ARCHIVE_SCHEMA = "bcs.freecad_fcstd_shape_archive/1.1"
+_FREECAD_FCSTD_ARCHIVE_METHOD = "fcstd_brep_archive_sha256"
 _FREECAD_UNORDERED_FALLBACK_PAIR_LIMIT = 4_000_000
 
 
@@ -969,6 +981,122 @@ def _freecad_raw_shape_digest(geometry: Any) -> Optional[str]:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _freecad_archive_entry_name_valid(value: Any) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\x00" in value
+        or "\\" in value
+        or ":" in value
+        or value.startswith("/")
+        or value.endswith("/")
+        or "//" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return False
+    return all(part and part not in {".", ".."} for part in value.split("/"))
+
+
+def _freecad_static_shape_digest(content: Any) -> Optional[str]:
+    if not isinstance(content, dict):
+        return None
+    payload = {
+        "method": "cheap_topology_metrics_bounds",
+        "topology_counts": content.get("shape_topology_counts"),
+        "metrics": content.get("shape_metrics"),
+        "bounds": content.get("shape_bounds"),
+    }
+    try:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _freecad_fcstd_archive_shape_snapshot_verified(content: Any) -> bool:
+    """Validate one cheap shape snapshot bound to exact persisted FCStd bytes."""
+
+    if not isinstance(content, dict):
+        return False
+    digest_pattern = re.compile(r"[0-9a-f]{64}")
+    if content.get("shape_snapshot_method") == _FREECAD_FCSTD_ARCHIVE_METHOD:
+        return bool(
+            content.get("shape_persistence_method")
+            == _FREECAD_FCSTD_ARCHIVE_METHOD
+            and content.get("shape_archive_schema")
+            == _FREECAD_FCSTD_ARCHIVE_SCHEMA
+            and content.get("shape_nonempty") is True
+            and content.get("shape_structure_verified") is True
+            and isinstance(content.get("shape_digest"), str)
+            and digest_pattern.fullmatch(content.get("shape_digest")) is not None
+            and all(
+                field not in content
+                for field in (
+                    "shape_topology_counts",
+                    "shape_metrics",
+                    "shape_bounds",
+                    "shape_archive_entry",
+                    "shape_archive_sha256",
+                    "shape_archive_evidence_digest",
+                )
+            )
+        )
+    topology = content.get("shape_topology_counts")
+    integer_fields = {
+        "shape_archive_fcstd_bytes": 1,
+        "shape_archive_document_xml_bytes": 1,
+        "shape_archive_entry_count": 1,
+        "shape_archive_mapping_count": 1,
+        "shape_archive_expected_shape_count": 1,
+        "shape_archive_expected_nonempty_shape_count": 0,
+        "shape_archive_expected_zero_ink_shape_count": 0,
+        "shape_archive_bytes": 1,
+        "shape_archive_compression_method": 0,
+        "shape_archive_crc32": 0,
+    }
+    if any(
+        type(content.get(field)) is not int or content.get(field) < minimum
+        for field, minimum in integer_fields.items()
+    ):
+        return False
+    return bool(
+        content.get("shape_persistence_method") == _FREECAD_FCSTD_ARCHIVE_METHOD
+        and content.get("shape_archive_schema") == _FREECAD_FCSTD_ARCHIVE_SCHEMA
+        and content.get("shape_snapshot_method")
+        == "cheap_topology_metrics_bounds"
+        and all(
+            isinstance(content.get(field), str)
+            and digest_pattern.fullmatch(content.get(field)) is not None
+            for field in (
+                "shape_digest",
+                "shape_archive_evidence_digest",
+                "shape_archive_fcstd_sha256",
+                "shape_archive_document_xml_sha256",
+                "shape_archive_sha256",
+            )
+        )
+        and content.get("shape_digest") == _freecad_static_shape_digest(content)
+        and content.get("shape_archive_zero_visible_ink") is False
+        and content.get("shape_nonempty") is True
+        and content.get("shape_structure_verified") is True
+        and isinstance(topology, dict)
+        and bool(topology)
+        and any(type(count) is int and count > 0 for count in topology.values())
+        and _freecad_archive_entry_name_valid(content.get("shape_archive_entry"))
+        and content.get("shape_archive_mapping_count")
+        >= content.get("shape_archive_expected_shape_count")
+        and content.get("shape_archive_entry_count")
+        >= content.get("shape_archive_mapping_count") + 1
+        and content.get("shape_archive_compression_method") in {0, 8}
+        and content.get("shape_archive_crc32") <= 0xFFFFFFFF
+    )
+
+
 def _freecad_shape_content_static_fields_match(left: Any, right: Any) -> bool:
     if not isinstance(left, dict) or not isinstance(right, dict):
         return False
@@ -1037,6 +1165,28 @@ def _freecad_public_shape_content_digest(content: Any) -> Optional[str]:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _freecad_shape_static_max_delta(left: Any, right: Any) -> Optional[float]:
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return None
+    deltas: List[float] = []
+    for mapping_name in ("shape_metrics", "shape_bounds"):
+        left_values = left.get(mapping_name)
+        right_values = right.get(mapping_name)
+        if (
+            not isinstance(left_values, dict)
+            or not isinstance(right_values, dict)
+            or set(left_values) != set(right_values)
+        ):
+            return None
+        for key in left_values:
+            left_number = _freecad_finite_number(left_values.get(key))
+            right_number = _freecad_finite_number(right_values.get(key))
+            if left_number is None or right_number is None:
+                return None
+            deltas.append(abs(left_number - right_number))
+    return max(deltas) if deltas else 0.0
+
+
 def _freecad_host_content_comparison(
     left: Any,
     right: Any,
@@ -1053,6 +1203,66 @@ def _freecad_host_content_comparison(
             "verified": bool(left_zero_ink and right_zero_ink and left == right),
             "certificate": None,
         }
+    left_archive = _freecad_fcstd_archive_shape_snapshot_verified(left)
+    right_archive = _freecad_fcstd_archive_shape_snapshot_verified(right)
+    if left_archive or right_archive:
+        archive_only = bool(
+            left.get("shape_snapshot_method") == _FREECAD_FCSTD_ARCHIVE_METHOD
+            or right.get("shape_snapshot_method") == _FREECAD_FCSTD_ARCHIVE_METHOD
+        )
+        if archive_only:
+            return {
+                "verified": bool(left_archive and right_archive and left == right),
+                "certificate": None,
+            }
+        left_content_digest = _freecad_public_shape_content_digest(left)
+        right_content_digest = _freecad_public_shape_content_digest(right)
+        max_delta = _freecad_shape_static_max_delta(left, right)
+        if (
+            not left_archive
+            or not right_archive
+            or left_content_digest is None
+            or right_content_digest is None
+            or max_delta is None
+            or max_delta > _FREECAD_SHAPE_FINGERPRINT_TOLERANCE
+            or not _freecad_shape_content_static_fields_match(left, right)
+        ):
+            return {"verified": False, "certificate": None}
+        certificate = {
+            "schema": _FREECAD_SHAPE_COMPARISON_SCHEMA,
+            "method": _FREECAD_FCSTD_ARCHIVE_METHOD,
+            "tolerance": _FREECAD_SHAPE_FINGERPRINT_QUANTUM,
+            "entity_id": str(entity_id or ""),
+            "archive_evidence_digest": left.get("shape_archive_evidence_digest"),
+            "fcstd_sha256": left.get("shape_archive_fcstd_sha256"),
+            "fcstd_bytes": left.get("shape_archive_fcstd_bytes"),
+            "document_xml_sha256": left.get(
+                "shape_archive_document_xml_sha256"
+            ),
+            "document_xml_bytes": left.get("shape_archive_document_xml_bytes"),
+            "archive_entry_count": left.get("shape_archive_entry_count"),
+            "shape_mapping_count": left.get("shape_archive_mapping_count"),
+            "expected_shape_count": left.get(
+                "shape_archive_expected_shape_count"
+            ),
+            "archive_entry": left.get("shape_archive_entry"),
+            "archive_entry_sha256": left.get("shape_archive_sha256"),
+            "archive_entry_bytes": left.get("shape_archive_bytes"),
+            "archive_entry_compression_method": left.get(
+                "shape_archive_compression_method"
+            ),
+            "archive_entry_crc32": left.get("shape_archive_crc32"),
+            "expected_content_digest": left_content_digest,
+            "actual_content_digest": right_content_digest,
+            "expected_topology_counts": dict(left.get("shape_topology_counts") or {}),
+            "actual_topology_counts": dict(right.get("shape_topology_counts") or {}),
+            "max_delta": max_delta,
+            "verified": True,
+        }
+        certificate["comparison_digest"] = _freecad_shape_comparison_digest(
+            certificate
+        )
+        return {"verified": True, "certificate": certificate}
     left_public = left.get("shape_fingerprint_geometry")
     right_public = right.get("shape_fingerprint_geometry")
     if left_public is None and right_public is None:
@@ -1089,12 +1299,17 @@ def _freecad_host_content_comparison(
         or not _freecad_shape_content_static_fields_match(left, right)
     ):
         return {"verified": False, "certificate": None}
-    geometry_comparison = _freecad_shape_geometry_comparison(left_raw, right_raw)
+    geometry_comparison = (
+        {"verified": True, "max_delta": 0.0}
+        if left_raw_digest == right_raw_digest
+        else _freecad_shape_geometry_comparison(left_raw, right_raw)
+    )
     max_delta = _freecad_finite_number(geometry_comparison.get("max_delta"))
     if geometry_comparison.get("verified") is not True or max_delta is None:
         return {"verified": False, "certificate": None}
     certificate: Dict[str, Any] = {
         "schema": _FREECAD_SHAPE_COMPARISON_SCHEMA,
+        "method": "sampled_geometry_tolerant",
         "tolerance": _FREECAD_SHAPE_FINGERPRINT_QUANTUM,
         "entity_id": str(entity_id or ""),
         "expected_sample_digest": left_raw_digest,
@@ -1125,6 +1340,56 @@ def _freecad_shape_comparison_certificate_valid(
 ) -> bool:
     if not isinstance(certificate, dict):
         return False
+    if certificate.get("method") == _FREECAD_FCSTD_ARCHIVE_METHOD:
+        left_content_digest = _freecad_public_shape_content_digest(left)
+        right_content_digest = _freecad_public_shape_content_digest(right)
+        max_delta = _freecad_finite_number(certificate.get("max_delta"))
+        expected_max_delta = _freecad_shape_static_max_delta(left, right)
+        comparison_digest = certificate.get("comparison_digest")
+        bound_fields = {
+            "archive_evidence_digest": "shape_archive_evidence_digest",
+            "fcstd_sha256": "shape_archive_fcstd_sha256",
+            "fcstd_bytes": "shape_archive_fcstd_bytes",
+            "document_xml_sha256": "shape_archive_document_xml_sha256",
+            "document_xml_bytes": "shape_archive_document_xml_bytes",
+            "archive_entry_count": "shape_archive_entry_count",
+            "shape_mapping_count": "shape_archive_mapping_count",
+            "expected_shape_count": "shape_archive_expected_shape_count",
+            "archive_entry": "shape_archive_entry",
+            "archive_entry_sha256": "shape_archive_sha256",
+            "archive_entry_bytes": "shape_archive_bytes",
+            "archive_entry_compression_method": (
+                "shape_archive_compression_method"
+            ),
+            "archive_entry_crc32": "shape_archive_crc32",
+        }
+        return bool(
+            _freecad_fcstd_archive_shape_snapshot_verified(left)
+            and _freecad_fcstd_archive_shape_snapshot_verified(right)
+            and certificate.get("schema") == _FREECAD_SHAPE_COMPARISON_SCHEMA
+            and certificate.get("tolerance")
+            == _FREECAD_SHAPE_FINGERPRINT_QUANTUM
+            and certificate.get("entity_id") == entity_id
+            and all(
+                certificate.get(certificate_field) == left.get(content_field)
+                and certificate.get(certificate_field) == right.get(content_field)
+                for certificate_field, content_field in bound_fields.items()
+            )
+            and certificate.get("expected_content_digest") == left_content_digest
+            and certificate.get("actual_content_digest") == right_content_digest
+            and certificate.get("expected_topology_counts")
+            == left.get("shape_topology_counts")
+            and certificate.get("actual_topology_counts")
+            == right.get("shape_topology_counts")
+            and expected_max_delta is not None
+            and max_delta == expected_max_delta
+            and 0.0 <= max_delta <= _FREECAD_SHAPE_FINGERPRINT_TOLERANCE
+            and _freecad_shape_content_static_fields_match(left, right)
+            and certificate.get("verified") is True
+            and isinstance(comparison_digest, str)
+            and re.fullmatch(r"[0-9a-f]{64}", comparison_digest) is not None
+            and comparison_digest == _freecad_shape_comparison_digest(certificate)
+        )
     left_geometry = left.get("shape_fingerprint_geometry")
     right_geometry = right.get("shape_fingerprint_geometry")
     left_content_digest = _freecad_public_shape_content_digest(left)
@@ -1135,6 +1400,7 @@ def _freecad_shape_comparison_certificate_valid(
         _freecad_shape_geometry_digest_valid(left_geometry)
         and _freecad_shape_geometry_digest_valid(right_geometry)
         and certificate.get("schema") == _FREECAD_SHAPE_COMPARISON_SCHEMA
+        and certificate.get("method") == "sampled_geometry_tolerant"
         and certificate.get("tolerance") == _FREECAD_SHAPE_FINGERPRINT_QUANTUM
         and certificate.get("entity_id") == entity_id
         and certificate.get("expected_sample_digest")
@@ -1182,6 +1448,32 @@ def _freecad_host_record_equivalent(
             and left_zero_ink
             and right_zero_ink
             and left_content == right_content
+        )
+    left_archive = _freecad_fcstd_archive_shape_snapshot_verified(left_content)
+    right_archive = _freecad_fcstd_archive_shape_snapshot_verified(right_content)
+    if left_archive or right_archive:
+        if (
+            left_content.get("shape_snapshot_method")
+            == _FREECAD_FCSTD_ARCHIVE_METHOD
+            or right_content.get("shape_snapshot_method")
+            == _FREECAD_FCSTD_ARCHIVE_METHOD
+        ):
+            return bool(
+                certificate is None
+                and left_archive
+                and right_archive
+                and left_content == right_content
+            )
+        return bool(
+            left_archive
+            and right_archive
+            and _freecad_shape_content_static_fields_match(left_content, right_content)
+            and _freecad_shape_comparison_certificate_valid(
+                certificate,
+                left_content,
+                right_content,
+                str(left.get("entity_id") or ""),
+            )
         )
     left_geometry = left_content.get("shape_fingerprint_geometry")
     right_geometry = right_content.get("shape_fingerprint_geometry")
@@ -1240,11 +1532,37 @@ def _freecad_zero_ink_shape_snapshot_verified(content: Any) -> bool:
 
     if not isinstance(content, dict):
         return False
+    digest = content.get("source_ink_evidence_sha256")
+    archive_base_valid = bool(
+        content.get("source_ink_classification") == "zero_visible_ink"
+        and isinstance(digest, str)
+        and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+        and content.get("shape_nonempty") is False
+        and content.get("shape_structure_verified") is False
+        and content.get("shape_digest") == ""
+    )
+    if content.get("shape_snapshot_method") == _FREECAD_FCSTD_ARCHIVE_METHOD:
+        return bool(
+            archive_base_valid
+            and content.get("shape_persistence_method")
+            == _FREECAD_FCSTD_ARCHIVE_METHOD
+            and content.get("shape_archive_schema")
+            == _FREECAD_FCSTD_ARCHIVE_SCHEMA
+            and all(
+                field not in content
+                for field in (
+                    "shape_topology_counts",
+                    "shape_metrics",
+                    "shape_bounds",
+                    "shape_archive_entry",
+                    "shape_archive_sha256",
+                    "shape_archive_evidence_digest",
+                )
+            )
+        )
     topology = content.get("shape_topology_counts")
     metrics = content.get("shape_metrics")
-    geometry = content.get("shape_fingerprint_geometry")
-    digest = content.get("source_ink_evidence_sha256")
-    return bool(
+    common_valid = bool(
         content.get("source_ink_classification") == "zero_visible_ink"
         and isinstance(digest, str)
         and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
@@ -1263,6 +1581,35 @@ def _freecad_zero_ink_shape_snapshot_verified(content: Any) -> bool:
             for value in metrics.values()
         )
         and content.get("shape_digest") == ""
+    )
+    if not common_valid:
+        return False
+    if content.get("shape_snapshot_method") == "cheap_topology_metrics_bounds":
+        bounds = content.get("shape_bounds")
+        return bool(
+            isinstance(bounds, dict)
+            and all(
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(float(value))
+                for value in bounds.values()
+            )
+            and all(
+                field not in content
+                for field in (
+                    "shape_fingerprint_schema",
+                    "shape_fingerprint_quantum",
+                    "shape_fingerprint_vertex_count",
+                    "shape_fingerprint_edge_count",
+                    "shape_fingerprint_sampled_edge_count",
+                    "shape_fingerprint_verified",
+                    "shape_fingerprint_geometry",
+                )
+            )
+        )
+    geometry = content.get("shape_fingerprint_geometry")
+    return bool(
+        "shape_snapshot_method" not in content
         and content.get("shape_fingerprint_schema")
         == _FREECAD_SHAPE_FINGERPRINT_SCHEMA
         and content.get("shape_fingerprint_quantum")
@@ -1343,10 +1690,713 @@ def _freecad_source_ink_inventory_binding_verified(
     )
 
 
+_FREECAD_FONT_DELIVERY_BOUND_FIELDS = frozenset(
+    {
+        "source_font_equivalence",
+        "font_substitution_applied",
+        "font_identity_verified",
+        "glyph_coverage_verified",
+        "delivered_font_sha256",
+        "font_candidate_source",
+        "source_font_asset_path",
+        "source_font_asset_sha256",
+        "staged_font_path",
+        "staged_font_sha256",
+        "staged_asset_verified",
+        "staged_asset_read_only",
+        "font_internal_identity_sha256",
+        "font_coverage_evidence_sha256",
+    }
+)
+_FREECAD_FONT_DELIVERY_INVENTORY_FIELDS = (
+    _FREECAD_FONT_DELIVERY_BOUND_FIELDS
+    | {
+        "delivered_font_path",
+        "source_font_identity_json",
+        "staged_asset_actual_sha256",
+        "staged_asset_digest_matches",
+    }
+)
+_FREECAD_REPORT_FONT_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _freecad_font_delivery_proof_recomputed(
+    terminal_evidence: Dict[str, Any],
+    staged_payload: bytes,
+    staged_sha256: str,
+) -> bool:
+    """Recompute both structured font proofs from the immutable staged bytes."""
+
+    internal_evidence = terminal_evidence.get("font_internal_identity_evidence")
+    coverage_evidence = terminal_evidence.get("font_coverage_evidence")
+    source_identity = terminal_evidence.get("source_font_identity")
+    source_text = terminal_evidence.get("source_text")
+    if (
+        type(internal_evidence) is not dict
+        or type(coverage_evidence) is not dict
+        or type(source_identity) is not dict
+        or not isinstance(source_text, str)
+        or not source_text
+    ):
+        return False
+    try:
+        # PDFImporterCore owns the canonical parser used at delivery.  Importing
+        # here is intentionally runtime-only: report verification happens after
+        # Core has loaded, and recomputes rather than trusting caller-supplied
+        # hexadecimal strings or semantic flags.
+        from PDFImporterCore import (
+            _font_bytes_glyph_coverage,
+            _font_internal_identity_evidence,
+        )
+
+        recomputed_identity = _font_internal_identity_evidence(
+            staged_payload,
+            source_identity,
+        )
+        recomputed_coverage = _font_bytes_glyph_coverage(
+            staged_payload,
+            source_text,
+        )
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+    return bool(
+        internal_evidence == recomputed_identity
+        and coverage_evidence == recomputed_coverage
+        and internal_evidence.get("font_sha256") == staged_sha256
+        and coverage_evidence.get("font_sha256") == staged_sha256
+        and terminal_evidence.get("font_internal_identity_sha256")
+        == recomputed_identity.get("evidence_sha256")
+        and terminal_evidence.get("font_coverage_evidence_sha256")
+        == recomputed_coverage.get("coverage_evidence_sha256")
+        and (
+            terminal_evidence.get("source_font_equivalence") is False
+            or recomputed_identity.get("font_identity_verified") is True
+        )
+        and terminal_evidence.get("glyph_coverage_verified")
+        is recomputed_coverage.get("glyph_coverage_verified")
+    )
+
+
+def _freecad_font_delivery_inventory_binding_verified(
+    terminal_evidence: Any,
+    content: Any,
+) -> bool:
+    """Bind visible 3D text to its exact immutable staged font bytes."""
+
+    if not isinstance(terminal_evidence, dict) or not isinstance(content, dict):
+        return False
+    font_delivery = content.get("font_delivery")
+    if (
+        type(font_delivery) is not dict
+        or set(font_delivery) != _FREECAD_FONT_DELIVERY_INVENTORY_FIELDS
+        or not _FREECAD_FONT_DELIVERY_BOUND_FIELDS.issubset(terminal_evidence)
+        or any(
+            font_delivery.get(field) != terminal_evidence.get(field)
+            for field in _FREECAD_FONT_DELIVERY_BOUND_FIELDS
+        )
+    ):
+        return False
+
+    source_font_identity = terminal_evidence.get("source_font_identity")
+    source_identity_json = font_delivery.get("source_font_identity_json")
+    if (
+        type(source_font_identity) is not dict
+        or set(source_font_identity) != {"raw_name", "normalized_key"}
+        or any(
+            not isinstance(source_font_identity.get(field), str)
+            or not source_font_identity.get(field)
+            or source_font_identity.get(field) != source_font_identity.get(field).strip()
+            for field in ("raw_name", "normalized_key")
+        )
+        or not isinstance(source_identity_json, str)
+        or not source_identity_json
+    ):
+        return False
+    try:
+        canonical_identity_json = json.dumps(
+            source_font_identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        parsed_identity = json.loads(source_identity_json)
+    except (RecursionError, TypeError, ValueError):
+        return False
+    if (
+        source_identity_json != canonical_identity_json
+        or parsed_identity != source_font_identity
+    ):
+        return False
+
+    equivalence = terminal_evidence.get("source_font_equivalence")
+    substitution = terminal_evidence.get("font_substitution_applied")
+    identity_verified = terminal_evidence.get("font_identity_verified")
+    coverage_verified = terminal_evidence.get("glyph_coverage_verified")
+    staged_verified = terminal_evidence.get("staged_asset_verified")
+    staged_read_only = terminal_evidence.get("staged_asset_read_only")
+    if (
+        type(equivalence) is not bool
+        or type(substitution) is not bool
+        or type(identity_verified) is not bool
+        or type(coverage_verified) is not bool
+        or type(staged_verified) is not bool
+        or type(staged_read_only) is not bool
+        or equivalence is substitution
+        or identity_verified is not equivalence
+        or coverage_verified is not True
+        or staged_verified is not True
+        or staged_read_only is not True
+        or font_delivery.get("staged_asset_digest_matches") is not True
+    ):
+        return False
+
+    digest_fields = (
+        "delivered_font_sha256",
+        "source_font_asset_sha256",
+        "staged_font_sha256",
+        "font_internal_identity_sha256",
+        "font_coverage_evidence_sha256",
+    )
+    if any(
+        not isinstance(terminal_evidence.get(field), str)
+        or re.fullmatch(r"[0-9a-f]{64}", terminal_evidence.get(field)) is None
+        for field in digest_fields
+    ):
+        return False
+    delivered_digest = terminal_evidence["delivered_font_sha256"]
+    if not all(
+        terminal_evidence.get(field) == delivered_digest
+        for field in ("source_font_asset_sha256", "staged_font_sha256")
+    ):
+        return False
+
+    source_path_value = terminal_evidence.get("source_font_asset_path")
+    staged_path_value = terminal_evidence.get("staged_font_path")
+    font_path_value = terminal_evidence.get("font_path")
+    candidate_source = terminal_evidence.get("font_candidate_source")
+    if (
+        not isinstance(source_path_value, str)
+        or not source_path_value
+        or source_path_value != source_path_value.strip()
+        or not Path(source_path_value).is_absolute()
+        or not isinstance(staged_path_value, str)
+        or not staged_path_value
+        or staged_path_value != staged_path_value.strip()
+        or not Path(staged_path_value).is_absolute()
+        or font_path_value != staged_path_value
+        or font_delivery.get("delivered_font_path") != staged_path_value
+        or font_delivery.get("staged_asset_actual_sha256")
+        != terminal_evidence.get("staged_font_sha256")
+        or not isinstance(candidate_source, str)
+        or not candidate_source
+        or candidate_source != candidate_source.strip()
+    ):
+        return False
+
+    staged_path = Path(staged_path_value)
+    if (
+        staged_path.stem.lower() != delivered_digest
+        or staged_path.suffix.lower() not in {".ttf", ".otf", ".ttc"}
+    ):
+        return False
+    try:
+        before = staged_path.stat()
+        if (
+            not staged_path.is_file()
+            or before.st_size <= 0
+            or before.st_size > _FREECAD_REPORT_FONT_MAX_BYTES
+            or before.st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            return False
+        digest = hashlib.sha256()
+        staged_payload = bytearray()
+        with staged_path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                staged_payload.extend(chunk)
+        after = staged_path.stat()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+    actual_digest = digest.hexdigest()
+    return bool(
+        (before.st_size, before.st_mtime_ns)
+        == (after.st_size, after.st_mtime_ns)
+        and actual_digest == delivered_digest
+        and _freecad_font_delivery_proof_recomputed(
+            terminal_evidence,
+            bytes(staged_payload),
+            actual_digest,
+        )
+    )
+
+
+def _freecad_expected_segment_source_ink_evidence(
+    parent_evidence: Any,
+    *,
+    child_source_item_id: str,
+    source_index_start: int,
+    source_index_end: int,
+) -> Optional[Dict[str, Any]]:
+    """Derive one child proof exclusively from an authoritative parent slice."""
+
+    if not isinstance(parent_evidence, dict):
+        return None
+    parent_characters = parent_evidence.get("characters")
+    parent_bindings = parent_evidence.get("font_asset_bindings")
+    if (
+        not isinstance(parent_characters, list)
+        or not isinstance(parent_bindings, list)
+        or type(source_index_start) is not int
+        or type(source_index_end) is not int
+        or source_index_start < 0
+        or source_index_end <= source_index_start
+        or source_index_end > len(parent_characters)
+    ):
+        return None
+    source_records = parent_characters[source_index_start:source_index_end]
+    if not source_records or any(not isinstance(record, dict) for record in source_records):
+        return None
+    characters = [
+        {**record, "source_index": index}
+        for index, record in enumerate(source_records)
+    ]
+    zero_flags = [record.get("zero_visible_ink") for record in characters]
+    if any(type(flag) is not bool for flag in zero_flags):
+        return None
+    classification = (
+        "zero_visible_ink"
+        if all(zero_flags)
+        else "mixed_visible_and_zero_ink"
+        if any(zero_flags)
+        else "visible_ink"
+    )
+    if classification == "mixed_visible_and_zero_ink":
+        return None
+    source_text = "".join(str(record.get("character") or "") for record in characters)
+    if not source_text:
+        return None
+    child_bindings = [
+        dict(binding)
+        for binding in parent_bindings
+        if isinstance(binding, dict)
+        and any(record.get("font_asset_binding") == binding for record in characters)
+    ]
+    expected = dict(parent_evidence)
+    expected.update(
+        {
+            "source_item_id": child_source_item_id,
+            "source_text": source_text,
+            "source_text_sha256": hashlib.sha256(source_text.encode("utf-8")).hexdigest(),
+            "classification": classification,
+            "zero_ink_characters_layout_only": bool(
+                classification == "zero_visible_ink"
+                and all(record.get("layout_only_zero_ink") is True for record in characters)
+            ),
+            "font_asset_bindings": child_bindings,
+            "glyph_id_sequence": [record.get("glyph_id") for record in characters],
+            "characters": characters,
+        }
+    )
+    try:
+        from .source_ink import source_ink_evidence_digest
+
+        expected["evidence_sha256"] = source_ink_evidence_digest(expected)
+    except (RecursionError, TypeError, ValueError):
+        return None
+    return expected
+
+
+def _freecad_segment_delivery_contexts(
+    terminal: Dict[str, Any],
+    *,
+    expected_pdf_sha256: str,
+    expected_page_number: int,
+) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Validate one mixed-run manifest and index its exact child host contexts."""
+
+    evidence = terminal.get("evidence")
+    if not isinstance(evidence, dict):
+        return None
+    manifest = evidence.get("source_segment_manifest")
+    deliveries = evidence.get("segment_deliveries")
+    if manifest is None and deliveries is None:
+        return None
+    if not isinstance(manifest, dict) or not isinstance(deliveries, list):
+        return {}
+
+    parent_id = terminal.get("source_item_id")
+    requested_type = str(terminal.get("requested_type") or "").strip().lower()
+    final_type = str(terminal.get("final_type") or "").strip().lower()
+    source_text = evidence.get("source_text")
+    segments = manifest.get("segments")
+    manifest_sha256 = manifest.get("manifest_sha256")
+    if (
+        manifest.get("schema") != "bcs.freecad_text_source_segments/1.0"
+        or manifest.get("parent_source_item_id") != parent_id
+        or manifest.get("requested_type") != requested_type
+        or manifest.get("parent_source_ink_evidence_sha256")
+        != (evidence.get("source_ink_evidence") or {}).get("evidence_sha256")
+        or manifest.get("source_text") != source_text
+        or manifest.get("source_text_sha256")
+        != hashlib.sha256(str(source_text).encode("utf-8")).hexdigest()
+        or not isinstance(segments, list)
+        or len(segments) < 2
+        or len(deliveries) != len(segments)
+        or re.fullmatch(r"[0-9a-f]{64}", str(manifest_sha256 or "")) is None
+    ):
+        return {}
+    unsigned_manifest = {
+        key: value for key, value in manifest.items() if key != "manifest_sha256"
+    }
+    try:
+        computed_manifest_sha256 = hashlib.sha256(
+            json.dumps(
+                unsigned_manifest,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+    except (TypeError, ValueError):
+        return {}
+    if computed_manifest_sha256 != manifest_sha256:
+        return {}
+
+    parent_source_ink = evidence.get("source_ink_evidence")
+    parent_font_identity = evidence.get("source_font_identity")
+    parent_font_bindings = evidence.get("source_font_asset_bindings")
+    parent_glyph_ids = evidence.get("source_glyph_id_sequence")
+    parent_characters = (
+        parent_source_ink.get("characters")
+        if isinstance(parent_source_ink, dict)
+        else None
+    )
+    if (
+        evidence.get("source_pdf_sha256") != expected_pdf_sha256
+        or evidence.get("source_page_number") != expected_page_number
+        or not isinstance(parent_font_identity, dict)
+        or not isinstance(parent_font_bindings, list)
+        or not isinstance(parent_glyph_ids, list)
+        or not isinstance(parent_characters, list)
+        or not _freecad_source_ink_evidence_verified(
+            parent_source_ink,
+            parent_id,
+            source_text,
+            expected_pdf_sha256=expected_pdf_sha256,
+            expected_page_number=expected_page_number,
+            expected_font_identity=parent_font_identity,
+            expected_font_asset_bindings=parent_font_bindings,
+            expected_glyph_id_sequence=parent_glyph_ids,
+        )
+    ):
+        return {}
+
+    child_ids: List[str] = []
+    cursor = 0
+    rebuilt_text: List[str] = []
+    contexts: Dict[str, Dict[str, Any]] = {}
+    all_created: set[str] = set()
+    all_delivery: set[str] = set()
+    all_support: set[str] = set()
+    for index, (segment, child) in enumerate(zip(segments, deliveries, strict=True)):
+        if not isinstance(segment, dict) or not isinstance(child, dict):
+            return {}
+        child_id = "%s:seg%d" % (parent_id, index)
+        child_text = segment.get("source_text")
+        start = segment.get("source_index_start")
+        end = segment.get("source_index_end")
+        role = segment.get("physical_role")
+        child_evidence = child.get("evidence")
+        child_source_ink = (
+            child_evidence.get("source_ink_evidence")
+            if isinstance(child_evidence, dict)
+            else None
+        )
+        child_created = child.get("created_entity_ids")
+        child_delivery = child.get("delivery_entity_ids")
+        child_support = child.get("support_entity_ids")
+        expected_child_source_ink = _freecad_expected_segment_source_ink_evidence(
+            parent_source_ink,
+            child_source_item_id=child_id,
+            source_index_start=start,
+            source_index_end=end,
+        )
+        expected_child_text = (
+            expected_child_source_ink.get("source_text")
+            if isinstance(expected_child_source_ink, dict)
+            else None
+        )
+        expected_child_role = (
+            "zero_visible_ink"
+            if isinstance(expected_child_source_ink, dict)
+            and expected_child_source_ink.get("classification")
+            == "zero_visible_ink"
+            else "visible"
+        )
+        if (
+            segment.get("child_source_item_id") != child_id
+            or segment.get("parent_source_item_id") != parent_id
+            or segment.get("requested_type") != requested_type
+            or type(start) is not int
+            or type(end) is not int
+            or start != cursor
+            or end <= start
+            or role not in {"visible", "zero_visible_ink"}
+            or expected_child_source_ink is None
+            or child_text != expected_child_text
+            or role != expected_child_role
+            or not isinstance(child_text, str)
+            or not child_text
+            or segment.get("source_text_sha256")
+            != hashlib.sha256(child_text.encode("utf-8")).hexdigest()
+            or child.get("source_item_id") != child_id
+            or child.get("requested_type") != requested_type
+            or child.get("attempted_type") != final_type
+            or child.get("final_type") != final_type
+            or child.get("outcome") != "verified"
+            or child.get("cleanup_complete") is not True
+            or child.get("removed_entity_ids") != []
+            or not isinstance(child_evidence, dict)
+            or child_evidence.get("source_text") != child_text
+            or child_evidence.get("source_text_preserved") is not True
+            or child_evidence.get("source_ink_evidence_persisted") is not True
+            or not isinstance(child_created, list)
+            or not isinstance(child_delivery, list)
+            or not child_delivery
+            or not isinstance(child_support, list)
+        ):
+            return {}
+        id_lists = (child_created, child_delivery, child_support)
+        if any(
+            len(values) != len(set(values))
+            or any(
+                not isinstance(entity_id, str)
+                or not entity_id
+                or entity_id != entity_id.strip()
+                for entity_id in values
+            )
+            for values in id_lists
+        ):
+            return {}
+        created_set = set(child_created)
+        delivery_set = set(child_delivery)
+        support_set = set(child_support)
+        if (
+            delivery_set.intersection(support_set)
+            or delivery_set.union(support_set) != created_set
+            or all_created.intersection(created_set)
+            or (
+                "delivery_count" in child
+                and (
+                    type(child.get("delivery_count")) is not int
+                    or child.get("delivery_count") != len(delivery_set)
+                )
+            )
+            or not isinstance(child_source_ink, dict)
+            or child_source_ink.get("classification")
+            != ("zero_visible_ink" if role == "zero_visible_ink" else "visible_ink")
+        ):
+            return {}
+        child_font_identity = child_evidence.get("source_font_identity")
+        child_font_bindings = child_evidence.get("source_font_asset_bindings")
+        child_glyph_ids = child_evidence.get("source_glyph_id_sequence")
+        if (
+            child_evidence.get("source_pdf_sha256") != expected_pdf_sha256
+            or child_evidence.get("source_page_number") != expected_page_number
+            or child_font_identity != parent_font_identity
+            or child_font_bindings
+            != expected_child_source_ink.get("font_asset_bindings")
+            or child_glyph_ids != expected_child_source_ink.get("glyph_id_sequence")
+            or child_source_ink != expected_child_source_ink
+            or not _freecad_source_ink_evidence_verified(
+                child_source_ink,
+                child_id,
+                child_text,
+                expected_pdf_sha256=expected_pdf_sha256,
+                expected_page_number=expected_page_number,
+                expected_font_identity=child_font_identity,
+                expected_font_asset_bindings=child_font_bindings,
+                expected_glyph_id_sequence=child_glyph_ids,
+            )
+        ):
+            return {}
+        context = {
+            "source_item_id": child_id,
+            "source_text": child_text,
+            "evidence": child_evidence,
+            "source_ink_evidence": child_source_ink,
+            "zero_visible_ink": role == "zero_visible_ink",
+            "font_identity": child_font_identity,
+            "font_asset_bindings": child_font_bindings,
+            "glyph_id_sequence": child_glyph_ids,
+            "delivery_entity_ids": list(child_delivery),
+            "support_entity_ids": list(child_support),
+        }
+        for entity_id in created_set:
+            contexts[entity_id] = context
+        child_ids.append(child_id)
+        rebuilt_text.append(child_text)
+        cursor = end
+        all_created.update(created_set)
+        all_delivery.update(delivery_set)
+        all_support.update(support_set)
+
+    if (
+        cursor != len(parent_characters)
+        or "".join(rebuilt_text) != source_text
+        or evidence.get("child_source_item_ids") != child_ids
+        or evidence.get("source_segment_ink_evidence_persisted") is not True
+        or all_created != set(terminal.get("created_entity_ids") or [])
+        or all_delivery != set(terminal.get("delivery_entity_ids") or [])
+        or all_support != set(terminal.get("support_entity_ids") or [])
+    ):
+        return {}
+    return contexts
+
+
+def _freecad_delivery_terminal_attempts(
+    delivery: Any,
+    attempt_ledger: Any,
+) -> Optional[List[Dict[str, Any]]]:
+    """Resolve terminal attempts from one digest-bound canonical ledger."""
+
+    if (
+        not isinstance(delivery, dict)
+        or delivery.get("schema")
+        != "bcs.text_representation_delivery/1.1"
+        or set(delivery)
+        != {
+            "schema",
+            "required",
+            "requested_type",
+            "verified",
+            "attempt_count",
+            "source_item_count",
+            "delivered_item_count",
+            "failed_item_count",
+            "items",
+            "invalid_reasons",
+        }
+        or any(
+            duplicate_field in delivery
+            for duplicate_field in (
+                "terminal_attempts",
+                "terminal_attempt_indexes",
+                "source_item_ids",
+            )
+        )
+        or not isinstance(attempt_ledger, list)
+        or any(not isinstance(attempt, dict) for attempt in attempt_ledger)
+        or type(delivery.get("attempt_count")) is not int
+        or delivery.get("attempt_count") != len(attempt_ledger)
+    ):
+        return None
+    resolution = resolve_text_representation_delivery(attempt_ledger, delivery)
+    if resolution.get("verified") is not True:
+        return None
+    source_ids: List[str] = []
+    terminal_index_by_source: Dict[str, int] = {}
+    for index, attempt in enumerate(attempt_ledger):
+        source_id = attempt.get("source_item_id")
+        if (
+            not isinstance(source_id, str)
+            or not source_id
+            or source_id != source_id.strip()
+        ):
+            return None
+        if source_id not in terminal_index_by_source:
+            source_ids.append(source_id)
+        terminal_index_by_source[source_id] = index
+    expected_indexes = [terminal_index_by_source[source_id] for source_id in source_ids]
+    items = delivery.get("items")
+    if (
+        not isinstance(items, list)
+        or len(items) != len(source_ids)
+    ):
+        return None
+    terminals: List[Dict[str, Any]] = []
+    for source_id, terminal_index, item in zip(
+        source_ids,
+        expected_indexes,
+        items,
+        strict=True,
+    ):
+        if (
+            not isinstance(item, dict)
+            or set(item)
+            != {
+                "source_item_id",
+                "terminal_attempt_index",
+                "final_type",
+                "verified",
+            }
+            or item.get("source_item_id") != source_id
+            or item.get("terminal_attempt_index") != terminal_index
+        ):
+            return None
+        source_indexes = [
+            index
+            for index, attempt in enumerate(attempt_ledger)
+            if attempt.get("source_item_id") == source_id
+        ]
+        for prior_index in source_indexes[:-1]:
+            prior = attempt_ledger[prior_index]
+            created_ids = prior.get("created_entity_ids")
+            removed_ids = prior.get("removed_entity_ids")
+            if (
+                prior.get("outcome") != "proven_impossible"
+                or prior.get("cleanup_complete") is not True
+                or not isinstance(created_ids, list)
+                or not isinstance(removed_ids, list)
+                or set(created_ids) != set(removed_ids)
+                or not isinstance(prior.get("proof"), dict)
+                or prior["proof"].get("cleanup_complete") is not True
+                or prior["proof"].get("source_item_id") != source_id
+            ):
+                return None
+        terminal = attempt_ledger[terminal_index]
+        final_type = (
+            str(terminal.get("final_type") or "")
+            .strip()
+            .lower()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+        attempted_type = (
+            str(terminal.get("attempted_type") or "")
+            .strip()
+            .lower()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+        terminal_verified = bool(
+            terminal.get("outcome") == "verified"
+            and terminal.get("cleanup_complete") is True
+            and final_type
+            and final_type == attempted_type
+        )
+        if (
+            item.get("final_type") != final_type
+            or item.get("verified") is not terminal_verified
+            or terminal_verified is not True
+        ):
+            return None
+        terminals.append(terminal)
+    return terminals
+
+
 def _freecad_delivery_inventory_binding_verified(
     delivery: Any,
+    attempt_ledger: Any,
     inventory: Any,
     expected_pdf_sha256: Optional[str],
+    page_source_observations: Any = None,
+    page_visual_authority: Any = None,
 ) -> bool:
     """Bind each terminal text delivery to its exact persisted host object."""
 
@@ -1359,9 +2409,15 @@ def _freecad_delivery_inventory_binding_verified(
         return False
 
     records = inventory.get("objects")
-    terminals = delivery.get("terminal_attempts")
-    if not isinstance(records, list) or not isinstance(terminals, list) or not terminals:
+    terminals = _freecad_delivery_terminal_attempts(delivery, attempt_ledger)
+    if not isinstance(records, list) or not isinstance(terminals, list):
         return False
+    if not terminals:
+        return bool(
+            delivery.get("required") is False
+            and delivery.get("source_item_count") == 0
+            and attempt_ledger == []
+        )
 
     records_by_id: Dict[str, Dict[str, Any]] = {}
     for record in records:
@@ -1372,7 +2428,15 @@ def _freecad_delivery_inventory_binding_verified(
             return False
         records_by_id[entity_id] = record
 
-    removed_entity_ids = delivery.get("removed_entity_ids", [])
+    removed_entity_ids = [
+        entity_id
+        for attempt in attempt_ledger
+        for entity_id in (
+            attempt.get("removed_entity_ids", [])
+            if isinstance(attempt.get("removed_entity_ids", []), list)
+            else []
+        )
+    ]
     if (
         not isinstance(removed_entity_ids, list)
         or any(
@@ -1395,7 +2459,76 @@ def _freecad_delivery_inventory_binding_verified(
             .replace(" ", "_")
         )
 
-    def meaningful_shape_content(content: Dict[str, Any]) -> bool:
+    archive_evidence = inventory.get("shape_archive_evidence")
+    archive_entries_by_id = {
+        entry.get("entity_id"): entry
+        for entry in (
+            archive_evidence.get("shape_entries", [])
+            if isinstance(archive_evidence, dict)
+            else []
+        )
+        if isinstance(entry, dict)
+        and isinstance(entry.get("entity_id"), str)
+        and entry.get("entity_id")
+    }
+
+    def archive_bound_shape_content(
+        entity_id: str,
+        content: Dict[str, Any],
+        *,
+        zero_visible_ink: bool,
+    ) -> bool:
+        entry = archive_entries_by_id.get(entity_id)
+        return bool(
+            isinstance(archive_evidence, dict)
+            and isinstance(entry, dict)
+            and entry.get("zero_visible_ink") is zero_visible_ink
+            and _freecad_content_bound_to_archive_evidence(
+                content,
+                archive_evidence,
+                entry,
+            )
+        )
+
+    def zero_ink_shape_content(entity_id: str, content: Dict[str, Any]) -> bool:
+        if not _freecad_zero_ink_shape_snapshot_verified(content):
+            return False
+        return bool(
+            content.get("shape_snapshot_method") != _FREECAD_FCSTD_ARCHIVE_METHOD
+            or archive_bound_shape_content(
+                entity_id,
+                content,
+                zero_visible_ink=True,
+            )
+        )
+
+    def zero_ink_shape_is_null_verified(
+        entity_id: str,
+        content: Dict[str, Any],
+        expected_is_null: Any,
+    ) -> bool:
+        if type(expected_is_null) is not bool:
+            return False
+        if "shape_is_null" in content:
+            return content.get("shape_is_null") is expected_is_null
+        return bool(
+            expected_is_null is True
+            and content.get("shape_snapshot_method")
+            == _FREECAD_FCSTD_ARCHIVE_METHOD
+            and archive_bound_shape_content(
+                entity_id,
+                content,
+                zero_visible_ink=True,
+            )
+        )
+
+    def meaningful_shape_content(entity_id: str, content: Dict[str, Any]) -> bool:
+        if content.get("shape_snapshot_method") == _FREECAD_FCSTD_ARCHIVE_METHOD:
+            return archive_bound_shape_content(
+                entity_id,
+                content,
+                zero_visible_ink=False,
+            )
         topology = content.get("shape_topology_counts")
         digest = content.get("shape_digest")
         return bool(
@@ -1449,6 +2582,10 @@ def _freecad_delivery_inventory_binding_verified(
         source_text = evidence.get("source_text")
         source_ink_evidence = evidence.get("source_ink_evidence")
         source_ink_verified = False
+        expected_page_number = None
+        expected_font_identity = None
+        expected_font_asset_bindings = None
+        expected_glyph_id_sequence = None
         if source_ink_evidence is not None:
             page_match = re.fullmatch(r"p([1-9][0-9]*):b[0-9]+:l[0-9]+:s[0-9]+", source_item_id)
             expected_page_number = int(page_match.group(1)) if page_match else None
@@ -1484,6 +2621,20 @@ def _freecad_delivery_inventory_binding_verified(
             source_ink_verified
             and source_ink_evidence.get("classification") == "zero_visible_ink"
         )
+        segment_contexts: Optional[Dict[str, Dict[str, Any]]] = None
+        if (
+            evidence.get("source_segment_manifest") is not None
+            or evidence.get("segment_deliveries") is not None
+        ):
+            if not source_ink_verified:
+                return False
+            segment_contexts = _freecad_segment_delivery_contexts(
+                terminal,
+                expected_pdf_sha256=expected_pdf_sha256,
+                expected_page_number=expected_page_number,
+            )
+            if not segment_contexts:
+                return False
         page_scope_match = re.fullmatch(r"p([1-9][0-9]*):page", source_item_id)
         if page_scope_match is not None:
             requested_type = normalize_representation(terminal.get("requested_type"))
@@ -1496,11 +2647,11 @@ def _freecad_delivery_inventory_binding_verified(
             ):
                 return False
             if requested_type != "raster":
-                from .page_visual import page_visual_fallback_proof_verified
-
                 page_proof = evidence.get("page_visual_fallback_proof")
-                raw_dictionary_sha256 = evidence.get(
-                    "page_visual_raw_text_dictionary_sha256"
+                observation = (
+                    page_source_observations.get(source_item_id)
+                    if isinstance(page_source_observations, dict)
+                    else None
                 )
                 attempted_type = normalize_representation(
                     page_proof.get("attempted_type")
@@ -1511,14 +2662,22 @@ def _freecad_delivery_inventory_binding_verified(
                     evidence.get("source_pdf_sha256") != expected_pdf_sha256
                     or evidence.get("source_page_number") != page_number
                     or evidence.get("page_visual_scope_id") != source_item_id
-                    or not page_visual_fallback_proof_verified(
+                    or not isinstance(observation, dict)
+                    or observation.get("importer_identity")
+                    != "bluecollarsystems.freecad.pdf_vector_importer"
+                    or observation.get("pdf_sha256") != expected_pdf_sha256
+                    or observation.get("page_number") != page_number
+                    or observation.get("source_item_id") != source_item_id
+                    or not page_visual_source_observation_v2_verified(
+                        observation,
+                        page_visual_authority,
+                    )
+                    or not page_visual_fallback_proof_v2_verified(
                         page_proof,
-                        expected_pdf_sha256=expected_pdf_sha256,
-                        expected_page_number=page_number,
-                        expected_source_scope_id=source_item_id,
+                        observation=observation,
+                        authority=page_visual_authority,
                         expected_requested_type=requested_type,
                         expected_attempted_type=attempted_type,
-                        expected_raw_text_dictionary_sha256=raw_dictionary_sha256,
                     )
                 ):
                     return False
@@ -1577,7 +2736,19 @@ def _freecad_delivery_inventory_binding_verified(
             record_parent_source_id = str(
                 record.get("parent_source_item_id") or ""
             )
-            if final_type in {"glyphs", "geometry"}:
+            record_context = (
+                segment_contexts.get(entity_id)
+                if segment_contexts is not None
+                else None
+            )
+            if segment_contexts is not None:
+                if (
+                    record_context is None
+                    or record_source_id != record_context["source_item_id"]
+                    or record_parent_source_id != source_item_id
+                ):
+                    return False
+            elif final_type in {"glyphs", "geometry"}:
                 if zero_ink_terminal:
                     if (
                         record_source_id != source_item_id
@@ -1597,21 +2768,68 @@ def _freecad_delivery_inventory_binding_verified(
                 or record_parent_source_id != ""
             ):
                 return False
+            record_evidence = (
+                record_context["evidence"]
+                if record_context is not None
+                else evidence
+            )
+            record_source_text = (
+                record_context["source_text"]
+                if record_context is not None
+                else source_text
+            )
+            record_source_ink_evidence = (
+                record_context["source_ink_evidence"]
+                if record_context is not None
+                else source_ink_evidence
+            )
+            record_source_ink_verified = bool(
+                record_context is not None or source_ink_verified
+            )
+            record_zero_ink_terminal = (
+                record_context["zero_visible_ink"]
+                if record_context is not None
+                else zero_ink_terminal
+            )
+            record_font_identity = (
+                record_context["font_identity"]
+                if record_context is not None
+                else expected_font_identity
+            )
+            record_font_asset_bindings = (
+                record_context["font_asset_bindings"]
+                if record_context is not None
+                else expected_font_asset_bindings
+            )
+            record_glyph_id_sequence = (
+                record_context["glyph_id_sequence"]
+                if record_context is not None
+                else expected_glyph_id_sequence
+            )
             category = str(record.get("category") or "")
             type_id = str(record.get("type_id") or "")
             content = record.get("content")
             if not isinstance(content, dict):
                 return False
-            if source_ink_verified and not _freecad_source_ink_inventory_binding_verified(
-                evidence,
+            if record_source_ink_verified and not _freecad_source_ink_inventory_binding_verified(
+                record_evidence,
                 content,
-                source_item_id,
-                source_text,
+                record_source_id,
+                record_source_text,
                 expected_pdf_sha256=expected_pdf_sha256,
                 expected_page_number=expected_page_number,
-                expected_font_identity=expected_font_identity,
-                expected_font_asset_bindings=expected_font_asset_bindings,
-                expected_glyph_id_sequence=expected_glyph_id_sequence,
+                expected_font_identity=record_font_identity,
+                expected_font_asset_bindings=record_font_asset_bindings,
+                expected_glyph_id_sequence=record_glyph_id_sequence,
+            ):
+                return False
+            if (
+                final_type == "3d_text"
+                and not record_zero_ink_terminal
+                and not _freecad_font_delivery_inventory_binding_verified(
+                    record_evidence,
+                    content,
+                )
             ):
                 return False
             if final_type == "raster":
@@ -1648,38 +2866,38 @@ def _freecad_delivery_inventory_binding_verified(
                     expected_proxy = "Label" if final_type == "labels" else "Text"
                     if (
                         type_id != "App::FeaturePython"
-                        or not isinstance(source_text, str)
-                        or not source_text
-                        or evidence.get("source_text_preserved") is not True
-                        or evidence.get("view_style_verified") is not True
+                        or not isinstance(record_source_text, str)
+                        or not record_source_text
+                        or record_evidence.get("source_text_preserved") is not True
+                        or record_evidence.get("view_style_verified") is not True
                         or content.get("proxy_type") != expected_proxy
-                        or content.get("text") != [source_text]
+                        or content.get("text") != [record_source_text]
                         or (
                             final_type == "labels"
-                            and content.get("custom_text") != [source_text]
+                            and content.get("custom_text") != [record_source_text]
                         )
                         or not isinstance(content.get("view_style"), dict)
                         or content["view_style"].get("view_present") is not True
                         or (
-                            zero_ink_terminal
+                            record_zero_ink_terminal
                             and (
-                                evidence.get("physical_visibility") is not False
+                                record_evidence.get("physical_visibility") is not False
                                 or content.get("text_visibility") is not False
                                 or content["view_style"].get("visibility") is not False
                             )
                         )
                         or (
-                            source_ink_evidence is not None
+                            record_source_ink_evidence is not None
                             and not _freecad_source_ink_inventory_binding_verified(
-                                evidence,
+                                record_evidence,
                                 content,
-                                source_item_id,
-                                source_text,
+                                record_source_id,
+                                record_source_text,
                                 expected_pdf_sha256=expected_pdf_sha256,
                                 expected_page_number=expected_page_number,
-                                expected_font_identity=expected_font_identity,
-                                expected_font_asset_bindings=expected_font_asset_bindings,
-                                expected_glyph_id_sequence=expected_glyph_id_sequence,
+                                expected_font_identity=record_font_identity,
+                                expected_font_asset_bindings=record_font_asset_bindings,
+                                expected_glyph_id_sequence=record_glyph_id_sequence,
                             )
                         )
                     ):
@@ -1687,39 +2905,45 @@ def _freecad_delivery_inventory_binding_verified(
                 if final_type in {"3d_text", "glyphs", "geometry"}:
                     if not type_id.startswith(("Part::", "PartDesign::", "Sketcher::")):
                         return False
-                    if zero_ink_terminal:
+                    if record_zero_ink_terminal:
                         exact_source_content = (
-                            content.get("string") == [source_text]
+                            content.get("string") == [record_source_text]
                             if final_type == "3d_text"
-                            else content.get("source_text") == source_text
+                            else content.get("source_text") == record_source_text
                         )
                         if (
                             not exact_source_content
                             or (
                                 final_type == "3d_text"
                                 and (
-                                    evidence.get("physical_visibility") is not False
+                                    record_evidence.get("physical_visibility") is not False
                                     or content.get("text_visibility") is not False
                                 )
                             )
-                            or not _freecad_zero_ink_shape_snapshot_verified(content)
+                            or not zero_ink_shape_content(entity_id, content)
                             or not _freecad_source_ink_inventory_binding_verified(
-                                evidence,
+                                record_evidence,
                                 content,
-                                source_item_id,
-                                source_text,
+                                record_source_id,
+                                record_source_text,
                                 expected_pdf_sha256=expected_pdf_sha256,
                                 expected_page_number=expected_page_number,
-                                expected_font_identity=expected_font_identity,
-                                expected_font_asset_bindings=expected_font_asset_bindings,
-                                expected_glyph_id_sequence=expected_glyph_id_sequence,
+                                expected_font_identity=record_font_identity,
+                                expected_font_asset_bindings=record_font_asset_bindings,
+                                expected_glyph_id_sequence=record_glyph_id_sequence,
                             )
                         ):
                             return False
-                    elif not meaningful_shape_content(content):
+                    elif not meaningful_shape_content(entity_id, content):
                         return False
 
-        if final_type in {"glyphs", "geometry"} and not zero_ink_terminal:
+        if segment_contexts is not None:
+            if {
+                str(record.get("source_item_id") or "")
+                for record in live_records.values()
+            } != set(evidence.get("child_source_item_ids") or []):
+                return False
+        elif final_type in {"glyphs", "geometry"} and not zero_ink_terminal:
             child_source_ids = evidence.get("child_source_item_ids")
             if (
                 not isinstance(child_source_ids, list)
@@ -1739,7 +2963,11 @@ def _freecad_delivery_inventory_binding_verified(
                 != set(child_source_ids)
             ):
                 return False
-        if final_type in {"glyphs", "geometry"} and zero_ink_terminal:
+        if (
+            segment_contexts is None
+            and final_type in {"glyphs", "geometry"}
+            and zero_ink_terminal
+        ):
             zero_content = (
                 live_records[delivery_ids[0]].get("content") or {}
                 if len(delivery_ids) == 1 and delivery_ids[0] in live_records
@@ -1764,39 +2992,121 @@ def _freecad_delivery_inventory_binding_verified(
                 or not isinstance(evidence.get("volume"), (int, float))
                 or not math.isfinite(float(evidence.get("volume")))
                 or abs(float(evidence.get("volume"))) > 1e-12
-                or type(evidence.get("shape_is_null")) is not bool
-                or evidence.get("shape_is_null") != zero_content.get("shape_is_null")
+                or not zero_ink_shape_is_null_verified(
+                    delivery_ids[0],
+                    zero_content,
+                    evidence.get("shape_is_null"),
+                )
                 or evidence.get("zero_visible_ink_verified") is not True
             ):
                 return False
 
         if final_type == "3d_text":
-            delivery_records = [live_records[entity_id] for entity_id in delivery_ids]
-            support_records = [live_records[entity_id] for entity_id in support_ids]
-            if zero_ink_terminal:
-                zero_record = delivery_records[0] if len(delivery_records) == 1 else {}
+            if segment_contexts is None:
+                delivery_groups = [
+                    {
+                        "source_text": source_text,
+                        "evidence": evidence,
+                        "zero_visible_ink": zero_ink_terminal,
+                        "delivery_entity_ids": list(delivery_ids),
+                        "support_entity_ids": list(support_ids),
+                    }
+                ]
+            else:
+                contexts_by_child = {
+                    context["source_item_id"]: context
+                    for context in segment_contexts.values()
+                }
+                child_order = evidence.get("child_source_item_ids") or []
+                if set(contexts_by_child) != set(child_order):
+                    return False
+                delivery_groups = [
+                    contexts_by_child[child_source_item_id]
+                    for child_source_item_id in child_order
+                ]
+
+            for group_context in delivery_groups:
+                group_delivery_ids = group_context["delivery_entity_ids"]
+                group_support_ids = group_context["support_entity_ids"]
+                group_delivery_records = [
+                    live_records[entity_id] for entity_id in group_delivery_ids
+                ]
+                group_support_records = [
+                    live_records[entity_id] for entity_id in group_support_ids
+                ]
+                group_source_text = group_context["source_text"]
+                group_evidence = group_context["evidence"]
+                group_zero_ink = group_context["zero_visible_ink"]
+                if not group_zero_ink:
+                    if (
+                        len(group_delivery_records) != 1
+                        or len(group_support_records) < 2
+                        or not isinstance(group_source_text, str)
+                        or not group_source_text
+                        or group_evidence.get("source_text_preserved") is not True
+                        or type(group_evidence.get("solid_count")) is not int
+                        or group_evidence.get("solid_count") <= 0
+                        or isinstance(group_evidence.get("volume"), bool)
+                        or not isinstance(group_evidence.get("volume"), (int, float))
+                        or not math.isfinite(float(group_evidence.get("volume")))
+                        or float(group_evidence.get("volume")) <= 0.0
+                    ):
+                        return False
+                    extrusion_record = group_delivery_records[0]
+                    extrusion_content = extrusion_record.get("content") or {}
+                    group_support_set = set(group_support_ids)
+                    if (
+                        extrusion_record.get("type_id") != "Part::Extrusion"
+                        or extrusion_content.get("base_entity_id")
+                        not in group_support_set
+                    ):
+                        return False
+                    shape_string_records = [
+                        record
+                        for record in group_support_records
+                        if record.get("entity_id")
+                        != extrusion_content.get("base_entity_id")
+                        and str(record.get("type_id") or "").startswith(
+                            ("Part::", "PartDesign::")
+                        )
+                        and (record.get("content") or {}).get("string")
+                        == [group_source_text]
+                    ]
+                    calibrated_support_records = [
+                        record
+                        for record in group_support_records
+                        if record.get("entity_id")
+                        == extrusion_content.get("base_entity_id")
+                        and str(record.get("type_id") or "").startswith(
+                            ("Part::", "PartDesign::")
+                        )
+                    ]
+                    if (
+                        len(shape_string_records) != 1
+                        or len(calibrated_support_records) != 1
+                    ):
+                        return False
+                    continue
+
+                zero_record = (
+                    group_delivery_records[0]
+                    if len(group_delivery_records) == 1
+                    else {}
+                )
                 zero_content = zero_record.get("content") or {}
                 if (
-                    len(delivery_records) != 1
-                    or support_records
-                    or not isinstance(source_text, str)
-                    or not source_text
-                    or evidence.get("source_text_preserved") is not True
-                    or zero_content.get("string") != [source_text]
-                    or not _freecad_zero_ink_shape_snapshot_verified(zero_content)
-                    or not _freecad_source_ink_inventory_binding_verified(
-                        evidence,
+                    len(group_delivery_records) != 1
+                    or group_support_records
+                    or not isinstance(group_source_text, str)
+                    or not group_source_text
+                    or group_evidence.get("source_text_preserved") is not True
+                    or zero_content.get("string") != [group_source_text]
+                    or not zero_ink_shape_content(
+                        group_delivery_ids[0],
                         zero_content,
-                        source_item_id,
-                        source_text,
-                        expected_pdf_sha256=expected_pdf_sha256,
-                        expected_page_number=expected_page_number,
-                        expected_font_identity=expected_font_identity,
-                        expected_font_asset_bindings=expected_font_asset_bindings,
-                        expected_glyph_id_sequence=expected_glyph_id_sequence,
                     )
                     or any(
-                        evidence.get(count_name) != 0
+                        group_evidence.get(count_name) != 0
                         for count_name in (
                             "vertex_count",
                             "edge_count",
@@ -1804,61 +3114,338 @@ def _freecad_delivery_inventory_binding_verified(
                             "solid_count",
                         )
                     )
-                    or isinstance(evidence.get("volume"), bool)
-                    or not isinstance(evidence.get("volume"), (int, float))
-                    or not math.isfinite(float(evidence.get("volume")))
-                    or abs(float(evidence.get("volume"))) > 1e-12
-                    or type(evidence.get("shape_is_null")) is not bool
-                    or evidence.get("shape_is_null")
-                    != zero_content.get("shape_is_null")
-                    or evidence.get("zero_visible_ink_verified") is not True
+                    or isinstance(group_evidence.get("volume"), bool)
+                    or not isinstance(group_evidence.get("volume"), (int, float))
+                    or not math.isfinite(float(group_evidence.get("volume")))
+                    or abs(float(group_evidence.get("volume"))) > 1e-12
+                    or not zero_ink_shape_is_null_verified(
+                        group_delivery_ids[0],
+                        zero_content,
+                        group_evidence.get("shape_is_null"),
+                    )
+                    or group_evidence.get("zero_visible_ink_verified") is not True
                 ):
                     return False
-                continue
-            if (
-                len(delivery_records) != 1
-                or len(support_records) < 2
-                or not isinstance(source_text, str)
-                or not source_text
-                or evidence.get("source_text_preserved") is not True
-                or type(evidence.get("solid_count")) is not int
-                or evidence.get("solid_count") <= 0
-                or isinstance(evidence.get("volume"), bool)
-                or not isinstance(evidence.get("volume"), (int, float))
-                or not math.isfinite(float(evidence.get("volume")))
-                or float(evidence.get("volume")) <= 0.0
-            ):
-                return False
-            extrusion_record = delivery_records[0]
-            extrusion_content = extrusion_record.get("content") or {}
-            if (
-                extrusion_record.get("type_id") != "Part::Extrusion"
-                or extrusion_content.get("base_entity_id") not in support_set
-            ):
-                return False
-            shape_string_records = [
-                record
-                for record in support_records
-                if record.get("entity_id") != extrusion_content.get("base_entity_id")
-                and str(record.get("type_id") or "").startswith(
-                    ("Part::", "PartDesign::")
-                )
-                and (record.get("content") or {}).get("string") == [source_text]
-            ]
-            calibrated_support_records = [
-                record
-                for record in support_records
-                if record.get("entity_id") == extrusion_content.get("base_entity_id")
-                and str(record.get("type_id") or "").startswith(
-                    ("Part::", "PartDesign::")
-                )
-            ]
-            if len(shape_string_records) != 1 or len(calibrated_support_records) != 1:
-                return False
 
     return bool(
         all_live_ids == representation_ids
         and all_terminal_removed_ids.issubset(set(removed_entity_ids))
+    )
+
+
+def _freecad_fcstd_archive_evidence_digest(evidence: Any) -> Optional[str]:
+    if not isinstance(evidence, dict):
+        return None
+    payload = {
+        key: value for key, value in evidence.items() if key != "evidence_digest"
+    }
+    try:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _freecad_host_inventory_digest(inventory: Any) -> Optional[str]:
+    if not isinstance(inventory, dict):
+        return None
+    payload = {
+        key: value for key, value in inventory.items() if key != "inventory_digest"
+    }
+    try:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _freecad_fcstd_archive_evidence_verified(
+    evidence: Any,
+    required_shape_ids: set,
+    required_zero_ink_shape_ids: Optional[set] = None,
+) -> bool:
+    if required_zero_ink_shape_ids is None:
+        required_zero_ink_shape_ids = set()
+    if (
+        not isinstance(evidence, dict)
+        or not isinstance(required_shape_ids, set)
+        or not isinstance(required_zero_ink_shape_ids, set)
+        or required_shape_ids.intersection(required_zero_ink_shape_ids)
+    ):
+        return False
+    required_all_shape_ids = required_shape_ids.union(required_zero_ink_shape_ids)
+    digest_pattern = re.compile(r"[0-9a-f]{64}")
+    entries = evidence.get("shape_entries")
+    integer_minimums = {
+        "fcstd_bytes": 1,
+        "document_xml_bytes": 1,
+        "archive_entry_count": 1,
+        "document_object_count": 0,
+        "shape_mapping_count": 0,
+        "expected_shape_count": 0,
+        "expected_nonempty_shape_count": 0,
+        "expected_zero_ink_shape_count": 0,
+    }
+    if (
+        evidence.get("schema") != _FREECAD_FCSTD_ARCHIVE_SCHEMA
+        or evidence.get("method") != _FREECAD_FCSTD_ARCHIVE_METHOD
+        or evidence.get("verified") is not True
+        or any(
+            type(evidence.get(field)) is not int
+            or evidence.get(field) < minimum
+            for field, minimum in integer_minimums.items()
+        )
+        or not isinstance(entries, list)
+        or evidence.get("expected_shape_count") != len(required_all_shape_ids)
+        or evidence.get("expected_nonempty_shape_count")
+        != len(required_shape_ids)
+        or evidence.get("expected_zero_ink_shape_count")
+        != len(required_zero_ink_shape_ids)
+        or evidence.get("shape_mapping_count") < len(required_all_shape_ids)
+        or evidence.get("archive_entry_count")
+        < evidence.get("shape_mapping_count") + 1
+        or evidence.get("document_object_count")
+        < evidence.get("shape_mapping_count")
+        or not all(
+            isinstance(evidence.get(field), str)
+            and digest_pattern.fullmatch(evidence.get(field)) is not None
+            for field in (
+                "fcstd_sha256",
+                "document_xml_sha256",
+                "evidence_digest",
+            )
+        )
+        or evidence.get("evidence_digest")
+        != _freecad_fcstd_archive_evidence_digest(evidence)
+    ):
+        return False
+    entries_by_id: Dict[str, Dict[str, Any]] = {}
+    entry_names = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return False
+        entity_id = entry.get("entity_id")
+        entry_name = entry.get("entry_name")
+        zero_visible_ink = entry.get("zero_visible_ink")
+        if (
+            not isinstance(entity_id, str)
+            or not entity_id
+            or entity_id in entries_by_id
+            or not _freecad_archive_entry_name_valid(entry_name)
+            or entry_name.casefold() in entry_names
+            or not isinstance(entry.get("sha256"), str)
+            or digest_pattern.fullmatch(entry.get("sha256")) is None
+            or type(entry.get("bytes")) is not int
+            or entry.get("bytes") < 0
+            or type(entry.get("compression_method")) is not int
+            or entry.get("compression_method") not in {0, 8}
+            or type(entry.get("crc32")) is not int
+            or not 0 <= entry.get("crc32") <= 0xFFFFFFFF
+            or type(zero_visible_ink) is not bool
+            or (
+                zero_visible_ink
+                and (
+                    entity_id not in required_zero_ink_shape_ids
+                    or entry.get("bytes") != 0
+                    or entry.get("sha256") != hashlib.sha256(b"").hexdigest()
+                    or entry.get("crc32") != 0
+                )
+            )
+            or (
+                not zero_visible_ink
+                and (
+                    entity_id not in required_shape_ids
+                    or entry.get("bytes") <= 0
+                )
+            )
+        ):
+            return False
+        entries_by_id[entity_id] = entry
+        entry_names.add(entry_name.casefold())
+    return set(entries_by_id) == required_all_shape_ids
+
+
+def _freecad_content_bound_to_archive_evidence(
+    content: Any,
+    evidence: Dict[str, Any],
+    entry: Dict[str, Any],
+) -> bool:
+    zero_visible_ink = entry.get("zero_visible_ink") is True
+    if content.get("shape_snapshot_method") == _FREECAD_FCSTD_ARCHIVE_METHOD:
+        return bool(
+            (
+                _freecad_zero_ink_shape_snapshot_verified(content)
+                if zero_visible_ink
+                else _freecad_fcstd_archive_shape_snapshot_verified(content)
+            )
+            and content.get("shape_archive_schema") == evidence.get("schema")
+            and (
+                content.get("shape_digest") == ""
+                if zero_visible_ink
+                else content.get("shape_digest") == entry.get("sha256")
+            )
+        )
+    if zero_visible_ink:
+        if not _freecad_zero_ink_shape_snapshot_verified(content):
+            return False
+    elif not _freecad_fcstd_archive_shape_snapshot_verified(content):
+        return False
+    bindings = {
+        "shape_archive_evidence_digest": evidence.get("evidence_digest"),
+        "shape_archive_fcstd_sha256": evidence.get("fcstd_sha256"),
+        "shape_archive_fcstd_bytes": evidence.get("fcstd_bytes"),
+        "shape_archive_document_xml_sha256": evidence.get("document_xml_sha256"),
+        "shape_archive_document_xml_bytes": evidence.get("document_xml_bytes"),
+        "shape_archive_entry_count": evidence.get("archive_entry_count"),
+        "shape_archive_mapping_count": evidence.get("shape_mapping_count"),
+        "shape_archive_expected_shape_count": evidence.get(
+            "expected_shape_count"
+        ),
+        "shape_archive_expected_nonempty_shape_count": evidence.get(
+            "expected_nonempty_shape_count"
+        ),
+        "shape_archive_expected_zero_ink_shape_count": evidence.get(
+            "expected_zero_ink_shape_count"
+        ),
+        "shape_archive_entry": entry.get("entry_name"),
+        "shape_archive_sha256": entry.get("sha256"),
+        "shape_archive_bytes": entry.get("bytes"),
+        "shape_archive_compression_method": entry.get("compression_method"),
+        "shape_archive_crc32": entry.get("crc32"),
+        "shape_archive_zero_visible_ink": zero_visible_ink,
+    }
+    return all(content.get(field) == value for field, value in bindings.items())
+
+
+def _freecad_archive_phase_timings_verified(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    required = {
+        "save_ms",
+        "archive_hash_ms",
+        "open_ms",
+        "cheap_inventory_ms",
+    }
+    return bool(
+        required.issubset(value)
+        and all(
+            _freecad_finite_number(value.get(field)) is not None
+            and _freecad_finite_number(value.get(field)) >= 0.0
+            for field in required
+        )
+    )
+
+
+def _freecad_compact_save_reopen_inventory_verified(
+    inventory: Dict[str, Any],
+    save_reopen: Dict[str, Any],
+) -> bool:
+    records = inventory.get("objects")
+    archive_evidence = inventory.get("shape_archive_evidence")
+    inventory_digest = inventory.get("inventory_digest")
+    if (
+        not isinstance(records, list)
+        or not isinstance(archive_evidence, dict)
+        or not isinstance(inventory_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", inventory_digest) is None
+        or inventory_digest != _freecad_host_inventory_digest(inventory)
+    ):
+        return False
+    required_shape_ids = {
+        record.get("entity_id")
+        for record in records
+        if isinstance(record, dict)
+        and isinstance(record.get("content"), dict)
+        and str(record.get("type_id") or "").startswith(
+            ("Part::", "PartDesign::", "Sketcher::")
+        )
+        and record["content"].get("shape_nonempty") is True
+    }
+    required_zero_ink_shape_ids = {
+        record.get("entity_id")
+        for record in records
+        if isinstance(record, dict)
+        and isinstance(record.get("content"), dict)
+        and str(record.get("type_id") or "").startswith(
+            ("Part::", "PartDesign::", "Sketcher::")
+        )
+        and _freecad_zero_ink_shape_snapshot_verified(record["content"])
+    }
+    if not _freecad_fcstd_archive_evidence_verified(
+        archive_evidence,
+        required_shape_ids,
+        required_zero_ink_shape_ids,
+    ):
+        return False
+    entries_by_id = {
+        entry.get("entity_id"): entry
+        for entry in archive_evidence.get("shape_entries", [])
+        if isinstance(entry, dict)
+    }
+    records_by_id = {
+        record.get("entity_id"): record
+        for record in records
+        if isinstance(record, dict)
+    }
+    required_all_ids = required_shape_ids.union(required_zero_ink_shape_ids)
+    if not all(
+        entity_id in records_by_id
+        and entity_id in entries_by_id
+        and _freecad_content_bound_to_archive_evidence(
+            records_by_id[entity_id].get("content"),
+            archive_evidence,
+            entries_by_id[entity_id],
+        )
+        for entity_id in required_all_ids
+    ):
+        return False
+    forbidden_duplicate_fields = {
+        "expected_objects",
+        "actual_objects",
+        "geometry_comparisons",
+        "shape_archive_evidence",
+        "expected_entity_ids",
+    }
+    discrepancy_fields = (
+        "missing_entity_ids",
+        "duplicate_actual_entity_ids",
+        "unexpected_entity_ids",
+        "mismatched_entities",
+    )
+    return bool(
+        save_reopen.get("schema")
+        == "bcs.freecad_save_reopen_inventory/1.0"
+        and save_reopen.get("method")
+        == "temporary_fcstd_save_copy_archive_reopen"
+        and save_reopen.get("required") is True
+        and save_reopen.get("verified") is True
+        and save_reopen.get("archive_unchanged_after_open") is True
+        and _freecad_archive_phase_timings_verified(
+            save_reopen.get("phase_timings_ms")
+        )
+        and not forbidden_duplicate_fields.intersection(save_reopen)
+        and all(
+            isinstance(save_reopen.get(field), list)
+            and not save_reopen.get(field)
+            for field in discrepancy_fields
+        )
+        and save_reopen.get("inventory_digest") == inventory_digest
+        and save_reopen.get("reopened_inventory_digest") == inventory_digest
+        and save_reopen.get("shape_archive_evidence_digest")
+        == archive_evidence.get("evidence_digest")
+        and save_reopen.get("expected_counts") == inventory.get("counts")
+        and save_reopen.get("actual_counts") == inventory.get("counts")
+        and save_reopen.get("counts_match") is True
     )
 
 
@@ -1872,6 +3459,11 @@ def _freecad_save_reopen_inventory_verified(
         return False
     if not isinstance(save_reopen, dict) or save_reopen.get("verified") is not True:
         return False
+    if save_reopen.get("schema") == "bcs.freecad_save_reopen_inventory/1.0":
+        return _freecad_compact_save_reopen_inventory_verified(
+            inventory,
+            save_reopen,
+        )
 
     inventory_ids = inventory.get("entity_ids")
     inventory_counts = inventory.get("counts")
@@ -1927,15 +3519,79 @@ def _freecad_save_reopen_inventory_verified(
         entity_id
         for entity_id, record in expected_by_id.items()
         if isinstance(record.get("content"), dict)
-        and record["content"].get("shape_fingerprint_geometry") is not None
-        and not _freecad_zero_ink_shape_snapshot_verified(record["content"])
+        and str(record.get("type_id") or "").startswith(
+            ("Part::", "PartDesign::", "Sketcher::")
+        )
+        and record["content"].get("shape_nonempty") is True
     }
+    zero_ink_shape_ids = {
+        entity_id
+        for entity_id, record in expected_by_id.items()
+        if isinstance(record.get("content"), dict)
+        and str(record.get("type_id") or "").startswith(
+            ("Part::", "PartDesign::", "Sketcher::")
+        )
+        and _freecad_zero_ink_shape_snapshot_verified(record["content"])
+    }
+    shape_evidence_mode = inventory.get("shape_evidence_mode", "sampled")
+    shape_proofs_valid = False
+    if shape_evidence_mode == "cheap":
+        inventory_archive = inventory.get("shape_archive_evidence")
+        save_archive = save_reopen.get("shape_archive_evidence")
+        entries_by_id = {
+            entry.get("entity_id"): entry
+            for entry in (
+                inventory_archive.get("shape_entries", [])
+                if isinstance(inventory_archive, dict)
+                else []
+            )
+            if isinstance(entry, dict)
+        }
+        shape_proofs_valid = bool(
+            save_reopen.get("method")
+            == "temporary_fcstd_save_copy_archive_reopen"
+            and save_reopen.get("archive_unchanged_after_open") is True
+            and _freecad_archive_phase_timings_verified(
+                save_reopen.get("phase_timings_ms")
+            )
+            and inventory_archive == save_archive
+            and _freecad_fcstd_archive_evidence_verified(
+                inventory_archive,
+                set(shape_ids),
+                set(zero_ink_shape_ids),
+            )
+            and set(entries_by_id) == set(shape_ids).union(zero_ink_shape_ids)
+            and all(
+                _freecad_content_bound_to_archive_evidence(
+                    expected_by_id[entity_id].get("content"),
+                    inventory_archive,
+                    entries_by_id[entity_id],
+                )
+                and _freecad_content_bound_to_archive_evidence(
+                    actual_by_id.get(entity_id, {}).get("content"),
+                    inventory_archive,
+                    entries_by_id[entity_id],
+                )
+                for entity_id in set(shape_ids).union(zero_ink_shape_ids)
+            )
+        )
+    elif shape_evidence_mode == "sampled":
+        shape_proofs_valid = all(
+            _freecad_shape_fingerprint_verified(
+                expected_by_id[entity_id].get("content")
+            )
+            and _freecad_shape_fingerprint_verified(
+                actual_by_id.get(entity_id, {}).get("content")
+            )
+            for entity_id in shape_ids
+        )
     objects_match = bool(
         len(expected_by_id) == len(expected_objects)
         and len(actual_by_id) == len(actual_objects)
         and len(comparison_by_id) == len(geometry_comparisons)
         and set(expected_by_id) == set(actual_by_id)
         and set(comparison_by_id) == shape_ids
+        and shape_proofs_valid
         and all(
             _freecad_host_record_equivalent(
                 expected_by_id[entity_id],
@@ -1990,6 +3646,11 @@ def _freecad_host_inventory_verified(inventory: Any, result: Any) -> bool:
     derived_ids: List[str] = []
     derived_categories = {name: [] for name in category_names}
     derived_type_counts: Dict[str, int] = {}
+    shape_evidence_mode = inventory.get("shape_evidence_mode", "sampled")
+    if shape_evidence_mode not in {"sampled", "cheap"}:
+        return False
+    required_shape_ids = set()
+    required_zero_ink_shape_ids = set()
     for record in records:
         if not isinstance(record, dict):
             return False
@@ -2042,9 +3703,46 @@ def _freecad_host_inventory_verified(inventory: Any, result: Any) -> bool:
             type(content.get("shape_nonempty")) is not bool
         ):
             return False
+        if (
+            type_id.startswith(("Part::", "PartDesign::", "Sketcher::"))
+            and content.get("shape_nonempty") is True
+        ):
+            required_shape_ids.add(entity_id)
+            topology = content.get("shape_topology_counts")
+            archive_only = (
+                content.get("shape_snapshot_method")
+                == _FREECAD_FCSTD_ARCHIVE_METHOD
+            )
+            shape_proof_valid = (
+                _freecad_shape_fingerprint_verified(content)
+                if shape_evidence_mode == "sampled"
+                else _freecad_fcstd_archive_shape_snapshot_verified(content)
+            )
+            if (
+                content.get("shape_structure_verified") is not True
+                or (
+                    not archive_only
+                    and (
+                        not isinstance(topology, dict)
+                        or not any(
+                            type(count) is int and count > 0
+                            for count in topology.values()
+                        )
+                    )
+                )
+                or not shape_proof_valid
+            ):
+                return False
         if representation in {"3d_text", "glyphs", "geometry"}:
             zero_ink_shape = _freecad_zero_ink_shape_snapshot_verified(content)
             if zero_ink_shape:
+                if (
+                    shape_evidence_mode == "cheap"
+                    and type_id.startswith(
+                        ("Part::", "PartDesign::", "Sketcher::")
+                    )
+                ):
+                    required_zero_ink_shape_ids.add(entity_id)
                 exact_source_present = (
                     isinstance(content.get("string"), list)
                     and len(content.get("string")) == 1
@@ -2058,17 +3756,30 @@ def _freecad_host_inventory_verified(inventory: Any, result: Any) -> bool:
                     return False
             else:
                 topology = content.get("shape_topology_counts")
+                archive_only = (
+                    content.get("shape_snapshot_method")
+                    == _FREECAD_FCSTD_ARCHIVE_METHOD
+                )
                 if (
                     content.get("shape_nonempty") is not True
                     or content.get("shape_structure_verified") is not True
-                    or not isinstance(topology, dict)
-                    or not any(
-                        type(count) is int and count > 0 for count in topology.values()
+                    or (
+                        not archive_only
+                        and (
+                            not isinstance(topology, dict)
+                            or not any(
+                                type(count) is int and count > 0
+                                for count in topology.values()
+                            )
+                        )
                     )
                     or not isinstance(content.get("shape_digest"), str)
                     or re.fullmatch(r"[0-9a-f]{64}", content.get("shape_digest"))
                     is None
-                    or not _freecad_shape_fingerprint_verified(content)
+                    or not (
+                        _freecad_shape_fingerprint_verified(content)
+                        or _freecad_fcstd_archive_shape_snapshot_verified(content)
+                    )
                 ):
                     return False
         derived_ids.append(entity_id)
@@ -2085,6 +3796,31 @@ def _freecad_host_inventory_verified(inventory: Any, result: Any) -> bool:
     )
     if counts != derived_counts:
         return False
+    if shape_evidence_mode == "cheap":
+        archive_evidence = inventory.get("shape_archive_evidence")
+        if not _freecad_fcstd_archive_evidence_verified(
+            archive_evidence,
+            required_shape_ids,
+            required_zero_ink_shape_ids,
+        ):
+            return False
+        entries_by_id = {
+            entry.get("entity_id"): entry
+            for entry in archive_evidence.get("shape_entries", [])
+            if isinstance(entry, dict)
+        }
+        records_by_id = {record.get("entity_id"): record for record in records}
+        if not all(
+            _freecad_content_bound_to_archive_evidence(
+                records_by_id[entity_id].get("content"),
+                archive_evidence,
+                entries_by_id[entity_id],
+            )
+            for entity_id in required_shape_ids.union(
+                required_zero_ink_shape_ids
+            )
+        ):
+            return False
     return bool(
         type(result.get("primitives")) is int
         and result.get("primitives") == derived_counts["vector_primitives"]
@@ -2095,6 +3831,7 @@ def _freecad_host_inventory_verified(inventory: Any, result: Any) -> bool:
 
 def _freecad_actual_text_entity_types_verified(
     delivery: Any,
+    attempt_ledger: Any,
     entity_types: Any,
     result: Any,
 ) -> bool:
@@ -2115,9 +3852,20 @@ def _freecad_actual_text_entity_types_verified(
     }
     expected_buckets = {bucket: 0 for bucket in TEXT_ENTITY_DELIVERED_BUCKETS}
     terminal_types: List[str] = []
-    terminals = delivery.get("terminal_attempts")
-    if not isinstance(terminals, list) or not terminals:
+    terminals = _freecad_delivery_terminal_attempts(delivery, attempt_ledger)
+    if not isinstance(terminals, list):
         return False
+    if not terminals:
+        return bool(
+            delivery.get("required") is False
+            and delivery.get("source_item_count") == 0
+            and attempt_ledger == []
+            and entity_types.get("delivery_counts_valid") is True
+            and entity_types.get("entity_type") == "none"
+            and entity_types.get("count") == 0
+            and all(entity_types.get(bucket) == 0 for bucket in expected_buckets)
+            and result.get("text_entities") == 0
+        )
 
     for terminal in terminals:
         if not isinstance(terminal, dict) or terminal.get("outcome") != "verified":
@@ -2188,7 +3936,696 @@ def _freecad_actual_text_entity_types_verified(
     )
 
 
-def build_import_contract_ready(report: "ImportReport") -> Dict[str, Any]:
+_TEXT_DELIVERY_OBLIGATION_FIELDS = {
+    "schema",
+    "required",
+    "requested_type",
+    "source_item_ids",
+}
+_HOST_TEXT_FALLBACK_LADDERS = {
+    "freecad": {
+        "text": ("text", "labels", "3d_text", "glyphs", "geometry", "raster"),
+        "labels": ("labels", "text", "3d_text", "glyphs", "geometry", "raster"),
+        "3d_text": ("3d_text", "glyphs", "geometry", "text", "labels", "raster"),
+        "glyphs": ("glyphs", "geometry", "3d_text", "text", "labels", "raster"),
+        "geometry": ("geometry", "glyphs", "3d_text", "text", "labels", "raster"),
+        "raster": ("raster",),
+    },
+    "blender": {
+        "labels": ("labels", "text", "3d_text", "glyphs", "geometry", "raster"),
+        "text": ("text", "3d_text", "glyphs", "geometry", "raster"),
+        "3d_text": ("3d_text", "text", "glyphs", "geometry", "raster"),
+        "glyphs": ("glyphs", "geometry", "raster"),
+        "geometry": ("geometry", "glyphs", "raster"),
+        "raster": ("raster",),
+    },
+    "librecad": {
+        "text": ("text", "glyphs", "geometry", "raster"),
+        "labels": ("labels", "text", "glyphs", "geometry", "raster"),
+        "glyphs": ("glyphs", "geometry", "text", "raster"),
+        "geometry": ("geometry", "glyphs", "text", "raster"),
+        "3d_text": ("3d_text", "text", "glyphs", "geometry", "raster"),
+        "raster": ("raster",),
+    },
+}
+_FREECAD_CLOSED_SVG_IMPOSSIBILITY_REASONS = {
+    "svg_renderer_unavailable",
+    "svg_payload_too_large",
+    "svg_has_no_glyph_placements",
+    "svg_glyph_outlines_unavailable",
+    "svg_item_glyph_bounds_unavailable",
+}
+_PAGE_VISUAL_IMPORTER_IDENTITIES = {
+    "freecad": "bluecollarsystems.freecad.pdf_vector_importer",
+    "blender": "bc_pdf_vector_importer.blender",
+    "librecad": "bluecollarsystems.librecad.pdf_importer",
+}
+_HOST_RESULT_PERSISTENCE_METHODS = {
+    "blender": "blender_post_commit_scene_reinspection_sha256",
+    "librecad": "librecad_atomic_dxf_write_reopen_sha256",
+}
+_HOST_RESULT_PERSISTENCE_FIELDS = {
+    "schema",
+    "host_app",
+    "importer_identity",
+    "source_pdf_sha256",
+    "import_session_id",
+    "method",
+    "commit_complete",
+    "persistence_verified",
+    "artifact_reinspection_complete",
+    "persistence_sha256",
+    "delivery_entity_ids_sha256",
+    "observed_delivery_entity_ids_sha256",
+}
+TEXT_ENTITY_DELIVERED_BUCKETS = (
+    "native_label",
+    "native_text",
+    "native_3d_text",
+    "glyph_curve",
+    "geometry_mesh",
+    "raster_patch",
+    "outline_curve_or_mesh",
+    "raw_geometry_edges",
+    "raster_text_patch",
+    "dxf_text",
+    "raster_image",
+    "fallback_geometry",
+)
+_ACTUAL_TEXT_ENTITY_TYPE_FIELDS = {
+    "entity_type",
+    "count",
+    "font_rendered",
+    "examples",
+    "delivery_counts_valid",
+    *TEXT_ENTITY_DELIVERED_BUCKETS,
+}
+_BLENDER_BUCKET_BY_TYPE = {
+    "labels": "native_label",
+    "text": "native_text",
+    "3d_text": "native_3d_text",
+    "glyphs": "glyph_curve",
+    "geometry": "geometry_mesh",
+    "raster": "raster_patch",
+}
+_LIBRECAD_BUCKET_BY_TYPE = {
+    "labels": "native_label",
+    "text": "dxf_text",
+    "3d_text": "native_3d_text",
+    "glyphs": "outline_curve_or_mesh",
+    "geometry": "raw_geometry_edges",
+    "raster": "raster_image",
+}
+
+
+def _contract_exact_text(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and value
+        and value == value.strip()
+    )
+
+
+def _contract_exact_string_list(value: Any) -> bool:
+    return bool(
+        isinstance(value, list)
+        and all(_contract_exact_text(item) for item in value)
+        and len(value) == len(set(value))
+    )
+
+
+def _scale_crosscheck_verified(extra: Dict[str, Any]) -> bool:
+    if "resolved_scale" in extra:
+        resolved_scale = extra.get("resolved_scale")
+        if not isinstance(resolved_scale, dict) or not resolved_scale:
+            return False
+    if "scale_hints" in extra and not isinstance(extra.get("scale_hints"), dict):
+        return False
+    try:
+        expected = build_scale_crosscheck(extra)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if expected is None:
+        return "scale_crosscheck" not in extra
+    return bool(
+        "scale_crosscheck" in extra
+        and isinstance(extra.get("scale_crosscheck"), dict)
+        and extra.get("scale_crosscheck") == expected
+    )
+
+
+def _page_visual_prior_verified(
+    host_app: str,
+    attempt: Dict[str, Any],
+    expected_pdf_sha256: str,
+    page_source_observations: Any,
+    page_visual_authority: Any,
+) -> Optional[bool]:
+    source_item_id = attempt.get("source_item_id")
+    if not isinstance(source_item_id, str):
+        return None
+    evidence = attempt.get("evidence")
+    if host_app == "freecad":
+        match = re.fullmatch(r"p([1-9][0-9]*):page", source_item_id)
+        proof = attempt.get("proof")
+    elif host_app in {"blender", "librecad"}:
+        match = re.fullmatch(r"page_visual:([1-9][0-9]*)", source_item_id)
+        proof = (
+            evidence.get("page_visual_fallback_proof")
+            if isinstance(evidence, dict)
+            else None
+        )
+    else:
+        return None
+    if match is None:
+        return None
+    expected_importer_identity = _PAGE_VISUAL_IMPORTER_IDENTITIES.get(host_app)
+    observation = (
+        page_source_observations.get(source_item_id)
+        if isinstance(page_source_observations, dict)
+        else None
+    )
+    page_number = int(match.group(1))
+    if not (
+        isinstance(observation, dict)
+        and observation.get("importer_identity") == expected_importer_identity
+        and observation.get("pdf_sha256") == expected_pdf_sha256
+        and observation.get("page_number") == page_number
+        and observation.get("source_item_id") == source_item_id
+        and page_visual_source_observation_v2_verified(
+            observation,
+            page_visual_authority,
+        )
+    ):
+        return False
+    created_ids = attempt.get("created_entity_ids")
+    removed_ids = attempt.get("removed_entity_ids")
+    attempted_type = attempt.get("attempted_type")
+    requested_type = attempt.get("requested_type")
+    return bool(
+        isinstance(proof, dict)
+        and _contract_exact_text(expected_importer_identity)
+        and isinstance(evidence, dict)
+        and _contract_exact_string_list(created_ids)
+        and _contract_exact_string_list(removed_ids)
+        and proof.get("created_entity_ids") == created_ids
+        and proof.get("removed_entity_ids") == removed_ids
+        and proof.get("cleanup_complete") is True
+        and page_visual_fallback_proof_v2_verified(
+            proof,
+            observation=observation,
+            authority=page_visual_authority,
+            expected_requested_type=requested_type,
+            expected_attempted_type=attempted_type,
+        )
+    )
+
+
+def _generic_item_impossibility_prior_verified(attempt: Dict[str, Any]) -> bool:
+    evidence = attempt.get("evidence")
+    if not isinstance(evidence, dict):
+        return False
+    proof = evidence.get(ITEM_IMPOSSIBILITY_EVIDENCE_KEY)
+    branch_evidence = dict(evidence)
+    branch_evidence.pop(ITEM_IMPOSSIBILITY_EVIDENCE_KEY, None)
+    return item_representation_impossibility_proof_verified(
+        proof,
+        branch_evidence=branch_evidence,
+        source_item_id=attempt.get("source_item_id"),
+        requested_type=attempt.get("requested_type"),
+        attempted_type=attempt.get("attempted_type"),
+        strategy=attempt.get("strategy"),
+        reason=attempt.get("reason"),
+        host_outcome=attempt.get("host_outcome"),
+        cleanup_complete=attempt.get("cleanup_complete"),
+        created_entity_ids=attempt.get("created_entity_ids"),
+        removed_entity_ids=attempt.get("removed_entity_ids"),
+        delivery_entity_ids=attempt.get("delivery_entity_ids"),
+        support_entity_ids=attempt.get("support_entity_ids"),
+        referenced_entity_ids=attempt.get("referenced_entity_ids"),
+        reused_entity_ids=attempt.get("reused_entity_ids"),
+        owned_block_names=attempt.get("owned_block_names"),
+    )
+
+
+def _freecad_item_impossibility_prior_verified(
+    attempt: Dict[str, Any],
+    expected_pdf_sha256: str,
+) -> bool:
+    proof = attempt.get("proof")
+    source_item_id = attempt.get("source_item_id")
+    page_match = (
+        re.match(r"^p([1-9][0-9]*):", source_item_id)
+        if isinstance(source_item_id, str)
+        else None
+    )
+    if (
+        not isinstance(proof, dict)
+        or proof.get("item_specific_proven_impossible") is not True
+        or "page_specific_proven_impossible" in proof
+        or proof.get("importer_identity")
+        != "bluecollarsystems.freecad.pdf_vector_importer"
+        or re.fullmatch(r"[0-9a-f]{64}", expected_pdf_sha256) is None
+        or proof.get("pdf_sha256") != expected_pdf_sha256
+        or page_match is None
+        or proof.get("page_number") != int(page_match.group(1))
+        or proof.get("source_item_id") != source_item_id
+        or proof.get("requested_type") != attempt.get("requested_type")
+        or proof.get("attempted_type") != attempt.get("attempted_type")
+        or not _contract_exact_text(attempt.get("reason_code"))
+        or proof.get("reason_code") != attempt.get("reason_code")
+        or not isinstance(proof.get("evidence"), dict)
+        or not proof.get("evidence")
+        or proof.get("attempted_sources_complete") is not True
+        or proof.get("cleanup_complete") is not True
+        or proof.get("created_entity_ids") != attempt.get("created_entity_ids")
+        or proof.get("removed_entity_ids") != attempt.get("removed_entity_ids")
+    ):
+        return False
+    results = proof.get("attempted_source_results")
+    if not isinstance(results, list) or not results:
+        return False
+    for result in results:
+        if (
+            not isinstance(result, dict)
+            or not _contract_exact_text(result.get("source"))
+            or not _contract_exact_text(result.get("outcome"))
+            or (
+                "pdf_sha256" in result
+                and result.get("pdf_sha256") != expected_pdf_sha256
+            )
+            or (
+                "page_number" in result
+                and result.get("page_number") != int(page_match.group(1))
+            )
+            or (
+                "source_item_id" in result
+                and result.get("source_item_id") != source_item_id
+            )
+        ):
+            return False
+
+    reason_code = proof.get("reason_code")
+    attempted_type = attempt.get("attempted_type")
+    page_number = int(page_match.group(1))
+    if reason_code == "mixed_source_ink_not_exactly_representable":
+        evidence = proof.get("evidence")
+        zero_indexes = evidence.get("zero_character_indexes")
+        visible_indexes = evidence.get("visible_character_indexes")
+        source_ink_digest = proof.get("source_ink_evidence_sha256")
+        if (
+            not isinstance(proof.get("font_identity"), dict)
+            or evidence.get("classification") != "mixed_visible_and_zero_ink"
+            or not isinstance(evidence.get("source_text_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", evidence.get("source_text_sha256")) is None
+            or not isinstance(source_ink_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", source_ink_digest) is None
+            or evidence.get("source_ink_evidence_sha256") != source_ink_digest
+            or not isinstance(zero_indexes, list)
+            or not isinstance(visible_indexes, list)
+            or not zero_indexes
+            or not visible_indexes
+            or any(type(index) is not int or index < 0 for index in zero_indexes)
+            or any(type(index) is not int or index < 0 for index in visible_indexes)
+            or len(zero_indexes) != len(set(zero_indexes))
+            or len(visible_indexes) != len(set(visible_indexes))
+            or set(zero_indexes).intersection(visible_indexes)
+            or len(results) != 1
+        ):
+            return False
+        [result] = results
+        return bool(
+            result.get("source") == "physical_source_ink_evidence"
+            and result.get("outcome") == "proven_impossible"
+            and result.get("reason_code") == reason_code
+            and result.get("pdf_sha256") == expected_pdf_sha256
+            and result.get("page_number") == page_number
+            and result.get("source_item_id") == source_item_id
+            and result.get("source_ink_evidence_sha256") == source_ink_digest
+        )
+
+    if attempted_type in {"glyphs", "geometry"}:
+        if (
+            reason_code not in _FREECAD_CLOSED_SVG_IMPOSSIBILITY_REASONS
+            or len(results) != 1
+        ):
+            return False
+        [result] = results
+        return bool(
+            result.get("source") == "svg_item_renderer"
+            and result.get("outcome") == "proven_impossible"
+            and result.get("reason_code") == reason_code
+            and result.get("pdf_sha256") == expected_pdf_sha256
+            and result.get("page_number") == page_number
+            and result.get("source_item_id") == source_item_id
+        )
+
+    # Missing an exact source font lowers font fidelity; it does not make the
+    # requested 3D Text representation impossible.  The producer must retain
+    # 3D Text with a substitute font instead of advancing the type ladder.
+    return False
+
+
+def _host_text_delivery_invalid_reasons(
+    host_app: str,
+    attempt_ledger: Any,
+    expected_pdf_sha256: str,
+    page_source_observations: Any,
+    page_visual_authority: Any = None,
+) -> List[str]:
+    if not isinstance(attempt_ledger, list):
+        return ["text delivery attempt ledger is not a list"]
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for attempt in attempt_ledger:
+        if not isinstance(attempt, dict):
+            continue
+        source_item_id = attempt.get("source_item_id")
+        if _contract_exact_text(source_item_id):
+            groups.setdefault(source_item_id, []).append(attempt)
+    if groups and host_app not in _HOST_TEXT_FALLBACK_LADDERS:
+        return [f"unsupported host-specific text ladder: {host_app or 'missing'}"]
+
+    reasons: List[str] = []
+    page_observation_ids = {
+        source_item_id
+        for source_item_id, attempts in groups.items()
+        if len(attempts) > 1
+        and (
+            (
+                host_app == "freecad"
+                and re.fullmatch(r"p[1-9][0-9]*:page", source_item_id)
+            )
+            or (
+                host_app in {"blender", "librecad"}
+                and re.fullmatch(r"page_visual:[1-9][0-9]*", source_item_id)
+            )
+        )
+    }
+    if (
+        page_source_observations is None
+        and page_observation_ids
+    ) or (
+        page_source_observations is not None
+        and (
+            not isinstance(page_source_observations, dict)
+            or set(page_source_observations) != page_observation_ids
+        )
+    ):
+        reasons.append(
+            "page_visual_source_observations do not exactly match page scopes"
+        )
+    host_ladders = _HOST_TEXT_FALLBACK_LADDERS.get(host_app, {})
+    for source_item_id, attempts in groups.items():
+        requested_type = attempts[0].get("requested_type")
+        sequence = [attempt.get("attempted_type") for attempt in attempts]
+        ladder = host_ladders.get(requested_type)
+        if (
+            ladder is None
+            or any(attempt.get("requested_type") != requested_type for attempt in attempts)
+            or sequence != list(ladder[: len(sequence)])
+        ):
+            reasons.append(f"{source_item_id} does not follow the exact host ladder prefix")
+
+        page_scope = bool(
+            (host_app == "freecad" and re.fullmatch(r"p[1-9][0-9]*:page", source_item_id))
+            or (
+                host_app in {"blender", "librecad"}
+                and re.fullmatch(r"page_visual:[1-9][0-9]*", source_item_id)
+            )
+        )
+        if page_scope and attempts[-1].get("final_type") != "raster":
+            reasons.append(f"{source_item_id} page-visual delivery is not terminal raster")
+
+        for local_index, prior in enumerate(attempts[:-1]):
+            if prior.get("final_type") is not None:
+                reasons.append(
+                    f"{source_item_id} attempt {local_index} impossible final_type is present"
+                )
+            page_verified = _page_visual_prior_verified(
+                host_app,
+                prior,
+                expected_pdf_sha256,
+                page_source_observations,
+                page_visual_authority,
+            )
+            if page_verified is not None:
+                proof_verified = page_verified
+            elif host_app == "freecad":
+                proof_verified = _freecad_item_impossibility_prior_verified(
+                    prior, expected_pdf_sha256
+                )
+            else:
+                proof_verified = _generic_item_impossibility_prior_verified(prior)
+            if not proof_verified:
+                reasons.append(
+                    f"{source_item_id} attempt {local_index} impossibility proof is invalid"
+                )
+    return reasons
+
+
+def _blender_terminal_delivery_count(terminal: Dict[str, Any]) -> Optional[int]:
+    record = terminal.get("host_record")
+    if not isinstance(record, dict):
+        return None
+    source_item_id = terminal.get("source_item_id")
+    requested_type = terminal.get("requested_type")
+    final_type = terminal.get("final_type")
+    raw_entity_ids = record.get("entity_ids")
+    contribution = record.get("delivered_count_contribution")
+    physical_count = record.get("physical_entity_count")
+    if (
+        record.get("item_id") != source_item_id
+        or type(record.get("page")) is not int
+        or record.get("page") <= 0
+        or type(record.get("source_span_id")) is not int
+        or record.get("source_span_id") < 0
+        or record.get("requested_representation") != requested_type
+        or record.get("final_representation") != final_type
+        or record.get("status") != "delivered"
+        or type(record.get("fallback_attempted")) is not bool
+        or type(record.get("fallback_used")) is not bool
+        or (
+            record.get("fallback_used")
+            and not record.get("fallback_attempted")
+        )
+        or record.get("fallback_used") != (requested_type != final_type)
+        or not _contract_exact_string_list(raw_entity_ids)
+        or type(physical_count) is not int
+        or physical_count < 0
+        or type(contribution) is not int
+        or contribution not in {0, 1}
+    ):
+        return None
+    delivery_ids = terminal.get("delivery_entity_ids")
+    if record.get("zero_ink_delivery") is True:
+        logical_id = record.get("logical_delivery_id")
+        if (
+            contribution != 0
+            or raw_entity_ids != []
+            or physical_count != 0
+            or not _contract_exact_text(logical_id)
+            or delivery_ids != [f"blender:logical:{logical_id}"]
+            or type(record.get("zero_ink_character_count")) is not int
+            or record.get("zero_ink_character_count") <= 0
+            or not isinstance(record.get("source_manifest_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", record.get("source_manifest_sha256")) is None
+            or not isinstance(record.get("zero_ink_delivery_manifest_sha256"), str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                record.get("zero_ink_delivery_manifest_sha256"),
+            )
+            is None
+        ):
+            return None
+        return 0
+    expected_delivery_ids = [f"blender:object:{entity_id}" for entity_id in raw_entity_ids]
+    if (
+        contribution != 1
+        or not raw_entity_ids
+        or physical_count != len(raw_entity_ids)
+        or delivery_ids != expected_delivery_ids
+    ):
+        return None
+    return 1
+
+
+def _non_freecad_actual_text_entity_types_verified(
+    host_app: str,
+    delivery_resolution: Dict[str, Any],
+    entity_types: Any,
+) -> bool:
+    if host_app not in {"blender", "librecad"}:
+        return False
+    if (
+        not isinstance(entity_types, dict)
+        or set(entity_types) != _ACTUAL_TEXT_ENTITY_TYPE_FIELDS
+        or entity_types.get("delivery_counts_valid") is not True
+        or type(entity_types.get("count")) is not int
+        or entity_types.get("count") < 0
+        or type(entity_types.get("font_rendered")) is not bool
+        or not isinstance(entity_types.get("examples"), list)
+        or any(not isinstance(value, str) for value in entity_types.get("examples"))
+    ):
+        return False
+    if any(
+        type(entity_types.get(bucket)) is not int
+        or entity_types.get(bucket) < 0
+        for bucket in TEXT_ENTITY_DELIVERED_BUCKETS
+    ):
+        return False
+
+    terminals = delivery_resolution.get("terminal_attempts")
+    if not isinstance(terminals, list):
+        return False
+    expected_buckets = {bucket: 0 for bucket in TEXT_ENTITY_DELIVERED_BUCKETS}
+    positive_types: List[str] = []
+    for terminal in terminals:
+        if not isinstance(terminal, dict):
+            return False
+        final_type = terminal.get("final_type")
+        if host_app == "blender":
+            bucket = _BLENDER_BUCKET_BY_TYPE.get(final_type)
+            contribution = _blender_terminal_delivery_count(terminal)
+        elif host_app == "librecad":
+            bucket = _LIBRECAD_BUCKET_BY_TYPE.get(final_type)
+            delivery_ids = terminal.get("delivery_entity_ids")
+            contribution = (
+                len(delivery_ids)
+                if _contract_exact_string_list(delivery_ids)
+                else None
+            )
+        else:
+            return False
+        if bucket is None or contribution is None:
+            return False
+        expected_buckets[bucket] += contribution
+        if contribution > 0:
+            positive_types.append(final_type)
+
+    if host_app == "blender":
+        expected_buckets["outline_curve_or_mesh"] = (
+            expected_buckets["glyph_curve"] + expected_buckets["geometry_mesh"]
+        )
+        total_buckets = [
+            bucket
+            for bucket in TEXT_ENTITY_DELIVERED_BUCKETS
+            if bucket != "outline_curve_or_mesh"
+        ]
+    else:
+        total_buckets = list(TEXT_ENTITY_DELIVERED_BUCKETS)
+    expected_total = sum(expected_buckets[bucket] for bucket in total_buckets)
+    unique_types = sorted(set(positive_types))
+    expected_type = (
+        "none"
+        if not unique_types
+        else unique_types[0]
+        if len(unique_types) == 1
+        else "mixed"
+    )
+    return bool(
+        entity_types.get("entity_type") == expected_type
+        and entity_types.get("count") == expected_total
+        and all(
+            entity_types.get(bucket) == expected_count
+            for bucket, expected_count in expected_buckets.items()
+        )
+    )
+
+
+def _terminal_delivery_entity_ids_sha256(
+    delivery_resolution: Dict[str, Any],
+) -> Optional[str]:
+    terminals = delivery_resolution.get("terminal_attempts")
+    if type(terminals) is not list:
+        return None
+    entity_ids: List[str] = []
+    for terminal in terminals:
+        if type(terminal) is not dict:
+            return None
+        delivery_ids = terminal.get("delivery_entity_ids")
+        if type(delivery_ids) is not list or any(
+            type(entity_id) is not str
+            or not entity_id
+            or entity_id != entity_id.strip()
+            for entity_id in delivery_ids
+        ):
+            return None
+        entity_ids.extend(delivery_ids)
+    if len(entity_ids) != len(set(entity_ids)):
+        return None
+    canonical = json.dumps(
+        sorted(entity_ids),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _non_freecad_host_result_persistence_verified(
+    *,
+    host_app: str,
+    persistence: Any,
+    importer: Any,
+    input_block: Any,
+    import_session_id: Any,
+    delivery_resolution: Dict[str, Any],
+) -> bool:
+    """Validate an adapter's fully bound post-commit artifact attestation.
+
+    Shared code can recompute report-side identities and delivery IDs, but it
+    cannot inspect a live Blender scene or a LibreCAD DXF itself. Producers
+    MUST calculate ``persistence_sha256`` only after committing and reinspecting
+    Blender scene state, or after atomically writing and reopening the DXF.
+    Format-valid hashes and flags without every binding below are insufficient.
+    """
+
+    expected_method = _HOST_RESULT_PERSISTENCE_METHODS.get(host_app)
+    expected_identity = _PAGE_VISUAL_IMPORTER_IDENTITIES.get(host_app)
+    source_pdf_sha256 = (
+        input_block.get("sha256") if type(input_block) is dict else None
+    )
+    importer_identity = (
+        importer.get("identity") if type(importer) is dict else None
+    )
+    delivery_ids_sha256 = _terminal_delivery_entity_ids_sha256(
+        delivery_resolution
+    )
+    if (
+        expected_method is None
+        or expected_identity is None
+        or type(persistence) is not dict
+        or set(persistence) != _HOST_RESULT_PERSISTENCE_FIELDS
+        or delivery_resolution.get("verified") is not True
+        or re.fullmatch(r"[0-9a-f]{64}", str(source_pdf_sha256 or "")) is None
+        or not _contract_exact_text(import_session_id)
+        or delivery_ids_sha256 is None
+    ):
+        return False
+    persistence_sha256 = persistence.get("persistence_sha256")
+    return bool(
+        persistence.get("schema") == "bcs.host_result_persistence/1.0"
+        and persistence.get("host_app") == host_app
+        and importer_identity == expected_identity
+        and persistence.get("importer_identity") == expected_identity
+        and persistence.get("source_pdf_sha256") == source_pdf_sha256
+        and persistence.get("import_session_id") == import_session_id
+        and persistence.get("method") == expected_method
+        and persistence.get("commit_complete") is True
+        and persistence.get("persistence_verified") is True
+        and persistence.get("artifact_reinspection_complete") is True
+        and type(persistence_sha256) is str
+        and re.fullmatch(r"[0-9a-f]{64}", persistence_sha256) is not None
+        and persistence.get("delivery_entity_ids_sha256")
+        == delivery_ids_sha256
+        and persistence.get("observed_delivery_entity_ids_sha256")
+        == delivery_ids_sha256
+    )
+
+
+def build_import_contract_ready(
+    report: "ImportReport",
+    page_visual_authority: Any = None,
+) -> Dict[str, Any]:
     """Aggregate report-contract readiness for app/Report Doctor gates."""
 
     extra = report.extra if isinstance(report.extra, dict) else {}
@@ -2197,70 +4634,167 @@ def build_import_contract_ready(report: "ImportReport") -> Dict[str, Any]:
 
     open_failure = extra.get("open_failure")
     has_stamp = bool(str(meta.get("build_stamp") or "").strip())
-    has_crosscheck = "scale_crosscheck" in extra
+    scale_crosscheck_ok = _scale_crosscheck_verified(extra)
     host_app = str((report.host or {}).get("app") or "").strip().lower()
+    supported_host = host_app in _HOST_TEXT_FALLBACK_LADDERS
     entity_types = extra.get("actual_text_entity_types")
     has_entity_types = isinstance(entity_types, dict)
-    status = str(extra.get("result_status") or result.get("status") or "success").lower()
     terminal_failure = extra.get("terminal_failure")
-    result_succeeded = status not in {
-        "failed",
-        "error",
-        "incomplete",
-        "cancelled",
-        "pending",
-        "pending_export",
-    } and terminal_failure is None
-    import_text_enabled = extra.get("import_text") is not False
-    delivery = extra.get("text_representation_delivery")
-    text_ok = bool(not import_text_enabled or has_entity_types)
-    text_delivery_ok = (
-        not import_text_enabled
-        or (
-            isinstance(delivery, dict)
-            and delivery.get("required") is True
-            and delivery.get("verified") is True
+    status_authorities = []
+    if "result_status" in extra:
+        status_authorities.append(extra.get("result_status"))
+    if "status" in result:
+        status_authorities.append(result.get("status"))
+    result_succeeded = bool(
+        status_authorities
+        and all(
+            type(status) is str and status == "success"
+            for status in status_authorities
         )
+        and terminal_failure is None
     )
+    delivery = extra.get("text_representation_delivery")
+    attempt_ledger = extra.get("text_delivery_attempts")
+    obligations = extra.get("text_delivery_obligations")
+    expected_source_item_ids: List[str] = []
+    obligations_valid = False
+    delivery_resolution: Dict[str, Any] = {
+        "verified": False,
+        "invalid_reasons": ["text delivery contract was not resolved"],
+    }
+    if (
+        isinstance(obligations, dict)
+        and set(obligations) == _TEXT_DELIVERY_OBLIGATION_FIELDS
+    ):
+        source_ids_value = obligations.get("source_item_ids")
+        if isinstance(source_ids_value, list):
+            expected_source_item_ids = list(source_ids_value)
+            exact_source_ids = bool(
+                all(
+                    isinstance(source_item_id, str)
+                    and bool(source_item_id)
+                    and source_item_id == source_item_id.strip()
+                    for source_item_id in expected_source_item_ids
+                )
+                and len(expected_source_item_ids)
+                == len(set(expected_source_item_ids))
+            )
+            requested_type = obligations.get("requested_type")
+            exact_requested_type = bool(
+                isinstance(requested_type, str)
+                and bool(requested_type)
+                and requested_type == requested_type.strip()
+                and requested_type == extra.get("text_mode")
+            )
+            required = obligations.get("required")
+            obligations_valid = bool(
+                obligations.get("schema")
+                == "bcs.text_delivery_obligations/1.0"
+                and type(required) is bool
+                and required == bool(expected_source_item_ids)
+                and exact_source_ids
+                and exact_requested_type
+                and isinstance(delivery, dict)
+                and delivery.get("required") is required
+                and delivery.get("requested_type") == requested_type
+            )
+    if (
+        obligations_valid
+        and isinstance(attempt_ledger, list)
+        and all(isinstance(attempt, dict) for attempt in attempt_ledger)
+    ):
+        delivery_resolution = resolve_text_representation_delivery(
+            attempt_ledger,
+            delivery,
+            expected_source_item_ids=expected_source_item_ids,
+            fallback_ladders=_HOST_TEXT_FALLBACK_LADDERS.get(host_app),
+        )
+    text_delivery_invalid_reasons = list(
+        delivery_resolution.get("invalid_reasons") or []
+    )
+    if not obligations_valid:
+        text_delivery_invalid_reasons.append(
+            "text_delivery_obligations keys or values do not exactly match schema"
+        )
+    host_delivery_reasons = _host_text_delivery_invalid_reasons(
+        host_app,
+        attempt_ledger,
+        str((report.input or {}).get("sha256") or ""),
+        extra.get("page_visual_source_observations"),
+        page_visual_authority,
+    )
+    text_delivery_invalid_reasons.extend(host_delivery_reasons)
+    text_delivery_ok = bool(
+        obligations_valid
+        and delivery_resolution.get("verified") is True
+        and not host_delivery_reasons
+    )
+    text_ok = bool(has_entity_types)
     representation_contract_ok = "representation_contract_violation" not in extra
 
     inventory = extra.get("actual_host_object_inventory")
     save_reopen = extra.get("save_reopen_inventory")
+    inventory_required = host_app == "freecad"
+    save_reopen_required = host_app == "freecad"
+    delivery_inventory_binding_required = host_app == "freecad"
+    host_result_persistence_required = supported_host
     if host_app == "freecad":
         inventory_ok = _freecad_host_inventory_verified(inventory, result)
         save_reopen_ok = _freecad_save_reopen_inventory_verified(
             inventory,
             save_reopen,
         )
-        text_ok = bool(
-            not import_text_enabled
-            or _freecad_actual_text_entity_types_verified(
-                delivery,
-                entity_types,
-                result,
-            )
+        text_ok = _freecad_actual_text_entity_types_verified(
+            delivery,
+            attempt_ledger,
+            entity_types,
+            result,
         )
-        delivery_inventory_binding_ok = bool(
-            not import_text_enabled
-            or _freecad_delivery_inventory_binding_verified(
-                delivery,
-                inventory,
-                str((report.input or {}).get("sha256") or "").strip().lower(),
-            )
+        delivery_inventory_binding_ok = _freecad_delivery_inventory_binding_verified(
+            delivery,
+            attempt_ledger,
+            inventory,
+            str((report.input or {}).get("sha256") or "").strip().lower(),
+            extra.get("page_visual_source_observations"),
+            page_visual_authority,
+        )
+        host_result_persistence_ok = bool(
+            inventory_ok and save_reopen_ok and delivery_inventory_binding_ok
         )
     else:
-        inventory_ok = True
-        save_reopen_ok = True
-        delivery_inventory_binding_ok = True
+        inventory_ok = False
+        save_reopen_ok = False
+        delivery_inventory_binding_ok = False
+        text_ok = _non_freecad_actual_text_entity_types_verified(
+            host_app,
+            delivery_resolution,
+            entity_types,
+        )
+        host_result_persistence_ok = _non_freecad_host_result_persistence_verified(
+            host_app=host_app,
+            persistence=extra.get("host_result_persistence"),
+            importer=report.importer,
+            input_block=report.input,
+            import_session_id=extra.get("import_session_id"),
+            delivery_resolution=delivery_resolution,
+        )
     ready = (
-        has_stamp
-        and has_crosscheck
+        supported_host
+        and has_stamp
+        and scale_crosscheck_ok
         and text_ok
         and text_delivery_ok
         and representation_contract_ok
-        and inventory_ok
-        and save_reopen_ok
-        and delivery_inventory_binding_ok
+        and (not inventory_required or inventory_ok)
+        and (not save_reopen_required or save_reopen_ok)
+        and (
+            not delivery_inventory_binding_required
+            or delivery_inventory_binding_ok
+        )
+        and (
+            not host_result_persistence_required
+            or host_result_persistence_ok
+        )
         and result_succeeded
         and open_failure is None
     )
@@ -2269,19 +4803,28 @@ def build_import_contract_ready(report: "ImportReport") -> Dict[str, Any]:
         "ready": ready,
         "checks": {
             "build_stamp": has_stamp,
-            "scale_crosscheck": has_crosscheck,
+            "supported_host": supported_host,
+            "scale_crosscheck": scale_crosscheck_ok,
             "actual_text_entity_types": text_ok,
             "text_delivery": text_delivery_ok,
             "representation_contract": representation_contract_ok,
             "host_object_inventory": inventory_ok,
             "save_reopen_inventory": save_reopen_ok,
             "delivery_inventory_binding": delivery_inventory_binding_ok,
+            "host_object_inventory_required": inventory_required,
+            "save_reopen_inventory_required": save_reopen_required,
+            "delivery_inventory_binding_required": (
+                delivery_inventory_binding_required
+            ),
+            "host_result_persistence": host_result_persistence_ok,
+            "host_result_persistence_required": host_result_persistence_required,
             "result_succeeded": result_succeeded,
             # Compatibility spelling retained for existing Report Doctor clients.
             "successful_result": result_succeeded,
             "no_terminal_failure": terminal_failure is None,
             "no_open_failure": open_failure is None,
         },
+        "text_delivery_invalid_reasons": text_delivery_invalid_reasons,
         "note": (
             "ready for contract consumers"
             if ready
@@ -2290,7 +4833,10 @@ def build_import_contract_ready(report: "ImportReport") -> Dict[str, Any]:
     }
 
 
-def enrich_import_report_extras(report: "ImportReport") -> None:
+def enrich_import_report_extras(
+    report: "ImportReport",
+    page_visual_authority: Any = None,
+) -> None:
     """Attach shared derived fields and refresh human_summary."""
 
     crosscheck = build_scale_crosscheck(report.extra)
@@ -2309,7 +4855,10 @@ def enrich_import_report_extras(report: "ImportReport") -> None:
         host = str((report.host or {}).get("app") or "")
         report.extra["model_3d"] = build_model_3d_extra(host)
     report.extra["human_summary"] = build_human_summary(report)
-    report.extra["import_contract_ready"] = build_import_contract_ready(report)
+    report.extra["import_contract_ready"] = build_import_contract_ready(
+        report,
+        page_visual_authority=page_visual_authority,
+    )
 
 
 def _format_text_mode(mode: str) -> str:
@@ -2350,7 +4899,12 @@ def build_human_summary(report: ImportReport | Dict[str, Any]) -> str:
     elapsed_s = elapsed_ms / 1000.0 if elapsed_ms > 0 else 0.0
 
     mode = str(data.get("mode") or "auto")
-    text_mode = _format_text_mode(str(extra.get("text_mode") or ""))
+    raw_text_mode = str(extra.get("text_mode") or "").strip()
+    text_mode = (
+        ""
+        if extra.get("import_text") is False or raw_text_mode.lower() == "none"
+        else _format_text_mode(raw_text_mode)
+    )
     pdf_name = _basename(str(input_block.get("file") or ""))
 
     parts: List[str] = []
@@ -2480,22 +5034,6 @@ class TextEntityVerification:
         return asdict(self)
 
 
-#: Bucket names hosts may report as DELIVERED entity counts (TEXTMODE-1).
-TEXT_ENTITY_DELIVERED_BUCKETS = (
-    "native_label",
-    "native_text",
-    "native_3d_text",
-    "glyph_curve",
-    "geometry_mesh",
-    "raster_patch",
-    "outline_curve_or_mesh",
-    "raw_geometry_edges",
-    "raster_text_patch",
-    "dxf_text",
-    "raster_image",
-    "fallback_geometry",
-)
-
 _DELIVERED_ENTITY_TYPES = {
     "native_label": "labels",
     "native_text": "text",
@@ -2552,12 +5090,25 @@ def build_actual_text_entity_types(
         examples=list(examples or [])[:3],
     )
     if delivered_counts is not None:
+        valid_delivered_counts = bool(
+            isinstance(delivered_counts, dict)
+            and set(delivered_counts).issubset(TEXT_ENTITY_DELIVERED_BUCKETS)
+            and all(
+                type(value) is int and value >= 0
+                for value in delivered_counts.values()
+            )
+        )
+        if not valid_delivered_counts:
+            return TextEntityVerification(
+                entity_type="none",
+                count=0,
+                font_rendered=False,
+                examples=list(examples or [])[:3],
+                delivery_counts_valid=False,
+            ).to_dict()
         delivered_buckets: List[str] = []
         for bucket in TEXT_ENTITY_DELIVERED_BUCKETS:
-            try:
-                value = int(delivered_counts.get(bucket, 0) or 0)
-            except (TypeError, ValueError):
-                value = 0
+            value = delivered_counts.get(bucket, 0)
             if value > 0:
                 setattr(info, bucket, value)
                 delivered_buckets.append(bucket)
@@ -2571,9 +5122,8 @@ def build_actual_text_entity_types(
                 bucket for bucket in count_buckets
                 if bucket != "outline_curve_or_mesh"
             ]
-            info.outline_curve_or_mesh = max(
-                int(info.outline_curve_or_mesh or 0),
-                int(info.glyph_curve or 0) + int(info.geometry_mesh or 0),
+            info.outline_curve_or_mesh = (
+                int(info.glyph_curve or 0) + int(info.geometry_mesh or 0)
             )
         delivered_total = sum(int(getattr(info, bucket, 0) or 0) for bucket in count_buckets)
         info.count = delivered_total
@@ -2583,7 +5133,7 @@ def build_actual_text_entity_types(
             return info.to_dict()
 
         delivered_types = {
-            _DELIVERED_ENTITY_TYPES[bucket] for bucket in delivered_buckets
+            _DELIVERED_ENTITY_TYPES[bucket] for bucket in count_buckets
         }
         info.entity_type = (
             next(iter(delivered_types)) if len(delivered_types) == 1 else "mixed"
@@ -2664,7 +5214,12 @@ class ImportReport:
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        extra = payload.get("extra")
+        if isinstance(extra, dict) and "import_contract_ready" in extra:
+            detached = type(self)._from_dict_unchecked(payload)
+            extra["import_contract_ready"] = build_import_contract_ready(detached)
+        return payload
 
     def to_json(self, indent: int = 2) -> str:
         payload = self.to_dict()
@@ -2682,7 +5237,7 @@ class ImportReport:
         atomic_write_text(output_path, self.to_json(indent=indent) + "\n")
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ImportReport":
+    def _from_dict_unchecked(cls, data: Dict[str, Any]) -> "ImportReport":
         return cls(
             schema=str(data.get("schema", SCHEMA)),
             host=dict(data.get("host", {}) or {}),
@@ -2697,6 +5252,13 @@ class ImportReport:
             report_meta=dict(data.get("report_meta", {}) or {}),
             extra=dict(data.get("extra", {}) or {}),
         )
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ImportReport":
+        report = cls._from_dict_unchecked(data)
+        if "import_contract_ready" in report.extra:
+            report.extra["import_contract_ready"] = build_import_contract_ready(report)
+        return report
 
     @classmethod
     def read_json(cls, input_path: str) -> "ImportReport":
@@ -2734,6 +5296,7 @@ def build_import_report(
     text_glyph_estimate: Optional[int] = None,
     text_fallback: Optional[Dict[str, Any]] = None,
     extra: Optional[Dict[str, Any]] = None,
+    page_visual_authority: Any = None,
 ) -> ImportReport:
     # TEXTMODE-1: a text-mode substitution is a loud fallback. Normalize the
     # host-supplied record; a real substitution marks fallback.used and adds
@@ -2828,7 +5391,12 @@ def build_import_report(
     report = ImportReport(
         host={"app": host_app, "version": host_version},
         runtime={"lang": runtime_lang, "version": runtime_version},
-        importer={"version": importer_version},
+        importer={
+            "version": importer_version,
+            "identity": _PAGE_VISUAL_IMPORTER_IDENTITIES.get(
+                str(host_app or "").strip().lower(), ""
+            ),
+        },
         pdf_engine={
             "name": pdf_engine_name,
             "version": pdf_engine_version,
@@ -2853,7 +5421,10 @@ def build_import_report(
         ),
         extra=extra_block,
     )
-    enrich_import_report_extras(report)
+    enrich_import_report_extras(
+        report,
+        page_visual_authority=page_visual_authority,
+    )
     return report
 
 

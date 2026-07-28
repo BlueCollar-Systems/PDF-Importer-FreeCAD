@@ -45,7 +45,7 @@ def _attach_visible_source_ink(item: dict) -> dict:
             "synthetic": False,
             "glyph_id": index + 1,
             "glyph_name": "glyph%05d" % (index + 1),
-            "glyph_bounds": (0.0, 0.0, 500.0, 700.0),
+            "glyph_bounds": [0.0, 0.0, 500.0, 700.0],
             "advance_width": 600.0,
             "layout_only_zero_ink": False,
             "font_asset_binding": dict(binding),
@@ -196,7 +196,8 @@ def test_legacy_text_helpers_cannot_reintroduce_whitespace_drop_roadblock():
 def test_atomic_raster_publication_survives_concurrent_same_key_writers(tmp_path):
     destination = tmp_path / "same-source-key.png"
     barrier = threading.Barrier(2)
-    payloads = (b"first-complete-png" * 100, b"second-complete-png" * 100)
+    # One content-addressed key may only ever name one exact payload.
+    payloads = (b"same-complete-png" * 100, b"same-complete-png" * 100)
 
     class Pixmap:
         def __init__(self, payload):
@@ -266,10 +267,15 @@ class _HostObject:
         self.ViewObject = _View()
         self.Placement = _Placement()
         self.PropertiesList = []
+        self._property_types = {}
 
-    def addProperty(self, _kind, name, _group):
+    def addProperty(self, kind, name, _group):
         if name not in self.PropertiesList:
             self.PropertiesList.append(name)
+        self._property_types[name] = kind
+
+    def getTypeIdOfProperty(self, name):  # noqa: N802 - FreeCAD API
+        return self._property_types.get(name, "")
 
 
 class _Document:
@@ -749,19 +755,12 @@ def test_rawdict_whitespace_span_is_a_canonical_exact_source_item():
     assert [char["c"] for char in item["span"]["chars"]] == [" ", " ", " "]
 
 
-def test_synthetic_raw_characters_are_bound_as_physical_zero_ink_evidence():
+def test_synthetic_raw_characters_are_not_bound_as_physical_zero_ink_evidence():
     item = _physically_bind_whitespace_item("text")
 
-    evidence = item["source_ink_evidence"]
-    assert evidence["classification"] == "zero_visible_ink"
-    assert evidence["all_characters_physically_resolved"] is True
-    assert evidence["source_text"] == "   "
-    assert evidence["source_item_id"] == item["source_item_id"]
-    assert [record["authority"] for record in evidence["characters"]] == [
-        "pymupdf_rawdict_synthetic_character",
-        "pymupdf_rawdict_synthetic_character",
-        "pymupdf_rawdict_synthetic_character",
-    ]
+    assert "source_ink_evidence" not in item
+    assert "source_font_asset_bindings" not in item
+    assert "source_glyph_id_sequence" not in item
 
 
 def test_non_synthetic_whitespace_without_physical_trace_is_not_called_zero_ink():
@@ -852,37 +851,24 @@ def test_native_item_delivery_rereads_live_text_transform_style_and_metadata(
 
 
 @pytest.mark.parametrize("attempted_type", ["text", "labels"])
-def test_native_whitespace_delivery_preserves_exact_content_with_physical_zero_ink(
+def test_native_synthetic_whitespace_is_terminal_and_clean(
     monkeypatch, attempted_type
 ):
     document, group = _install_native_host(monkeypatch)
     item = _physically_bind_whitespace_item(attempted_type)
 
-    result = core._deliver_text_item_native(
-        item,
-        attempted_type,
-        core.ImportOptions(
-            text_mode=attempted_type,
-            import_text=True,
-            scale_to_mm=False,
-            user_scale=1.0,
-        ),
-        text_group=group,
-        page_h=100.0,
-        scale=1.0,
-    )
+    with pytest.raises(core.TextRepresentationFailure) as raised:
+        core._deliver_text_item_native(
+            item,
+            attempted_type,
+            core.ImportOptions(text_mode=attempted_type, import_text=True),
+            text_group=group,
+            page_h=100.0,
+            scale=1.0,
+        )
 
-    host = document.getObject(result["created_entity_ids"][0])
-    assert list(host.Text) == ["   "]
-    if attempted_type == "labels":
-        assert list(host.CustomText) == ["   "]
-    assert host.PDFRepresentation == attempted_type
-    assert host.PDFSourceInkClassification == "zero_visible_ink"
-    assert len(host.PDFSourceInkEvidenceSHA256) == 64
-    assert result["final_type"] == attempted_type
-    assert result["evidence"]["source_ink_evidence"]["classification"] == (
-        "zero_visible_ink"
-    )
+    assert raised.value.attempt["reason"] == "source_ink_authority_missing"
+    assert document.Objects == []
 
 
 @pytest.mark.parametrize("attempted_type", ["text", "labels"])
@@ -934,7 +920,7 @@ def test_zero_ink_evidence_accepts_freecad_null_shape_without_volume() -> None:
     assert evidence["volume_authority"] == "null_shape_has_no_evaluable_volume"
 
 
-def test_zero_ink_3d_text_persists_exact_text_on_physically_empty_3d_host(
+def test_synthetic_whitespace_3d_text_is_terminal_and_clean(
     monkeypatch,
 ):
     document, group = _install_native_host(monkeypatch)
@@ -955,32 +941,22 @@ def test_zero_ink_3d_text_persists_exact_text_on_physically_empty_3d_host(
         ),
     )
 
-    result = core._deliver_text_item_3d(
-        item,
-        "3d_text",
-        core.ImportOptions(text_mode="3d_text", import_text=True),
-        text_group=group,
-        page_h=100.0,
-        scale=1.0,
-    )
+    with pytest.raises(core.TextRepresentationFailure) as raised:
+        core._deliver_text_item_3d(
+            item,
+            "3d_text",
+            core.ImportOptions(text_mode="3d_text", import_text=True),
+            text_group=group,
+            page_h=100.0,
+            scale=1.0,
+        )
 
-    assert result["outcome"] == "verified"
-    assert result["final_type"] == "3d_text"
-    assert result["delivery_entity_ids"] == result["created_entity_ids"]
-    assert result["support_entity_ids"] == []
-    assert result["evidence"]["zero_visible_ink_verified"] is True
-    host = document.getObject(result["delivery_entity_ids"][0])
-    assert host.String == "   "
-    assert host.TypeId == "Part::Feature"
-    assert host.Shape.isNull() is True
-    assert host.PDFTextVisibility is False
-    assert host.PDFRepresentation == "3d_text"
-    assert host.PDFSourceInkClassification == "zero_visible_ink"
-    assert document.Objects == [host]
+    assert raised.value.attempt["reason"] == "source_ink_authority_missing"
+    assert document.Objects == []
 
 
 @pytest.mark.parametrize("attempted_type", ["glyphs", "geometry"])
-def test_zero_ink_svg_mode_persists_empty_requested_entity_from_physical_authority(
+def test_synthetic_whitespace_svg_modes_are_terminal_and_clean(
     monkeypatch, attempted_type
 ):
     from PDFVectorImporter.src import PDFSvgTextRenderer as renderer
@@ -996,28 +972,22 @@ def test_zero_ink_svg_mode_persists_empty_requested_entity_from_physical_authori
         ),
     )
 
-    result = core._deliver_text_item_svg(
-        item,
-        attempted_type,
-        core.ImportOptions(text_mode=attempted_type, import_text=True),
-        pdf_path="fixture.pdf",
-        page_h=100.0,
-        page_w=100.0,
-        scale=1.0,
-        fc_doc=document,
-        parent_group=group,
-        render_cache={},
-    )
+    with pytest.raises(core.TextRepresentationFailure) as raised:
+        core._deliver_text_item_svg(
+            item,
+            attempted_type,
+            core.ImportOptions(text_mode=attempted_type, import_text=True),
+            pdf_path="fixture.pdf",
+            page_h=100.0,
+            page_w=100.0,
+            scale=1.0,
+            fc_doc=document,
+            parent_group=group,
+            render_cache={},
+        )
 
-    assert result["outcome"] == "verified"
-    assert result["final_type"] == attempted_type
-    assert result["delivery_count"] == 1
-    assert result["evidence"]["zero_visible_ink_verified"] is True
-    host = document.getObject(result["delivery_entity_ids"][0])
-    assert host.TypeId == "Part::Feature"
-    assert host.PDFRepresentation == attempted_type
-    assert host.PDFSourceInkClassification == "zero_visible_ink"
-    assert host.Shape.isNull() is True
+    assert raised.value.attempt["reason"] == "source_ink_authority_missing"
+    assert document.Objects == []
 
 
 @pytest.mark.parametrize("attempted_type", ["text", "labels"])
@@ -1136,7 +1106,7 @@ def test_rotated_native_text_remains_text_with_verified_persistent_placement(
     assert document.Objects[0].Proxy.Type == "Text"
 
 
-def test_item_raster_delivery_is_persistent_verified_and_source_bound(
+def test_item_raster_rejects_unbound_mock_page_and_direct_deliverer_bypass(
     monkeypatch, tmp_path
 ):
     document, group = _install_native_host(monkeypatch)
@@ -1165,42 +1135,23 @@ def test_item_raster_delivery_is_persistent_verified_and_source_bound(
 
     monkeypatch.setattr(core, "_raster_asset_dir", lambda: tmp_path)
 
-    result = core._deliver_text_item_raster(
-        item,
-        "raster",
-        opts,
-        page=Page(),
-        page_h=100.0,
-        scale=1.0,
-        fc_doc=document,
-        parent_group=group,
-    )
+    with pytest.raises(core.TextRepresentationFailure) as raised:
+        core._deliver_text_item_raster(
+            item,
+            "raster",
+            opts,
+            page=Page(),
+            page_h=100.0,
+            scale=1.0,
+            fc_doc=document,
+            parent_group=group,
+        )
 
-    assert result["outcome"] == "verified"
-    host = document.getObject(result["created_entity_ids"][0])
-    raster_path = Path(host.PDFRasterFile)
-    assert raster_path.is_file()
-    assert raster_path.read_bytes() == b"verified-raster-patch"
-    assert host.ImageFile == str(raster_path)
-    assert host.PDFSourceItemId == item["source_item_id"]
-    assert host.PDFRepresentation == "raster"
-    assert host.PDFSourceSHA256 == item["pdf_sha256"]
-    assert host.PDFRasterSHA256 == result["evidence"]["source_asset_sha256"]
-    assert result["evidence"]["raster_content_verified"] is True
-    assert result["evidence"]["source_ink_evidence"] == item[
-        "source_ink_evidence"
-    ]
-    assert result["evidence"]["source_ink_evidence_persisted"] is True
-    assert host.PDFSourceInkClassification == "visible_ink"
-    assert (
-        host.PDFSourceInkEvidenceSHA256
-        == item["source_ink_evidence"]["evidence_sha256"]
-    )
-    assert host.XSize == pytest.approx(item["bbox"][2] - item["bbox"][0])
-    assert host.YSize == pytest.approx(item["bbox"][3] - item["bbox"][1])
+    assert raised.value.attempt["reason"] == "invalid_raster_ladder_prefix"
+    assert document.Objects == []
 
 
-def test_full_page_raster_returns_verified_persistent_host_evidence(
+def test_full_page_raster_rejects_fabricated_digest_and_mock_page(
     monkeypatch, tmp_path
 ):
     document, group = _install_native_host(monkeypatch)
@@ -1238,28 +1189,18 @@ def test_full_page_raster_returns_verified_persistent_host_evidence(
 
     monkeypatch.setattr(core, "_raster_asset_dir", lambda: tmp_path)
 
-    result = core._import_page_as_raster(
-        SimpleNamespace(),
-        Page(),
-        1,
-        80.0,
-        opts,
-        1.0,
-        group,
-        document,
-    )
-
-    assert result["outcome"] == "verified"
-    host = document.getObject(result["created_entity_ids"][0])
-    assert host.TypeId == "Image::ImagePlane"
-    assert Path(host.PDFRasterFile).read_bytes() == b"verified-full-page-raster"
-    assert host.ImageFile == host.PDFRasterFile
-    assert host.PDFSourceSHA256 == "b" * 64
-    assert host.PDFRasterSHA256 == result["evidence"]["source_asset_sha256"]
-    assert host.XSize == pytest.approx(120.0)
-    assert host.YSize == pytest.approx(80.0)
-    assert result["evidence"]["raster_file_included"] is True
-    assert result["evidence"]["raster_content_verified"] is True
+    with pytest.raises(core.ImportLifecycleError, match="source identity"):
+        core._import_page_as_raster(
+            SimpleNamespace(),
+            Page(),
+            1,
+            80.0,
+            opts,
+            1.0,
+            group,
+            document,
+        )
+    assert document.Objects == []
 
 
 def test_raster_verifier_accepts_freecad_cache_rewrites_only_when_bytes_match(tmp_path):
@@ -1271,6 +1212,9 @@ def test_raster_verifier_accepts_freecad_cache_rewrites_only_when_bytes_match(tm
     host = SimpleNamespace(
         ImageFile=str(image_cache),
         PDFRasterFile=str(included_cache),
+        getTypeIdOfProperty=lambda name: (
+            "App::PropertyFileIncluded" if name == "PDFRasterFile" else ""
+        ),
     )
 
     evidence = core._raster_file_evidence(host, source)
@@ -1360,8 +1304,6 @@ def test_page_import_function_has_consistent_two_value_return_contract():
 def test_production_import_rolls_back_every_post_baseline_object_on_page_failure(
     monkeypatch, tmp_path
 ):
-    from pdfcadcore import fitz_loader
-
     document = _Document()
     existing = document.addObject("Part::Feature", "Existing")
     document.committed = False
@@ -1397,7 +1339,7 @@ def test_production_import_rolls_back_every_post_baseline_object_on_page_failure
 
     opened = []
 
-    def safe_open(_path):
+    def open_source_attempt(_opts):
         pdf = Pdf()
         opened.append(pdf)
         return pdf
@@ -1407,9 +1349,12 @@ def test_production_import_rolls_back_every_post_baseline_object_on_page_failure
         document.addObject("Part::Feature", "Partial_Text")
         raise RuntimeError("synthetic page failure")
 
-    monkeypatch.setattr(fitz_loader, "safe_open", safe_open)
-    monkeypatch.setattr(core, "_ensure_doc", lambda: document)
-    monkeypatch.setattr(core, "_pdf_file_sha256", lambda _path: "c" * 64)
+    monkeypatch.setattr(core, "_open_pdf_source_attempt", open_source_attempt)
+    monkeypatch.setattr(
+        core,
+        "_ensure_doc_with_ownership",
+        lambda: (document, False),
+    )
     monkeypatch.setattr(core, "_import_pdf_page_inner", fail_page)
     monkeypatch.setattr(core, "_err", lambda *_args: None)
     opts = core.ImportOptions(
@@ -1418,9 +1363,14 @@ def test_production_import_rolls_back_every_post_baseline_object_on_page_failure
         text_mode="labels",
         import_report_path=str(tmp_path / "report.json"),
     )
+    source_path = tmp_path / "fixture.pdf"
+    source_document = core.fitz.open()
+    source_document.new_page()
+    source_document.save(str(source_path))
+    source_document.close()
 
     with pytest.raises(RuntimeError, match="synthetic page failure"):
-        core.import_pdf("fixture.pdf", opts)
+        core.import_pdf(str(source_path), opts)
 
     assert document.aborted is True
     assert document.committed is False

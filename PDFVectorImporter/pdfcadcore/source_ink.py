@@ -10,7 +10,7 @@ import hashlib
 import json
 import math
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 
 SOURCE_INK_EVIDENCE_SCHEMA = "pdf_source_ink_evidence_v1"
@@ -18,8 +18,66 @@ SOURCE_INK_EVIDENCE_AUTHORITY = "pymupdf_rawdict_texttrace_exact_font"
 SOURCE_INK_CLASSIFICATIONS = frozenset(
     {"visible_ink", "zero_visible_ink", "mixed_visible_and_zero_ink"}
 )
+SOURCE_INK_EVIDENCE_FIELDS = frozenset(
+    {
+        "schema",
+        "authority",
+        "pdf_sha256",
+        "page_number",
+        "source_item_id",
+        "source_text",
+        "source_text_sha256",
+        "font_identity",
+        "classification",
+        "zero_ink_characters_layout_only",
+        "all_characters_physically_resolved",
+        "font_asset_bindings",
+        "glyph_id_sequence",
+        "characters",
+        "evidence_sha256",
+    }
+)
+SOURCE_INK_FONT_IDENTITY_FIELDS = frozenset({"raw_name", "normalized_key"})
+SOURCE_INK_FONT_ASSET_BINDING_FIELDS = frozenset(
+    {
+        "asset_id",
+        "source_xref",
+        "source_font_sha256",
+        "usable_font_sha256",
+        "base_font_name",
+        "span_font_name",
+        "source_format",
+        "usable_format",
+        "source_origin",
+    }
+)
+SOURCE_INK_CHARACTER_FIELDS = frozenset(
+    {
+        "source_index",
+        "character",
+        "authority",
+        "physically_resolved",
+        "zero_visible_ink",
+        "layout_only_zero_ink",
+        "synthetic",
+        "glyph_id",
+        "glyph_name",
+        "glyph_bounds",
+        "advance_width",
+        "font_asset_binding",
+        "source_font_sha256",
+        "usable_font_sha256",
+        "trace_type",
+        "opacity",
+    }
+)
+SOURCE_INK_CHARACTER_AUTHORITIES = frozenset(
+    {
+        "pymupdf_texttrace_nonpainting_render_mode",
+        "exact_pdf_font_glyph_bounds",
+    }
+)
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
-_SOURCE_ITEM_RE = re.compile(r"p([1-9][0-9]*):b[0-9]+:l[0-9]+:s[0-9]+")
 _LAYOUT_ONLY_GLYPH_NAMES = frozenset(
     {
         "space",
@@ -42,16 +100,49 @@ def layout_only_glyph_name(value: Any) -> bool:
     )
 
 
+def _strict_json_value(value: Any, seen: Optional[Set[int]] = None) -> Any:
+    """Return strict JSON data while rejecting non-finite values and cycles."""
+
+    if seen is None:
+        seen = set()
+    if value is None or type(value) in {bool, int, str}:
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("source-ink evidence contains a non-finite number")
+        return value
+    if type(value) not in {list, dict}:
+        raise TypeError("source-ink evidence contains a non-JSON value")
+    marker = id(value)
+    if marker in seen:
+        raise ValueError("source-ink evidence contains a cycle")
+    seen.add(marker)
+    try:
+        if type(value) is list:
+            return [_strict_json_value(item, seen) for item in value]
+        if any(type(key) is not str for key in value):
+            raise TypeError("source-ink evidence contains a non-string object key")
+        return {
+            key: _strict_json_value(value[key], seen)
+            for key in sorted(value)
+        }
+    finally:
+        seen.remove(marker)
+
+
 def source_ink_evidence_digest(evidence: Dict[str, Any]) -> str:
     """Return the canonical digest for one source-ink evidence record."""
 
-    payload = dict(evidence or {})
+    if type(evidence) is not dict:
+        raise TypeError("source-ink evidence must be a plain JSON object")
+    payload = _strict_json_value(evidence)
     payload.pop("evidence_sha256", None)
     serialized = json.dumps(
         payload,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(serialized).hexdigest()
 
@@ -98,7 +189,7 @@ def verified_font_asset_binding(asset: Any) -> Optional[Dict[str, Any]]:
 
 
 def _font_identity_valid(value: Any) -> bool:
-    if not isinstance(value, dict) or not value:
+    if type(value) is not dict or set(value) != SOURCE_INK_FONT_IDENTITY_FIELDS:
         return False
     raw_name = value.get("raw_name")
     normalized_key = value.get("normalized_key")
@@ -121,7 +212,10 @@ def _finite_number(value: Any) -> bool:
 
 
 def _font_asset_binding_valid(value: Any) -> bool:
-    if not isinstance(value, dict):
+    if (
+        type(value) is not dict
+        or set(value) != SOURCE_INK_FONT_ASSET_BINDING_FIELDS
+    ):
         return False
     source_sha256 = value.get("source_font_sha256")
     usable_sha256 = value.get("usable_font_sha256")
@@ -152,7 +246,7 @@ def _glyph_bounds_valid(value: Any) -> bool:
     return bool(
         value is None
         or (
-            isinstance(value, (list, tuple))
+            type(value) is list
             and len(value) == 4
             and all(_finite_number(component) for component in value)
         )
@@ -173,21 +267,29 @@ def source_ink_evidence_verified(
     """Validate one sealed record against an independently supplied source item."""
 
     if (
-        not isinstance(evidence, dict)
+        type(evidence) is not dict
+        or set(evidence) != SOURCE_INK_EVIDENCE_FIELDS
         or not isinstance(expected_pdf_sha256, str)
         or _SHA256_RE.fullmatch(expected_pdf_sha256) is None
         or type(expected_page_number) is not int
         or expected_page_number <= 0
         or not isinstance(expected_source_item_id, str)
+        or not expected_source_item_id
+        or expected_source_item_id != expected_source_item_id.strip()
         or not isinstance(expected_source_text, str)
         or not expected_source_text
         or not _font_identity_valid(expected_font_identity)
         or not isinstance(expected_font_asset_bindings, list)
+        or any(
+            not _font_asset_binding_valid(binding)
+            for binding in expected_font_asset_bindings
+        )
         or not isinstance(expected_glyph_id_sequence, list)
+        or any(
+            glyph_id is not None and (type(glyph_id) is not int or glyph_id < 0)
+            for glyph_id in expected_glyph_id_sequence
+        )
     ):
-        return False
-    source_match = _SOURCE_ITEM_RE.fullmatch(expected_source_item_id)
-    if source_match is None or int(source_match.group(1)) != expected_page_number:
         return False
 
     characters = evidence.get("characters")
@@ -207,6 +309,7 @@ def source_ink_evidence_verified(
         or evidence.get("source_text") != expected_source_text
         or evidence.get("source_text_sha256")
         != hashlib.sha256(expected_source_text.encode("utf-8")).hexdigest()
+        or not _font_identity_valid(evidence.get("font_identity"))
         or evidence.get("font_identity") != expected_font_identity
         or evidence.get("all_characters_physically_resolved") is not True
         or classification not in SOURCE_INK_CLASSIFICATIONS
@@ -214,11 +317,15 @@ def source_ink_evidence_verified(
         or not isinstance(characters, list)
         or not characters
         or not isinstance(asset_bindings, list)
-        or asset_bindings != expected_font_asset_bindings
         or any(not _font_asset_binding_valid(binding) for binding in asset_bindings)
+        or asset_bindings != expected_font_asset_bindings
         or len({binding["asset_id"] for binding in asset_bindings})
         != len(asset_bindings)
         or not isinstance(glyph_id_sequence, list)
+        or any(
+            glyph_id is not None and (type(glyph_id) is not int or glyph_id < 0)
+            for glyph_id in glyph_id_sequence
+        )
         or glyph_id_sequence != expected_glyph_id_sequence
         or len(glyph_id_sequence) != len(characters)
         or not isinstance(digest, str)
@@ -229,7 +336,7 @@ def source_ink_evidence_verified(
     resolved_text: List[str] = []
     zero_flags: List[bool] = []
     for index, record in enumerate(characters):
-        if not isinstance(record, dict):
+        if type(record) is not dict or set(record) != SOURCE_INK_CHARACTER_FIELDS:
             return False
         character = record.get("character")
         authority = record.get("authority")
@@ -242,73 +349,56 @@ def source_ink_evidence_verified(
             or record.get("physically_resolved") is not True
             or type(record.get("zero_visible_ink")) is not bool
             or glyph_id != glyph_id_sequence[index]
-            or authority
-            not in {
-                "pymupdf_rawdict_synthetic_character",
-                "pymupdf_texttrace_nonpainting_render_mode",
-                "exact_pdf_font_glyph_bounds",
-            }
+            or authority not in SOURCE_INK_CHARACTER_AUTHORITIES
         ):
             return False
 
-        if authority == "pymupdf_rawdict_synthetic_character":
+        opacity = record.get("opacity")
+        bounds = record.get("glyph_bounds")
+        advance_width = record.get("advance_width")
+        layout_only_zero_ink = record.get("layout_only_zero_ink")
+        if (
+            record.get("synthetic") is not False
+            or type(glyph_id) is not int
+            or glyph_id < 0
+            or not isinstance(record.get("glyph_name"), str)
+            or not record.get("glyph_name")
+            or type(record.get("trace_type")) is not int
+            or not _finite_number(opacity)
+            or not _glyph_bounds_valid(bounds)
+            or not _finite_number(advance_width)
+            or float(advance_width) < 0.0
+            or type(layout_only_zero_ink) is not bool
+            or not _font_asset_binding_valid(font_binding)
+            or font_binding not in asset_bindings
+            or record.get("source_font_sha256")
+            != font_binding.get("source_font_sha256")
+            or record.get("usable_font_sha256")
+            != font_binding.get("usable_font_sha256")
+        ):
+            return False
+        expected_layout_only = bool(
+            bounds is None
+            and float(advance_width) > 0.0
+            and layout_only_glyph_name(record.get("glyph_name"))
+        )
+        if layout_only_zero_ink != expected_layout_only:
+            return False
+        if authority == "pymupdf_texttrace_nonpainting_render_mode":
             if (
-                record.get("synthetic") is not True
-                or record.get("zero_visible_ink") is not True
-                or record.get("layout_only_zero_ink") is not True
-                or glyph_id is not None
+                record.get("zero_visible_ink") is not True
                 or (
-                    font_binding is not None
-                    and (
-                        not _font_asset_binding_valid(font_binding)
-                        or font_binding not in asset_bindings
-                    )
+                    record.get("trace_type") != 3
+                    and float(opacity) > 0.0
                 )
             ):
                 return False
-        else:
-            opacity = record.get("opacity")
-            bounds = record.get("glyph_bounds")
-            advance_width = record.get("advance_width")
-            layout_only_zero_ink = record.get("layout_only_zero_ink")
-            if (
-                record.get("synthetic") is not False
-                or type(glyph_id) is not int
-                or glyph_id < 0
-                or not isinstance(record.get("glyph_name"), str)
-                or not record.get("glyph_name")
-                or type(record.get("trace_type")) is not int
-                or not _finite_number(opacity)
-                or not _glyph_bounds_valid(bounds)
-                or not _finite_number(advance_width)
-                or float(advance_width) < 0.0
-                or type(layout_only_zero_ink) is not bool
-                or not _font_asset_binding_valid(font_binding)
-                or font_binding not in asset_bindings
-            ):
-                return False
-            expected_layout_only = bool(
-                bounds is None
-                and float(advance_width) > 0.0
-                and layout_only_glyph_name(record.get("glyph_name"))
-            )
-            if layout_only_zero_ink != expected_layout_only:
-                return False
-            if authority == "pymupdf_texttrace_nonpainting_render_mode":
-                if (
-                    record.get("zero_visible_ink") is not True
-                    or (
-                        record.get("trace_type") != 3
-                        and float(opacity) > 0.0
-                    )
-                ):
-                    return False
-            elif (
-                record.get("trace_type") == 3
-                or float(opacity) <= 0.0
-                or record.get("zero_visible_ink") != (bounds is None)
-            ):
-                return False
+        elif (
+            record.get("trace_type") == 3
+            or float(opacity) <= 0.0
+            or record.get("zero_visible_ink") != (bounds is None)
+        ):
+            return False
 
         resolved_text.append(character)
         zero_flags.append(record["zero_visible_ink"])
@@ -328,9 +418,13 @@ def source_ink_evidence_verified(
     expected_layout_only = bool(
         zero_layout_flags and all(flag is True for flag in zero_layout_flags)
     )
+    try:
+        expected_digest = source_ink_evidence_digest(evidence)
+    except (RecursionError, TypeError, ValueError):
+        return False
     return bool(
         "".join(resolved_text) == expected_source_text
         and classification == expected_classification
         and zero_ink_characters_layout_only == expected_layout_only
-        and digest == source_ink_evidence_digest(evidence)
+        and digest == expected_digest
     )

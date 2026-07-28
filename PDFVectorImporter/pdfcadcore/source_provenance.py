@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import hashlib
 import json
+import re
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -155,9 +156,19 @@ def build_source_provenance(
     importer_version: str = "",
     build_stamp: str = "",
     page_count: Optional[int] = None,
+    source_display_path: Optional[str] = None,
+    source_sha256: Optional[str] = None,
 ) -> SourceProvenanceManifest:
-    source_pdf: Dict[str, Any] = {"path": str(pdf_path)}
-    if pdf_path and Path(pdf_path).is_file():
+    display_path = str(
+        source_display_path if source_display_path is not None else pdf_path
+    )
+    source_pdf: Dict[str, Any] = {"path": display_path}
+    if source_sha256 is not None:
+        digest = str(source_sha256).strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError("prebound source PDF SHA-256 is invalid")
+        source_pdf["sha256"] = digest
+    elif pdf_path and Path(pdf_path).is_file():
         source_pdf["sha256"] = _sha256_file(pdf_path)
     if page_count is not None and page_count > 0:
         source_pdf["page_count"] = int(page_count)
@@ -186,6 +197,8 @@ def write_source_provenance_sidecar(
     importer_version: str = "",
     build_stamp: str = "",
     page_count: Optional[int] = None,
+    source_display_path: Optional[str] = None,
+    source_sha256: Optional[str] = None,
 ) -> str:
     manifest = build_source_provenance(
         import_session_id=import_session_id,
@@ -195,6 +208,8 @@ def write_source_provenance_sidecar(
         importer_version=importer_version,
         build_stamp=build_stamp,
         page_count=page_count,
+        source_display_path=source_display_path,
+        source_sha256=source_sha256,
     )
     return manifest.write_json(output_path)
 

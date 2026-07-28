@@ -261,16 +261,22 @@ def build_parts_bootstrap(
     page_count: int = 0,
     rows: Optional[List[Dict[str, Any]]] = None,
     import_build_stamp: Optional[Dict[str, Any]] = None,
+    source_display_path: Optional[str] = None,
+    source_sha256: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return a valid bcs.parts_bootstrap/1.0 payload."""
     part_rows = list(rows or [])
+    display_path = str(
+        source_display_path if source_display_path is not None else pdf_path
+    )
     payload: Dict[str, Any] = {
         "schema": SCHEMA,
         "rows": part_rows,
         "parts": part_rows,
         "part_count": len(part_rows),
         "source_pdf": {
-            "file": str(Path(pdf_path).name),
+            "file": str(Path(display_path).name),
+            "path": display_path,
             "pages": int(page_count or 0),
         },
         "tables": [
@@ -281,7 +287,12 @@ def build_parts_bootstrap(
             }
         ] if part_rows else [],
     }
-    if pdf_path and Path(pdf_path).is_file():
+    if source_sha256 is not None:
+        digest = str(source_sha256).strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError("prebound source PDF SHA-256 is invalid")
+        payload["source_pdf"]["sha256"] = digest
+    elif pdf_path and Path(pdf_path).is_file():
         payload["source_pdf"]["sha256"] = _sha256_file(pdf_path)
     if import_build_stamp:
         payload["import_build_stamp"] = dict(import_build_stamp)
@@ -298,6 +309,8 @@ def build_parts_bootstrap_stub(
     page_count: int = 0,
     rows: Optional[List[Dict[str, Any]]] = None,
     import_build_stamp: Optional[Dict[str, Any]] = None,
+    source_display_path: Optional[str] = None,
+    source_sha256: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Backward-compatible alias for build_parts_bootstrap."""
     return build_parts_bootstrap(
@@ -305,6 +318,8 @@ def build_parts_bootstrap_stub(
         page_count=page_count,
         rows=rows,
         import_build_stamp=import_build_stamp,
+        source_display_path=source_display_path,
+        source_sha256=source_sha256,
     )
 
 
@@ -316,6 +331,8 @@ def write_parts_bootstrap_sidecar(
     rows: Optional[List[Dict[str, Any]]] = None,
     text_items: Optional[Iterable[Any]] = None,
     import_build_stamp: Optional[Dict[str, Any]] = None,
+    source_display_path: Optional[str] = None,
+    source_sha256: Optional[str] = None,
 ) -> str:
     from .atomic_io import atomic_write_text
 
@@ -328,6 +345,8 @@ def write_parts_bootstrap_sidecar(
         page_count=page_count,
         rows=extracted,
         import_build_stamp=import_build_stamp,
+        source_display_path=source_display_path,
+        source_sha256=source_sha256,
     )
     return atomic_write_text(
         path, json.dumps(manifest, indent=2, allow_nan=False) + "\n"

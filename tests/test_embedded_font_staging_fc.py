@@ -25,6 +25,50 @@ PDF_SHA_A = "a" * 64
 PDF_SHA_B = "b" * 64
 
 
+def test_shapestring_font_cache_uses_temp_when_user_mod_root_is_unwritable(
+    tmp_path, monkeypatch,
+):
+    blocked_root = tmp_path / "blocked-user-root"
+    blocked_root.write_text("not a directory", encoding="utf-8")
+    fallback_root = tmp_path / "fallback-temp"
+    fallback_root.mkdir()
+
+    class FakeFreeCAD:
+        @staticmethod
+        def getUserAppDataDir():
+            return str(blocked_root)
+
+    monkeypatch.setattr(core, "FreeCAD", FakeFreeCAD)
+    monkeypatch.setattr(core.tempfile, "gettempdir", lambda: str(fallback_root))
+
+    cache_dir = core._shapestring_font_cache_dir()
+
+    assert cache_dir == fallback_root / "bc_fc_pdf_font_cache"
+    assert cache_dir.is_dir()
+
+
+def test_raster_asset_dir_uses_temp_when_user_mod_root_is_unwritable(
+    tmp_path, monkeypatch,
+):
+    blocked_root = tmp_path / "blocked-raster-user-root"
+    blocked_root.write_text("not a directory", encoding="utf-8")
+    fallback_root = tmp_path / "raster-fallback-temp"
+    fallback_root.mkdir()
+
+    class FakeFreeCAD:
+        @staticmethod
+        def getUserAppDataDir():
+            return str(blocked_root)
+
+    monkeypatch.setattr(core, "FreeCAD", FakeFreeCAD)
+    monkeypatch.setattr(core.tempfile, "gettempdir", lambda: str(fallback_root))
+
+    cache_dir = core._raster_asset_dir()
+
+    assert cache_dir == fallback_root / "bc_fc_pdf_raster_cache"
+    assert cache_dir.is_dir()
+
+
 def _set_completed_font_session(
     opts,
     *,

@@ -249,8 +249,43 @@ try:
     opts = core.ImportOptions()
     opts.verbose = False
     opts.import_report_path = report_path
+    with core.fitz.open(pdf_path) as source_doc:
+        result["probe_image_info"] = [
+            {
+                "bbox": list(info.get("bbox") or []),
+                "xref": int(info.get("xref") or 0),
+                "width": int(info.get("width") or 0),
+                "height": int(info.get("height") or 0),
+            }
+            for info in source_doc[0].get_image_info(xrefs=True)
+        ]
+    original_image_import = core._import_embedded_images_as_planes
+    def observed_image_import(pdf_doc, page, *args, **kwargs):
+        result["image_import_called"] = True
+        result["image_info_at_import"] = [
+            {
+                "bbox": list(info.get("bbox") or []),
+                "xref": int(info.get("xref") or 0),
+            }
+            for info in page.get_image_info(xrefs=True)
+        ]
+        try:
+            placed = original_image_import(pdf_doc, page, *args, **kwargs)
+        except Exception as exc:
+            result["image_import_exception"] = "%%s: %%s" %% (
+                exc.__class__.__name__, exc)
+            raise
+        result["image_import_result"] = int(placed)
+        return placed
+    core._import_embedded_images_as_planes = observed_image_import
     core.import_pdf(pdf_path, opts)
     result["image_planes"] = _planes_of(doc, copy_prefix="plane")
+    result["ignore_images"] = bool(getattr(opts, "ignore_images", False))
+    result["image_plane_count"] = int(
+        getattr(opts, "image_plane_count", 0) or 0)
+    result["document_object_types"] = [
+        str(getattr(obj, "TypeId", "") or "") for obj in doc.Objects
+    ]
     result["n_extrusions"] = sum(
         1 for obj in doc.Objects if obj.TypeId == "Part::Extrusion")
     result["text_delivered_counts"] = dict(
@@ -262,8 +297,9 @@ try:
     reopened = FreeCAD.open(save_path)
     result["reopened_planes"] = _planes_of(reopened)
     result["ok"] = True
-except Exception:
+except Exception as exc:
     result["error"] = traceback.format_exc()
+    result["attempt"] = getattr(exc, "attempt", None)
 with open(out_path, "w") as handle:
     json.dump(result, handle)
 """
@@ -287,6 +323,12 @@ def test_hybrid_delivers_per_image_planes_without_full_page_underlay(tmp_path):
     assert SPAN_AWAY_TEXT in spans and SPAN_OVER_TEXT in spans, (
         "fixture generation lost its text spans: %s" % sorted(spans)
     )
+    import fitz
+    with fitz.open(str(fixture)) as fixture_doc:
+        fixture_images = fixture_doc[0].get_image_info(xrefs=True)
+    assert len(fixture_images) == 1, (
+        "fixture generation lost its embedded image: %s" % fixture_images
+    )
 
     probe_path = tmp_path / "hybrid_dedupe_probe.py"
     probe_path.write_text(PROBE_SOURCE % {"repo": str(REPO_ROOT)}, encoding="utf-8")
@@ -304,7 +346,9 @@ def test_hybrid_delivers_per_image_planes_without_full_page_underlay(tmp_path):
         % (completed.returncode, completed.stdout[-500:], completed.stderr[-500:])
     )
     result = json.loads(out_path.read_text(encoding="utf-8"))
-    assert result.get("ok"), "probe failed: %s" % result.get("error", "")
+    assert result.get("ok"), "probe failed: %s\nattempt: %s" % (
+        result.get("error", ""), result.get("attempt"),
+    )
 
     page_w_mm = PAGE_W_PT * MM_PER_PT
     page_h_mm = PAGE_H_PT * MM_PER_PT
@@ -314,8 +358,28 @@ def test_hybrid_delivers_per_image_planes_without_full_page_underlay(tmp_path):
     planes = result.get("image_planes") or []
     assert len(planes) == 1, (
         "hybrid must place exactly one ImagePlane for the one embedded image, "
-        "got %d: %s" % (len(planes), [p["name"] for p in planes])
-    )
+        "got %d: %s\nstdout: %s\nstderr: %s"
+        % (
+                len(planes),
+                [p["name"] for p in planes],
+                "\n".join(
+                    line for line in completed.stdout.splitlines()
+                    if "image" in line.lower() or "warn" in line.lower()
+                ),
+                completed.stderr[-2000:] + "\nprobe image info: %s"
+                % {
+                    "probe_image_info": result.get("probe_image_info"),
+                    "ignore_images": result.get("ignore_images"),
+                    "image_plane_count": result.get("image_plane_count"),
+                    "image_import_called": result.get("image_import_called"),
+                    "image_info_at_import": result.get("image_info_at_import"),
+                    "image_import_result": result.get("image_import_result"),
+                    "image_import_exception": result.get(
+                        "image_import_exception"),
+                    "document_object_types": result.get("document_object_types"),
+                },
+            )
+        )
     plane = planes[0]
     coverage = (plane["x_size"] * plane["y_size"]) / (page_w_mm * page_h_mm)
     assert coverage < 0.9, (

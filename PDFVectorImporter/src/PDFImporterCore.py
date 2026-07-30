@@ -1944,12 +1944,27 @@ def _render_text_spans_exact_labels(
     return len(delivered)
 
 
+def _ensure_writable_cache_dir(candidate: Path, probe_prefix: str) -> Path:
+    candidate.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=probe_prefix, dir=str(candidate), delete=True
+    ):
+        pass
+    return candidate
+
+
 def _shapestring_font_cache_dir() -> Path:
     try:
         base = Path(FreeCAD.getUserAppDataDir())
-        return base / "Mod" / "PDFVectorImporter" / "font_cache"
-    except (AttributeError, RuntimeError, TypeError, ValueError):
-        return Path(tempfile.gettempdir()) / "bc_fc_pdf_font_cache"
+        return _ensure_writable_cache_dir(
+            base / "Mod" / "PDFVectorImporter" / "font_cache",
+            ".bc-font-cache-write-",
+        )
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return _ensure_writable_cache_dir(
+            Path(tempfile.gettempdir()) / "bc_fc_pdf_font_cache",
+            ".bc-font-cache-write-",
+        )
 
 
 def _stage_page_shapestring_fonts(
@@ -4395,9 +4410,15 @@ def _raster_asset_dir() -> Path:
     """Persistent, content-addressed raster assets owned by this importer."""
     try:
         root = Path(FreeCAD.getUserAppDataDir())
-        return root / "Mod" / "PDFVectorImporter" / "raster_cache"
-    except (AttributeError, RuntimeError, TypeError, ValueError):
-        return Path(tempfile.gettempdir()) / "bc_fc_pdf_raster_cache"
+        return _ensure_writable_cache_dir(
+            root / "Mod" / "PDFVectorImporter" / "raster_cache",
+            ".bc-raster-cache-write-",
+        )
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return _ensure_writable_cache_dir(
+            Path(tempfile.gettempdir()) / "bc_fc_pdf_raster_cache",
+            ".bc-raster-cache-write-",
+        )
 
 
 def _save_pixmap_atomic(pix, image_path: Path) -> None:

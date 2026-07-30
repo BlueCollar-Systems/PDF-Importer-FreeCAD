@@ -19,10 +19,63 @@ for path in (str(SRC_DIR), str(MOD_ROOT)):
         sys.path.insert(0, path)
 
 import PDFImporterCore as core  # noqa: E402
+from PDFVectorImporter.pdfcadcore import embedded_fonts  # noqa: E402
 
 
 PDF_SHA_A = "a" * 64
 PDF_SHA_B = "b" * 64
+
+
+def test_cmap_repair_adds_host_safe_names_to_anonymous_subset_font():
+    """Missing name IDs must not reach native host font loaders."""
+    builder = FontBuilder(1000, isTTF=True)
+    builder.setupGlyphOrder([".notdef", "A"])
+    pen = TTGlyphPen(None)
+    empty_glyph = pen.glyph()
+    builder.setupGlyf({".notdef": empty_glyph, "A": empty_glyph})
+    builder.setupHorizontalMetrics({".notdef": (500, 0), "A": (600, 0)})
+    builder.setupHorizontalHeader(ascent=800, descent=-200)
+    builder.setupCharacterMap({65: "A"})
+    builder.setupOS2()
+    builder.setupNameTable(
+        {
+            "familyName": "Disposable fixture",
+            "styleName": "Regular",
+            "uniqueFontIdentifier": "Disposable fixture Regular",
+            "fullName": "Disposable fixture Regular",
+            "psName": "DisposableFixture-Regular",
+        }
+    )
+    builder.setupPost()
+    builder.setupMaxp()
+    del builder.font["cmap"]
+    del builder.font["name"]
+    source = io.BytesIO()
+    builder.font.save(source, reorderTables=False)
+
+    usable_format, usable_bytes, cmap_installed = embedded_fonts._usable_font(
+        source.getvalue(),
+        "ttf",
+        "OCR Exact / Anonymous",
+        {65: 1},
+    )
+
+    assert usable_format == "ttf"
+    assert cmap_installed is True
+    font = TTFont(io.BytesIO(usable_bytes), lazy=False)
+    try:
+        assert font.getBestCmap() == {65: "A"}
+        names = {
+            int(record.nameID): record.toUnicode()
+            for record in font["name"].names
+            if int(record.nameID) in {1, 2, 3, 4, 5, 6}
+        }
+        assert names[1] == "OCR Exact / Anonymous"
+        assert names[2] == "Regular"
+        assert names[4] == "OCR Exact / Anonymous"
+        assert names[6] == "OCR-Exact-Anonymous"
+    finally:
+        font.close()
 
 
 def test_shapestring_font_cache_uses_temp_when_user_mod_root_is_unwritable(

@@ -389,7 +389,11 @@ def main() -> int:
             strict_text_fidelity=bool(cfg_obj.strict_text_fidelity),
             hatch_mode=str(cfg_obj.hatch_mode),
             group_by_color=bool(cfg_obj.group_by_color),
-            assign_linewidth=bool(cfg_obj.assign_linewidth),
+            # ImportOptions spells this field assign_linewidth; ImportConfig
+            # spells it assign_lineweight. Reading the ImportOptions name off
+            # the config object raised AttributeError and aborted every run,
+            # so this headless harness could not execute at all.
+            assign_linewidth=bool(cfg_obj.assign_lineweight),
             map_dashes=bool(cfg_obj.map_dashes),
             detect_arcs=bool(cfg_obj.detect_arcs),
             ignore_images=bool(cfg_obj.ignore_images),

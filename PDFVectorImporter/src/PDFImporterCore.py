@@ -2213,6 +2213,27 @@ def _font_source_result(
     return result
 
 
+# Staging outcomes that are a proven, deterministic property of the SOURCE font
+# rather than a runtime failure of ours. Each means "this PDF embeds no usable
+# exact program for this item", which is an absence, not an error:
+#
+#   embedded_font_payload_empty        base-14 faces (Helvetica, Times, Courier)
+#                                      carry a font dictionary but no font file
+#   embedded_font_has_no_unicode_cmap  subset fonts routinely ship without one
+#   embedded_font_format_unsupported   the embedded program is not a face type
+#                                      ShapeString can consume
+#
+# Classifying these as `invalid` made them indistinguishable from corruption, so
+# the ladder refused to descend and one ordinary font aborted the whole import.
+# Transient/ambiguous failures -- extraction exceptions, hash mismatches, IO
+# errors, malformed records -- deliberately stay `invalid`.
+_PROVEN_EXACT_FONT_ABSENCE_REASONS = frozenset({
+    "embedded_font_payload_empty",
+    "embedded_font_has_no_unicode_cmap",
+    "embedded_font_format_unsupported",
+})
+
+
 def _resolve_shapestring_font_path_with_evidence(
     font_name: str,
     opts: Optional[ImportOptions] = None,
@@ -2536,6 +2557,7 @@ def _resolve_shapestring_font_path_with_evidence(
         )]
 
     exact_nonembedded_observation: Optional[Dict[str, Any]] = None
+    exact_unusable_observation: Optional[Dict[str, Any]] = None
     try:
         if failures is None:
             if _allow_unbound_compat:
@@ -2600,12 +2622,27 @@ def _resolve_shapestring_font_path_with_evidence(
                     exact_nonembedded_observation = copy.deepcopy(failure)
                 continue
             if failed_key == key:
+                failure_reason = str(
+                    failure.get("reason") or "embedded_font_staging_failed"
+                )
+                failure_exception = str(failure.get("exception") or "")
+                if (
+                    failure_reason in _PROVEN_EXACT_FONT_ABSENCE_REASONS
+                    and not failure_exception
+                ):
+                    # Proven absence of a usable exact program, not a runtime
+                    # failure. Record it as evidence and let the ladder descend
+                    # one rung; an exception attached would mean something went
+                    # wrong at runtime, so that still falls through to invalid.
+                    if exact_unusable_observation is None:
+                        exact_unusable_observation = copy.deepcopy(failure)
+                    continue
                 return None, [source_result(
                     "embedded_font",
                     "invalid",
                     font_identity,
-                    reason=str(failure.get("reason") or "embedded_font_staging_failed"),
-                    exception=str(failure.get("exception") or ""),
+                    reason=failure_reason,
+                    exception=failure_exception,
                 )]
     except Exception as exc:
         return None, [source_result(
@@ -2616,7 +2653,11 @@ def _resolve_shapestring_font_path_with_evidence(
             exception="%s: %s" % (exc.__class__.__name__, exc),
         )]
 
-    if exact_nonembedded_observation is None and not _allow_unbound_compat:
+    if (
+        exact_nonembedded_observation is None
+        and exact_unusable_observation is None
+        and not _allow_unbound_compat
+    ):
         return None, [source_result(
             "embedded_font",
             "invalid",
@@ -2628,6 +2669,12 @@ def _resolve_shapestring_font_path_with_evidence(
     if exact_nonembedded_observation is not None:
         embedded_absence_details["inventory_observation"] = (
             exact_nonembedded_observation
+        )
+    if exact_unusable_observation is not None:
+        # Keep the exact staging reason on the record: the ladder descends, but
+        # the report must still say *why* the exact font could not be used.
+        embedded_absence_details["unusable_observation"] = (
+            exact_unusable_observation
         )
     results.append(source_result(
         "embedded_font",

@@ -752,7 +752,7 @@ def test_completed_inventory_without_exact_observation_is_invalid_not_absence():
         ),
     ],
 )
-def test_normal_return_inventory_gaps_are_recorded_and_terminal_for_exact_span(
+def test_normal_return_inventory_gaps_are_recorded_and_descend_for_exact_span(
     monkeypatch,
     tmp_path,
     rows,
@@ -796,11 +796,30 @@ def test_normal_return_inventory_gaps_are_recorded_and_terminal_for_exact_span(
         page_number=1,
     )
 
+    # The guarantee that must never change, in every case below: no font is
+    # substituted for the exact source font.
     assert path is None
-    assert len(results) == 1
     assert results[0]["source"] == "embedded_font"
-    assert results[0]["outcome"] == "invalid"
-    assert results[0]["reason"] == expected_reason
+
+    if expected_reason in core._PROVEN_EXACT_FONT_ABSENCE_REASONS:
+        # Owner decision 2026-07-31. An empty payload or an unsupported face
+        # format is a proven, deterministic property of the source PDF --
+        # base-14 faces carry no font file at all -- not a runtime failure of
+        # ours. Reporting it as `invalid` made it indistinguishable from
+        # corruption, so the ladder refused to descend and ONE ordinary font
+        # aborted the entire import. It is now an absence: the ladder descends,
+        # the next exact source may be tried, and the staging reason is kept.
+        assert results[0]["outcome"] == "not_found"
+        assert results[0]["unusable_observation"]["reason"] == expected_reason
+        assert len(results) == 2
+        assert results[1]["source"] == "system_font"
+    else:
+        # Malformed inventory rows and invalid xrefs are NOT proof of absence --
+        # something is wrong with the data, and descending would hide it. These
+        # stay terminal exactly as before.
+        assert len(results) == 1
+        assert results[0]["outcome"] == "invalid"
+        assert results[0]["reason"] == expected_reason
 
 
 def test_zero_xref_inventory_row_is_explicit_exact_nonembedded_observation(

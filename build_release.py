@@ -73,9 +73,20 @@ PYMUPDF_SPEC = "PyMuPDF>=1.24,<2.0"
 FONTTOOLS_SPEC = "fonttools>=4.50,<5.0"
 RUNTIME_DEPENDENCY_SPECS = (PYMUPDF_SPEC, FONTTOOLS_SPEC)
 VENDORED_LIB_DIR = ADDON_DIR / "src" / "lib"
+DETERMINISTIC_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 
 
 def _should_exclude(rel: Path) -> bool:
+    parts = rel.parts
+    # ``pip --target`` creates Windows console launchers whose shebang embeds
+    # the build machine's absolute Python path.  The importer never calls these
+    # command-line wrappers, so shipping them is both non-portable and
+    # non-reproducible.  Wheel RECORD files contain hashes for those wrappers
+    # and are likewise unnecessary for runtime imports.
+    if len(parts) >= 3 and parts[:3] == ("src", "lib", "bin"):
+        return True
+    if rel.name == "RECORD" and any(part.endswith(".dist-info") for part in parts):
+        return True
     for part in rel.parts:
         if part in EXCLUDE_DIRS:
             return True
@@ -84,6 +95,19 @@ def _should_exclude(rel: Path) -> bool:
     if rel.suffix.lower() in EXCLUDE_SUFFIXES:
         return True
     return False
+
+
+def _write_deterministic_file(
+    archive: zipfile.ZipFile, source: Path, archive_name: Path
+) -> None:
+    """Write one regular file without leaking host timestamps or permissions."""
+    info = zipfile.ZipInfo(
+        archive_name.as_posix(), date_time=DETERMINISTIC_ZIP_TIMESTAMP
+    )
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.create_system = 3
+    info.external_attr = (0o100644 & 0xFFFF) << 16
+    archive.writestr(info, source.read_bytes())
 
 
 def _read_version() -> str:
@@ -267,7 +291,7 @@ def build(out_dir: Path, *, vendor_deps: bool = True) -> Path:
                 continue
             # Archive path: PDFVectorImporter/<rel>
             arc_name = Path("PDFVectorImporter") / rel
-            zf.write(abs_path, arc_name)
+            _write_deterministic_file(zf, abs_path, arc_name)
             file_count += 1
 
     print(f"Built: {zip_path}")

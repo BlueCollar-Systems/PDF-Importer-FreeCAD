@@ -3,7 +3,7 @@
 **BUILT. NOT BOUGHT.**
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
-![Version: 4.0.74](https://img.shields.io/badge/Version-4.0.74-blue.svg)
+![Version: 4.0.75](https://img.shields.io/badge/Version-4.0.75-blue.svg)
 ![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
 
 Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.
@@ -12,7 +12,11 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 
 > BlueCollar Systems -- BUILT. NOT BOUGHT.
 
-## Recent fixes (v4.0.74)
+## Recent fixes (v4.0.75)
+
+- Release ZIPs are now reproducible and omit unused Python console launchers
+  and wheel records that embed build-machine paths. The shipped runtime stays
+  self-contained while every published byte can be verified locally.
 
 - Font and raster caches now verify that FreeCAD's user Mod directory is
   writable and automatically use a temporary cache when it is not. This keeps

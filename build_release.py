@@ -44,6 +44,7 @@ EXCLUDE_DIRS = {
     "_archived",
     "qa_runs",
     "adapters",  # CLI test harnesses — not needed at FreeCAD runtime
+    "tests",
     "temp",
 }
 

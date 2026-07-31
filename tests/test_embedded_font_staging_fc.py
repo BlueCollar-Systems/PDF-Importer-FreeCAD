@@ -138,6 +138,63 @@ def test_exact_inventory_name_outranks_weaker_internal_family_aliases(monkeypatc
     assert asset.base_font_name == "Arial"
 
 
+def test_distinct_exact_programs_with_same_name_remain_ambiguous(monkeypatch):
+    class Document:
+        @staticmethod
+        def extract_font(xref):
+            programs = {1: b"font-program-a", 2: b"font-program-b", 3: b"font-program-a"}
+            return "SameExactName", "ttf", "Type0", programs[xref]
+
+    class Page:
+        parent = Document()
+
+        @staticmethod
+        def get_texttrace():
+            return []
+
+        @staticmethod
+        def get_fonts(*, full=False):
+            assert full is True
+            return [
+                (1, "ttf", "Type0", "SameExactName", "F0", "Identity-H"),
+                (2, "ttf", "Type0", "SameExactName", "F1", "Identity-H"),
+                (3, "ttf", "Type0", "SameExactName", "F2", "Identity-H"),
+            ]
+
+    monkeypatch.setattr(
+        embedded_fonts,
+        "_page_unicode_glyph_maps",
+        lambda _page: ({"SameExactName": {65: 1}}, set(), None),
+    )
+    monkeypatch.setattr(
+        embedded_fonts,
+        "_font_program_name_aliases",
+        lambda _data, _format: set(),
+    )
+    monkeypatch.setattr(
+        embedded_fonts,
+        "_usable_font",
+        lambda source, source_format, _name, _mapping: (
+            source_format,
+            source,
+            True,
+        ),
+    )
+    monkeypatch.setattr(
+        embedded_fonts,
+        "_font_delivery_metrics",
+        lambda _data: (1000, 800, -200, (500, 500)),
+    )
+
+    catalog = embedded_fonts.EmbeddedFontCatalog.from_page(Page(), page_number=31)
+
+    assert catalog.for_span("SameExactName") is None
+    failure = catalog.failure_for_span("SameExactName")
+    assert failure is not None
+    assert failure.reason == "ambiguous_exact_embedded_font_match"
+    assert failure.proof_category == "source_font_ambiguous_for_item"
+
+
 def test_cmap_repair_classifies_fonttools_assertion_as_malformed_source(monkeypatch):
     monkeypatch.setattr(
         embedded_fonts,

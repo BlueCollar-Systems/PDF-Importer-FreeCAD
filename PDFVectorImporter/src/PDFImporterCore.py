@@ -2620,6 +2620,17 @@ def _resolve_shapestring_font_path_with_evidence(
                     failure_reason in _PROVEN_EXACT_FONT_ABSENCE_REASONS
                     and not failure_exception
                 ):
+                    if (
+                        failure.get("outcome") != "failed"
+                        or type(failure.get("xref")) is not int
+                        or failure.get("xref") <= 0
+                    ):
+                        return None, [source_result(
+                            "embedded_font",
+                            "invalid",
+                            font_identity,
+                            reason="malformed_font_staging_failure",
+                        )]
                     if exact_unusable_observation is None:
                         exact_unusable_observation = copy.deepcopy(failure)
                     continue

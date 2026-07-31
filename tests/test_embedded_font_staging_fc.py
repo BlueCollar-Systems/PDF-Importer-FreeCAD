@@ -827,6 +827,7 @@ def test_deterministic_font_reason_with_runtime_exception_remains_invalid(
         opts,
         failures=[
             {
+                "xref": 5,
                 "font": "Siwa-Regular",
                 "outcome": "failed",
                 "reason": "embedded_font_payload_empty",
@@ -863,6 +864,7 @@ def test_proven_exact_embedded_font_absence_descends_without_substitution(reason
         opts,
         failures=[
             {
+                "xref": 5,
                 "font": "Siwa-Regular",
                 "outcome": "failed",
                 "reason": reason,
@@ -884,6 +886,42 @@ def test_proven_exact_embedded_font_absence_descends_without_substitution(reason
     assert results[0]["unusable_observation"]["reason"] == reason
     assert results[1]["source"] == "system_font"
     assert results[1]["outcome"] == "not_found"
+
+
+@pytest.mark.parametrize(
+    ("outcome", "xref"),
+    [("unknown", 5), ("failed", None), ("failed", "5"), ("failed", 0)],
+)
+def test_malformed_deterministic_absence_record_cannot_authorize_fallback(
+    outcome,
+    xref,
+):
+    opts = core.ImportOptions(text_mode="3d_text")
+    _set_completed_font_session(
+        opts,
+        failures=[
+            {
+                "xref": xref,
+                "font": "Siwa-Regular",
+                "outcome": outcome,
+                "reason": "embedded_font_payload_empty",
+                "exception": "",
+            }
+        ],
+    )
+
+    path, results = core._resolve_shapestring_font_path_with_evidence(
+        "Siwa-Regular",
+        opts,
+        pdf_sha256=PDF_SHA_A,
+        page_number=1,
+    )
+
+    assert path is None
+    assert len(results) == 1
+    assert results[0]["source"] == "embedded_font"
+    assert results[0]["outcome"] == "invalid"
+    assert results[0]["reason"] == "malformed_font_staging_failure"
 
 
 def test_zero_xref_inventory_row_is_explicit_exact_nonembedded_observation(

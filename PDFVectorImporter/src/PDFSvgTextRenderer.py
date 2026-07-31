@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Tuple
 
 try:
@@ -1264,11 +1265,69 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
             "matched_placement_indices": matched_indices,
             "assignment_method": assignment_method,
         }
+        if source_manifest is not None:
+            item_filter_evidence["global_unmatched_placement_indices"] = list(
+                unmatched_indices or []
+            )
         if empty_placement_indices:
             item_filter_evidence["empty_placement_indices"] = list(
                 empty_placement_indices
             )
         if not matched_glyphs:
+            raster_source_placements = (
+                cache.get("raster_source_placements") if cache is not None else None
+            )
+            if raster_source_placements is None:
+                raster_source_placements = _parse_raster_source_placements(svg)
+                if cache is not None:
+                    cache["raster_source_placements"] = list(
+                        raster_source_placements
+                    )
+            matching_raster_sources = []
+            for source_id, svg_bbox in list(raster_source_placements or []):
+                host_points = []
+                for svg_x, svg_y in (
+                    (svg_bbox[0], svg_bbox[1]),
+                    (svg_bbox[0], svg_bbox[3]),
+                    (svg_bbox[2], svg_bbox[1]),
+                    (svg_bbox[2], svg_bbox[3]),
+                ):
+                    host_x = (float(svg_x) - vb_min_x) * x_unit_to_mm
+                    host_y = (
+                        (vb_h + vb_min_y - float(svg_y)) * y_unit_to_mm
+                        if flip_y
+                        else (float(svg_y) - vb_min_y) * y_unit_to_mm
+                    )
+                    host_points.append((host_x, host_y))
+                host_bbox = (
+                    min(point[0] for point in host_points),
+                    min(point[1] for point in host_points),
+                    max(point[0] for point in host_points),
+                    max(point[1] for point in host_points),
+                )
+                if _bbox_intersection_area(host_bbox, host_filter_bbox) > 1e-12:
+                    matching_raster_sources.append((str(source_id), host_bbox))
+            if matching_raster_sources:
+                raise TextRepresentationRenderError(
+                    "svg_item_raster_source_only",
+                    {
+                        "requested_type": item_filter["requested_type"],
+                        "attempted_type": representation,
+                        "source_item_id": item_filter["source_item_id"],
+                        "renderer": renderer_name,
+                        "placement_count": len(placements),
+                        **item_filter_evidence,
+                        "raster_source_ids": [
+                            source_id for source_id, _bbox in matching_raster_sources
+                        ],
+                        "raster_source_host_bboxes": [
+                            host_bbox for _source_id, host_bbox in matching_raster_sources
+                        ],
+                        "created_entity_ids": [],
+                        "removed_entity_ids": [],
+                        "cleanup_complete": True,
+                    },
+                )
             raise TextRepresentationRenderError(
                     (
                         "svg_item_assignment_empty"
@@ -1817,9 +1876,143 @@ def _parse_viewbox(svg: str):
     return (0.0, 0.0, 0.0, 0.0)
 
 
+def _svg_rendered_body(svg: str) -> str:
+    """Return SVG markup with reusable definition bodies removed."""
+    return re.sub(
+        r"<defs\b[^>]*>.*?</defs>",
+        "",
+        svg,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+
+def _compose_svg_matrices(outer, inner):
+    """Compose SVG affine matrices using the standard column-vector form."""
+    oa, ob, oc, od, oe, of = outer
+    ia, ib, ic, id_, ie, iff = inner
+    return (
+        oa * ia + oc * ib,
+        ob * ia + od * ib,
+        oa * ic + oc * id_,
+        ob * ic + od * id_,
+        oa * ie + oc * iff + oe,
+        ob * ie + od * iff + of,
+    )
+
+
+def _svg_matrix_from_transform(value: str):
+    match = re.search(r"matrix\(([^)]*)\)", str(value or ""), re.IGNORECASE)
+    if not match:
+        return (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    parts = [
+        part
+        for part in re.split(r"[\s,]+", match.group(1).strip())
+        if part
+    ]
+    if len(parts) < 6:
+        return (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    try:
+        matrix = tuple(float(value) for value in parts[:6])
+    except (TypeError, ValueError):
+        return (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    return matrix if all(math.isfinite(value) for value in matrix) else (
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+    )
+
+
+def _svg_use_matrix_from_tag(tag: str):
+    matrix = _svg_matrix_from_transform(
+        re.search(r'transform="([^"]+)"', tag, re.IGNORECASE).group(1)
+        if re.search(r'transform="([^"]+)"', tag, re.IGNORECASE)
+        else ""
+    )
+    a, b, c, d, e, f = matrix
+    return (a, b, c, d, e + _attr_float(tag, "x", 0.0), f + _attr_float(tag, "y", 0.0))
+
+
+def _parse_vector_source_glyphs(svg: str):
+    """Expand reusable Poppler ``source-*`` groups into local glyph matrices."""
+    try:
+        root = ET.fromstring(svg)
+    except (ET.ParseError, TypeError, ValueError):
+        return {}
+
+    def local_name(element):
+        return str(element.tag).rsplit("}", 1)[-1].lower()
+
+    def href_value(element):
+        for key, value in element.attrib.items():
+            if str(key).rsplit("}", 1)[-1].lower() == "href":
+                return str(value or "").strip().lstrip("#")
+        return ""
+
+    def element_matrix(element, *, include_use_offset=False):
+        matrix = _svg_matrix_from_transform(element.attrib.get("transform", ""))
+        if include_use_offset:
+            a, b, c, d, e, f = matrix
+            try:
+                use_x = float(element.attrib.get("x", 0.0) or 0.0)
+                use_y = float(element.attrib.get("y", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                use_x = use_y = 0.0
+            matrix = (a, b, c, d, e + use_x, f + use_y)
+        return matrix
+
+    sources = {}
+
+    def collect(node, inherited, target):
+        current = _compose_svg_matrices(inherited, element_matrix(node))
+        for child in list(node):
+            if local_name(child) == "use":
+                glyph_id = href_value(child)
+                if _glyph_reference_id(glyph_id):
+                    target.append(
+                        (
+                            glyph_id,
+                            _compose_svg_matrices(
+                                current,
+                                element_matrix(child, include_use_offset=True),
+                            ),
+                        )
+                    )
+            else:
+                collect(child, current, target)
+
+    identity = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    for element in root.iter():
+        source_id = str(element.attrib.get("id", "") or "")
+        if local_name(element) != "g" or not source_id.startswith("source-"):
+            continue
+        glyphs = []
+        collect(element, identity, glyphs)
+        if glyphs:
+            sources[source_id] = glyphs
+    return sources
+
+
 def _parse_use_placements(svg: str):
     placements = []
-    for m in re.finditer(r'<use\b[^>]*>', svg, re.IGNORECASE | re.DOTALL):
+    # A Poppler SVG can contain ``<use>`` nodes inside ``<defs>`` to build a
+    # reusable composite source. Those nodes are definition internals, not
+    # page paints; treating them as page glyphs creates false placements near
+    # the local definition origin and makes otherwise exact global assignment
+    # fail. Only scan the rendered document body here.
+    rendered_svg = _svg_rendered_body(svg)
+    vector_sources = (
+        _parse_vector_source_glyphs(svg)
+        if re.search(
+            r'(?:xlink:href|href)="#source-', rendered_svg, re.IGNORECASE
+        )
+        else {}
+    )
+    for m in re.finditer(
+        r'<use\b[^>]*>', rendered_svg, re.IGNORECASE | re.DOTALL
+    ):
         tag = m.group(0)
         href_m = re.search(r'(?:xlink:href|href)="([^"]+)"', tag, re.IGNORECASE)
         if not href_m:
@@ -1828,6 +2021,18 @@ def _parse_use_placements(svg: str):
         if not href.startswith("#"):
             continue
         gid = href[1:]
+        if gid in vector_sources:
+            page_matrix = _svg_use_matrix_from_tag(tag)
+            for child_gid, child_matrix in vector_sources[gid]:
+                placements.append(
+                    (
+                        child_gid,
+                        0.0,
+                        0.0,
+                        list(_compose_svg_matrices(page_matrix, child_matrix)),
+                    )
+                )
+            continue
         if not _glyph_reference_id(gid):
             continue
         x = _attr_float(tag, "x", 0.0)
@@ -1844,6 +2049,88 @@ def _parse_use_placements(svg: str):
                     except (TypeError, ValueError):
                         matrix = None
         placements.append((gid, x, y, matrix))
+    return placements
+
+
+def _parse_raster_source_placements(
+    svg: str,
+) -> List[Tuple[str, Tuple[float, float, float, float]]]:
+    """Return page-painted SVG image-source bounds in SVG coordinates."""
+    image_sources: Dict[str, Tuple[float, float, float, float]] = {}
+    for tag in re.findall(r"<image\b[^>]*>", svg, re.IGNORECASE | re.DOTALL):
+        id_match = re.search(r'\bid="([^"]+)"', tag, re.IGNORECASE)
+        if not id_match or not id_match.group(1).startswith("source-"):
+            continue
+        source_id = id_match.group(1)
+        x = _attr_float(tag, "x", 0.0)
+        y = _attr_float(tag, "y", 0.0)
+        width = _attr_float(tag, "width", 0.0)
+        height = _attr_float(tag, "height", 0.0)
+        if all(math.isfinite(value) for value in (x, y, width, height)) and (
+            width > 0.0 and height > 0.0
+        ):
+            image_sources[source_id] = (x, y, x + width, y + height)
+
+    placements: List[Tuple[str, Tuple[float, float, float, float]]] = []
+    if not image_sources:
+        return placements
+    for match in re.finditer(
+        r"<use\b[^>]*>", _svg_rendered_body(svg), re.IGNORECASE | re.DOTALL
+    ):
+        tag = match.group(0)
+        href_match = re.search(
+            r'(?:xlink:href|href)="([^"]+)"', tag, re.IGNORECASE
+        )
+        if not href_match:
+            continue
+        source_id = href_match.group(1).strip().lstrip("#")
+        local_bbox = image_sources.get(source_id)
+        if local_bbox is None:
+            continue
+        use_x = _attr_float(tag, "x", 0.0)
+        use_y = _attr_float(tag, "y", 0.0)
+        matrix = None
+        transform_match = re.search(r'transform="([^"]+)"', tag, re.IGNORECASE)
+        if transform_match:
+            matrix_match = re.search(
+                r"matrix\(([^)]*)\)", transform_match.group(1), re.IGNORECASE
+            )
+            if matrix_match:
+                parts = [
+                    part
+                    for part in re.split(r"[\s,]+", matrix_match.group(1).strip())
+                    if part
+                ]
+                if len(parts) >= 6:
+                    try:
+                        matrix = tuple(float(value) for value in parts[:6])
+                    except (TypeError, ValueError):
+                        matrix = None
+        transformed = []
+        for local_x, local_y in (
+            (local_bbox[0], local_bbox[1]),
+            (local_bbox[0], local_bbox[3]),
+            (local_bbox[2], local_bbox[1]),
+            (local_bbox[2], local_bbox[3]),
+        ):
+            local_x += use_x
+            local_y += use_y
+            if matrix is not None:
+                a, b, c, d, e, f = matrix
+                svg_x = a * local_x + c * local_y + e
+                svg_y = b * local_x + d * local_y + f
+            else:
+                svg_x = local_x
+                svg_y = local_y
+            transformed.append((svg_x, svg_y))
+        x_values = [point[0] for point in transformed]
+        y_values = [point[1] for point in transformed]
+        placements.append(
+            (
+                source_id,
+                (min(x_values), min(y_values), max(x_values), max(y_values)),
+            )
+        )
     return placements
 
 

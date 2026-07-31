@@ -457,8 +457,8 @@ def test_exact_bound_proof_advances_to_only_the_next_rung():
     assert event["proof"]["proof_chain"] == [proof]
 
 
-@pytest.mark.parametrize("requested", ["labels", "3d_text", "glyphs", "geometry"])
-def test_exact_3d_font_proof_schema_accepts_any_original_ladder_request(requested):
+@pytest.mark.parametrize("requested", ["labels", "3d_text"])
+def test_exact_3d_font_proof_schema_accepts_native_text_ladder_requests(requested):
     item = _fallback_item(requested=requested)
     proof = _impossibility_proof(item, requested, "3d_text")
 
@@ -769,8 +769,8 @@ def test_every_requested_mode_has_a_finite_noncyclic_ladder_ending_raster():
         "text": ("text", "labels", "3d_text", "glyphs", "geometry", "raster"),
         "labels": ("labels", "text", "3d_text", "glyphs", "geometry", "raster"),
         "3d_text": ("3d_text", "glyphs", "geometry", "text", "labels", "raster"),
-        "glyphs": ("glyphs", "geometry", "3d_text", "text", "labels", "raster"),
-        "geometry": ("geometry", "glyphs", "3d_text", "text", "labels", "raster"),
+        "glyphs": ("glyphs", "geometry", "raster"),
+        "geometry": ("geometry", "glyphs", "raster"),
         "raster": ("raster",),
     }
 
@@ -780,6 +780,19 @@ def test_every_requested_mode_has_a_finite_noncyclic_ladder_ending_raster():
         assert ladder[-1] == "raster"
         assert len(ladder) == len(set(ladder))
         assert len(ladder) <= 6
+
+
+def test_outline_modes_do_not_cross_into_semantically_different_native_text():
+    assert core.TEXT_ITEM_FALLBACK_LADDERS["glyphs"] == (
+        "glyphs",
+        "geometry",
+        "raster",
+    )
+    assert core.TEXT_ITEM_FALLBACK_LADDERS["geometry"] == (
+        "geometry",
+        "glyphs",
+        "raster",
+    )
 
 
 def test_requested_success_records_requested_equals_delivered():

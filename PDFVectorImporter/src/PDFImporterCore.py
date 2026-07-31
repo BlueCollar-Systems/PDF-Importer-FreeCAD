@@ -2728,8 +2728,11 @@ TEXT_ITEM_FALLBACK_LADDERS = {
     "text": ("text", "labels", "3d_text", "glyphs", "geometry", "raster"),
     "labels": ("labels", "text", "3d_text", "glyphs", "geometry", "raster"),
     "3d_text": ("3d_text", "glyphs", "geometry", "text", "labels", "raster"),
-    "glyphs": ("glyphs", "geometry", "3d_text", "text", "labels", "raster"),
-    "geometry": ("geometry", "glyphs", "3d_text", "text", "labels", "raster"),
+    # Outline requests stay within outline semantics. If neither SVG outline
+    # representation exists, an exact raster crop preserves appearance; native
+    # or 3D text would silently substitute a different font/representation.
+    "glyphs": ("glyphs", "geometry", "raster"),
+    "geometry": ("geometry", "glyphs", "raster"),
     "raster": ("raster",),
 }
 
@@ -2740,6 +2743,8 @@ CLOSED_SVG_ITEM_IMPOSSIBILITY_REASONS = frozenset(
         "svg_has_no_glyph_placements",
         "svg_glyph_outlines_unavailable",
         "svg_item_glyph_bounds_unavailable",
+        "svg_item_raster_source_only",
+        "svg_item_assignment_empty",
     }
 )
 
@@ -3129,6 +3134,21 @@ def _validate_item_impossibility_proof(
         evidence = proof.get("evidence")
         if not isinstance(evidence, dict) or not evidence:
             raise ValueError("SVG impossibility evidence is empty")
+        if reason_code == "svg_item_assignment_empty":
+            renderer_evidence = evidence.get("renderer_evidence")
+            if (
+                not isinstance(renderer_evidence, dict)
+                or renderer_evidence.get("source_item_id") != source_item_id
+                or renderer_evidence.get("assignment_method")
+                != "source_manifest_global_bounded_v1"
+                or renderer_evidence.get("matched_placement_indices") != []
+                or renderer_evidence.get("global_unmatched_placement_indices") != []
+                or type(renderer_evidence.get("placement_count")) is not int
+                or renderer_evidence.get("placement_count") <= 0
+            ):
+                raise ValueError(
+                    "global empty-assignment impossibility evidence is incomplete"
+                )
         attempted_source_results = proof.get("attempted_source_results")
         if (
             not isinstance(attempted_source_results, list)
@@ -4789,7 +4809,10 @@ def _deliver_text_item_native(
                 direction="Custom",
                 points=[anchor, anchor],
             )
-            text_property = "Text"
+            # Draft Label owns source text in CustomText. Its Text property is a
+            # derived display value that remains empty until document recompute,
+            # which is deliberately deferred until page/import completion.
+            text_property = "CustomText"
             expected_type = "App::FeaturePython"
             expected_proxy_type = "Label"
         if host_obj is None or id(host_obj) in baseline_objects:
@@ -4961,6 +4984,7 @@ def _deliver_text_item_native(
             "host_proxy_type": actual_proxy_type,
             "source_text": source_text,
             "source_text_preserved": True,
+            "source_text_property": text_property,
             "source_item_id_verified": True,
             "expected_anchor_xyz": expected_anchor,
             "verified_anchor_xyz": tuple(actual_anchor),
@@ -5055,6 +5079,70 @@ def _raster_file_evidence(host_obj, source_asset_path: Path) -> Dict[str, Any]:
         evidence[evidence_name + "_sha256"] = actual_sha256
     evidence["raster_content_verified"] = True
     return evidence
+
+
+def _cached_text_raster_pixmap(
+    page,
+    clip,
+    *,
+    requested_dpi: int,
+    page_number: int,
+    opts: ImportOptions,
+):
+    """Crop one item from a bounded, once-rendered page pixmap."""
+    try:
+        max_pixels = int(
+            os.environ.get("BC_FC_TEXT_RASTER_CACHE_MAX_PIXELS", "16000000")
+        )
+    except (TypeError, ValueError):
+        max_pixels = 16_000_000
+    max_pixels = max(10_000, max_pixels)
+    page_rect = page.rect
+    page_area = max(float(page_rect.width) * float(page_rect.height), 1.0)
+    bounded_dpi = int(
+        math.floor(72.0 * math.sqrt(float(max_pixels) / page_area))
+    )
+    effective_dpi = max(72, min(int(requested_dpi), bounded_dpi))
+    zoom = effective_dpi / 72.0
+    cache_key = (
+        id(page),
+        int(page_number),
+        effective_dpi,
+        float(page_rect.x0),
+        float(page_rect.y0),
+        float(page_rect.x1),
+        float(page_rect.y1),
+    )
+    cache = getattr(opts, "_text_raster_page_cache", None)
+    if not isinstance(cache, dict) or cache.get("key") != cache_key:
+        full_pixmap = page.get_pixmap(
+            matrix=fitz.Matrix(zoom, zoom),
+            alpha=True,
+        )
+        cache = {
+            "key": cache_key,
+            "pixmap": full_pixmap,
+            "effective_dpi": effective_dpi,
+            "render_count": 1,
+        }
+        opts._text_raster_page_cache = cache
+    else:
+        full_pixmap = cache.get("pixmap")
+        if full_pixmap is None:
+            raise RuntimeError("text raster page cache lost its pixmap")
+
+    pixel_rect = fitz.IRect(
+        int(math.floor(float(full_pixmap.x) + (float(clip.x0) - float(page_rect.x0)) * zoom)),
+        int(math.floor(float(full_pixmap.y) + (float(clip.y0) - float(page_rect.y0)) * zoom)),
+        int(math.ceil(float(full_pixmap.x) + (float(clip.x1) - float(page_rect.x0)) * zoom)),
+        int(math.ceil(float(full_pixmap.y) + (float(clip.y1) - float(page_rect.y0)) * zoom)),
+    )
+    pixel_rect &= full_pixmap.irect
+    if pixel_rect.is_empty or pixel_rect.width <= 0 or pixel_rect.height <= 0:
+        raise RuntimeError("source item raster cache crop is empty")
+    cropped = fitz.Pixmap(full_pixmap.colorspace, pixel_rect, bool(full_pixmap.alpha))
+    cropped.copy(full_pixmap, pixel_rect)
+    return cropped, effective_dpi
 
 
 def _deliver_text_item_raster(
@@ -5165,12 +5253,22 @@ def _deliver_text_item_raster(
         )
         if clip.is_empty or clip.width <= 0.0 or clip.height <= 0.0:
             raise ValueError("source item raster clip is empty")
-        zoom = dpi / 72.0
-        pix = page.get_pixmap(
-            matrix=fitz.Matrix(zoom, zoom),
-            clip=clip,
-            alpha=True,
-        )
+        effective_dpi = dpi
+        if fitz is not None and isinstance(page, fitz.Page):
+            pix, effective_dpi = _cached_text_raster_pixmap(
+                page,
+                clip,
+                requested_dpi=dpi,
+                page_number=page_number,
+                opts=opts,
+            )
+        else:
+            zoom = dpi / 72.0
+            pix = page.get_pixmap(
+                matrix=fitz.Matrix(zoom, zoom),
+                clip=clip,
+                alpha=True,
+            )
         if int(getattr(pix, "width", 0) or 0) <= 0 or int(
             getattr(pix, "height", 0) or 0
         ) <= 0:
@@ -5186,7 +5284,7 @@ def _deliver_text_item_raster(
                     clip.y0,
                     clip.x1,
                     clip.y1,
-                    dpi,
+                    effective_dpi,
                 )
             ).encode("utf-8")
         ).hexdigest()
@@ -5248,7 +5346,7 @@ def _deliver_text_item_raster(
         host_obj.PDFRasterSHA256 = raster_sha256
         _annotate_text_host_object(host_obj, source_item_id, "raster")
         parent_group.addObject(host_obj)
-        fc_doc.recompute()
+        _recompute_page_if_needed(fc_doc, opts)
     except Exception as exc:
         fail(
             "raster_text_host_creation_failed",
@@ -5299,7 +5397,8 @@ def _deliver_text_item_raster(
             "pdf_sha256": pdf_sha256,
             "pixel_width": int(pix.width),
             "pixel_height": int(pix.height),
-            "dpi": dpi,
+            "dpi": effective_dpi,
+            "requested_dpi": dpi,
             "source_bbox": bbox,
             "expected_anchor_xyz": expected_anchor,
             "verified_anchor_xyz": tuple(actual_anchor),
@@ -8893,11 +8992,16 @@ def _reset_import_run_state(opts: ImportOptions) -> None:
 
 
 def _recompute_page_if_needed(fc_doc, opts: ImportOptions) -> bool:
-    """Recompute now for standalone pages, or once after a multi-page batch."""
+    """Recompute now for direct page calls, or once after an orchestrated import."""
     if bool(getattr(opts, "_defer_page_recompute", False)):
         return False
     fc_doc.recompute()
     return True
+
+
+def _should_defer_item_recompute(valid_page_count: int) -> bool:
+    """Return whether import_pdf will supply the final document recompute."""
+    return int(valid_page_count) > 0
 
 
 def _remove_post_baseline_document_objects(
@@ -9005,9 +9109,8 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             total_pages = len(pdoc)
             # Default to all pages when no explicit page list is provided
             pages = opts.pages or list(range(1, total_pages + 1))
-            opts._defer_page_recompute = (
+            opts._defer_page_recompute = _should_defer_item_recompute(
                 sum(1 for page_number in pages if 1 <= page_number <= total_pages)
-                > 1
             )
             if total_pages > 0:
                 page_height_scaled = pdoc.load_page(0).rect.height * _unit_scale

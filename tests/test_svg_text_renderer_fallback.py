@@ -48,6 +48,58 @@ def test_parses_poppler_glyph_group_ids() -> None:
     assert renderer._parse_use_placements(svg) == [("glyph-0-1", 3.0, 4.0, None)]
 
 
+def test_page_placements_expand_only_rendered_reusable_uses_inside_svg_defs() -> None:
+    svg = (
+        '<svg viewBox="0 0 200 100"><defs>'
+        '<g id="glyph-0-1"><path d="M0 0L1 0Z"/></g>'
+        '<g id="source-1"><use href="#glyph-0-1" x="1" y="2"/></g>'
+        "</defs>"
+        '<use href="#source-1" transform="matrix(1,0,0,1,20,30)"/>'
+        '<use href="#glyph-0-1" x="23" y="34"/>'
+        "</svg>"
+    )
+
+    assert renderer._parse_use_placements(svg) == [
+        ("glyph-0-1", 0.0, 0.0, [1.0, 0.0, 0.0, 1.0, 21.0, 32.0]),
+        ("glyph-0-1", 23.0, 34.0, None)
+    ]
+
+
+def test_parses_rendered_raster_source_placements_without_definition_internals() -> None:
+    svg = (
+        '<svg viewBox="0 0 400 300"><defs>'
+        '<image id="source-17" x="0" y="0" width="23" height="24" '
+        'href="data:image/png;base64,AA=="/>'
+        '<g id="source-18"><use href="#glyph-0-1" x="1" y="2"/></g>'
+        "</defs>"
+        '<use href="#source-17" transform="matrix(.48,0,0,.48,251.52,51.84)"/>'
+        '<use href="#source-18" transform="matrix(1,0,0,1,20,30)"/>'
+        "</svg>"
+    )
+
+    placements = renderer._parse_raster_source_placements(svg)
+
+    assert len(placements) == 1
+    assert placements[0][0] == "source-17"
+    assert placements[0][1] == pytest.approx((251.52, 51.84, 262.56, 63.36))
+
+
+def test_flattens_rendered_poppler_vector_source_into_page_glyph_placements() -> None:
+    svg = (
+        '<svg xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 200 100">'
+        "<defs>"
+        '<g id="glyph-0-1"><path d="M0 0L1 0Z"/></g>'
+        '<g id="source-22"><g><use xlink:href="#glyph-0-1" x="1" y="2"/></g></g>'
+        "</defs>"
+        '<use xlink:href="#source-22" transform="matrix(.5,0,0,.5,20,30)"/>'
+        "</svg>"
+    )
+
+    assert renderer._parse_use_placements(svg) == [
+        ("glyph-0-1", 0.0, 0.0, [0.5, 0.0, 0.0, 0.5, 20.5, 31.0])
+    ]
+
+
 def test_poppler_empty_glyph_group_is_recorded_as_intentional_empty_outline() -> None:
     svg = (
         '<svg viewBox="0 0 200 100"><defs>'

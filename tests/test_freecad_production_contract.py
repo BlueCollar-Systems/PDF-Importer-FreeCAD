@@ -362,6 +362,97 @@ def test_svg_item_deliverer_emits_valid_typed_impossibility_for_closed_reason(
     )["cleanup_complete"] is True
 
 
+def test_svg_raster_backed_item_is_a_closed_vector_impossibility(
+    monkeypatch,
+):
+    from PDFVectorImporter.src import PDFSvgTextRenderer as renderer
+
+    def raster_source_only(*_args, **_kwargs):
+        raise renderer.TextRepresentationRenderError(
+            "svg_item_raster_source_only",
+            {
+                "raster_source_ids": ["source-17"],
+                "raster_source_host_bboxes": [(8.0, 73.0, 38.0, 82.0)],
+                "created_entity_ids": [],
+                "removed_entity_ids": [],
+                "cleanup_complete": True,
+            },
+        )
+
+    monkeypatch.setattr(renderer, "render_text", raster_source_only)
+    document, group = _install_native_host(monkeypatch)
+    item = _canonical_item("glyphs")
+
+    with pytest.raises(core.TextItemImpossible) as raised:
+        core._deliver_text_item_svg(
+            item,
+            "glyphs",
+            core.ImportOptions(text_mode="glyphs"),
+            pdf_path="fixture.pdf",
+            page_h=100.0,
+            page_w=100.0,
+            scale=1.0,
+            fc_doc=document,
+            parent_group=group,
+            render_cache={},
+        )
+
+    assert raised.value.proof["reason_code"] == "svg_item_raster_source_only"
+    assert core._validate_item_impossibility_proof(
+        item,
+        "glyphs",
+        "glyphs",
+        raised.value.proof,
+    )["cleanup_complete"] is True
+
+
+def test_exhaustive_global_assignment_empty_is_a_closed_vector_impossibility(
+    monkeypatch,
+):
+    from PDFVectorImporter.src import PDFSvgTextRenderer as renderer
+
+    def globally_unassigned(*_args, **_kwargs):
+        raise renderer.TextRepresentationRenderError(
+            "svg_item_assignment_empty",
+            {
+                "source_item_id": item["source_item_id"],
+                "assignment_method": "source_manifest_global_bounded_v1",
+                "placement_count": 3,
+                "matched_placement_indices": [],
+                "global_unmatched_placement_indices": [],
+                "created_entity_ids": [],
+                "removed_entity_ids": [],
+                "cleanup_complete": True,
+            },
+        )
+
+    monkeypatch.setattr(renderer, "render_text", globally_unassigned)
+    document, group = _install_native_host(monkeypatch)
+    item = _canonical_item("glyphs")
+
+    with pytest.raises(core.TextItemImpossible) as raised:
+        core._deliver_text_item_svg(
+            item,
+            "glyphs",
+            core.ImportOptions(text_mode="glyphs"),
+            pdf_path="fixture.pdf",
+            page_h=100.0,
+            page_w=100.0,
+            scale=1.0,
+            fc_doc=document,
+            parent_group=group,
+            render_cache={},
+        )
+
+    assert raised.value.proof["reason_code"] == "svg_item_assignment_empty"
+    assert core._validate_item_impossibility_proof(
+        item,
+        "glyphs",
+        "glyphs",
+        raised.value.proof,
+    )["cleanup_complete"] is True
+
+
 def test_canonical_page_orchestrator_preserves_original_source_identity(monkeypatch):
     item = _canonical_item("labels")
     raw_tdict = {
@@ -572,7 +663,7 @@ def test_native_item_delivery_rereads_live_text_transform_style_and_metadata(
     assert document.recompute_calls == 0
 
 
-def test_page_recompute_can_be_deferred_until_multi_page_import_finishes():
+def test_page_recompute_can_be_deferred_until_import_finishes():
     document = _Document()
     opts = core.ImportOptions()
 
@@ -583,6 +674,12 @@ def test_page_recompute_can_be_deferred_until_multi_page_import_finishes():
 
     assert core._recompute_page_if_needed(document, opts) is False
     assert document.recompute_calls == 1
+
+
+def test_orchestrated_import_defers_item_recompute_even_for_one_page():
+    assert core._should_defer_item_recompute(0) is False
+    assert core._should_defer_item_recompute(1) is True
+    assert core._should_defer_item_recompute(2) is True
 
 
 @pytest.mark.parametrize("attempted_type", ["text", "labels"])
@@ -624,6 +721,44 @@ def test_native_item_delivery_headless_rereads_honest_app_style_metadata(
     assert result["outcome"] == "verified"
     assert result["evidence"]["style_verification"] == "headless_app_metadata"
     assert result["evidence"]["view_style_verified"] is False
+
+
+def test_label_delivery_accepts_custom_text_before_deferred_document_recompute(
+    monkeypatch,
+):
+    document, group = _install_native_host(monkeypatch)
+    original_make_label = core.Draft.make_label
+
+    def make_label_with_deferred_derived_text(**kwargs):
+        host = original_make_label(**kwargs)
+        # Real Draft Labels populate their authoritative CustomText immediately,
+        # but derive Text only when the document recomputes.
+        host.Text = []
+        return host
+
+    monkeypatch.setattr(core.Draft, "make_label", make_label_with_deferred_derived_text)
+    item = _canonical_item("labels")
+
+    result = core._deliver_text_item_native(
+        item,
+        "labels",
+        core.ImportOptions(
+            text_mode="labels",
+            import_text=True,
+            scale_to_mm=False,
+            user_scale=1.0,
+        ),
+        text_group=group,
+        page_h=100.0,
+        scale=1.0,
+    )
+
+    host = document.getObject(result["created_entity_ids"][0])
+    assert list(host.CustomText) == [item["text"]]
+    assert list(host.Text) == []
+    assert result["outcome"] == "verified"
+    assert result["evidence"]["source_text_property"] == "CustomText"
+    assert document.recompute_calls == 0
 
 
 def test_rotated_native_text_remains_text_with_verified_persistent_placement(
@@ -777,6 +912,7 @@ def test_item_raster_delivery_is_persistent_verified_and_source_bound(
         user_scale=1.0,
         raster_dpi=144,
     )
+    opts._defer_page_recompute = True
 
     class Pixmap:
         width = 16
@@ -818,6 +954,40 @@ def test_item_raster_delivery_is_persistent_verified_and_source_bound(
     assert result["evidence"]["raster_content_verified"] is True
     assert host.XSize == pytest.approx(item["bbox"][2] - item["bbox"][0])
     assert host.YSize == pytest.approx(item["bbox"][3] - item["bbox"][1])
+    assert document.recompute_calls == 0
+
+
+def test_text_raster_cache_renders_page_once_at_bounded_effective_dpi(
+    monkeypatch,
+):
+    fitz = pytest.importorskip("fitz")
+    pdf = fitz.open()
+    page = pdf.new_page(width=200.0, height=100.0)
+    page.insert_text((20.0, 50.0), "CACHE", fontsize=12.0)
+    opts = core.ImportOptions(raster_dpi=300)
+    monkeypatch.setenv("BC_FC_TEXT_RASTER_CACHE_MAX_PIXELS", "40000")
+
+    first, first_dpi = core._cached_text_raster_pixmap(
+        page,
+        fitz.Rect(15.0, 35.0, 80.0, 55.0),
+        requested_dpi=300,
+        page_number=1,
+        opts=opts,
+    )
+    second, second_dpi = core._cached_text_raster_pixmap(
+        page,
+        fitz.Rect(90.0, 35.0, 150.0, 55.0),
+        requested_dpi=300,
+        page_number=1,
+        opts=opts,
+    )
+
+    assert 72 <= first_dpi < 300
+    assert second_dpi == first_dpi
+    assert first.width > 0 and first.height > 0
+    assert second.width > 0 and second.height > 0
+    assert opts._text_raster_page_cache["render_count"] == 1
+    pdf.close()
 
 
 def test_full_page_raster_returns_verified_persistent_host_evidence(

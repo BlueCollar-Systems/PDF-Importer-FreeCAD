@@ -106,7 +106,7 @@ def import_core_module():
 
 def build_import_options(core, cfg_obj, pages):
     """Translate the shared ImportConfig vocabulary to the FreeCAD core."""
-    return core.ImportOptions(
+    options = core.ImportOptions(
         pages=pages,
         scale_to_mm=bool(cfg_obj.scale_to_mm),
         user_scale=float(cfg_obj.user_scale),
@@ -141,7 +141,13 @@ def build_import_options(core, cfg_obj, pages):
         layer_mode=str(cfg_obj.layer_mode),
         compound_batch_size=int(cfg_obj.compound_batch_size),
         heavy_page_threshold=int(cfg_obj.heavy_page_threshold),
+        auto_resolved_mode=cfg_obj.auto_resolved_mode,
+        auto_reason=cfg_obj.auto_reason,
     )
+    # This compatibility field is intentionally dynamic on ImportOptions, but
+    # the core consumes it to decide whether semantic 3D generation runs.
+    options.model3d_semantic = bool(cfg_obj.model3d_semantic)
+    return options
 
 
 def _looks_like_python(path_or_name: str) -> bool:

@@ -902,7 +902,7 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
             raise TextRepresentationRenderError(
                 "invalid_svg_render_cache",
                 {"requested_type": representation},
-            )
+            ) from None
     else:
         vb_min_x, vb_min_y, vb_w, vb_h = _parse_viewbox(svg)
         if vb_w <= 0 or vb_h <= 0:

@@ -1,5 +1,6 @@
 from PDFVectorImporter.adapters import freecad_harness
 from PDFVectorImporter.pdfcadcore.import_config import ImportConfig
+from PDFVectorImporter.src import PDFImporterCore as core
 
 
 class _Options:
@@ -58,3 +59,16 @@ def test_harness_maps_config_lineweight_to_core_linewidth():
     }
     for field_name in direct_fields:
         assert getattr(options, field_name) == getattr(config, field_name)
+
+
+def test_harness_preserves_config_evidence_and_semantic_model_intent():
+    config = ImportConfig.auto()
+    config.auto_resolved_mode = "hybrid"
+    config.auto_reason = "synthetic evidence reason"
+    config.model3d_semantic = True
+
+    options = freecad_harness.build_import_options(core, config, [2])
+
+    assert options.auto_resolved_mode == "hybrid"
+    assert options.auto_reason == "synthetic evidence reason"
+    assert options.model3d_semantic is True

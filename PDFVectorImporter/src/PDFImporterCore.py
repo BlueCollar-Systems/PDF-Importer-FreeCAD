@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 import functools
 import hashlib
+import json
 import math
 from contextlib import contextmanager
 import os
@@ -88,6 +89,12 @@ AUTO_FILL_PURE_STROKE_MAX = 0.02
 AUTO_FILL_PURE_MIN_GROUPS = 12
 AUTO_FILL_PURE_MIN_ITEMS = 24
 AUTO_FILL_PURE_LARGE_RECT_RATIO = 0.03
+
+# Above this per-page instance count, individual raster rendering, hashing, and
+# ImagePlane creation is disproportionately expensive on older hardware.  Keep
+# up to 64 independently editable placements; compact denser inventories into
+# one exact transparent images-only plane.
+DENSE_EMBEDDED_IMAGE_INSTANCE_THRESHOLD = 64
 AUTO_FILL_COMPLEX_RATIO = 0.98
 AUTO_FILL_COMPLEX_STROKE_MAX = 0.01
 AUTO_FILL_COMPLEX_MIN_ITEMS = 3000
@@ -3855,6 +3862,41 @@ def _document_objects(doc) -> List[Any]:
         return []
 
 
+def _prepare_native_text_object_index(
+    opts: ImportOptions,
+    doc,
+    *,
+    refresh: bool = False,
+) -> Dict[str, Any]:
+    """Index document membership once per text-delivery batch.
+
+    FreeCAD's ``Document.Objects`` accessor materializes the complete object
+    collection.  Reading it for every source span makes native text delivery
+    quadratic on drawing sheets.  The import is synchronous, so one index at
+    the start of each page is authoritative; successful deliveries extend it
+    in constant time.  A terminal failure still performs a full scan so any
+    partially-created factory objects can be rolled back safely.
+    """
+    index = getattr(opts, "_native_text_object_index", None)
+    if not isinstance(index, dict) or index.get("document") is not doc:
+        index = {
+            "document": doc,
+            "object_ids": set(),
+            "entity_ids": set(),
+        }
+        refresh = True
+    if refresh:
+        objects = _document_objects(doc)
+        index["object_ids"] = {id(host_obj) for host_obj in objects}
+        index["entity_ids"] = {
+            entity_id
+            for entity_id in (_host_object_id(host_obj) for host_obj in objects)
+            if entity_id
+        }
+    opts._native_text_object_index = index
+    return index
+
+
 def _text_host_document(shape_string, text_group):
     for candidate in (
         getattr(shape_string, "Document", None),
@@ -4649,11 +4691,13 @@ def _deliver_text_item_native(
     source_item_id = str(bound_item.get("source_item_id") or "")
     requested_type = bound_item.get("requested_type")
     doc = _text_host_document(None, text_group)
-    baseline_objects: set = set()
+    baseline_objects: Optional[set] = None
+    baseline_entity_ids: Optional[set] = None
+    object_index: Optional[Dict[str, Any]] = None
     owned: List[Any] = []
 
     def fail(reason: str, evidence: Optional[Dict[str, Any]] = None):
-        if doc is not None and baseline_objects:
+        if doc is not None and baseline_objects is not None:
             try:
                 for host_obj in _document_objects(doc):
                     if id(host_obj) not in baseline_objects and all(
@@ -4745,7 +4789,9 @@ def _deliver_text_item_native(
             raise ValueError("canonical native text delivery context is invalid")
         if attempted_type in {"text", "labels"} and Draft is None:
             raise ValueError("FreeCAD Draft is unavailable for native Text/Labels")
-        baseline_objects = {id(host_obj) for host_obj in _document_objects(doc)}
+        object_index = _prepare_native_text_object_index(opts, doc)
+        baseline_objects = object_index["object_ids"]
+        baseline_entity_ids = object_index["entity_ids"]
     except Exception as exc:
         fail(
             "invalid_native_text_source_item",
@@ -4815,7 +4861,13 @@ def _deliver_text_item_native(
             text_property = "CustomText"
             expected_type = "App::FeaturePython"
             expected_proxy_type = "Label"
-        if host_obj is None or id(host_obj) in baseline_objects:
+        created_entity_id = _host_object_id(host_obj) if host_obj is not None else ""
+        if (
+            host_obj is None
+            or id(host_obj) in baseline_objects
+            or not created_entity_id
+            or created_entity_id in baseline_entity_ids
+        ):
             raise RuntimeError("native text factory returned no new host object")
         owned.append(host_obj)
         text_group.addObject(host_obj)
@@ -4937,7 +4989,6 @@ def _deliver_text_item_native(
         if (
             not entity_id
             or live_object is not host_obj
-            or host_obj not in _document_objects(doc)
             or (expected_type and str(getattr(host_obj, "TypeId", "")) != expected_type)
             or actual_proxy_type != expected_proxy_type
             or actual_text_values != [source_text]
@@ -4969,6 +5020,9 @@ def _deliver_text_item_native(
             "native_text_host_verification_failed",
             {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
         )
+
+    object_index["object_ids"].add(id(host_obj))
+    object_index["entity_ids"].add(entity_id)
 
     return {
         "source_item_id": source_item_id,
@@ -7155,6 +7209,7 @@ def _render_canonical_text_items(
         ),
     }
 
+    _prepare_native_text_object_index(opts, fc_doc, refresh=True)
     results: List[Dict[str, Any]] = []
     delivered_source_ids: List[str] = []
     final_types: List[str] = []
@@ -7483,17 +7538,44 @@ def _images_only_page_copy(pdf_doc, page):
     return tmp_doc, tmp_page
 
 
+def _embedded_image_manifest_sha256(
+    instances: List[Tuple[Any, int, str]],
+    *,
+    pdf_sha256: str,
+    page_num: int,
+) -> str:
+    """Return a stable identity for every image placement on one source page."""
+    manifest = {
+        "schema": "bc.freecad.embedded-image-manifest.v1",
+        "pdf_sha256": str(pdf_sha256),
+        "page_number": int(page_num),
+        "instances": [
+            {
+                "index": index,
+                "xref": int(xref),
+                "bbox": [format(float(value), ".12g") for value in tuple(rect)],
+                "image_digest": str(image_digest or ""),
+            }
+            for index, (rect, xref, image_digest) in enumerate(instances, start=1)
+        ],
+    }
+    payload = json.dumps(
+        manifest, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _import_embedded_images_as_planes(pdf_doc, page, page_num: int,
                                       page_h: float, opts: ImportOptions,
                                       scale: float, parent, fc_doc) -> int:
-    """Place one verified ImagePlane per embedded image instance.
+    """Place verified ImagePlanes for the page's embedded image instances.
 
     Hybrid dedupe (R-C): instead of one full-page ``get_pixmap`` underlay
     that rasterizes text + linework + images (double-render), each embedded
-    image block is rendered on its own — from an images-only copy of the
-    page, so rotated/sheared/masked placements keep their exact page
-    appearance — and placed at its bbox. Native vectors and native text
-    render everything else, so nothing is drawn twice.
+    Tractable inventories render one plane per image block from an images-only
+    page copy. Dense inventories render that same images-only page once as a
+    transparent full-page composite. Native vectors and native text render
+    everything else, so nothing is drawn twice.
 
     Image::ImagePlane renders CENTERED on its Placement (verified in the
     live FreeCAD GUI viewport, 2026-07-27), so each plane is anchored at
@@ -7512,7 +7594,10 @@ def _import_embedded_images_as_planes(pdf_doc, page, page_num: int,
         rect = fitz.Rect(bbox) & page.rect
         if rect.is_empty or rect.width <= 0.5 or rect.height <= 0.5:
             continue
-        instances.append((rect, int(info.get("xref") or 0)))
+        image_digest = info.get("digest") or ""
+        if isinstance(image_digest, (bytes, bytearray)):
+            image_digest = bytes(image_digest).hex()
+        instances.append((rect, int(info.get("xref") or 0), str(image_digest)))
     if not instances:
         return 0
 
@@ -7543,8 +7628,168 @@ def _import_embedded_images_as_planes(pdf_doc, page, page_num: int,
             patches_include_page_ink = True
 
         img_group = _make_group(parent, "Images", fc_doc)
+        if (
+            len(instances) > DENSE_EMBEDDED_IMAGE_INSTANCE_THRESHOLD
+            and not patches_include_page_ink
+        ):
+            ip = None
+            try:
+                dpi = _adaptive_patch_dpi(page, opts, page.rect)
+                zoom = dpi / 72.0
+                pix = render_page.get_pixmap(
+                    matrix=fitz.Matrix(zoom, zoom),
+                    clip=render_page.rect,
+                    alpha=True,
+                )
+                if int(getattr(pix, "width", 0) or 0) <= 0 or int(
+                    getattr(pix, "height", 0) or 0
+                ) <= 0:
+                    raise RuntimeError("dense image composite contains no pixels")
+                img_path = asset_dir / (
+                    "img_%s_p%d_composite_%ddpi.png"
+                    % (digest[:16], page_num, dpi)
+                )
+                _save_pixmap_atomic(pix, img_path)
+                raster_sha256 = _path_sha256(img_path)
+                manifest_sha256 = _embedded_image_manifest_sha256(
+                    instances,
+                    pdf_sha256=digest,
+                    page_num=page_num,
+                )
+
+                corners = [
+                    _to_fc(point, page_h, opts, scale)
+                    for point in (
+                        (page.rect.x0, page.rect.y0),
+                        (page.rect.x0, page.rect.y1),
+                        (page.rect.x1, page.rect.y0),
+                        (page.rect.x1, page.rect.y1),
+                    )
+                ]
+                xs = [float(point.x) for point in corners]
+                ys = [float(point.y) for point in corners]
+                w_units = max(xs) - min(xs)
+                h_units = max(ys) - min(ys)
+                center = _v(
+                    (max(xs) + min(xs)) / 2.0,
+                    (max(ys) + min(ys)) / 2.0,
+                    -0.1,
+                )
+                if w_units <= 0.0 or h_units <= 0.0:
+                    raise ValueError("dense image composite placement has no area")
+
+                ip = fc_doc.addObject(
+                    "Image::ImagePlane", "PDF_Images_p%d_Composite" % page_num
+                )
+                if ip is None:
+                    raise RuntimeError("ImagePlane factory returned no new host object")
+                ip.ImageFile = str(img_path)
+                ip.XSize = w_units
+                ip.YSize = h_units
+                ip.Placement = Placement(center, Rotation())
+                add_property = getattr(ip, "addProperty", None)
+                if not callable(add_property):
+                    raise RuntimeError("ImagePlane cannot embed its raster asset")
+                props = set(getattr(ip, "PropertiesList", []) or [])
+                for property_kind, property_name in (
+                    ("App::PropertyFileIncluded", "PDFRasterFile"),
+                    ("App::PropertyString", "PDFSourceSHA256"),
+                    ("App::PropertyString", "PDFRasterSHA256"),
+                    ("App::PropertyInteger", "PDFEmbeddedImageInstanceCount"),
+                    ("App::PropertyString", "PDFEmbeddedImageManifestSHA256"),
+                    ("App::PropertyString", "PDFEmbeddedImageDelivery"),
+                ):
+                    if property_name not in props:
+                        add_property(property_kind, property_name, "PDF Import")
+                        props.add(property_name)
+                ip.PDFRasterFile = str(img_path)
+                ip.PDFSourceSHA256 = digest
+                ip.PDFRasterSHA256 = raster_sha256
+                ip.PDFEmbeddedImageInstanceCount = len(instances)
+                ip.PDFEmbeddedImageManifestSHA256 = manifest_sha256
+                ip.PDFEmbeddedImageDelivery = "dense_images_only_composite_v1"
+                _annotate_text_host_object(
+                    ip, "p%d:images-composite" % int(page_num), "raster"
+                )
+                img_group.addObject(ip)
+
+                entity_id = _host_object_id(ip)
+                live = fc_doc.getObject(entity_id)
+                raster_file_evidence = _raster_file_evidence(ip, img_path)
+                anchor = _host_anchor_xyz(ip)
+                expected_anchor = (
+                    float(center.x),
+                    float(center.y),
+                    float(center.z),
+                )
+                if (
+                    not entity_id
+                    or live is not ip
+                    or str(getattr(ip, "TypeId", "")) != "Image::ImagePlane"
+                    or str(getattr(ip, "PDFSourceSHA256", "")) != digest
+                    or str(getattr(ip, "PDFRasterSHA256", ""))
+                    != raster_file_evidence["source_asset_sha256"]
+                    or int(getattr(ip, "PDFEmbeddedImageInstanceCount", 0) or 0)
+                    != len(instances)
+                    or str(getattr(ip, "PDFEmbeddedImageManifestSHA256", ""))
+                    != manifest_sha256
+                    or str(getattr(ip, "PDFEmbeddedImageDelivery", ""))
+                    != "dense_images_only_composite_v1"
+                    or not math.isclose(float(ip.XSize), w_units, abs_tol=1e-7)
+                    or not math.isclose(float(ip.YSize), h_units, abs_tol=1e-7)
+                    or anchor is None
+                    or any(
+                        abs(anchor[index] - expected_anchor[index]) > 1e-7
+                        for index in range(3)
+                    )
+                    or getattr(ip, "PDFSourceItemId", None)
+                    != "p%d:images-composite" % int(page_num)
+                    or getattr(ip, "PDFRepresentation", None) != "raster"
+                ):
+                    raise RuntimeError(
+                        "dense image composite host evidence could not be verified"
+                    )
+            except Exception:
+                if ip is not None:
+                    try:
+                        _remove_owned_text_objects(fc_doc, img_group, [ip])
+                    except Exception:
+                        pass
+                raise
+
+            opts.image_plane_count = int(
+                getattr(opts, "image_plane_count", 0) or 0
+            ) + 1
+            report_extra = dict(getattr(opts, "_report_extra", {}) or {})
+            dense_records = list(report_extra.get("dense_image_composites") or [])
+            dense_records.append(
+                {
+                    "page_number": int(page_num),
+                    "source_instance_count": len(instances),
+                    "manifest_sha256": manifest_sha256,
+                    "raster_sha256": raster_sha256,
+                    "dpi": int(dpi),
+                    "pixel_width": int(getattr(pix, "width", 0) or 0),
+                    "pixel_height": int(getattr(pix, "height", 0) or 0),
+                    "delivery": "dense_images_only_composite_v1",
+                }
+            )
+            report_extra["dense_image_composites"] = dense_records
+            opts._report_extra = report_extra
+            if opts.auto_reason:
+                opts.auto_reason = str(opts.auto_reason).replace(
+                    "embedded images placed individually (no full-page underlay)",
+                    "dense embedded images consolidated into one transparent "
+                    "images-only composite (no text/vector underlay)",
+                )
+            _msg(
+                f"Page {page_num}: consolidated {len(instances)} embedded image "
+                "instances into one transparent images-only plane"
+            )
+            return 1
+
         placed = 0
-        for idx, (rect, xref) in enumerate(instances, start=1):
+        for idx, (rect, xref, _image_digest) in enumerate(instances, start=1):
             ip = None
             try:
                 dpi = _adaptive_patch_dpi(page, opts, rect)
@@ -8989,6 +9234,7 @@ def _reset_import_run_state(opts: ImportOptions) -> None:
     opts._scale_cached_pages = set()
     opts._pdf_sha256 = ""
     opts._defer_page_recompute = False
+    opts._native_text_object_index = None
 
 
 def _recompute_page_if_needed(fc_doc, opts: ImportOptions) -> bool:

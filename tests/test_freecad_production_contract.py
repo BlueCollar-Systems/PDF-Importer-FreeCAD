@@ -663,6 +663,47 @@ def test_native_item_delivery_rereads_live_text_transform_style_and_metadata(
     assert document.recompute_calls == 0
 
 
+def test_native_item_delivery_indexes_document_once_for_many_spans(monkeypatch):
+    document, group = _install_native_host(monkeypatch)
+    for index in range(100):
+        document.addObject("Part::Feature", "Existing_%03d" % index)
+
+    real_document_objects = core._document_objects
+    scans = []
+
+    def counted_document_objects(doc):
+        scans.append(len(doc.Objects))
+        return real_document_objects(doc)
+
+    monkeypatch.setattr(core, "_document_objects", counted_document_objects)
+    opts = core.ImportOptions(
+        text_mode="text",
+        import_text=True,
+        scale_to_mm=False,
+        user_scale=1.0,
+    )
+
+    created_ids = []
+    for span_index in range(25):
+        item = _canonical_item("text")
+        item["source_item_id"] = "p1:b0:l0:s%d" % span_index
+        item["span_index"] = span_index
+        result = core._deliver_text_item_native(
+            item,
+            "text",
+            opts,
+            text_group=group,
+            page_h=100.0,
+            scale=1.0,
+        )
+        created_ids.extend(result["created_entity_ids"])
+
+    assert len(created_ids) == 25
+    assert len(set(created_ids)) == 25
+    assert scans == [100]
+    assert all(document.getObject(entity_id) is not None for entity_id in created_ids)
+
+
 def test_page_recompute_can_be_deferred_until_import_finishes():
     document = _Document()
     opts = core.ImportOptions()

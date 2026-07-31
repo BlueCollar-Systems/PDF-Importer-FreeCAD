@@ -74,3 +74,22 @@ def test_windows_release_downloads_and_stages_the_published_zip():
     assert 'gh release download "$TAG"' in workflow
     assert '--pattern "FreeCAD-PDF-Importer_${TAG}.zip"' in workflow
     assert 'build_windows_installer.py --source-zip "$SOURCE_ZIP"' in workflow
+
+
+def test_auto_release_publishes_zip_and_installer_atomically():
+    workflow = (
+        Path(build_windows_installer.REPO_ROOT)
+        / ".github"
+        / "workflows"
+        / "auto-release.yml"
+    ).read_text(encoding="utf-8")
+
+    install_inno = workflow.index("- name: Install Inno Setup")
+    build_installer = workflow.index(
+        'build_windows_installer.py --source-zip "${ZIP}"'
+    )
+    publish = workflow.index("gh release create")
+    assert install_inno < build_installer < publish
+    assert 'SETUP="dist/FreeCAD-PDF-Importer-Setup_v' in workflow
+    assert '"${ZIP}" "${SETUP}"' in workflow
+    assert "gh workflow run windows-release.yml" not in workflow

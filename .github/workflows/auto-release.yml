@@ -33,10 +33,6 @@ defaults:
 permissions:
   contents: write
   pull-requests: write
-  # actions: write lets the final step dispatch windows-release with
-  # GITHUB_TOKEN (workflow_dispatch is exempt from the GITHUB_TOKEN
-  # no-retrigger rule, unlike the tag push that left the workflow dormant).
-  actions: write
 
 concurrency:
   group: auto-release
@@ -117,6 +113,19 @@ jobs:
       - name: Build release zip
         run: python build_release.py
 
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build Windows installer from the same canonical ZIP
+        run: |
+          set -e
+          ZIP="FreeCAD-PDF-Importer_v${{ steps.version.outputs.version }}.zip"
+          SETUP="dist/FreeCAD-PDF-Importer-Setup_v${{ steps.version.outputs.version }}.exe"
+          python build_windows_installer.py --source-zip "${ZIP}"
+          test -f "${ZIP}"
+          test -f "${SETUP}"
+
       - name: Smoke release zip dependency payload
         run: python scripts/smoke_release_zip.py "FreeCAD-PDF-Importer_v*.zip"
 
@@ -128,6 +137,7 @@ jobs:
           set -e
           VERSION="v${{ steps.version.outputs.version }}"
           ZIP="FreeCAD-PDF-Importer_v${{ steps.version.outputs.version }}.zip"
+          SETUP="dist/FreeCAD-PDF-Importer-Setup_v${{ steps.version.outputs.version }}.exe"
 
           if gh release view "${VERSION}" >/dev/null 2>&1; then
             echo "Release ${VERSION} already exists — skipping."
@@ -149,14 +159,17 @@ jobs:
           # tag whose commit touches .github/workflows/ is rejected. gh creates
           # the tag at the target commit through the API, which is not subject to
           # that restriction.
+          # gh CLI creates a draft, uploads every supplied asset, and only then
+          # publishes. This keeps ZIP + Setup.exe atomic and compatible with
+          # repository-level immutable releases.
           gh release create "${VERSION}" \
             --target "${RELEASE_TARGET:-$GITHUB_SHA}" \
             --title "${VERSION} — PDF Vector Importer for FreeCAD" \
             --notes "Automated release from latest \`main\` commit.
 
-          **Install:** Download \`${ZIP}\` below, extract into your FreeCAD Mod folder, and restart FreeCAD. Or install via **Tools > Addon Manager**." \
+          **Install:** Run \`$(basename "${SETUP}")\` for the simplest Windows setup, or extract \`${ZIP}\` into your FreeCAD Mod folder and restart FreeCAD." \
             --latest \
-            "${ZIP}"
+            "${ZIP}" "${SETUP}"
           echo "minted=true" >> "$GITHUB_OUTPUT"
 
       - name: Check website dispatch token secret
@@ -202,15 +215,3 @@ jobs:
         run: |
           echo "::warning::Skipping website dispatch because no valid dispatch token secret is configured."
           echo "Set WEBSITE_DISPATCH_TOKEN (or BLUECOLLAR_WEBSITE_DISPATCH_TOKEN / REPO_DISPATCH_TOKEN) to enable cross-repo dispatch."
-
-      # R21-2: GITHUB_TOKEN-created tags never fire the windows-release
-      # tag-push trigger (dormant since v4.0.51), so dispatch it explicitly
-      # after every mint. workflow_dispatch created with GITHUB_TOKEN DOES
-      # start a run (documented exemption from the no-retrigger rule).
-      - name: Dispatch windows-release for minted tag
-        if: steps.mint.outputs.minted == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh workflow run windows-release.yml -f tag="v${{ steps.version.outputs.version }}"
-          echo "Dispatched windows-release for v${{ steps.version.outputs.version }}"

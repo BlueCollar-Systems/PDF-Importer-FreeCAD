@@ -1,7 +1,7 @@
 # PDF Vector Importer for FreeCAD
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Version: 4.0.75](https://img.shields.io/badge/Version-4.0.75-green.svg)
+![Version: 4.0.76](https://img.shields.io/badge/Version-4.0.76-green.svg)
 ![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
 
 **Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.**
@@ -12,7 +12,10 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 
 ---
 
-## Recent fixes (v4.0.75)
+## Recent fixes (v4.0.76)
+
+- The canonical ZIP and Windows Setup.exe now publish in one atomic release,
+  so immutable release protection can lock both assets together.
 
 - Release archives are reproducible and no longer contain unused
   build-machine-bound Python console launchers or their wheel records.

@@ -648,6 +648,22 @@ class TestReleaseSafety:
         assert "--clobber" not in workflow
         assert "softprops/action-gh-release" not in workflow
 
+    def test_atomic_release_rejects_an_existing_tag_without_a_release(self):
+        workflow = (
+            REPO_ROOT / ".github" / "workflows" / "auto-release.yml"
+        ).read_text(encoding="utf-8")
+        release_guard_at = workflow.index('if gh release view "${VERSION}"')
+        tag_guard_at = workflow.index(
+            'git ls-remote --exit-code --tags origin "refs/tags/${VERSION}"',
+            release_guard_at,
+        )
+        publish_at = workflow.index("gh release create", tag_guard_at)
+        guarded = workflow[tag_guard_at:publish_at]
+        assert tag_guard_at < publish_at
+        assert 'git rev-list -n 1 "${VERSION}"' in guarded
+        assert '"${TAG_TARGET}" != "${RELEASE_TARGET}"' in guarded
+        assert "exit 1" in guarded
+
     def test_atomic_release_publishes_complete_asset_set(self):
         workflow = (
             REPO_ROOT / ".github" / "workflows" / "auto-release.yml"

@@ -154,6 +154,16 @@ jobs:
               --warnings-file .release-safety/warnings.json
             exit 0
           fi
+          if git ls-remote --exit-code --tags origin "refs/tags/${VERSION}" >/dev/null 2>&1; then
+            git fetch --force origin "refs/tags/${VERSION}:refs/tags/${VERSION}"
+            TAG_TARGET="$(git rev-list -n 1 "${VERSION}")"
+            if [ "${TAG_TARGET}" != "${RELEASE_TARGET}" ]; then
+              echo "::error::Tag ${VERSION} already exists at ${TAG_TARGET}, not release target ${RELEASE_TARGET}."
+            else
+              echo "::error::Tag ${VERSION} already exists at the release target but has no GitHub release. Refusing ambiguous publication."
+            fi
+            exit 1
+          fi
           # Create the tag via the gh/releases API (GITHUB_TOKEN), NOT `git push
           # origin <tag>`: the checkout PAT lacks `workflow` scope, so pushing a
           # tag whose commit touches .github/workflows/ is rejected. gh creates

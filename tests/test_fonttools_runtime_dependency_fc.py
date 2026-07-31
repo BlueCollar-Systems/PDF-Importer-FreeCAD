@@ -50,12 +50,20 @@ def test_release_builder_verifies_and_vendors_both_runtime_dependencies():
     spec.loader.exec_module(module)
 
     assert module.RUNTIME_DEPENDENCY_SPECS == (
-        "PyMuPDF>=1.24,<2.0",
-        "fonttools>=4.50,<5.0",
+        "PyMuPDF==1.28.0",
+        "fonttools==4.63.0",
     )
+    lock = (REPO_ROOT / "requirements-release.lock").read_text(encoding="utf-8")
+    assert "PyMuPDF==1.28.0" in lock
+    assert "sha256:e01e90fd86abfeb37ceb921eddb951f988a11d45ff6ce6b7664f2039849068ec" in lock
+    assert "fonttools==4.63.0" in lock
+    assert "sha256:063e08bd17bd5a90127a14123de0d6a952dbc847695fd98b63c043d58057f90c" in lock
     source = (REPO_ROOT / "build_release.py").read_text(encoding="utf-8")
     assert "import fontTools" in source
-    assert "*RUNTIME_DEPENDENCY_SPECS" in source
+    assert '"--require-hashes"' in source
+    assert '"--only-binary"' in source
+    assert "RUNTIME_DEPENDENCY_LOCK" in source
+    assert "py_version != (3, 11)" in source
 
 
 def test_both_interactive_setup_paths_install_and_verify_fonttools():

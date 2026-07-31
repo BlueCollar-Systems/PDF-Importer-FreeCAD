@@ -69,9 +69,10 @@ EXCLUDE_SUFFIXES = {
     ".swp",
 }
 
-PYMUPDF_SPEC = "PyMuPDF>=1.24,<2.0"
-FONTTOOLS_SPEC = "fonttools>=4.50,<5.0"
+PYMUPDF_SPEC = "PyMuPDF==1.28.0"
+FONTTOOLS_SPEC = "fonttools==4.63.0"
 RUNTIME_DEPENDENCY_SPECS = (PYMUPDF_SPEC, FONTTOOLS_SPEC)
+RUNTIME_DEPENDENCY_LOCK = REPO_ROOT / "requirements-release.lock"
 VENDORED_LIB_DIR = ADDON_DIR / "src" / "lib"
 DETERMINISTIC_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 
@@ -187,9 +188,9 @@ def _lib_has_runtime_dependencies(python_exe: Path, lib_dir: Path) -> bool:
         "or getattr(fitz, 'VersionBind', ''))\n"
         "font_version = version_tuple(getattr(fontTools, 'version', '') "
         "or getattr(fontTools, '__version__', ''))\n"
-        "if not ((1, 24) <= fitz_version < (2, 0)):\n"
+        "if fitz_version != (1, 28, 0):\n"
         "    raise SystemExit(4)\n"
-        "if not ((4, 50) <= font_version < (5, 0)):\n"
+        "if font_version != (4, 63, 0):\n"
         "    raise SystemExit(5)\n"
         "print('OK')\n"
     )
@@ -234,15 +235,20 @@ def ensure_runtime_dependencies(*, vendor: bool = True) -> Path:
         )
 
     py_version = _python_version(preferred)
-    if py_version < (3, 10):
+    if py_version != (3, 11):
         raise RuntimeError(
             f"{preferred} is Python {py_version[0]}.{py_version[1]}; "
-            "PyMuPDF wheels require Python 3.10+."
+            "the reviewed release wheel lock requires CPython 3.11."
         )
 
     if VENDORED_LIB_DIR.exists():
         shutil.rmtree(VENDORED_LIB_DIR)
     VENDORED_LIB_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not RUNTIME_DEPENDENCY_LOCK.is_file():
+        raise RuntimeError(
+            f"Hashed release dependency lock is missing: {RUNTIME_DEPENDENCY_LOCK}"
+        )
 
     print(f"Vendoring {', '.join(RUNTIME_DEPENDENCY_SPECS)} into {VENDORED_LIB_DIR}")
     print(f"Using Python: {preferred}")
@@ -252,12 +258,14 @@ def ensure_runtime_dependencies(*, vendor: bool = True) -> Path:
             "-m",
             "pip",
             "install",
-            "--upgrade",
+            "--require-hashes",
+            "--no-deps",
             "--only-binary",
             ":all:",
             "--target",
             str(VENDORED_LIB_DIR),
-            *RUNTIME_DEPENDENCY_SPECS,
+            "--requirement",
+            str(RUNTIME_DEPENDENCY_LOCK),
         ],
         check=True,
     )

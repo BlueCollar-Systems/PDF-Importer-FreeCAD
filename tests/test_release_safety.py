@@ -653,13 +653,15 @@ class TestReleaseSafety:
             REPO_ROOT / ".github" / "workflows" / "auto-release.yml"
         ).read_text(encoding="utf-8")
         release_guard_at = workflow.index('if gh release view "${VERSION}"')
-        tag_guard_at = workflow.index(
-            'git ls-remote --exit-code --tags origin "refs/tags/${VERSION}"',
-            release_guard_at,
-        )
+        tag_guard_at = workflow.index("TAG_LOOKUP_STATUS=0", release_guard_at)
         publish_at = workflow.index("gh release create", tag_guard_at)
         guarded = workflow[tag_guard_at:publish_at]
         assert tag_guard_at < publish_at
+        assert 'TAG_LOOKUP_STATUS=0' in guarded
+        assert 'git ls-remote --exit-code --tags origin "refs/tags/${VERSION}"' in guarded
+        assert '|| TAG_LOOKUP_STATUS=$?' in guarded
+        assert '"${TAG_LOOKUP_STATUS}" -eq 2' in guarded
+        assert '"${TAG_LOOKUP_STATUS}" -ne 0' in guarded
         assert 'git rev-list -n 1 "${VERSION}"' in guarded
         assert '"${TAG_TARGET}" != "${RELEASE_TARGET}"' in guarded
         assert "exit 1" in guarded

@@ -154,7 +154,16 @@ jobs:
               --warnings-file .release-safety/warnings.json
             exit 0
           fi
-          if git ls-remote --exit-code --tags origin "refs/tags/${VERSION}" >/dev/null 2>&1; then
+          TAG_LOOKUP_STATUS=0
+          git ls-remote --exit-code --tags origin "refs/tags/${VERSION}" >/dev/null 2>&1 || TAG_LOOKUP_STATUS=$?
+          if [ "${TAG_LOOKUP_STATUS}" -ne 0 ]; then
+            if [ "${TAG_LOOKUP_STATUS}" -eq 2 ]; then
+              echo "Tag ${VERSION} is absent; publication may create it at ${RELEASE_TARGET}."
+            else
+              echo "::error::Unable to determine whether tag ${VERSION} exists (git ls-remote exit ${TAG_LOOKUP_STATUS})."
+              exit 1
+            fi
+          else
             git fetch --force origin "refs/tags/${VERSION}:refs/tags/${VERSION}"
             TAG_TARGET="$(git rev-list -n 1 "${VERSION}")"
             if [ "${TAG_TARGET}" != "${RELEASE_TARGET}" ]; then

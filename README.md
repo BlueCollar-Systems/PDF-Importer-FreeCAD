@@ -110,14 +110,10 @@ python build_release.py
    - `FreeCAD-PDF-Importer_vX.Y.Z.zip`
    - `FreeCAD-PDF-Importer-Setup_vX.Y.Z.exe`
 
-### Auto-Build on GitHub Releases
-1. Push a tag in `vX.Y.Z` format (example: `v3.5.1`).
-2. GitHub Actions workflow `windows-release` builds both artifacts.
-3. The workflow attaches the ZIP and Setup.exe to that GitHub Release.
-
 ### Auto-Release Mint on `main` Pushes
 The `auto-release` workflow mints a `vX.Y.Z` release automatically when a
-push to `main` carries a version bump. Two deliberate guards apply:
+push to `main` carries a version bump. The `auto-release` workflow builds and publishes both artifacts
+atomically before the release becomes immutable. Two deliberate guards apply:
 
 - Docs-only pushes never mint: the workflow ignores `**/*.md`, `docs/**`,
   and archive paths (board Q-08-a / ANS-09-1).

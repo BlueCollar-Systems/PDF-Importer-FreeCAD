@@ -93,3 +93,9 @@ def test_obsolete_second_stage_windows_release_workflow_is_removed():
         "Setup.exe is published atomically by auto-release; a second-stage "
         "publisher is redundant and incompatible with immutable releases"
     )
+
+    readme = (Path(build_windows_installer.REPO_ROOT) / "README.md").read_text(
+        encoding="utf-8"
+    )
+    assert "workflow `windows-release`" not in readme
+    assert "`auto-release` workflow builds and publishes both artifacts" in readme

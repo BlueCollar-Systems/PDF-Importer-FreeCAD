@@ -9268,6 +9268,7 @@ def _reset_import_run_state(opts: ImportOptions) -> None:
     opts._shapestring_font_staging_sessions = []
     opts._report_extra = {}
     opts._model3d_solids = 0
+    opts._model3d_semantic_objects = 0
     opts._model3d_intent = None
     opts._model3d_intent_feasible = False
     opts._model3d_text_evidence = []
@@ -9288,8 +9289,180 @@ def _recompute_page_if_needed(fc_doc, opts: ImportOptions) -> bool:
 
 
 def _should_defer_item_recompute(valid_page_count: int) -> bool:
-    """Return whether import_pdf will supply the final document recompute."""
+    """Return whether import_pdf will finalize recompute after all pages."""
     return int(valid_page_count) > 0
+
+
+_PROPERTY_OR_SHAPE_COMPLETE_TYPE_IDS = frozenset({
+    "App::DocumentObjectGroup",
+    "App::FeaturePython",
+    "Image::ImagePlane",
+    "Part::Feature",
+})
+
+
+def _create_semantic_model3d_members(fc_doc, opts: ImportOptions):
+    """Create optional semantic members before the final recompute decision."""
+    opts._model3d_semantic_objects = 0
+    if not bool(getattr(opts, "model3d_semantic", False)):
+        return None
+    intent = getattr(opts, "_model3d_intent", None) or {}
+    members = intent.get("members") if isinstance(intent, dict) else []
+    if not members:
+        return None
+    try:
+        from pdfcadcore.semantic_members import create_semantic_members
+
+        semantic_report = create_semantic_members(list(members), doc=fc_doc)
+        opts._model3d_semantic_objects = int(
+            (semantic_report or {}).get("objects_created", 0) or 0
+        )
+        report_extra = dict(getattr(opts, "_report_extra", {}) or {})
+        model3d_extra = dict(report_extra.get("model_3d") or {})
+        model3d_extra["semantic_members"] = semantic_report
+        report_extra["model_3d"] = model3d_extra
+        opts._report_extra = report_extra
+        return semantic_report
+    except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+        if opts.verbose:
+            _warn(f"Semantic member generation skipped: {exc}")
+        return None
+
+
+def _verified_3d_text_target_ids(opts: ImportOptions) -> List[str]:
+    """Return stable live-object ids owned by verified dependent 3D text."""
+    target_ids: List[str] = []
+    for attempt in (getattr(opts, "text_delivery_attempts", []) or []):
+        evidence = attempt.get("evidence") if isinstance(attempt, dict) else {}
+        if (
+            not isinstance(attempt, dict)
+            or attempt.get("outcome") != "verified"
+            or attempt.get("final_type") != "3d_text"
+            or attempt.get("cleanup_complete") is not True
+            or not isinstance(evidence, dict)
+            or evidence.get("implementation") != "parametric_shapestring_fallback_v1"
+        ):
+            continue
+        removed = {
+            str(entity_id)
+            for entity_id in (attempt.get("removed_entity_ids") or [])
+            if str(entity_id or "")
+        }
+        for field_name in ("support_entity_ids", "delivery_entity_ids"):
+            for entity_id in (attempt.get(field_name) or []):
+                stable_id = str(entity_id or "")
+                if stable_id and stable_id not in removed and stable_id not in target_ids:
+                    target_ids.append(stable_id)
+    return target_ids
+
+
+def _finalize_import_recompute(
+    fc_doc,
+    opts: ImportOptions,
+    *,
+    baseline_object_ids: set,
+    baseline_object_names: set,
+) -> Dict[str, Any]:
+    """Recompute only when an imported representation proves that it needs it.
+
+    Imported groups, native Text/Labels, ImagePlanes, and ``Part::Feature``
+    objects already carry their authoritative properties or assigned Shapes.
+    Parametric 3D text dependencies are recomputed by exact ledger-owned id.
+    Model-3D objects and any unrecognized dynamic object retain the conservative
+    whole-document path.
+    """
+    started = time.perf_counter()
+    post_baseline = [
+        host_obj
+        for host_obj in _document_objects(fc_doc)
+        if id(host_obj) not in baseline_object_ids
+        and _host_object_id(host_obj) not in baseline_object_names
+    ]
+    post_by_name = {
+        _host_object_id(host_obj): host_obj
+        for host_obj in post_baseline
+        if _host_object_id(host_obj)
+    }
+    type_counts: Dict[str, int] = {}
+    for host_obj in post_baseline:
+        type_id = str(getattr(host_obj, "TypeId", "") or "")
+        type_counts[type_id] = type_counts.get(type_id, 0) + 1
+
+    target_ids = _verified_3d_text_target_ids(opts)
+    target_objects: List[Any] = []
+    unresolved_target_ids: List[str] = []
+    for entity_id in target_ids:
+        host_obj = post_by_name.get(entity_id)
+        try:
+            resolved = fc_doc.getObject(entity_id)
+        except (AttributeError, RuntimeError, TypeError):
+            resolved = None
+        if host_obj is None or resolved is not host_obj:
+            unresolved_target_ids.append(entity_id)
+        else:
+            target_objects.append(host_obj)
+
+    targeted_names = set(target_ids)
+    unproven_type_ids = sorted({
+        str(getattr(host_obj, "TypeId", "") or "")
+        for host_obj in post_baseline
+        if _host_object_id(host_obj) not in targeted_names
+        and str(getattr(host_obj, "TypeId", "") or "")
+        not in _PROPERTY_OR_SHAPE_COMPLETE_TYPE_IDS
+    })
+    model3d_object_count = (
+        int(getattr(opts, "_model3d_solids", 0) or 0)
+        + int(getattr(opts, "_model3d_semantic_objects", 0) or 0)
+    )
+    telemetry: Dict[str, Any] = {
+        "schema": "bc.freecad.final-recompute.v1",
+        "strategy": "skipped",
+        "reason": "property_or_shape_complete",
+        "post_baseline_object_count": len(post_baseline),
+        "post_baseline_type_counts": dict(sorted(type_counts.items())),
+        "target_entity_ids": list(target_ids),
+        "unresolved_target_entity_ids": list(unresolved_target_ids),
+        "unproven_type_ids": list(unproven_type_ids),
+        "model3d_object_count": model3d_object_count,
+        "fallback_full": False,
+    }
+
+    if model3d_object_count > 0:
+        telemetry.update(strategy="full", reason="model3d_objects_created")
+        fc_doc.recompute()
+    elif unresolved_target_ids:
+        telemetry.update(
+            strategy="full",
+            reason="unprovable_3d_text_targets",
+            fallback_full=True,
+        )
+        fc_doc.recompute()
+    elif unproven_type_ids:
+        telemetry.update(
+            strategy="full",
+            reason="unproven_post_baseline_object_types",
+        )
+        fc_doc.recompute()
+    elif target_objects:
+        telemetry.update(strategy="targeted", reason="dependent_3d_text_objects")
+        try:
+            fc_doc.recompute(target_objects)
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            telemetry.update(
+                strategy="full",
+                reason="targeted_recompute_unavailable",
+                fallback_full=True,
+                targeted_error="%s: %s" % (exc.__class__.__name__, exc),
+            )
+            fc_doc.recompute()
+
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    telemetry["elapsed_ms"] = elapsed_ms
+    opts.phase_timings_ms["final_recompute_ms"] = elapsed_ms
+    report_extra = dict(getattr(opts, "_report_extra", {}) or {})
+    report_extra["final_recompute"] = telemetry
+    opts._report_extra = report_extra
+    return telemetry
 
 
 def _remove_post_baseline_document_objects(
@@ -9585,7 +9758,13 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             pass
 
     t_phase = time.perf_counter()
-    fc_doc.recompute()
+    _create_semantic_model3d_members(fc_doc, opts)
+    _finalize_import_recompute(
+        fc_doc,
+        opts,
+        baseline_object_ids=baseline_object_ids,
+        baseline_object_names=baseline_object_names,
+    )
     _autofit_import_view(fc_doc)
     opts.phase_timings_ms["postprocess_ms"] = (time.perf_counter() - t_phase) * 1000.0
 
@@ -9635,28 +9814,6 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         opts._report_extra["result_status"] = "success"
         opts._report_extra.pop("terminal_failure", None)
 
-        if bool(getattr(opts, "model3d_semantic", False)):
-            intent = getattr(opts, "_model3d_intent", None) or {}
-            members = intent.get("members") if isinstance(intent, dict) else []
-            if members:
-                try:
-                    from pdfcadcore.semantic_members import create_semantic_members
-
-                    semantic_report = create_semantic_members(
-                        list(members),
-                        doc=fc_doc,
-                    )
-                    if not hasattr(opts, "_report_extra"):
-                        opts._report_extra = {}
-                    model3d_extra = dict(
-                        getattr(opts, "_report_extra", {}).get("model_3d") or {}
-                    )
-                    model3d_extra["semantic_members"] = semantic_report
-                    opts._report_extra["model_3d"] = model3d_extra
-                except (ImportError, RuntimeError, TypeError, ValueError) as e:
-                    if opts.verbose:
-                        _warn(f"Semantic member generation skipped: {e}")
-        
         write_import_report(
             pdf_path=pdf_path,
             output_path=report_path,

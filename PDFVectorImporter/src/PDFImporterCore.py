@@ -88,6 +88,36 @@ AUTO_FILL_PURE_STROKE_MAX = 0.02
 AUTO_FILL_PURE_MIN_GROUPS = 12
 AUTO_FILL_PURE_MIN_ITEMS = 24
 AUTO_FILL_PURE_LARGE_RECT_RATIO = 0.03
+AUTO_FILL_COMPLEX_RATIO = 0.98
+AUTO_FILL_COMPLEX_STROKE_MAX = 0.01
+AUTO_FILL_COMPLEX_MIN_ITEMS = 3000
+
+
+def _drawing_work_item_count(drawings) -> int:
+    """Count path operations, not only PyMuPDF drawing containers."""
+    total = 0
+    for drawing in drawings or ():
+        items = drawing.get("items", ()) if isinstance(drawing, dict) else ()
+        try:
+            total += len(items or ())
+        except TypeError:
+            total += sum(1 for _item in items or ())
+    return total
+
+
+def _is_heavy_vector_page(drawings, threshold: int) -> bool:
+    """Detect pages that are heavy by groups or by contained path operations."""
+    try:
+        limit = int(threshold)
+    except (TypeError, ValueError):
+        return False
+    if limit <= 0:
+        return False
+    drawing_groups = list(drawings or ())
+    return (
+        len(drawing_groups) > limit
+        or _drawing_work_item_count(drawing_groups) > limit
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -262,6 +292,18 @@ def _looks_like_fill_art_flood(n_drawings: int,
     # Average items per drawing — glyph/fill-art floods have 1-3 items each,
     # while real drawings (garden plans, floor plans) have many more.
     avg_items = total_items / float(max(n_drawings, 1))
+
+    # Newer PDF producers may coalesce decorative map art into path groups
+    # containing many operations. Extreme fill-only composition remains a
+    # closed map/art signal even when the old low-items-per-group guard does
+    # not apply.
+    complex_pure_fill = (
+        fill_ratio >= AUTO_FILL_COMPLEX_RATIO
+        and stroke_ratio <= AUTO_FILL_COMPLEX_STROKE_MAX
+        and total_items >= AUTO_FILL_COMPLEX_MIN_ITEMS
+    )
+    if complex_pure_fill:
+        return True
 
     # New fast path for coalesced pure-fill PDFs (common with newer PyMuPDF):
     # if the page is almost entirely fill-only and has virtually no stroke
@@ -2816,6 +2858,79 @@ class TextItemImpossible(RuntimeError):
         self.proof = dict(proof or {})
 
 
+def _raise_nul_source_text_impossible(
+    item: Dict[str, Any],
+    requested: str,
+    attempted: str,
+) -> None:
+    """Prove that FreeCAD string-backed text cannot persist a source NUL."""
+    source_text = item.get("text") if isinstance(item, dict) else None
+    nul_indices = (
+        [index for index, character in enumerate(source_text) if character == "\x00"]
+        if isinstance(source_text, str)
+        else []
+    )
+    if (
+        not nul_indices
+        or attempted not in {"text", "labels", "3d_text"}
+        or requested not in TEXT_ITEM_FALLBACK_LADDERS
+        or attempted not in TEXT_ITEM_FALLBACK_LADDERS[requested]
+    ):
+        return
+
+    source_text_sha256 = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+    source_result = {
+        "source": "freecad_string_value_domain",
+        "outcome": "proven_impossible",
+        "reason_code": "source_text_contains_nul",
+        "pdf_sha256": item.get("pdf_sha256"),
+        "page_number": item.get("page_number"),
+        "source_item_id": item.get("source_item_id"),
+        "source_text_sha256": source_text_sha256,
+        "nul_codepoint_indices": list(nul_indices),
+    }
+    proof = {
+        "item_specific_proven_impossible": True,
+        "importer_identity": FREECAD_TEXT_IMPORTER_IDENTITY,
+        "pdf_sha256": item.get("pdf_sha256"),
+        "page_number": item.get("page_number"),
+        "source_item_id": item.get("source_item_id"),
+        "requested_type": requested,
+        "attempted_type": attempted,
+        "reason_code": "source_text_contains_nul",
+        "evidence": {
+            "source_text_sha256": source_text_sha256,
+            "nul_codepoint_indices": list(nul_indices),
+            "host_value_domain": "freecad_string_property",
+        },
+        "attempted_source_results": [source_result],
+        "attempted_sources_complete": True,
+        "created_entity_ids": [],
+        "removed_entity_ids": [],
+        "cleanup_complete": True,
+    }
+    attempt = {
+        "source_item_id": item.get("source_item_id"),
+        "requested_type": requested,
+        "attempted_type": attempted,
+        "final_type": None,
+        "outcome": "proven_impossible",
+        "reason": "source_text_contains_nul",
+        "reason_code": "source_text_contains_nul",
+        "created_entity_ids": [],
+        "removed_entity_ids": [],
+        "cleanup_complete": True,
+        "evidence": dict(proof["evidence"]),
+        "proof": proof,
+    }
+    raise TextItemImpossible(
+        "%s cannot persist source NUL for %s"
+        % (attempted, item.get("source_item_id") or "item"),
+        attempt=attempt,
+        proof=proof,
+    )
+
+
 def _validated_entity_ids(value, *, field_name: str, allow_empty: bool) -> List[str]:
     if not isinstance(value, list):
         raise ValueError("%s must be a list" % field_name)
@@ -2887,6 +3002,67 @@ def _validate_item_impossibility_proof(
         raise ValueError("attempted representation is not a fallible ladder rung")
 
     reason_code = proof.get("reason_code")
+    if reason_code == "source_text_contains_nul":
+        if attempted not in {"text", "labels", "3d_text"}:
+            raise ValueError("NUL-text proof does not apply to this representation")
+        source_text = item.get("text")
+        nul_indices = (
+            [
+                index
+                for index, character in enumerate(source_text)
+                if character == "\x00"
+            ]
+            if isinstance(source_text, str)
+            else []
+        )
+        source_text_sha256 = (
+            hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+            if isinstance(source_text, str)
+            else ""
+        )
+        evidence = proof.get("evidence")
+        attempted_source_results = proof.get("attempted_source_results")
+        if (
+            not nul_indices
+            or not isinstance(evidence, dict)
+            or evidence.get("source_text_sha256") != source_text_sha256
+            or evidence.get("nul_codepoint_indices") != nul_indices
+            or evidence.get("host_value_domain") != "freecad_string_property"
+            or not isinstance(attempted_source_results, list)
+            or len(attempted_source_results) != 1
+            or not isinstance(attempted_source_results[0], dict)
+            or attempted_source_results[0].get("source")
+            != "freecad_string_value_domain"
+            or attempted_source_results[0].get("outcome")
+            != "proven_impossible"
+            or attempted_source_results[0].get("reason_code") != reason_code
+            or attempted_source_results[0].get("pdf_sha256") != pdf_sha256
+            or attempted_source_results[0].get("page_number") != page_number
+            or attempted_source_results[0].get("source_item_id") != source_item_id
+            or attempted_source_results[0].get("source_text_sha256")
+            != source_text_sha256
+            or attempted_source_results[0].get("nul_codepoint_indices")
+            != nul_indices
+            or proof.get("attempted_sources_complete") is not True
+        ):
+            raise ValueError("NUL-text impossibility evidence is incomplete")
+        created_ids = _validated_entity_ids(
+            proof.get("created_entity_ids"),
+            field_name="created_entity_ids",
+            allow_empty=True,
+        )
+        removed_ids = _validated_entity_ids(
+            proof.get("removed_entity_ids"),
+            field_name="removed_entity_ids",
+            allow_empty=True,
+        )
+        if (
+            proof.get("cleanup_complete") is not True
+            or set(created_ids) != set(removed_ids)
+        ):
+            raise ValueError("NUL-text impossibility cleanup is incomplete")
+        return dict(proof)
+
     if attempted in {"glyphs", "geometry"}:
         if reason_code not in CLOSED_SVG_ITEM_IMPOSSIBILITY_REASONS:
             raise ValueError("SVG impossibility reason is not a closed predicate")
@@ -4168,6 +4344,12 @@ def _deliver_text_item_native(
             {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
         )
 
+    _raise_nul_source_text_impossible(
+        bound_item,
+        requested_type,
+        attempted_type,
+    )
+
     try:
         from pdfcadcore.text_scale import effective_span_font_size_pt
 
@@ -4273,7 +4455,6 @@ def _deliver_text_item_native(
                         color_properties.append(property_name)
                 if not color_properties:
                     raise RuntimeError("native host exposes no writable color property")
-        doc.recompute()
     except Exception as exc:
         fail(
             "native_text_creation_or_style_failed",
@@ -4967,6 +5148,12 @@ def _deliver_text_item_3d(
             "invalid_3d_text_source_item",
             {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
         )
+
+    _raise_nul_source_text_impossible(
+        bound_item,
+        requested_type,
+        attempted_type,
+    )
 
     try:
         font_path, source_results = _resolve_shapestring_font_path_with_evidence(
@@ -6024,6 +6211,7 @@ def _deliver_text_item_svg(
             requested_representation=requested_type,
             page_rotation_matrix=_page_matrix_values(opts),
             render_cache=render_cache,
+            defer_recompute=True,
         )
     except TextRepresentationRenderError as exc:
         renderer_reason = str(
@@ -6257,6 +6445,7 @@ def _render_canonical_text_items(
     delivered_source_ids: List[str] = []
     final_types: List[str] = []
     delivered_entity_count = 0
+    created_host_entity_count = 0
     bucket_by_type = {
         "text": "native_text",
         "labels": "native_label",
@@ -6282,6 +6471,9 @@ def _render_canonical_text_items(
         delivered_source_ids.append(source_item_id)
         final_types.append(final_type)
         delivered_entity_count += created_count
+        created_host_entity_count += len(
+            list(result.get("created_entity_ids") or [])
+        )
         _record_text_delivery(opts, bucket_by_type[final_type], created_count)
 
     unique_final_types = sorted(set(final_types))
@@ -6290,6 +6482,7 @@ def _render_canonical_text_items(
             unique_final_types[0] if len(unique_final_types) == 1 else "mixed"
         ),
         "count": delivered_entity_count,
+        "host_entity_count": created_host_entity_count,
         "source_item_count": len(results),
         "source_item_ids": delivered_source_ids,
         "font_rendered": any(value in {"text", "labels", "3d_text"} for value in final_types),
@@ -6758,11 +6951,6 @@ def _autofit_import_view(fc_doc) -> None:
         import FreeCADGui as Gui
     except ImportError:
         return
-
-    try:
-        fc_doc.recompute()
-    except (RuntimeError, AttributeError):
-        pass
 
     try:
         Gui.updateGui()
@@ -7304,15 +7492,19 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
     obj_count = 0
 
     # ── Heavy-page detection ──
-    # When a page has a huge number of drawing groups, automatically engage
+    # When a page has a huge number of drawing groups or path operations,
+    # automatically engage
     # safe-mode behavior: larger compound batches, throttled progress updates,
     # and guarded arc fitting.  This keeps vector import fully intact but
     # stops FreeCAD from drowning in per-object GUI overhead.
-    _is_heavy = (opts.heavy_page_threshold > 0
-                 and n_drawings > opts.heavy_page_threshold)
+    _drawing_items = _drawing_work_item_count(drawings)
+    _is_heavy = _is_heavy_vector_page(drawings, opts.heavy_page_threshold)
     if _is_heavy and opts.verbose:
-        _msg(f"Page {page_num}: heavy page detected ({n_drawings} groups > "
-             f"{opts.heavy_page_threshold}) — engaging safe-mode batching")
+        _msg(
+            f"Page {page_num}: heavy page detected "
+            f"({n_drawings} groups, {_drawing_items} path operations; "
+            f"threshold {opts.heavy_page_threshold}) — engaging safe-mode batching"
+        )
 
     # ── Compound batching state ──
     # Collect shapes in memory and commit them as Part::Compound objects
@@ -7872,7 +8064,13 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 "examples": [],
                 "attempts": [verified_attempt],
             }
-        obj_count += int(text_entity_info.get("count", 0) or 0)
+        obj_count += int(
+            text_entity_info.get(
+                "host_entity_count",
+                text_entity_info.get("count", 0),
+            )
+            or 0
+        )
         _progress_update(
             89,
             "Rendering %s (%d source items)..."
@@ -7975,7 +8173,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         progress.setValue(100)
         progress.close()
 
-    fc_doc.recompute()
+    _recompute_page_if_needed(fc_doc, opts)
     elapsed_total = time.time() - _import_start
     _msg(f"Page {page_num}: {obj_count} objects created in {elapsed_total:.1f}s")
     return top_group, text_entity_info
@@ -8038,6 +8236,15 @@ def _reset_import_run_state(opts: ImportOptions) -> None:
     opts._model3d_text_evidence = []
     opts._bootstrap_text_items = []
     opts._pdf_sha256 = ""
+    opts._defer_page_recompute = False
+
+
+def _recompute_page_if_needed(fc_doc, opts: ImportOptions) -> bool:
+    """Recompute now for standalone pages, or once after a multi-page batch."""
+    if bool(getattr(opts, "_defer_page_recompute", False)):
+        return False
+    fc_doc.recompute()
+    return True
 
 
 def _remove_post_baseline_document_objects(
@@ -8141,6 +8348,10 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             total_pages = len(pdoc)
             # Default to all pages when no explicit page list is provided
             pages = opts.pages or list(range(1, total_pages + 1))
+            opts._defer_page_recompute = (
+                sum(1 for page_number in pages if 1 <= page_number <= total_pages)
+                > 1
+            )
             if total_pages > 0:
                 page_height_scaled = pdoc.load_page(0).rect.height * _unit_scale
             for p in pages:

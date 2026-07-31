@@ -119,6 +119,35 @@ class FakeShape:
         )
 
 
+def test_shape_nonempty_prefers_constant_cost_host_edge_count():
+    class HostShape:
+        def isNull(self):
+            return False
+
+        def countElement(self, element_type):
+            assert element_type == "Edge"
+            return 3
+
+        @property
+        def Edges(self):
+            raise AssertionError("materializing every edge is unnecessary")
+
+    assert renderer._shape_nonempty(HostShape(), require_edges=True) is True
+
+
+def test_shape_edge_count_does_not_materialize_large_host_edge_lists():
+    class HostShape:
+        def countElement(self, element_type):
+            assert element_type == "Edge"
+            return 410678
+
+        @property
+        def Edges(self):
+            raise AssertionError("materializing every raw edge is unnecessary")
+
+    assert renderer._shape_edge_count(HostShape()) == 410678
+
+
 class FakeMatrix:
     def __init__(self):
         for row in range(1, 5):
@@ -144,13 +173,123 @@ class FakeFreeCAD:
 class FakePart:
     @staticmethod
     def makeCompound(edges):
-        return FakeShape(edges)
+        flattened = []
+        for edge_or_shape in edges:
+            if isinstance(edge_or_shape, FakeShape):
+                flattened.extend(edge_or_shape.Edges)
+            else:
+                flattened.append(edge_or_shape)
+        return FakeShape(flattened)
 
 
 class SmallGlyphPart:
     @staticmethod
     def makeCompound(edges):
         return FakeShape(edges, bounds=(0.0, -0.75, 0.75, 0.0))
+
+
+def test_global_assignment_rebalances_overlapping_fraction_spans():
+    placed_glyphs = [
+        (0, "one", FakeShape([FakeEdge("one")], bounds=(1.0, 1.0, 2.0, 2.0))),
+        (1, "two", FakeShape([FakeEdge("two")], bounds=(7.0, 7.0, 8.0, 8.0))),
+        (2, "slash", FakeShape([FakeEdge("slash")], bounds=(8.0, 8.0, 9.0, 9.0))),
+    ]
+    manifest = [
+        {
+            "source_order": 0,
+            "source_item_id": "p1:b0:l0:s0",
+            "page_number": 1,
+            "pdf_sha256": "abc",
+            "bbox": (0.0, 0.0, 10.0, 10.0),
+            "text": "12",
+        },
+        {
+            "source_order": 1,
+            "source_item_id": "p1:b0:l0:s1",
+            "page_number": 1,
+            "pdf_sha256": "abc",
+            "bbox": (4.0, 4.0, 6.0, 6.0),
+            "text": "/",
+        },
+    ]
+
+    assignments, _host_bboxes, unmatched = (
+        renderer._build_global_placement_assignments(
+            placed_glyphs,
+            manifest,
+            page_num=1,
+            pdf_sha256="abc",
+            page_rotation_matrix=(1.0, 0.0, 0.0, 1.0, 0.0, 0.0),
+            vb_min_x=0.0,
+            vb_min_y=0.0,
+            vb_w=100.0,
+            vb_h=100.0,
+            page_w=100.0,
+            page_h=100.0,
+            x_unit_to_mm=1.0,
+            y_unit_to_mm=1.0,
+            flip_y=False,
+        )
+    )
+
+    assert unmatched == []
+    assert len(assignments["p1:b0:l0:s0"]) == 2
+    assert len(assignments["p1:b0:l0:s1"]) == 1
+
+
+def test_global_assignment_uses_exact_spatial_candidates(monkeypatch):
+    intersection_calls = 0
+    original_intersection = renderer._bbox_intersection_area
+
+    def count_intersection(left, right):
+        nonlocal intersection_calls
+        intersection_calls += 1
+        return original_intersection(left, right)
+
+    monkeypatch.setattr(renderer, "_bbox_intersection_area", count_intersection)
+    manifest = []
+    placed_glyphs = []
+    for index in range(200):
+        x0 = float((index % 20) * 20)
+        y0 = float((index // 20) * 20)
+        bbox = (x0, y0, x0 + 10.0, y0 + 10.0)
+        source_id = f"p1:b{index}:l0:s0"
+        manifest.append(
+            {
+                "source_order": index,
+                "source_item_id": source_id,
+                "page_number": 1,
+                "pdf_sha256": "abc",
+                "bbox": bbox,
+                "text": "X",
+            }
+        )
+        placed_glyphs.append(
+            (index, "glyph", FakeShape([FakeEdge(index)], bounds=bbox))
+        )
+
+    assignments, _host_bboxes, unmatched = (
+        renderer._build_global_placement_assignments(
+            placed_glyphs,
+            manifest,
+            page_num=1,
+            pdf_sha256="abc",
+            page_rotation_matrix=(1.0, 0.0, 0.0, 1.0, 0.0, 0.0),
+            vb_min_x=0.0,
+            vb_min_y=0.0,
+            vb_w=400.0,
+            vb_h=200.0,
+            page_w=400.0,
+            page_h=200.0,
+            x_unit_to_mm=1.0,
+            y_unit_to_mm=1.0,
+            flip_y=False,
+        )
+    )
+
+    assert unmatched == []
+    assert all(assignments[f"p1:b{index}:l0:s0"] == [index] for index in range(200))
+    assert intersection_calls < 5000
 
 
 class FakeFeature:
@@ -178,6 +317,7 @@ class FakeDocument:
         self.fail_after = fail_after
         self.created = 0
         self.removed = []
+        self.recompute_calls = 0
 
     def addObject(self, kind, name):
         assert kind == "Part::Feature"
@@ -200,6 +340,7 @@ class FakeDocument:
         self.Objects = survivors
 
     def recompute(self):
+        self.recompute_calls += 1
         return None
 
 
@@ -313,12 +454,31 @@ def test_page_svg_cache_is_source_bound_rendered_once_and_claims_each_placement(
 ):
     _install_renderer(monkeypatch)
     render_calls = []
+    parse_calls = {"viewbox": 0, "glyph_defs": 0, "placements": 0}
+    original_viewbox = renderer._parse_viewbox
+    original_glyph_defs = renderer._parse_all_glyph_defs
+    original_placements = renderer._parse_use_placements
 
     def render_once(*_args):
         render_calls.append(True)
         return SVG
 
+    def parse_viewbox_once(svg):
+        parse_calls["viewbox"] += 1
+        return original_viewbox(svg)
+
+    def parse_glyph_defs_once(svg):
+        parse_calls["glyph_defs"] += 1
+        return original_glyph_defs(svg)
+
+    def parse_placements_once(svg):
+        parse_calls["placements"] += 1
+        return original_placements(svg)
+
     monkeypatch.setattr(renderer, "_render_svg_with_pymupdf", render_once)
+    monkeypatch.setattr(renderer, "_parse_viewbox", parse_viewbox_once)
+    monkeypatch.setattr(renderer, "_parse_all_glyph_defs", parse_glyph_defs_once)
+    monkeypatch.setattr(renderer, "_parse_use_placements", parse_placements_once)
     doc = FakeDocument()
     group = FakeGroup()
     cache = {}
@@ -359,6 +519,7 @@ def test_page_svg_cache_is_source_bound_rendered_once_and_claims_each_placement(
     )
 
     assert len(render_calls) == 1
+    assert parse_calls == {"viewbox": 1, "glyph_defs": 1, "placements": 1}
     assert first["item_filter"]["matched_placement_indices"] == [0]
     assert second["item_filter"]["matched_placement_indices"] == [1]
     assert cache["claimed_placement_indices"] == {0, 1}
@@ -583,6 +744,36 @@ def test_item_filter_creates_only_glyphs_intersecting_exact_source_bbox(monkeypa
     assert [obj.PDFSourceItemId for obj in group.objects] == [
         item["source_item_id"] + ":g0"
     ]
+
+
+@pytest.mark.parametrize("representation", ["glyphs", "geometry"])
+def test_item_filter_can_defer_document_recompute_until_page_commit(
+    monkeypatch, representation
+):
+    _install_renderer(monkeypatch)
+    doc = FakeDocument()
+    group = FakeGroup()
+    item = _source_item(
+        bbox=(8.0, 18.0, 18.0, 27.0),
+        requested_type=representation,
+    )
+
+    result = renderer.render_text(
+        "fixture.pdf",
+        1,
+        100.0,
+        1.0,
+        page_w=100.0,
+        fc_doc=doc,
+        parent_group=group,
+        representation=representation,
+        source_item=item,
+        requested_representation=representation,
+        defer_recompute=True,
+    )
+
+    assert result["outcome"] == "verified"
+    assert doc.recompute_calls == 0
 
 
 def test_real_rotated_page_item_filters_never_cross_relabel(tmp_path, monkeypatch):

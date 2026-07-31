@@ -141,6 +141,7 @@ class _HostObject:
 class _Document:
     def __init__(self):
         self.Objects = []
+        self.recompute_calls = 0
 
     def addObject(self, kind, name):
         obj = _HostObject(self, f"{name}_{len(self.Objects)}", kind)
@@ -154,6 +155,7 @@ class _Document:
         self.Objects = [obj for obj in self.Objects if obj.Name != name]
 
     def recompute(self, *_args):
+        self.recompute_calls += 1
         return None
 
 
@@ -418,6 +420,7 @@ def test_canonical_page_orchestrator_preserves_original_source_identity(monkeypa
         )
     ]
     assert result["count"] == 1
+    assert result["host_entity_count"] == 1
     assert result["source_item_ids"] == ["p1:b0:l0:s0"]
 
 
@@ -466,6 +469,7 @@ def test_canonical_3d_counts_visible_delivery_not_hidden_support_objects(monkeyp
 
     assert result["source_item_count"] == 1
     assert result["count"] == 1
+    assert result["host_entity_count"] == 3
     assert opts.text_delivered_counts == {"native_3d_text": 1}
 
 
@@ -505,6 +509,7 @@ def test_canonical_geometry_counts_serialized_raw_edges_not_container_objects(
     )
 
     assert result["count"] == 17
+    assert result["host_entity_count"] == 1
     assert opts.text_delivered_counts == {"raw_geometry_edges": 17}
 
 
@@ -564,6 +569,20 @@ def test_native_item_delivery_rereads_live_text_transform_style_and_metadata(
         result["evidence"]["rotation_deg"],
         abs_tol=1e-7,
     )
+    assert document.recompute_calls == 0
+
+
+def test_page_recompute_can_be_deferred_until_multi_page_import_finishes():
+    document = _Document()
+    opts = core.ImportOptions()
+
+    assert core._recompute_page_if_needed(document, opts) is True
+    assert document.recompute_calls == 1
+
+    opts._defer_page_recompute = True
+
+    assert core._recompute_page_if_needed(document, opts) is False
+    assert document.recompute_calls == 1
 
 
 @pytest.mark.parametrize("attempted_type", ["text", "labels"])
@@ -640,6 +659,110 @@ def test_rotated_native_text_remains_text_with_verified_persistent_placement(
     assert len(document.Objects) == 1
     assert document.Objects[0].TypeId == "App::FeaturePython"
     assert document.Objects[0].Proxy.Type == "Text"
+
+
+@pytest.mark.parametrize("attempted_type", ["text", "labels"])
+def test_native_text_nul_is_proven_impossible_before_host_creation(
+    monkeypatch, attempted_type
+):
+    document, group = _install_native_host(monkeypatch)
+    item = _canonical_item("text")
+    item["text"] = "\x00"
+    item["span"]["text"] = "\x00"
+    opts = core.ImportOptions(
+        text_mode="text",
+        import_text=True,
+        scale_to_mm=False,
+        user_scale=1.0,
+    )
+
+    with pytest.raises(core.TextItemImpossible) as raised:
+        core._deliver_text_item_native(
+            item,
+            attempted_type,
+            opts,
+            text_group=group,
+            page_h=100.0,
+            scale=1.0,
+        )
+
+    assert document.Objects == []
+    proof = raised.value.proof
+    assert proof["reason_code"] == "source_text_contains_nul"
+    assert proof["evidence"]["nul_codepoint_indices"] == [0]
+    assert core._validate_item_impossibility_proof(
+        item,
+        "text",
+        attempted_type,
+        proof,
+    ) == proof
+
+
+def test_nul_text_advances_to_exact_svg_glyph_delivery(monkeypatch):
+    document, group = _install_native_host(monkeypatch)
+    item = _canonical_item("text")
+    item["text"] = "\x00"
+    item["span"]["text"] = "\x00"
+    opts = core.ImportOptions(
+        text_mode="text",
+        import_text=True,
+        scale_to_mm=False,
+        user_scale=1.0,
+    )
+
+    def native(source_item, attempted, state):
+        return core._deliver_text_item_native(
+            source_item,
+            attempted,
+            state,
+            text_group=group,
+            page_h=100.0,
+            scale=1.0,
+        )
+
+    def text_3d(source_item, attempted, state):
+        return core._deliver_text_item_3d(
+            source_item,
+            attempted,
+            state,
+            text_group=group,
+            page_h=100.0,
+            scale=1.0,
+        )
+
+    def glyphs(source_item, attempted, _state):
+        return {
+            "source_item_id": source_item["source_item_id"],
+            "requested_type": "text",
+            "attempted_type": attempted,
+            "final_type": attempted,
+            "outcome": "verified",
+            "created_entity_ids": ["Glyph001"],
+            "removed_entity_ids": [],
+            "cleanup_complete": True,
+            "evidence": {"svg_source_glyph_verified": True},
+        }
+
+    result = core._run_text_item_fallback_ladder(
+        item,
+        "text",
+        {
+            "text": native,
+            "labels": native,
+            "3d_text": text_3d,
+            "glyphs": glyphs,
+        },
+        opts,
+    )
+
+    assert result["final_type"] == "glyphs"
+    assert result["attempted_types"] == ["text", "labels", "3d_text", "glyphs"]
+    assert [proof["reason_code"] for proof in result["proof_chain"]] == [
+        "source_text_contains_nul",
+        "source_text_contains_nul",
+        "source_text_contains_nul",
+    ]
+    assert document.Objects == []
 
 
 def test_item_raster_delivery_is_persistent_verified_and_source_bound(

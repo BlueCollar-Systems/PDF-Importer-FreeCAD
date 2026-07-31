@@ -179,6 +179,21 @@ def _cleanup_owned(doc, parent_group, owned: List[object]) -> dict:
     }
 
 
+def _shape_edge_count(shape) -> int:
+    if shape is None:
+        return 0
+    count_element = getattr(shape, "countElement", None)
+    if callable(count_element):
+        try:
+            return max(0, int(count_element("Edge")))
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+    try:
+        return len(list(getattr(shape, "Edges", []) or []))
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return 0
+
+
 def _shape_nonempty(shape, *, require_edges: bool = False) -> bool:
     if shape is None:
         return False
@@ -188,10 +203,7 @@ def _shape_nonempty(shape, *, require_edges: bool = False) -> bool:
     except (AttributeError, RuntimeError, TypeError, ValueError):
         return False
     if require_edges:
-        try:
-            return bool(list(getattr(shape, "Edges", []) or []))
-        except (AttributeError, RuntimeError, TypeError, ValueError):
-            return False
+        return _shape_edge_count(shape) > 0
     return True
 
 
@@ -482,13 +494,62 @@ def _build_global_placement_assignments(
     host_bboxes = {
         entry["source_item_id"]: entry["host_bbox"] for entry in normalized
     }
+    grid_dimension = max(8, min(64, int(math.ceil(math.sqrt(len(normalized))))))
+    grid_min_x = min(entry["host_bbox"][0] for entry in normalized)
+    grid_min_y = min(entry["host_bbox"][1] for entry in normalized)
+    grid_max_x = max(entry["host_bbox"][2] for entry in normalized)
+    grid_max_y = max(entry["host_bbox"][3] for entry in normalized)
+    grid_cell_w = max((grid_max_x - grid_min_x) / grid_dimension, 1e-9)
+    grid_cell_h = max((grid_max_y - grid_min_y) / grid_dimension, 1e-9)
+
+    def bbox_grid_cells(bbox):
+        x0 = max(
+            0,
+            min(
+                grid_dimension - 1,
+                int(math.floor((bbox[0] - grid_min_x) / grid_cell_w)),
+            ),
+        )
+        y0 = max(
+            0,
+            min(
+                grid_dimension - 1,
+                int(math.floor((bbox[1] - grid_min_y) / grid_cell_h)),
+            ),
+        )
+        x1 = max(
+            0,
+            min(
+                grid_dimension - 1,
+                int(math.floor((bbox[2] - grid_min_x) / grid_cell_w)),
+            ),
+        )
+        y1 = max(
+            0,
+            min(
+                grid_dimension - 1,
+                int(math.floor((bbox[3] - grid_min_y) / grid_cell_h)),
+            ),
+        )
+        return (
+            (grid_x, grid_y)
+            for grid_x in range(min(x0, x1), max(x0, x1) + 1)
+            for grid_y in range(min(y0, y1), max(y0, y1) + 1)
+        )
+
+    source_grid = {}
+    for normalized_index, entry in enumerate(normalized):
+        for grid_cell in bbox_grid_cells(entry["host_bbox"]):
+            source_grid.setdefault(grid_cell, []).append(normalized_index)
     tied_groups: Dict[Tuple[str, ...], List[int]] = {}
     unmatched_indices = []
+    placement_bboxes = {}
 
     for placement_index, _gid, placed_shape in placed_glyphs:
         placed_bbox = _shape_host_bbox(placed_shape)
         if placed_bbox is None:
             raise ValueError(f"SVG placement {placement_index} has no finite bounds")
+        placement_bboxes[int(placement_index)] = placed_bbox
         placed_area = max(
             (placed_bbox[2] - placed_bbox[0]) * (placed_bbox[3] - placed_bbox[1]),
             1e-12,
@@ -496,7 +557,11 @@ def _build_global_placement_assignments(
         placed_x = (placed_bbox[0] + placed_bbox[2]) / 2.0
         placed_y = (placed_bbox[1] + placed_bbox[3]) / 2.0
         candidates = []
-        for entry in normalized:
+        candidate_entry_indices = set()
+        for grid_cell in bbox_grid_cells(placed_bbox):
+            candidate_entry_indices.update(source_grid.get(grid_cell, ()))
+        for normalized_index in sorted(candidate_entry_indices):
+            entry = normalized[normalized_index]
             host_bbox = entry["host_bbox"]
             overlap = _bbox_intersection_area(placed_bbox, host_bbox)
             if overlap <= 1e-12:
@@ -551,6 +616,59 @@ def _build_global_placement_assignments(
             assignments[source_id].extend(indices)
             assigned_counts[source_id] += len(indices)
 
+    # PDF extractors sometimes split a stacked fraction into overlapping
+    # source spans (for example ``12`` and ``/``), while the SVG renderer
+    # reports all three outlines under the larger span's bounds. Preserve the
+    # one-to-one global assignment but move only a donor's proven surplus to
+    # an entirely empty overlapping source item. This is deliberately narrow:
+    # ordinary spans, ligatures, and non-overlapping text are untouched.
+    source_order_by_id = {
+        entry["source_item_id"]: entry["source_order"] for entry in normalized
+    }
+    for target_entry in normalized:
+        target_id = target_entry["source_item_id"]
+        if assigned_counts[target_id] != 0 or source_units[target_id] <= 0:
+            continue
+        donor_ids = [
+            donor_entry["source_item_id"]
+            for donor_entry in normalized
+            if (
+                donor_entry["source_item_id"] != target_id
+                and assigned_counts[donor_entry["source_item_id"]]
+                > source_units[donor_entry["source_item_id"]]
+                and _bbox_intersection_area(
+                    donor_entry["host_bbox"], target_entry["host_bbox"]
+                )
+                > 1e-12
+            )
+        ]
+        if not donor_ids:
+            continue
+        target_bbox = target_entry["host_bbox"]
+        target_x = (target_bbox[0] + target_bbox[2]) / 2.0
+        target_y = (target_bbox[1] + target_bbox[3]) / 2.0
+        candidates = []
+        for donor_id in donor_ids:
+            for placement_index in assignments[donor_id]:
+                placed_bbox = placement_bboxes[placement_index]
+                placed_x = (placed_bbox[0] + placed_bbox[2]) / 2.0
+                placed_y = (placed_bbox[1] + placed_bbox[3]) / 2.0
+                candidates.append(
+                    (
+                        math.hypot(placed_x - target_x, placed_y - target_y),
+                        source_order_by_id[donor_id],
+                        int(placement_index),
+                        donor_id,
+                    )
+                )
+        if not candidates:
+            continue
+        _distance, _donor_order, placement_index, donor_id = min(candidates)
+        assignments[donor_id].remove(placement_index)
+        assignments[target_id].append(placement_index)
+        assigned_counts[donor_id] -= 1
+        assigned_counts[target_id] += 1
+
     for indices in assignments.values():
         indices.sort()
     assigned_indices = [index for indices in assignments.values() for index in indices]
@@ -566,10 +684,11 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 representation: str = "glyphs",
                 source_item: Optional[dict] = None,
                 requested_representation: Optional[str] = None,
-                page_rotation_matrix: Optional[
-                    Tuple[float, float, float, float, float, float]
-                ] = None,
-                render_cache: Optional[dict] = None) -> dict:
+                 page_rotation_matrix: Optional[
+                     Tuple[float, float, float, float, float, float]
+                 ] = None,
+                 render_cache: Optional[dict] = None,
+                 defer_recompute: bool = False) -> dict:
     """Render and verify the explicitly requested SVG text representation.
 
     Glyphs creates one placed-outline entity per glyph. Geometry preserves
@@ -694,9 +813,6 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 "invalid_svg_render_cache",
                 {"requested_type": representation},
             )
-    exe = find_pdftocairo()
-    renderer_name = "pdftocairo" if exe else "pymupdf"
-
     doc = fc_doc or (getattr(FreeCAD, "ActiveDocument", None) if FreeCAD else None)
     if doc is None:
         raise TextRepresentationRenderError(
@@ -728,17 +844,26 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
         ) from exc
 
     svg = cache.get("svg") if cache is not None else None
+    exe = None
+    renderer_name = (
+        str(cache.get("renderer_name") or "pymupdf")
+        if cache is not None and svg is not None
+        else "pymupdf"
+    )
     if svg is not None:
-        renderer_name = str(cache.get("renderer_name") or renderer_name)
-    elif exe:
-        svg = _render_svg_with_pdftocairo(exe, pdf_path, page_num)
+        pass
     else:
-        if FreeCAD:
-            FreeCAD.Console.PrintMessage(
-                "PDFSvgTextRenderer: pdftocairo not found — using bundled "
-                "PyMuPDF SVG text fallback.\n"
-            )
-        svg = _render_svg_with_pymupdf(pdf_path, page_num)
+        exe = find_pdftocairo()
+        renderer_name = "pdftocairo" if exe else "pymupdf"
+        if exe:
+            svg = _render_svg_with_pdftocairo(exe, pdf_path, page_num)
+        else:
+            if FreeCAD:
+                FreeCAD.Console.PrintMessage(
+                    "PDFSvgTextRenderer: pdftocairo not found — using bundled "
+                    "PyMuPDF SVG text fallback.\n"
+                )
+            svg = _render_svg_with_pymupdf(pdf_path, page_num)
 
     if not svg:
         raise TextRepresentationRenderError(
@@ -763,12 +888,35 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
         cache["svg"] = svg
         cache["renderer_name"] = renderer_name
 
-    # Parse SVG dimensions / viewBox
-    vb_min_x, vb_min_y, vb_w, vb_h = _parse_viewbox(svg)
-    if vb_w <= 0 or vb_h <= 0:
-        svg_w = _parse_svg_dim(svg, "width", page_w if page_w and page_w > 0 else page_h)
-        svg_h = _parse_svg_dim(svg, "height", page_h)
-        vb_min_x, vb_min_y, vb_w, vb_h = 0.0, 0.0, float(svg_w), float(svg_h)
+    # Parse page-wide SVG structures exactly once. Canonical item delivery
+    # calls this function for every span, so reparsing the same XML payload
+    # turned dense pages into an O(source-items × SVG-size) workload.
+    cached_viewbox = cache.get("svg_viewbox") if cache is not None else None
+    if cached_viewbox is not None:
+        try:
+            vb_min_x, vb_min_y, vb_w, vb_h = (
+                float(value) for value in cached_viewbox
+            )
+        except (TypeError, ValueError):
+            raise TextRepresentationRenderError(
+                "invalid_svg_render_cache",
+                {"requested_type": representation},
+            )
+    else:
+        vb_min_x, vb_min_y, vb_w, vb_h = _parse_viewbox(svg)
+        if vb_w <= 0 or vb_h <= 0:
+            svg_w = _parse_svg_dim(
+                svg, "width", page_w if page_w and page_w > 0 else page_h
+            )
+            svg_h = _parse_svg_dim(svg, "height", page_h)
+            vb_min_x, vb_min_y, vb_w, vb_h = (
+                0.0,
+                0.0,
+                float(svg_w),
+                float(svg_h),
+            )
+        if cache is not None:
+            cache["svg_viewbox"] = (vb_min_x, vb_min_y, vb_w, vb_h)
 
     page_w_eff = float(page_w) if page_w and page_w > 0 else float(vb_w)
     page_h_eff = float(page_h) if page_h and page_h > 0 else float(vb_h)
@@ -777,7 +925,16 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
 
     # Parse all glyph definitions so an intentional empty outline (normally a
     # space) is distinguishable from a nonempty outline that failed parsing.
-    all_glyph_defs = _parse_all_glyph_defs(svg)
+    all_glyph_defs = cache.get("all_glyph_defs") if cache is not None else None
+    if all_glyph_defs is None:
+        all_glyph_defs = _parse_all_glyph_defs(svg)
+        if cache is not None:
+            cache["all_glyph_defs"] = all_glyph_defs
+    elif not isinstance(all_glyph_defs, dict):
+        raise TextRepresentationRenderError(
+            "invalid_svg_render_cache",
+            {"requested_type": representation},
+        )
     glyph_defs = {
         glyph_id: path_d
         for glyph_id, path_d in all_glyph_defs.items()
@@ -785,7 +942,16 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
     }
 
     # Parse use placements
-    placements = _parse_use_placements(svg)
+    placements = cache.get("placements") if cache is not None else None
+    if placements is None:
+        placements = _parse_use_placements(svg)
+        if cache is not None:
+            cache["placements"] = placements
+    elif not isinstance(placements, list):
+        raise TextRepresentationRenderError(
+            "invalid_svg_render_cache",
+            {"requested_type": representation},
+        )
 
     if not placements:
         raise TextRepresentationRenderError(
@@ -1128,7 +1294,7 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
     child_source_ids: List[str] = []
     attempts: List[dict] = []
     raw_edge_count = 0
-    geometry_edges: List[object] = []
+    geometry_shapes: List[object] = []
     creation_started = False
 
     def claim_new_object(obj, role: str) -> None:
@@ -1174,11 +1340,11 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 if parent_group is not None:
                     parent_group.addObject(obj)
             else:
-                edges = list(getattr(placed_shape, "Edges", []) or [])
-                if not edges:
+                placed_edge_count = _shape_edge_count(placed_shape)
+                if placed_edge_count <= 0:
                     raise RuntimeError("placed glyph has no raw geometry edges")
-                geometry_edges.extend(edges)
-                raw_edge_count += len(edges)
+                geometry_shapes.append(placed_shape)
+                raw_edge_count += placed_edge_count
 
             created_ids.extend(glyph_created_ids)
             if item_filter is None and representation == "glyphs":
@@ -1207,7 +1373,7 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 )
 
         if representation == "geometry":
-            if not geometry_edges or raw_edge_count != len(geometry_edges):
+            if not geometry_shapes or raw_edge_count <= 0:
                 raise RuntimeError("raw geometry edge collection is incomplete")
             parent_source_item_id = (
                 item_filter["source_item_id"] if item_filter is not None else None
@@ -1223,12 +1389,12 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 f"Text_Geometry_p{int(page_num)}",
             )
             claim_new_object(obj, "source-item geometry compound")
-            obj.Shape = Part.makeCompound(geometry_edges)
+            obj.Shape = Part.makeCompound(geometry_shapes)
             stored_shape = getattr(obj, "Shape", None)
-            stored_edges = list(getattr(stored_shape, "Edges", []) or [])
+            stored_edge_count = _shape_edge_count(stored_shape)
             if (
                 not _shape_nonempty(stored_shape, require_edges=True)
-                or len(stored_edges) != raw_edge_count
+                or stored_edge_count != raw_edge_count
             ):
                 raise RuntimeError("host geometry compound lost raw outline edges")
             _annotate_text_entity(
@@ -1301,7 +1467,13 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                     }
                 )
 
-        doc.recompute()
+        # The canonical importer delivers one source item at a time, then
+        # recomputes once at the page/import commit boundary. Recomputing the
+        # whole document here made dense pages quadratic (one full recompute
+        # per span). Direct/legacy callers retain the immediate verification
+        # barrier unless they explicitly opt into the page-level transaction.
+        if not defer_recompute:
+            doc.recompute()
         if (
             not created_ids
             or len(created_ids) != len(owned)
@@ -1344,12 +1516,7 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 raise RuntimeError("created SVG text host metadata is unverifiable")
             if representation == "geometry":
                 refreshed_shape = getattr(host_obj, "Shape", None)
-                try:
-                    refreshed_edges = list(
-                        getattr(refreshed_shape, "Edges", []) or []
-                    )
-                except (AttributeError, RuntimeError, TypeError, ValueError):
-                    refreshed_edges = []
+                refreshed_edge_count = _shape_edge_count(refreshed_shape)
                 try:
                     declared_edge_count = int(host_obj.PDFRawEdgeCount)
                 except (AttributeError, RuntimeError, TypeError, ValueError):
@@ -1357,12 +1524,12 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 if (
                     not _shape_nonempty(refreshed_shape, require_edges=True)
                     or declared_edge_count != raw_edge_count
-                    or len(refreshed_edges) != declared_edge_count
+                    or refreshed_edge_count != declared_edge_count
                     or str(getattr(host_obj, "PDFGeometryGrouping", "") or "")
                     != "source_item_compound_v1"
                 ):
                     raise RuntimeError(
-                        "recomputed geometry compound raw edge count is invalid"
+                        "stored geometry compound raw edge count is invalid"
                     )
 
         if item_filter is not None:

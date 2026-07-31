@@ -78,6 +78,115 @@ def test_cmap_repair_adds_host_safe_names_to_anonymous_subset_font():
         font.close()
 
 
+def test_exact_inventory_name_outranks_weaker_internal_family_aliases(monkeypatch):
+    class Document:
+        @staticmethod
+        def extract_font(xref):
+            names = {
+                1: "ABCDEF+Arial",
+                2: "ArialMT",
+                3: "Arial-BoldMT",
+            }
+            return names[xref], "ttf", "Type0", f"font-{xref}".encode("ascii")
+
+    class Page:
+        parent = Document()
+
+        @staticmethod
+        def get_texttrace():
+            return []
+
+        @staticmethod
+        def get_fonts(*, full=False):
+            assert full is True
+            return [
+                (1, "ttf", "Type0", "ABCDEF+Arial", "F0", "Identity-H"),
+                (2, "ttf", "Type0", "ArialMT", "F1", "Identity-H"),
+                (3, "ttf", "Type0", "Arial-BoldMT", "F2", "Identity-H"),
+            ]
+
+    monkeypatch.setattr(
+        embedded_fonts,
+        "_page_unicode_glyph_maps",
+        lambda _page: ({"Arial": {65: 1}}, set(), None),
+    )
+    monkeypatch.setattr(
+        embedded_fonts,
+        "_font_program_name_aliases",
+        lambda _data, _format: {"Arial"},
+    )
+    monkeypatch.setattr(
+        embedded_fonts,
+        "_usable_font",
+        lambda source, source_format, _name, _mapping: (
+            source_format,
+            source,
+            True,
+        ),
+    )
+    monkeypatch.setattr(
+        embedded_fonts,
+        "_font_delivery_metrics",
+        lambda _data: (1000, 800, -200, (500, 500)),
+    )
+
+    catalog = embedded_fonts.EmbeddedFontCatalog.from_page(Page(), page_number=30)
+    asset = catalog.for_span("Arial")
+
+    assert asset is not None
+    assert asset.source_xref == 1
+    assert asset.base_font_name == "Arial"
+
+
+def test_cmap_repair_classifies_fonttools_assertion_as_malformed_source(monkeypatch):
+    monkeypatch.setattr(
+        embedded_fonts,
+        "_install_pdf_unicode_cmap_unchecked",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError(
+                "corrupt cmap table format 4 (data length: 74, header length: 80)"
+            )
+        ),
+    )
+
+    with pytest.raises(
+        embedded_fonts.ExactFontSourceImpossible,
+        match="corrupt cmap table format 4",
+    ):
+        embedded_fonts._install_pdf_unicode_cmap(
+            b"malformed-font",
+            {65: 1},
+            "MalformedFont",
+        )
+
+
+def test_fonttools_assertions_from_malformed_source_tables_do_not_escape(monkeypatch):
+    import fontTools.ttLib
+
+    class MalformedFont:
+        reader = {"head": object()}
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        @staticmethod
+        def getGlyphOrder():
+            raise AssertionError(
+                "corrupt cmap table format 4 (data length: 74, header length: 80)"
+            )
+
+        @staticmethod
+        def close():
+            pass
+
+    monkeypatch.setattr(fontTools.ttLib, "TTFont", MalformedFont)
+
+    assert embedded_fonts._fonttools_loadable(b"malformed-font") is False
+    assert embedded_fonts._font_program_name_aliases(
+        b"malformed-font", "ttf"
+    ) == set()
+
+
 def test_shapestring_font_cache_uses_temp_when_user_mod_root_is_unwritable(
     tmp_path, monkeypatch,
 ):

@@ -7365,7 +7365,7 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
         ip.PDFRasterSHA256 = raster_sha256
         _annotate_text_host_object(ip, "p%d:page" % int(page_num), "raster")
         parent.addObject(ip)
-        fc_doc.recompute()
+        _recompute_page_if_needed(fc_doc, opts)
         entity_id = _host_object_id(ip)
         live = fc_doc.getObject(entity_id)
         anchor = _host_anchor_xyz(ip)
@@ -8141,7 +8141,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
     if _progress_check_cancel():
         if progress:
             progress.close()
-        fc_doc.recompute()
+        _recompute_page_if_needed(fc_doc, opts)
         return top_group, None
 
     placed_full_page_raster_background = False
@@ -8168,7 +8168,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             if progress:
                 progress.setValue(100)
                 progress.close()
-            fc_doc.recompute()
+            _recompute_page_if_needed(fc_doc, opts)
             _msg(f"Page {page_num}: imported as raster image")
             return top_group, None
 
@@ -8209,7 +8209,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             if progress:
                 progress.setValue(100)
                 progress.close()
-            fc_doc.recompute()
+            _recompute_page_if_needed(fc_doc, opts)
             _msg(f"Page {page_num}: imported as raster image")
             return top_group, None
 
@@ -8356,7 +8356,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 if _batch_size:
                     _flush_batch(force=True)
                 progress.close()
-                fc_doc.recompute()
+                _recompute_page_if_needed(fc_doc, opts)
                 return top_group, None
 
         items = path_group.get("items", [])
@@ -8647,7 +8647,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                         80 + int(5 * _flush_idx / max(n_style_keys, 1)),
                         f"Building compound {_flush_idx}/{n_style_keys}...")
                 if _progress_check_cancel():
-                    fc_doc.recompute()
+                    _recompute_page_if_needed(fc_doc, opts)
                     return top_group, None
                 _flush_batch(_fk, force=True)
         if opts.verbose:
@@ -8662,7 +8662,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         _progress_update(86, "Importing text...")
 
         if _progress_check_cancel():
-            fc_doc.recompute()
+            _recompute_page_if_needed(fc_doc, opts)
             return top_group, None
         text_group = _make_group(top_group or fc_doc, "Text", fc_doc)
         try:

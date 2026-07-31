@@ -682,6 +682,12 @@ def test_orchestrated_import_defers_item_recompute_even_for_one_page():
     assert core._should_defer_item_recompute(2) is True
 
 
+def test_page_inner_never_bypasses_deferred_recompute():
+    source = inspect.getsource(core._import_pdf_page_inner)
+
+    assert "fc_doc.recompute()" not in source
+
+
 @pytest.mark.parametrize("attempted_type", ["text", "labels"])
 def test_native_item_delivery_headless_rereads_honest_app_style_metadata(
     monkeypatch, attempted_type
@@ -1004,6 +1010,7 @@ def test_full_page_raster_returns_verified_persistent_host_evidence(
         raster_dpi_user_set=True,
     )
     opts._pdf_sha256 = "b" * 64
+    opts._defer_page_recompute = True
 
     class Rect:
         x0 = 0.0
@@ -1050,6 +1057,7 @@ def test_full_page_raster_returns_verified_persistent_host_evidence(
     assert host.YSize == pytest.approx(80.0)
     assert result["evidence"]["raster_file_included"] is True
     assert result["evidence"]["raster_content_verified"] is True
+    assert document.recompute_calls == 0
 
 
 def test_raster_verifier_accepts_freecad_cache_rewrites_only_when_bytes_match(tmp_path):

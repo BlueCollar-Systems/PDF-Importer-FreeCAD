@@ -1333,3 +1333,80 @@ def test_verified_item_3d_result_has_complete_ids_and_evidence(monkeypatch):
     )
     assert normalized["delivery_entity_ids"] == [extrusion.Name]
     assert set(normalized["support_entity_ids"]) == {support.Name, calibrated.Name}
+
+
+def test_verified_item_3d_prefers_one_exact_compound_with_editable_metadata(
+    monkeypatch,
+):
+    document, draft, group = _install_host(monkeypatch)
+    item = _canonical_3d_item("TEXT")
+    resolution = _found_font_resolution(item)
+    monkeypatch.setattr(
+        core,
+        "_resolve_shapestring_font_path_with_evidence",
+        lambda *_args, **_kwargs: resolution,
+    )
+
+    class CompoundHost(FakeHostObject):
+        def __init__(self, placement, target_advance):
+            self.Document = document
+            self._set_host_name("PDF_3D_Text_0")
+            self.Label = "PDF 3D Text"
+            self.TypeId = "Part::Feature"
+            self.PropertiesList = []
+            self.ViewObject = None
+            self.Placement = placement
+            self.Shape = FakeShape(
+                solid=True,
+                width=target_advance,
+                height=5.0,
+                angle=0.0,
+            )
+
+        def addProperty(self, _kind, name, _group):
+            self.PropertiesList.append(name)
+
+    def create_compound(
+        _doc,
+        *,
+        placement,
+        target_advance_fc,
+        text_group,
+        configure_host,
+        **_kwargs,
+    ):
+        host = CompoundHost(placement, target_advance_fc)
+        document.Objects.append(host)
+        configure_host(host)
+        text_group.addObject(host)
+        return host, 0.5, target_advance_fc * 2.0, target_advance_fc
+
+    monkeypatch.setattr(
+        core, "_create_verified_compound_text3d_entity", create_compound
+    )
+
+    result = core._deliver_text_item_3d(
+        item,
+        "3d_text",
+        core.ImportOptions(text_mode="3d_text"),
+        text_group=group,
+        page_h=100.0,
+        scale=1.0,
+    )
+
+    assert len(document.Objects) == 1
+    host = document.Objects[0]
+    assert result["created_entity_ids"] == [host.Name]
+    assert result["delivery_entity_ids"] == [host.Name]
+    assert result["support_entity_ids"] == []
+    assert result["evidence"]["implementation"] == "exact_glyph_solid_compound_v1"
+    assert result["evidence"]["host_entity_count"] == 1
+    assert result["evidence"]["source_metadata_editable"] is True
+    assert host.PDFSourceText == item["text"]
+    assert host.PDFSourceItemId == item["source_item_id"]
+    assert host.PDFRepresentation == "3d_text"
+    assert host.PDFGeometryEncoding == "exact_glyph_solid_compound_v1"
+    assert host.PDFFontFile == resolution[0]
+    assert host.PDFFontFileSHA256 == resolution[1][0]["sha256"]
+    assert draft.calls == []
+    assert draft.label_calls == []

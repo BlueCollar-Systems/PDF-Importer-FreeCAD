@@ -3985,6 +3985,334 @@ def _make_shapestring_host(doc, source_text: str, font_path: str):
     return make_shapestring(source_text, font_path)
 
 
+def _shape_solid_count(shape) -> int:
+    """Count solids without materializing the full OCC sub-shape array."""
+    count_element = getattr(shape, "countElement", None)
+    if callable(count_element):
+        try:
+            return int(count_element("Solid"))
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+    try:
+        return len(list(getattr(shape, "Solids", []) or []))
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return 0
+
+
+def _persist_text3d_source_metadata(
+    obj,
+    *,
+    source_text: str,
+    font_path: str,
+    font_sha256: str,
+    depth: float,
+    target_advance_fc: float,
+    horizontal_scale: float,
+) -> None:
+    """Keep the exact source span and geometry recipe editable after save/reopen."""
+    if not isinstance(source_text, str) or not source_text or "\x00" in source_text:
+        raise ValueError("3D Text source metadata is invalid")
+    if not isinstance(font_path, str) or not font_path:
+        raise ValueError("3D Text font metadata is invalid")
+    numeric_values = (float(depth), float(target_advance_fc), float(horizontal_scale))
+    if any(not math.isfinite(value) or value <= 0.0 for value in numeric_values):
+        raise ValueError("3D Text dimension metadata is invalid")
+    font_digest = str(font_sha256 or "").lower()
+    if font_digest and re.fullmatch(r"[0-9a-f]{64}", font_digest) is None:
+        raise ValueError("3D Text font digest metadata is invalid")
+
+    properties = set(getattr(obj, "PropertiesList", []) or [])
+    add_property = getattr(obj, "addProperty", None)
+    source_digest = hashlib.sha256(
+        source_text.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
+    values = (
+        ("App::PropertyString", "PDFSourceText", source_text),
+        ("App::PropertyString", "PDFSourceTextSHA256", source_digest),
+        ("App::PropertyString", "PDFFontFile", font_path),
+        ("App::PropertyString", "PDFFontFileSHA256", font_digest),
+        ("App::PropertyFloat", "PDFExtrusionDepth", numeric_values[0]),
+        ("App::PropertyFloat", "PDFTargetAdvance", numeric_values[1]),
+        ("App::PropertyFloat", "PDFHorizontalScale", numeric_values[2]),
+        (
+            "App::PropertyString",
+            "PDFGeometryEncoding",
+            "exact_glyph_solid_compound_v1",
+        ),
+    )
+    for property_kind, property_name, property_value in values:
+        if property_name not in properties and callable(add_property):
+            add_property(property_kind, property_name, "PDF Import")
+            properties.add(property_name)
+        setattr(obj, property_name, property_value)
+
+
+def _closed_text3d_wires(wire_shapes: List[Any]) -> List[Any]:
+    """Normalize FreeType wire fragments into closed outline wires."""
+    closed: List[Any] = []
+    for wire_shape in wire_shapes or ():
+        edges = list(getattr(wire_shape, "Edges", []) or [])
+        if not edges:
+            continue
+        connected = Part.Compound(edges).connectEdgesToWires()
+        for wire in list(getattr(connected, "Wires", []) or []):
+            if bool(getattr(wire, "isClosed", lambda: False)()):
+                closed.append(wire)
+    return closed
+
+
+def _text3d_faces_for_outlines(wire_shapes: List[Any]) -> List[Any]:
+    """Create counter-aware faces from one or more glyph outlines."""
+    wire_list = _closed_text3d_wires(wire_shapes)
+    if not wire_list:
+        raise RuntimeError("source glyph did not produce closed outline wires")
+    errors: List[str] = []
+    for maker in (
+        "Part::FaceMakerBullseye",
+        "Part::FaceMakerCheese",
+        "Part::FaceMakerSimple",
+    ):
+        try:
+            face_shape = Part.makeFace(wire_list, maker)
+            faces = list(getattr(face_shape, "Faces", []) or [])
+            if not faces and str(getattr(face_shape, "ShapeType", "")) == "Face":
+                faces = [face_shape]
+            if not faces:
+                raise RuntimeError("face maker returned no faces")
+            for face in faces:
+                validate = getattr(face, "validate", None)
+                if callable(validate):
+                    validate()
+                try:
+                    if float(face.normalAt(0, 0).z) < 0.0:
+                        face.reverse()
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    pass
+            return faces
+        except Exception as exc:
+            errors.append("%s: %s: %s" % (maker, exc.__class__.__name__, exc))
+    raise RuntimeError("source glyph face creation failed (%s)" % "; ".join(errors))
+
+
+class _Text3DOutlineMemo:
+    """Bounded import-scoped cache of exact unit-size counter-aware faces."""
+
+    MAX_ENTRIES = 256
+
+    def __init__(self):
+        self._cache: Dict[Tuple[str, str], Tuple[Any, float, int]] = {}
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+
+    def get_or_build(self, key, builder):
+        normalized_key = (str(key[0]), str(key[1]))
+        cached = self._cache.get(normalized_key)
+        if cached is not None:
+            self.hits += 1
+            shape, native_advance, visible_character_count = cached
+            return (
+                shape.copy(),
+                float(native_advance),
+                int(visible_character_count),
+            )
+        self.misses += 1
+        shape, native_advance, visible_character_count = builder()
+        if len(self._cache) >= self.MAX_ENTRIES:
+            oldest_key = next(iter(self._cache))
+            self._cache.pop(oldest_key, None)
+            self.evictions += 1
+        self._cache[normalized_key] = (
+            shape.copy(),
+            float(native_advance),
+            int(visible_character_count),
+        )
+        return shape, float(native_advance), int(visible_character_count)
+
+    def clear(self) -> None:
+        self._cache.clear()
+
+
+_ACTIVE_TEXT3D_OUTLINE_MEMO: Optional[_Text3DOutlineMemo] = None
+
+
+def _build_exact_text3d_outline_template(source_text: str, font_path: str):
+    """Build exact counter-aware faces once at unit font size."""
+    characters = Part.makeWireString(source_text, font_path, 1.0, 0)
+    if not isinstance(characters, (list, tuple)) or len(characters) != len(source_text):
+        raise RuntimeError("source glyph inventory does not match source text")
+    outlines: List[Any] = []
+    visible_character_count = 0
+    for source_character, character_wires in zip(
+        source_text, characters, strict=True
+    ):
+        if source_character.isspace():
+            continue
+        visible_character_count += 1
+        character_outlines = list(character_wires or [])
+        if not character_outlines:
+            raise RuntimeError("source glyph produced no outline geometry")
+        outlines.extend(character_outlines)
+    if visible_character_count <= 0 or not outlines:
+        raise RuntimeError("source font produced no visible glyph outlines")
+    outline_compound = Part.Compound(outlines)
+    native_advance = float(
+        getattr(outline_compound.BoundBox, "XLength", 0.0) or 0.0
+    )
+    if not math.isfinite(native_advance) or native_advance <= 1e-9:
+        raise RuntimeError("source glyph baseline extent could not be measured")
+    faces = _text3d_faces_for_outlines(outlines)
+    face_compound = Part.Compound(faces)
+    if (
+        bool(getattr(face_compound, "isNull", lambda: True)())
+        or not list(getattr(face_compound, "Faces", []) or [])
+    ):
+        raise RuntimeError("source glyph faces could not be verified")
+    return face_compound, native_advance, visible_character_count
+
+
+def _build_exact_text3d_compound_shape(
+    *,
+    source_text: str,
+    font_path: str,
+    font_size_fc: float,
+    depth: float,
+    target_advance_fc: float,
+):
+    """Bake one source span into exact, width-calibrated glyph solids."""
+    if Part is None or FreeCAD is None or Vector is None:
+        raise RuntimeError("FreeCAD Part geometry API unavailable")
+    numeric_values = (
+        float(font_size_fc),
+        float(depth),
+        float(target_advance_fc),
+    )
+    if any(not math.isfinite(value) or value <= 0.0 for value in numeric_values):
+        raise RuntimeError("3D Text compound dimensions are invalid")
+    if not isinstance(source_text, str) or not source_text or source_text.isspace():
+        raise RuntimeError("3D Text compound source is empty")
+
+    build_template = lambda: _build_exact_text3d_outline_template(
+        source_text, font_path
+    )
+    if _ACTIVE_TEXT3D_OUTLINE_MEMO is None:
+        face_template, unit_advance, visible_character_count = build_template()
+    else:
+        face_template, unit_advance, visible_character_count = (
+            _ACTIVE_TEXT3D_OUTLINE_MEMO.get_or_build(
+                (source_text, font_path), build_template
+            )
+        )
+    native_advance = unit_advance * numeric_values[0]
+    horizontal_scale = numeric_values[2] / native_advance
+    if (
+        not math.isfinite(horizontal_scale)
+        or horizontal_scale <= 1e-4
+        or horizontal_scale >= 1e4
+    ):
+        raise RuntimeError("source glyph horizontal scale is invalid")
+
+    matrix_factory = getattr(FreeCAD, "Matrix", None)
+    if not callable(matrix_factory):
+        raise RuntimeError("FreeCAD affine matrix API unavailable")
+    matrix = matrix_factory()
+    matrix.A11 = float(numeric_values[2] / unit_advance)
+    matrix.A22 = float(numeric_values[0])
+    transformed_faces = face_template.transformGeometry(matrix)
+    if (
+        visible_character_count <= 0
+        or transformed_faces is None
+        or bool(getattr(transformed_faces, "isNull", lambda: True)())
+    ):
+        raise RuntimeError("source text produced no visible solid glyphs")
+
+    extruded = transformed_faces.extrude(Vector(0.0, 0.0, numeric_values[1]))
+    if (
+        extruded is None
+        or bool(getattr(extruded, "isNull", lambda: True)())
+        or _shape_solid_count(extruded) <= 0
+        or float(getattr(extruded, "Volume", 0.0) or 0.0) <= 0.0
+    ):
+        raise RuntimeError("source glyph extrusion did not produce verified solids")
+    compound = Part.Compound([extruded])
+    solid_count = _shape_solid_count(compound)
+    volume = float(getattr(compound, "Volume", 0.0) or 0.0)
+    verified_advance = float(
+        getattr(compound.BoundBox, "XLength", 0.0) or 0.0
+    )
+    tolerance = max(0.05, numeric_values[2] * 0.03)
+    if (
+        bool(getattr(compound, "isNull", lambda: True)())
+        or solid_count <= 0
+        or not math.isfinite(volume)
+        or volume <= 0.0
+        or not math.isfinite(verified_advance)
+        or abs(verified_advance - numeric_values[2]) > tolerance
+    ):
+        raise RuntimeError("3D Text compound geometry verification failed")
+    return compound, horizontal_scale, native_advance, verified_advance
+
+
+def _create_verified_compound_text3d_entity(
+    doc,
+    *,
+    source_text: str,
+    font_path: str,
+    font_size_fc: float,
+    depth: float,
+    target_advance_fc: float,
+    placement,
+    text_group,
+    baseline_object_ids: Optional[set] = None,
+    configure_host=None,
+):
+    """Create one persistent Part::Feature carrying an exact 3D source span."""
+    protected_baseline_ids = set(baseline_object_ids or ())
+    if any(type(object_id) is not int for object_id in protected_baseline_ids):
+        raise RuntimeError("3D Text ownership baseline is invalid")
+    compound, horizontal_scale, native_advance, verified_advance = (
+        _build_exact_text3d_compound_shape(
+            source_text=source_text,
+            font_path=font_path,
+            font_size_fc=font_size_fc,
+            depth=depth,
+            target_advance_fc=target_advance_fc,
+        )
+    )
+    host_obj = None
+    try:
+        host_obj = doc.addObject("Part::Feature", "PDF_3D_Text")
+        if host_obj is None:
+            raise RuntimeError("Part::Feature factory returned no host object")
+        if id(host_obj) in protected_baseline_ids:
+            raise RuntimeError("Part::Feature factory returned a pre-existing object")
+        host_obj.Label = "PDF 3D Text"
+        host_obj.Shape = compound
+        host_obj.Placement = placement
+        if callable(configure_host):
+            configure_host(host_obj)
+        shape = getattr(host_obj, "Shape", None)
+        if (
+            str(getattr(host_obj, "TypeId", "") or "") != "Part::Feature"
+            or shape is None
+            or bool(getattr(shape, "isNull", lambda: True)())
+            or _shape_solid_count(shape) <= 0
+            or float(getattr(shape, "Volume", 0.0) or 0.0) <= 0.0
+        ):
+            raise RuntimeError("Part::Feature did not preserve verified solid 3D text")
+        text_group.addObject(host_obj)
+        return (
+            host_obj,
+            float(horizontal_scale),
+            float(native_advance),
+            float(verified_advance),
+        )
+    except Exception:
+        if host_obj is not None:
+            _remove_owned_text_objects(doc, text_group, [host_obj])
+        raise
+
+
 def _create_verified_text3d_entity(
     shape_string,
     *,
@@ -5329,6 +5657,244 @@ def _deliver_text_item_3d(
             },
         )
 
+    depth = max(font_size_fc * 0.12, 0.05)
+    source_color = _span_source_color(span)
+    normalized_font = _normalize_pdf_font_name(source_font)
+    font_digest = str(font_source_result.get("sha256") or "")
+    compound_failure_evidence: Optional[Dict[str, Any]] = None
+    stage = "host_annotation"
+
+    def _configure_item_host(host_obj):
+        nonlocal stage
+        stage = "host_annotation"
+        _annotate_text_host_object(host_obj, source_item_id, "3d_text")
+        stage = "source_color"
+        _persist_text_style_metadata(
+            host_obj,
+            font_name=normalized_font,
+            font_size=font_size_fc,
+            source_color=source_color,
+        )
+        _apply_text_color(host_obj, source_color)
+        stage = "calibration_extrusion"
+
+    # Fast exact path: make all glyph solids in memory and persist the entire
+    # source span as one Part::Feature. This avoids three parametric document
+    # objects and three recomputes per span while retaining the proven
+    # ShapeString/clone/extrusion implementation as an internal same-mode
+    # fallback whenever the baked solid cannot verify.
+    try:
+        creation_started = True
+        stage = "compound_3d_text"
+        (
+            compound_entity,
+            horizontal_scale,
+            native_advance_fc,
+            verified_advance_fc,
+        ) = _create_verified_compound_text3d_entity(
+            doc,
+            source_text=source_text,
+            font_path=font_path,
+            font_size_fc=font_size_fc,
+            depth=depth,
+            target_advance_fc=target_advance_fc,
+            placement=Placement(pos, rot),
+            text_group=text_group,
+            baseline_object_ids=baseline_objects,
+            configure_host=_configure_item_host,
+        )
+        add_owned(compound_entity)
+        collection_error = collect_owned()
+        if collection_error:
+            raise RuntimeError("owned object collection failed: %s" % collection_error)
+        stage = "compound_source_metadata"
+        _persist_text3d_source_metadata(
+            compound_entity,
+            source_text=source_text,
+            font_path=font_path,
+            font_sha256=font_digest,
+            depth=depth,
+            target_advance_fc=target_advance_fc,
+            horizontal_scale=horizontal_scale,
+        )
+
+        color_metadata = _format_color_metadata(source_color)
+        view = getattr(compound_entity, "ViewObject", None)
+        style_verification = "headless_app_metadata"
+        if (
+            str(getattr(compound_entity, "PDFTextFontName", "") or "")
+            != normalized_font
+            or not math.isclose(
+                float(compound_entity.PDFTextFontSize),
+                float(font_size_fc),
+                abs_tol=1e-7,
+            )
+            or str(getattr(compound_entity, "PDFTextJustification", "") or "")
+            != "Left"
+            or str(getattr(compound_entity, "PDFTextColorRGB", "") or "")
+            != color_metadata
+        ):
+            raise RuntimeError("source text style metadata could not be verified")
+        if view is not None:
+            if source_color is not None:
+                rendered_colors = [
+                    getattr(view, prop, None)
+                    for prop in ("TextColor", "ShapeColor", "LineColor", "PointColor")
+                ]
+                if not any(
+                    isinstance(color, (tuple, list))
+                    and len(color) >= 3
+                    and all(
+                        abs(float(color[index]) - float(source_color[index])) <= 1e-6
+                        for index in range(3)
+                    )
+                    for color in rendered_colors
+                ):
+                    raise RuntimeError("source text color could not be verified")
+            style_verification = "gui_view_and_app_metadata"
+
+        stage = "compound_host_verification"
+        created_ids, ids_complete = owned_ids()
+        compound_id = _host_object_id(compound_entity)
+        verified_rotation_deg = _host_text_rotation_deg(compound_entity)
+        verified_anchor_xyz = _host_anchor_xyz(compound_entity)
+        expected_anchor_xyz = (float(pos.x), float(pos.y), float(pos.z))
+        shape = getattr(compound_entity, "Shape", None)
+        solid_count = _shape_solid_count(shape) if shape is not None else 0
+        volume = float(getattr(shape, "Volume", 0.0) or 0.0) if shape is not None else 0.0
+        live_objects = list(getattr(doc, "Objects", []) or [])
+        metadata_verified = bool(
+            getattr(compound_entity, "PDFSourceText", None) == source_text
+            and getattr(compound_entity, "PDFSourceTextSHA256", None)
+            == hashlib.sha256(
+                source_text.encode("utf-8", errors="surrogatepass")
+            ).hexdigest()
+            and getattr(compound_entity, "PDFFontFile", None) == font_path
+            and getattr(compound_entity, "PDFFontFileSHA256", None) == font_digest
+            and getattr(compound_entity, "PDFGeometryEncoding", None)
+            == "exact_glyph_solid_compound_v1"
+            and math.isclose(
+                float(compound_entity.PDFExtrusionDepth),
+                float(depth),
+                abs_tol=1e-9,
+            )
+            and math.isclose(
+                float(compound_entity.PDFTargetAdvance),
+                float(target_advance_fc),
+                abs_tol=1e-9,
+            )
+            and math.isclose(
+                float(compound_entity.PDFHorizontalScale),
+                float(horizontal_scale),
+                abs_tol=1e-9,
+            )
+        )
+        if (
+            not ids_complete
+            or created_ids != [compound_id]
+            or not any(candidate is compound_entity for candidate in live_objects)
+            or getattr(compound_entity, "PDFSourceItemId", None) != source_item_id
+            or getattr(compound_entity, "PDFRepresentation", None) != "3d_text"
+            or str(getattr(compound_entity, "TypeId", "") or "") != "Part::Feature"
+            or shape is None
+            or bool(getattr(shape, "isNull", lambda: True)())
+            or solid_count <= 0
+            or not math.isfinite(volume)
+            or volume <= 0.0
+            or verified_rotation_deg is None
+            or not _rotation_matches(verified_rotation_deg, host_rotation_deg)
+            or verified_anchor_xyz is None
+            or any(
+                abs(verified_anchor_xyz[index] - expected_anchor_xyz[index]) > 1e-7
+                for index in range(3)
+            )
+            or not metadata_verified
+            or not math.isfinite(float(native_advance_fc))
+            or not math.isfinite(float(verified_advance_fc))
+            or abs(float(verified_advance_fc) - target_advance_fc)
+            > max(0.05, target_advance_fc * 0.03)
+        ):
+            raise RuntimeError("compound 3D Text host evidence could not be verified")
+
+        return {
+            "source_item_id": source_item_id,
+            "requested_type": requested_type,
+            "attempted_type": "3d_text",
+            "final_type": "3d_text",
+            "outcome": "verified",
+            "created_entity_ids": created_ids,
+            "delivery_entity_ids": [compound_id],
+            "support_entity_ids": [],
+            "removed_entity_ids": [],
+            "cleanup_complete": True,
+            "evidence": {
+                "implementation": "exact_glyph_solid_compound_v1",
+                "source_text": source_text,
+                "source_text_preserved": True,
+                "source_metadata_editable": True,
+                "source_item_id": source_item_id,
+                "source_item_id_verified": True,
+                "entity_type": "Part::Feature",
+                "host_entity_count": 1,
+                "solid_count": int(solid_count),
+                "volume": volume,
+                "rotation_deg": float(verified_rotation_deg),
+                "verified_anchor_xyz": tuple(verified_anchor_xyz),
+                "target_advance": float(target_advance_fc),
+                "native_advance": float(native_advance_fc),
+                "verified_advance": float(verified_advance_fc),
+                "font_path": font_path,
+                "font_file_sha256": font_digest,
+                "font_source_result": font_source_result,
+                "nominal_height": float(font_size_fc),
+                "horizontal_scale": float(horizontal_scale),
+                "extrusion_depth": float(depth),
+                "source_color": source_color,
+                "color_verified": True,
+                "style_verification": style_verification,
+                "view_style_verified": style_verification
+                == "gui_view_and_app_metadata",
+            },
+        }
+    except Exception as exc:
+        compound_failure_evidence = {
+            "stage": stage,
+            "exception": "%s: %s" % (exc.__class__.__name__, exc),
+        }
+        if owned:
+            collection_error = collect_owned()
+            if collection_error:
+                terminal_failure(
+                    "compound_3d_text_cleanup_failed",
+                    {
+                        "attempted_source_results": source_results,
+                        "font_path": font_path,
+                        "compound_failure": compound_failure_evidence,
+                        "ownership_collection_error": collection_error,
+                    },
+                )
+            removed_ids, cleanup_complete = _remove_owned_text_objects(
+                doc, text_group, owned
+            )
+            if (
+                not cleanup_complete
+                or any(
+                    id(host_obj) not in baseline_objects
+                    for host_obj in list(getattr(doc, "Objects", []) or [])
+                )
+            ):
+                terminal_failure(
+                    "compound_3d_text_cleanup_failed",
+                    {
+                        "attempted_source_results": source_results,
+                        "font_path": font_path,
+                        "compound_failure": compound_failure_evidence,
+                        "removed_entity_ids": removed_ids,
+                    },
+                )
+        owned.clear()
+        creation_started = False
+
     try:
         creation_started = True
         shape_string = _make_shapestring_host(
@@ -5353,27 +5919,6 @@ def _deliver_text_item_3d(
     stage = "placement"
     try:
         shape_string.Placement = Placement(pos, rot)
-        depth = max(font_size_fc * 0.12, 0.05)
-        source_color = _span_source_color(span)
-        normalized_font = _normalize_pdf_font_name(source_font)
-
-        def _configure_item_host(host_obj):
-            # P1 ordering: every custom property write happens BEFORE the host
-            # object's recompute inside _create_verified_text3d_entity, so the
-            # page-end document recompute has nothing left to re-execute.
-            nonlocal stage
-            stage = "host_annotation"
-            _annotate_text_host_object(host_obj, source_item_id, "3d_text")
-            stage = "source_color"
-            _persist_text_style_metadata(
-                host_obj,
-                font_name=normalized_font,
-                font_size=font_size_fc,
-                source_color=source_color,
-            )
-            _apply_text_color(host_obj, source_color)
-            stage = "calibration_extrusion"
-
         stage = "calibration_extrusion"
         (
             extrusion,
@@ -5516,11 +6061,14 @@ def _deliver_text_item_3d(
         "removed_entity_ids": [],
         "cleanup_complete": True,
         "evidence": {
+            "implementation": "parametric_shapestring_fallback_v1",
+            "compound_failure": compound_failure_evidence,
             "source_text": source_text,
             "source_text_preserved": True,
             "source_item_id": source_item_id,
             "source_item_id_verified": True,
             "entity_type": str(getattr(extrusion, "TypeId", "") or ""),
+            "host_entity_count": 3,
             "solid_count": len(solids),
             "volume": volume,
             "rotation_deg": float(verified_rotation_deg),
@@ -7067,24 +7615,35 @@ class _WireStringMemo:
 
 @contextmanager
 def _wirestring_memo_scope(opts: Optional["ImportOptions"] = None):
-    """Install the makeWireString memo for one import run (always restored)."""
+    """Install import-scoped wire and exact-face memos (always restored)."""
+    global _ACTIVE_TEXT3D_OUTLINE_MEMO
     if Part is None or not callable(getattr(Part, "makeWireString", None)):
         yield None
         return
     memo = _WireStringMemo(Part)
+    outline_memo = _Text3DOutlineMemo()
+    prior_outline_memo = _ACTIVE_TEXT3D_OUTLINE_MEMO
+    _ACTIVE_TEXT3D_OUTLINE_MEMO = outline_memo
     memo.install()
     try:
         yield memo
     finally:
         memo.restore()
+        _ACTIVE_TEXT3D_OUTLINE_MEMO = prior_outline_memo
         if opts is not None:
             try:
                 opts.wirestring_cache_stats = {
                     "hits": int(memo.hits),
                     "misses": int(memo.misses),
                 }
+                opts.text3d_outline_cache_stats = {
+                    "hits": int(outline_memo.hits),
+                    "misses": int(outline_memo.misses),
+                    "evictions": int(outline_memo.evictions),
+                }
             except (AttributeError, TypeError):
                 pass
+        outline_memo.clear()
 
 
 def _memoized_wirestrings(func):

@@ -641,6 +641,66 @@ def _merge_page_scale_into_opts(opts: ImportOptions, resolved) -> None:
     opts.scale_hints = hints
 
 
+def _cache_canonical_text_metadata(
+    opts: ImportOptions,
+    items: List[Dict[str, Any]],
+    *,
+    page_num: int,
+    page_w: float,
+    page_h: float,
+):
+    """Reuse already-extracted canonical spans for BOM and scale metadata.
+
+    Pathological Type3 PDFs can spend minutes in each MuPDF text-page pass.
+    The representation pipeline already owns the exact source dictionary, so
+    rereading every page after import is both redundant and user-visible.
+    """
+    from pdfcadcore.generic_classifier import classify_text
+    from pdfcadcore.primitives import NormalizedText, PageData
+    from pdfcadcore.resolved_scale import resolve_page_scale
+
+    bootstrap_items = list(getattr(opts, "_bootstrap_text_items", []) or [])
+    opts._bootstrap_text_items = bootstrap_items
+    bootstrap_preflight_pages = set(
+        getattr(opts, "_bootstrap_preflight_pages", set()) or set()
+    )
+    normalized_items = []
+    for index, item in enumerate(items):
+        text = str(item.get("text", "") or "").strip()
+        if not text:
+            continue
+        if int(page_num) not in bootstrap_preflight_pages:
+            bootstrap_items.append({"text": text, "page": int(page_num)})
+
+        origin = tuple(item.get("origin") or (0.0, 0.0))
+        source_x = float(origin[0]) if len(origin) >= 1 else 0.0
+        source_y = float(origin[1]) if len(origin) >= 2 else 0.0
+        normalized_items.append(
+            NormalizedText(
+                id=index,
+                text=text,
+                normalized=" ".join(text.upper().split()),
+                insertion=(source_x, float(page_h) - source_y),
+                bbox=tuple(item.get("bbox") or ()) or None,
+                page_number=int(page_num),
+            )
+        )
+
+    page_data = PageData(
+        page_number=int(page_num),
+        width=float(page_w),
+        height=float(page_h),
+        text_items=normalized_items,
+    )
+    classify_text(page_data)
+    resolved = resolve_page_scale(page_data)
+    _merge_page_scale_into_opts(opts, resolved)
+    cached_pages = set(getattr(opts, "_scale_cached_pages", set()) or set())
+    cached_pages.add(int(page_num))
+    opts._scale_cached_pages = cached_pages
+    return resolved
+
+
 def _pymupdf_version() -> str:
     return str(getattr(fitz, "__version__", "") or "")
 
@@ -6899,6 +6959,13 @@ def _render_canonical_text_items(
     items = list(
         _iter_text_source_items(source_dict, int(page_num), pdf_sha256, requested)
     )
+    _cache_canonical_text_metadata(
+        opts,
+        items,
+        page_num=int(page_num),
+        page_w=float(page_w),
+        page_h=float(page_h),
+    )
 
     font_stage_complete = False
     svg_render_cache: Dict[str, Any] = {
@@ -7694,6 +7761,23 @@ def import_pdf_page(pdf_path: str, page_num: int = 1,
     return result
 
 
+def _page_visual_inventory(page, import_mode: str):
+    """Read vector/image inventory only when the requested strategy needs it."""
+    if str(import_mode or "").strip().lower() == "raster":
+        return [], 0
+    try:
+        drawings = page.get_drawings()
+    except Exception as exc:
+        _warn(f"get_drawings() failed: {exc}")
+        drawings = []
+    try:
+        image_count = len(page.get_images(full=True))
+    except Exception as exc:
+        _warn(f"get_images() failed: {exc}")
+        image_count = 0
+    return drawings, image_count
+
+
 def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
     """Inner implementation — pdf_doc is guaranteed to be closed by caller."""
     if pdf_doc.is_encrypted:
@@ -7804,18 +7888,11 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         except (AttributeError, RuntimeError):
             pass
 
+    raw_tdict = None
+
     # ── Vector drawings ──
-    try:
-        drawings = page.get_drawings()
-    except Exception as e:
-        _warn(f"get_drawings() failed: {e}")
-        drawings = []
+    drawings, n_images = _page_visual_inventory(page, opts.import_mode)
     n_drawings = len(drawings)
-    try:
-        n_images = len(page.get_images(full=True))
-    except Exception as e:
-        _warn(f"get_images() failed: {e}")
-        n_images = 0
     if opts.verbose:
         _msg(f"PDF page {page_num}: {n_drawings} drawing groups, "
              f"{n_images} embedded images found")
@@ -7827,11 +7904,25 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         # Auto-detect: profile the page content to choose best mode
         _progress_update(2, "Analyzing page content...")
         try:
-            # blocks is far cheaper than dict on text-heavy shop drawings.
-            blocks = page.get_text("blocks") or []
-            n_text_blocks = sum(1 for b in blocks if len(b) >= 7 and b[6] == 0)
+            if opts.import_text and opts.text_mode != "none":
+                # The exact dictionary is required later for representation
+                # delivery. Keep it so a pathological page is interpreted only
+                # once for text instead of once here and again at delivery.
+                raw_tdict = page.get_text("dict") or {}
+                n_text_blocks = sum(
+                    1
+                    for block in raw_tdict.get("blocks", [])
+                    if isinstance(block, dict) and block.get("type") == 0
+                )
+            else:
+                # Blocks remains the lightweight path when no text delivery was
+                # requested.
+                blocks = page.get_text("blocks") or []
+                n_text_blocks = sum(
+                    1 for block in blocks if len(block) >= 7 and block[6] == 0
+                )
         except Exception as e:
-            _warn(f"get_text(blocks) failed during auto-mode: {e}")
+            _warn(f"get_text failed during auto-mode: {e}")
             n_text_blocks = 0
 
         # Build lightweight vector density metrics once so multiple auto rules
@@ -8476,7 +8567,8 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             return top_group, None
         text_group = _make_group(top_group or fc_doc, "Text", fc_doc)
         try:
-            raw_tdict = page.get_text("dict")
+            if raw_tdict is None:
+                raw_tdict = page.get_text("dict")
         except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
             attempt = {
                 "source_item_id": "p%d:page" % int(page_num),
@@ -8794,6 +8886,8 @@ def _reset_import_run_state(opts: ImportOptions) -> None:
     opts._model3d_intent_feasible = False
     opts._model3d_text_evidence = []
     opts._bootstrap_text_items = []
+    opts._bootstrap_preflight_pages = set()
+    opts._scale_cached_pages = set()
     opts._pdf_sha256 = ""
     opts._defer_page_recompute = False
 
@@ -8899,6 +8993,10 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     page_height_scaled = 792 * _unit_scale  # default: US Letter height in points
     page_heights_scaled: Dict[int, float] = {}
     model3d_text_evidence: List[str] = []
+    collect_model3d_text = bool(
+        _normalize_model3d_mode(getattr(opts, "model3d_mode", "off")) != "off"
+        or getattr(opts, "model3d_semantic", False)
+    )
     t_phase = time.perf_counter()
     try:
         from pdfcadcore.fitz_loader import PdfOpenError, safe_open
@@ -8918,33 +9016,47 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                     try:
                         _page_for_meta = pdoc.load_page(p - 1)
                         page_heights_scaled[p] = _page_for_meta.rect.height * _unit_scale
-                        try:
-                            page_text = _page_for_meta.get_text("text") or ""
-                            model3d_text_evidence.append(page_text)
-                            for line in page_text.splitlines():
-                                line = line.strip()
-                                if line:
-                                    opts._bootstrap_text_items.append(
-                                        {"text": line, "page": p}
-                                    )
-                        except (RuntimeError, ValueError, AttributeError):
-                            pass
+                        if collect_model3d_text:
+                            try:
+                                page_text = _page_for_meta.get_text("text") or ""
+                                model3d_text_evidence.append(page_text)
+                                opts._bootstrap_preflight_pages.add(int(p))
+                                for line in page_text.splitlines():
+                                    line = line.strip()
+                                    if line:
+                                        opts._bootstrap_text_items.append(
+                                            {"text": line, "page": p}
+                                        )
+                            except (RuntimeError, ValueError, AttributeError):
+                                pass
                     except (ValueError, RuntimeError):
                         pass
         opts.phase_timings_ms["open_pdf_ms"] = (time.perf_counter() - t_phase) * 1000.0
-        try:
-            from pdfcadcore.model3d_intent import analyze_model3d_intent
+        if collect_model3d_text:
+            try:
+                from pdfcadcore.model3d_intent import analyze_model3d_intent
 
-            intent = analyze_model3d_intent(model3d_text_evidence, host_supports_3d=True)
-            opts._model3d_intent = intent.to_dict()
-            opts._model3d_intent_feasible = bool(intent.feasible)
-            opts._model3d_text_evidence = list(model3d_text_evidence)
-        except (ImportError, RuntimeError, TypeError, ValueError, AttributeError):
+                intent = analyze_model3d_intent(
+                    model3d_text_evidence,
+                    host_supports_3d=True,
+                )
+                opts._model3d_intent = intent.to_dict()
+                opts._model3d_intent_feasible = bool(intent.feasible)
+                opts._model3d_text_evidence = list(model3d_text_evidence)
+            except (ImportError, RuntimeError, TypeError, ValueError, AttributeError):
+                opts._model3d_intent = {
+                    "feasible": False,
+                    "plates": [],
+                    "members": [],
+                    "skipped_reason": "3D intent analysis unavailable",
+                }
+                opts._model3d_intent_feasible = False
+        else:
             opts._model3d_intent = {
                 "feasible": False,
                 "plates": [],
                 "members": [],
-                "skipped_reason": "3D intent analysis unavailable",
+                "skipped_reason": "option_off",
             }
             opts._model3d_intent_feasible = False
     except PdfOpenError as e:
@@ -9097,14 +9209,19 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         from pdfcadcore.fitz_loader import safe_open as _scale_safe_open
         from pdfcadcore.resolved_scale import probe_page_scale
 
-        with _scale_safe_open(pdf_path) as scale_doc:
-            for p in pages:
-                if p < 1 or p > total_pages:
-                    continue
-                _merge_page_scale_into_opts(
-                    opts,
-                    probe_page_scale(scale_doc.load_page(p - 1), p),
-                )
+        uncached_scale_pages = [
+            p
+            for p in pages
+            if 1 <= p <= total_pages
+            and p not in set(getattr(opts, "_scale_cached_pages", set()) or set())
+        ]
+        if uncached_scale_pages:
+            with _scale_safe_open(pdf_path) as scale_doc:
+                for p in uncached_scale_pages:
+                    _merge_page_scale_into_opts(
+                        opts,
+                        probe_page_scale(scale_doc.load_page(p - 1), p),
+                    )
     except ImportError:
         pass
     except (RuntimeError, OSError, ValueError, TypeError) as e:

@@ -1045,3 +1045,103 @@ def test_production_import_rolls_back_every_post_baseline_object_on_page_failure
     assert document.aborted is True
     assert document.committed is False
     assert document.Objects == [existing]
+
+
+def test_model3d_off_skips_document_text_preflight(monkeypatch, tmp_path):
+    from pdfcadcore import fitz_loader
+
+    document = _Document()
+    document.openTransaction = lambda _name: None
+    document.commitTransaction = lambda: None
+    document.abortTransaction = lambda: None
+    text_reads = []
+
+    class Page:
+        rect = SimpleNamespace(height=100.0, width=100.0)
+
+        def get_text(self, kind):
+            text_reads.append(kind)
+            raise AssertionError("disabled 3D mode must not pre-read page text")
+
+    class Pdf:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+        def __len__(self):
+            return 1
+
+        def load_page(self, _index):
+            return Page()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(fitz_loader, "safe_open", lambda _path: Pdf())
+    monkeypatch.setattr(core, "_ensure_doc", lambda: document)
+    monkeypatch.setattr(core, "_pdf_file_sha256", lambda _path: "d" * 64)
+    monkeypatch.setattr(
+        core,
+        "_import_pdf_page_inner",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("synthetic page stop")
+        ),
+    )
+    monkeypatch.setattr(core, "_err", lambda *_args: None)
+    opts = core.ImportOptions(
+        pages=[1],
+        import_text=True,
+        text_mode="text",
+        import_report_path=str(tmp_path / "report.json"),
+    )
+    opts.model3d_mode = "off"
+    opts.model3d_semantic = False
+
+    with pytest.raises(RuntimeError, match="synthetic page stop"):
+        core.import_pdf("fixture.pdf", opts)
+
+    assert text_reads == []
+
+
+def test_canonical_text_items_cache_bootstrap_and_scale_without_page_reread():
+    opts = core.ImportOptions(import_text=True, text_mode="text")
+    opts._bootstrap_text_items = []
+    opts._scale_cached_pages = set()
+    items = [
+        {
+            "text": 'SCALE 1/4" = 1\'-0"',
+            "origin": (80.0, 90.0),
+            "bbox": (80.0, 85.0, 99.0, 95.0),
+        }
+    ]
+
+    resolved = core._cache_canonical_text_metadata(
+        opts,
+        items,
+        page_num=1,
+        page_w=100.0,
+        page_h=100.0,
+    )
+
+    assert opts._bootstrap_text_items == [
+        {"text": 'SCALE 1/4" = 1\'-0"', "page": 1}
+    ]
+    assert opts._scale_cached_pages == {1}
+    assert resolved.factor == pytest.approx(48.0)
+    assert opts.resolved_scale["factor"] == pytest.approx(48.0)
+
+
+def test_explicit_raster_inventory_never_interprets_vector_drawings():
+    class Page:
+        def get_drawings(self):
+            raise AssertionError("explicit raster must not interpret vectors")
+
+        def get_images(self, **_kwargs):
+            raise AssertionError("explicit raster needs only the rendered page")
+
+    drawings, image_count = core._page_visual_inventory(Page(), "raster")
+
+    assert drawings == []
+    assert image_count == 0

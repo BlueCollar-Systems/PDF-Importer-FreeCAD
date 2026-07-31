@@ -30,6 +30,7 @@ R4-2: every unmet precondition skips VISIBLY with the concrete reason.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import shutil
@@ -46,6 +47,7 @@ PAGE_H_PT = 200.0
 IMAGE_RECT_PT = (30.0, 120.0, 130.0, 180.0)  # x0, y0, x1, y1 (PDF, y-down)
 SPAN_AWAY_TEXT = "DEDUPEALPHA"
 SPAN_OVER_TEXT = "OVER"
+DENSE_IMAGE_COUNT = 65
 
 _FREECADCMD_CANDIDATES = (
     os.environ.get("BCS_FREECADCMD", ""),
@@ -131,6 +133,53 @@ def _build_hybrid_fixture(pdf_path: Path, font_file: str) -> None:
                     doc.xref_set_key(fd_xref, "FontName", "/%s" % span_font)
     doc.save(str(pdf_path))
     doc.close()
+
+
+def _build_dense_image_fixture(pdf_path: Path) -> None:
+    """A vector-marked page with enough image instances to require compaction."""
+    import fitz
+
+    pixels = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 12, 8))
+    pixels.clear_with(90)
+    image_bytes = pixels.tobytes("png")
+    doc = fitz.open()
+    page = doc.new_page(width=PAGE_W_PT, height=PAGE_H_PT)
+    for index in range(DENSE_IMAGE_COUNT):
+        column, row = index % 13, index // 13
+        x0 = 8.0 + column * 21.0
+        y0 = 8.0 + row * 24.0
+        page.insert_image(
+            fitz.Rect(x0, y0, x0 + 14.0, y0 + 10.0),
+            stream=image_bytes,
+            keep_proportion=False,
+        )
+    # This line must not appear in the transparent images-only composite.
+    page.draw_line(fitz.Point(5, 190), fitz.Point(295, 190), width=3.0)
+    doc.save(str(pdf_path))
+    doc.close()
+
+
+def _expected_images_only_samples(pdf_path: Path, dpi: int):
+    import fitz
+
+    with fitz.open(str(pdf_path)) as source:
+        images_only = fitz.open()
+        images_only.insert_pdf(source, from_page=0, to_page=0)
+        page = images_only[0]
+        page.add_redact_annot(page.rect)
+        try:
+            page.apply_redactions(
+                images=fitz.PDF_REDACT_IMAGE_NONE,
+                graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED,
+                text=fitz.PDF_REDACT_TEXT_REMOVE,
+            )
+        except TypeError:
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+        pixmap = page.get_pixmap(
+            matrix=fitz.Matrix(dpi / 72.0, dpi / 72.0), alpha=True)
+        result = (pixmap.width, pixmap.height, pixmap.n, bytes(pixmap.samples))
+        images_only.close()
+        return result
 
 
 def _fixture_spans(pdf_path: Path):
@@ -234,6 +283,12 @@ def _planes_of(doc, copy_prefix=None):
             "base": [float(base.x), float(base.y), float(base.z)],
             "source_item_id": str(getattr(obj, "PDFSourceItemId", "") or ""),
             "representation": str(getattr(obj, "PDFRepresentation", "") or ""),
+            "source_sha256": str(getattr(obj, "PDFSourceSHA256", "") or ""),
+            "raster_sha256": str(getattr(obj, "PDFRasterSHA256", "") or ""),
+            "embedded_image_instance_count": int(getattr(
+                obj, "PDFEmbeddedImageInstanceCount", 0) or 0),
+            "embedded_image_manifest_sha256": str(getattr(
+                obj, "PDFEmbeddedImageManifestSHA256", "") or ""),
         })
     return planes
 
@@ -303,6 +358,21 @@ except Exception as exc:
 with open(out_path, "w") as handle:
     json.dump(result, handle)
 """
+
+DENSE_PROBE_SOURCE = PROBE_SOURCE.replace(
+    "import json, os, shutil, sys, traceback",
+    "import hashlib, json, os, shutil, sys, traceback",
+).replace(
+    "    core.import_pdf(pdf_path, opts)",
+    """    page_group = doc.addObject(\"App::DocumentObjectGroup\", \"PDF_Page_1\")
+    opts._pdf_sha256 = hashlib.sha256(open(pdf_path, \"rb\").read()).hexdigest()
+    with core.fitz.open(pdf_path) as source_doc:
+        page = source_doc[0]
+        result[\"direct_image_import_result\"] = int(
+            core._import_embedded_images_as_planes(
+                source_doc, page, 1, float(page.rect.height), opts,
+                core.MM_PER_PT, page_group, doc))""",
+)
 
 
 def test_hybrid_delivers_per_image_planes_without_full_page_underlay(tmp_path):
@@ -459,3 +529,82 @@ def test_hybrid_delivers_per_image_planes_without_full_page_underlay(tmp_path):
     assert reopened[0]["raster_file_exists"], (
         "reopened plane lost its embedded raster asset (PDFRasterFile)"
     )
+
+
+def test_dense_embedded_images_use_one_exact_persistent_transparent_composite(
+    tmp_path,
+):
+    try:
+        import fitz
+    except ImportError:
+        pytest.skip("PyMuPDF (fitz) unavailable in the dev environment")
+    freecadcmd = _find_freecadcmd()
+    if not freecadcmd:
+        pytest.skip("FreeCADCmd.exe not found — dense image delivery not exercised")
+
+    fixture = tmp_path / "dense_images_fixture.pdf"
+    _build_dense_image_fixture(fixture)
+    with fitz.open(str(fixture)) as source:
+        assert len(source[0].get_image_info(xrefs=True)) == DENSE_IMAGE_COUNT
+
+    probe_path = tmp_path / "dense_images_probe.py"
+    probe_path.write_text(
+        DENSE_PROBE_SOURCE % {"repo": str(REPO_ROOT)}, encoding="utf-8"
+    )
+    out_path = tmp_path / "dense_images_result.json"
+    report_path = tmp_path / "dense_images_import_report.json"
+    completed = subprocess.run(
+        [freecadcmd, str(probe_path), str(out_path), str(report_path), str(fixture)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert out_path.is_file(), (
+        "dense probe produced no result (rc=%s)\nstdout: %s\nstderr: %s"
+        % (completed.returncode, completed.stdout[-2000:], completed.stderr[-2000:])
+    )
+    result = json.loads(out_path.read_text(encoding="utf-8"))
+    assert result.get("ok"), "dense probe failed: %s" % result.get("error", "")
+
+    planes = result.get("image_planes") or []
+    assert len(planes) == 1, (
+        "dense page must compact %d source instances into one plane, got %d"
+        % (DENSE_IMAGE_COUNT, len(planes))
+    )
+    plane = planes[0]
+    assert plane["source_item_id"] == "p1:images-composite"
+    assert plane["representation"] == "raster"
+    assert plane["embedded_image_instance_count"] == DENSE_IMAGE_COUNT
+    assert len(plane["embedded_image_manifest_sha256"]) == 64
+    assert len(plane["source_sha256"]) == 64
+    assert len(plane["raster_sha256"]) == 64
+
+    composite_path = Path(plane["pixels_png"] or plane["image_file"])
+    assert composite_path.is_file()
+    assert hashlib.sha256(composite_path.read_bytes()).hexdigest() == plane["raster_sha256"]
+    actual = fitz.Pixmap(str(composite_path))
+    expected_w, expected_h, expected_n, expected_samples = (
+        _expected_images_only_samples(fixture, dpi=300)
+    )
+    assert (actual.width, actual.height, actual.n) == (
+        expected_w,
+        expected_h,
+        expected_n,
+    )
+    assert bytes(actual.samples) == expected_samples
+    assert actual.alpha == 1
+    # Bottom-left pixels intersect only the vector marker in the source PDF;
+    # alpha zero proves vector/text ink was not duplicated into the composite.
+    assert actual.pixel(10, actual.height - 42)[-1] == 0
+
+    assert int(result.get("image_plane_count") or 0) == 1
+    reopened = result.get("reopened_planes") or []
+    assert len(reopened) == 1
+    assert reopened[0]["raster_file_exists"]
+    assert reopened[0]["source_item_id"] == "p1:images-composite"
+    assert reopened[0]["embedded_image_instance_count"] == DENSE_IMAGE_COUNT
+    assert (
+        reopened[0]["embedded_image_manifest_sha256"]
+        == plane["embedded_image_manifest_sha256"]
+    )
+    assert reopened[0]["raster_sha256"] == plane["raster_sha256"]

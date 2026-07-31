@@ -637,37 +637,24 @@ class TestReleaseSafety:
             re.MULTILINE,
         )
 
-    def test_windows_release_never_overwrites_existing_assets(self):
+    def test_atomic_release_never_overwrites_existing_assets(self):
         workflow = (
-            REPO_ROOT / ".github" / "workflows" / "windows-release.yml"
+            REPO_ROOT / ".github" / "workflows" / "auto-release.yml"
         ).read_text(encoding="utf-8")
-        publish_at = workflow.index("- name: Publish GitHub Release assets")
-        publish_block = workflow[publish_at:]
-        assert "uses: softprops/action-gh-release@v2" in publish_block
-        assert re.search(
-            r"^\s+overwrite_files:\s*false\s*$", publish_block, re.MULTILINE
-        )
-
-    def test_windows_release_skips_publish_when_assets_exist(self):
-        # Same-tag dispatch guard: when the release already carries every
-        # asset name this run built, the publish step must be skipped
-        # entirely (R17-1 immutability), not left to the upload action.
-        workflow = (
-            REPO_ROOT / ".github" / "workflows" / "windows-release.yml"
-        ).read_text(encoding="utf-8")
-        guard_at = workflow.index(
-            "- name: Guard against re-uploading existing release assets"
-        )
-        publish_at = workflow.index("- name: Publish GitHub Release assets")
+        guard_at = workflow.index('if gh release view "${VERSION}"')
+        publish_at = workflow.index("gh release create", guard_at)
         assert guard_at < publish_at
-        guard_block = workflow[guard_at:publish_at]
-        assert "id: asset_guard" in guard_block
-        assert "gh release view" in guard_block
-        assert 'skip_upload=$skip" >> "$GITHUB_OUTPUT"' in guard_block
-        publish_block = workflow[publish_at:]
-        assert (
-            "if: steps.asset_guard.outputs.skip_upload != 'true'" in publish_block
-        )
+        assert "gh release upload" not in workflow
+        assert "--clobber" not in workflow
+        assert "softprops/action-gh-release" not in workflow
+
+    def test_atomic_release_publishes_complete_asset_set(self):
+        workflow = (
+            REPO_ROOT / ".github" / "workflows" / "auto-release.yml"
+        ).read_text(encoding="utf-8")
+        assert 'ZIP="FreeCAD-PDF-Importer_v' in workflow
+        assert 'SETUP="dist/FreeCAD-PDF-Importer-Setup_v' in workflow
+        assert '"${ZIP}" "${SETUP}"' in workflow
 
     def test_steel_shapes_release_never_overwrites_existing_assets(self):
         workflow = (

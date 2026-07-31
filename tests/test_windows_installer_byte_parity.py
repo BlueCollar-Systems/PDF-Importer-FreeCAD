@@ -63,19 +63,6 @@ def test_stage_release_rejects_payload_with_wrong_package_version(
         build_windows_installer.stage_release(source_zip)
 
 
-def test_windows_release_downloads_and_stages_the_published_zip():
-    workflow = (
-        Path(build_windows_installer.REPO_ROOT)
-        / ".github"
-        / "workflows"
-        / "windows-release.yml"
-    ).read_text(encoding="utf-8")
-
-    assert 'gh release download "$TAG"' in workflow
-    assert '--pattern "FreeCAD-PDF-Importer_${TAG}.zip"' in workflow
-    assert 'build_windows_installer.py --source-zip "$SOURCE_ZIP"' in workflow
-
-
 def test_auto_release_publishes_zip_and_installer_atomically():
     workflow = (
         Path(build_windows_installer.REPO_ROOT)
@@ -93,3 +80,16 @@ def test_auto_release_publishes_zip_and_installer_atomically():
     assert 'SETUP="dist/FreeCAD-PDF-Importer-Setup_v' in workflow
     assert '"${ZIP}" "${SETUP}"' in workflow
     assert "gh workflow run windows-release.yml" not in workflow
+
+
+def test_obsolete_second_stage_windows_release_workflow_is_removed():
+    workflow = (
+        Path(build_windows_installer.REPO_ROOT)
+        / ".github"
+        / "workflows"
+        / "windows-release.yml"
+    )
+    assert not workflow.exists(), (
+        "Setup.exe is published atomically by auto-release; a second-stage "
+        "publisher is redundant and incompatible with immutable releases"
+    )

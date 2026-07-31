@@ -32,7 +32,6 @@ def test_ci_and_release_gates_install_declared_project_dependencies():
     workflows = (
         ".github/workflows/fc-pdfimporter-ci.yml",
         ".github/workflows/auto-release.yml",
-        ".github/workflows/windows-release.yml",
     )
 
     for relative in workflows:

@@ -752,7 +752,7 @@ def test_completed_inventory_without_exact_observation_is_invalid_not_absence():
         ),
     ],
 )
-def test_normal_return_inventory_gaps_are_recorded_and_terminal_for_exact_span(
+def test_normal_return_inventory_gaps_are_recorded_and_descend_for_exact_span(
     monkeypatch,
     tmp_path,
     rows,
@@ -797,10 +797,93 @@ def test_normal_return_inventory_gaps_are_recorded_and_terminal_for_exact_span(
     )
 
     assert path is None
-    assert len(results) == 1
     assert results[0]["source"] == "embedded_font"
+
+    proven_absence = {
+        "embedded_font_payload_empty",
+        "embedded_font_has_no_unicode_cmap",
+        "embedded_font_format_unsupported",
+    }
+    if expected_reason in proven_absence:
+        assert results[0]["outcome"] == "not_found"
+        assert results[0]["unusable_observation"]["reason"] == expected_reason
+        assert len(results) == 2
+        assert results[1]["source"] == "system_font"
+    else:
+        assert len(results) == 1
+        assert results[0]["outcome"] == "invalid"
+        assert results[0]["reason"] == expected_reason
+
+
+@pytest.mark.parametrize(
+    "exception_text",
+    ["RuntimeError: extraction failed", "OSError: font file unavailable"],
+)
+def test_deterministic_font_reason_with_runtime_exception_remains_invalid(
+    exception_text,
+):
+    opts = core.ImportOptions(text_mode="3d_text")
+    _set_completed_font_session(
+        opts,
+        failures=[
+            {
+                "font": "Siwa-Regular",
+                "outcome": "failed",
+                "reason": "embedded_font_payload_empty",
+                "exception": exception_text,
+            }
+        ],
+    )
+
+    path, results = core._resolve_shapestring_font_path_with_evidence(
+        "Siwa-Regular",
+        opts,
+        pdf_sha256=PDF_SHA_A,
+        page_number=1,
+    )
+
+    assert path is None
+    assert len(results) == 1
     assert results[0]["outcome"] == "invalid"
-    assert results[0]["reason"] == expected_reason
+    assert results[0]["reason"] == "embedded_font_payload_empty"
+    assert results[0]["exception"] == exception_text
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "embedded_font_payload_empty",
+        "embedded_font_has_no_unicode_cmap",
+        "embedded_font_format_unsupported",
+    ],
+)
+def test_proven_exact_embedded_font_absence_descends_without_substitution(reason):
+    opts = core.ImportOptions(text_mode="3d_text")
+    _set_completed_font_session(
+        opts,
+        failures=[
+            {
+                "font": "Siwa-Regular",
+                "outcome": "failed",
+                "reason": reason,
+                "exception": "",
+            }
+        ],
+    )
+
+    path, results = core._resolve_shapestring_font_path_with_evidence(
+        "Siwa-Regular",
+        opts,
+        pdf_sha256=PDF_SHA_A,
+        page_number=1,
+    )
+
+    assert path is None
+    assert results[0]["source"] == "embedded_font"
+    assert results[0]["outcome"] == "not_found"
+    assert results[0]["unusable_observation"]["reason"] == reason
+    assert results[1]["source"] == "system_font"
+    assert results[1]["outcome"] == "not_found"
 
 
 def test_zero_xref_inventory_row_is_explicit_exact_nonembedded_observation(

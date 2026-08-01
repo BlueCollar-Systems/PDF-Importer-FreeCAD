@@ -54,4 +54,27 @@ PDFVectorImporter/temp/
 PDFVectorImporter/src/lib/
 test_all_pdfs.py
 
+# Local source documents and CAD results derived from private QA corpora
+*.PDF
+*.dxf
+*.DXF
+*.dwg
+*.DWG
+*.skp
+*.SKP
+*.FCStd
+*.FCStd1
+*.blend
+*.blend1
+*_import_report*.json
+*_failed_import_report*.json
+*_assets/
+PDFTest*/
+*test-corpus*/
+Imported Evidence/
+**/Imported Evidence/
+
+# Shipped product assets are not private QA derivatives.
+!steel_shapes/**
+
 _LLM_CONTROL_PACK/

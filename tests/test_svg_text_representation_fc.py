@@ -292,6 +292,60 @@ def test_global_assignment_uses_exact_spatial_candidates(monkeypatch):
     assert intersection_calls < 5000
 
 
+def test_global_assignment_expands_thin_tall_source_bounds_before_unmatched():
+    source_id = "p1:b0:l0:s0"
+    manifest = [
+        {
+            "source_order": 0,
+            "source_item_id": source_id,
+            "page_number": 1,
+            "pdf_sha256": "abc",
+            "bbox": (10.0, 10.0, 10.2, 20.0),
+            "text": "1",
+        }
+    ]
+    placed_glyphs = [
+        (
+            0,
+            "thin-shop-glyph",
+            FakeShape(
+                [FakeEdge("thin-shop-glyph")],
+                bounds=(10.25, 14.0, 10.35, 15.0),
+            ),
+        ),
+        (
+            1,
+            "distant-glyph",
+            FakeShape(
+                [FakeEdge("distant-glyph")],
+                bounds=(20.0, 14.0, 20.1, 15.0),
+            ),
+        ),
+    ]
+
+    assignments, _host_bboxes, unmatched = (
+        renderer._build_global_placement_assignments(
+            placed_glyphs,
+            manifest,
+            page_num=1,
+            pdf_sha256="abc",
+            page_rotation_matrix=(1.0, 0.0, 0.0, 1.0, 0.0, 0.0),
+            vb_min_x=0.0,
+            vb_min_y=0.0,
+            vb_w=100.0,
+            vb_h=100.0,
+            page_w=100.0,
+            page_h=100.0,
+            x_unit_to_mm=1.0,
+            y_unit_to_mm=1.0,
+            flip_y=False,
+        )
+    )
+
+    assert assignments[source_id] == [0]
+    assert unmatched == [1]
+
+
 class FakeFeature:
     def __init__(self, name):
         self._name = name

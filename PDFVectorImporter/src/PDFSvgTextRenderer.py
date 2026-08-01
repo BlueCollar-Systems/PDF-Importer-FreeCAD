@@ -588,6 +588,40 @@ def _build_global_placement_assignments(
             )
             candidates.append((score, entry["source_order"], entry["source_item_id"]))
         if not candidates:
+            # Grid cells can miss thin/tall shop glyphs whose centers sit just
+            # outside the source AABB. Expand once by 25% of the larger host
+            # span (min 0.5 mm) before declaring the placement unmatched.
+            for entry in normalized:
+                host_bbox = entry["host_bbox"]
+                span_w = max(host_bbox[2] - host_bbox[0], 0.0)
+                span_h = max(host_bbox[3] - host_bbox[1], 0.0)
+                margin = max(max(span_w, span_h) * 0.25, 0.5)
+                expanded = (
+                    host_bbox[0] - margin,
+                    host_bbox[1] - margin,
+                    host_bbox[2] + margin,
+                    host_bbox[3] + margin,
+                )
+                overlap = _bbox_intersection_area(placed_bbox, expanded)
+                if overlap <= 1e-12:
+                    continue
+                host_x = (host_bbox[0] + host_bbox[2]) / 2.0
+                host_y = (host_bbox[1] + host_bbox[3]) / 2.0
+                host_area = max(span_w * span_h, 1e-12)
+                center_inside = (
+                    expanded[0] <= placed_x <= expanded[2]
+                    and expanded[1] <= placed_y <= expanded[3]
+                )
+                score = (
+                    1 if center_inside else 0,
+                    round(overlap / placed_area, 12),
+                    round(-math.hypot(placed_x - host_x, placed_y - host_y), 12),
+                    round(-host_area, 12),
+                )
+                candidates.append(
+                    (score, entry["source_order"], entry["source_item_id"])
+                )
+        if not candidates:
             unmatched_indices.append(int(placement_index))
             continue
         best_score = max(candidate[0] for candidate in candidates)

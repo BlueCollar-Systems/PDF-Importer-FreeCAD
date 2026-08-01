@@ -1,7 +1,7 @@
 # PDF Vector Importer for FreeCAD
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Version: 4.0.81](https://img.shields.io/badge/Version-4.0.81-green.svg)
+![Version: 4.0.82](https://img.shields.io/badge/Version-4.0.82-green.svg)
 ![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
 
 **Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.**
@@ -11,6 +11,13 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 > **BlueCollar Systems** -- BUILT. NOT BOUGHT.
 
 ---
+
+## Recent fixes (v4.0.82)
+
+- Unique staged-font recovery is restricted to MuPDF's measured 24-character
+  span-name truncation boundary. Longer names remain exact-match only, while a
+  genuine unique truncation resolves through completed font staging before 3D
+  text delivery.
 
 ## Recent fixes (v4.0.81)
 

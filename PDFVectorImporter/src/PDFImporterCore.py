@@ -2313,7 +2313,7 @@ def _unique_truncated_font_key(raw_name, key, candidate_keys):
     * exactly one candidate may extend the key. Zero or several means the
       identity is not proven and the caller keeps its existing behaviour.
     """
-    if len(str(raw_name or "")) < _MUPDF_SPAN_FONT_NAME_LIMIT:
+    if len(str(raw_name or "")) != _MUPDF_SPAN_FONT_NAME_LIMIT:
         return None
     if not key:
         return None

@@ -136,6 +136,45 @@ def test_shared_catalog_non_type3_without_xref_remains_terminal_page_failure():
     assert catalog.failure_for_span("Siwa-Regular").reason == "invalid_page_font_record"
 
 
+def test_truncated_span_font_name_resolves_through_completed_staging(tmp_path):
+    """A unique 24-character MuPDF span name must bind to its staged font."""
+    import hashlib
+    import PDFEmbeddedFonts as staging_fonts
+
+    full_name = "SyntheticExactFontFamily-Regular"
+    truncated_name = full_name[:24]
+    assert len(truncated_name) == 24
+    staged_path = tmp_path / "synthetic-exact-font.ttf"
+    staged_payload = b"generic staged font fixture"
+    staged_path.write_bytes(staged_payload)
+    opts = core.ImportOptions(text_mode="3d_text")
+    staged_key = staging_fonts.normalize_font_key(full_name)
+    _set_completed_font_session(
+        opts,
+        records={
+            staged_key: {
+                "path": str(staged_path),
+                "sha256": hashlib.sha256(staged_payload).hexdigest(),
+                "source": "pdf_embedded",
+                "xref": 17,
+            }
+        },
+    )
+
+    path, results = core._resolve_shapestring_font_path_with_evidence(
+        truncated_name,
+        opts,
+        pdf_sha256=PDF_SHA_A,
+        page_number=1,
+    )
+
+    assert path == str(staged_path)
+    assert len(results) == 1
+    assert results[0]["source"] == "embedded_font"
+    assert results[0]["outcome"] == "found"
+    assert results[0]["staging_complete"] is True
+
+
 def test_truncated_span_font_name_resolves_to_its_one_staged_font():
     """MuPDF truncates a span's font name at 24 chars; the staged font is real.
 
@@ -177,6 +216,15 @@ def test_short_span_font_name_still_requires_an_exact_match():
     candidates = [staging_fonts.normalize_font_key("ArialNarrow")]
 
     assert core._unique_truncated_font_key(short, key, candidates) is None
+
+
+def test_longer_than_mupdf_span_limit_still_requires_an_exact_match():
+    """Only the measured 24-character boundary proves truncation occurred."""
+    raw_name = "X" * (core._MUPDF_SPAN_FONT_NAME_LIMIT + 1)
+    key = staging_fonts.normalize_font_key(raw_name)
+    candidate = staging_fonts.normalize_font_key(raw_name + "-Extended")
+
+    assert core._unique_truncated_font_key(raw_name, key, [candidate]) is None
 
 
 def test_cmap_repair_adds_host_safe_names_to_anonymous_subset_font():

@@ -3,7 +3,7 @@
 **BUILT. NOT BOUGHT.**
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
-![Version: 4.0.80](https://img.shields.io/badge/Version-4.0.80-blue.svg)
+![Version: 4.0.81](https://img.shields.io/badge/Version-4.0.81-blue.svg)
 ![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
 
 Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.
@@ -11,6 +11,14 @@ Import vector geometry, text, and images from PDF files into FreeCAD as editable
 Arc reconstruction, dash mapping, color grouping, OCG layer support, and reference-based scaling -- all powered by pure-Python PDF parsing via PyMuPDF.
 
 > BlueCollar Systems -- BUILT. NOT BOUGHT.
+
+## Recent fixes (v4.0.81)
+
+- Exact staged-font matching now recognizes MuPDF's measured 24-character
+  span-name truncation only when one unique longer staged font proves the
+  identity. Ambiguous and untruncated prefix matches still fail closed, so the
+  fix restores affected Noto symbol text without risking Arial/Arial Narrow or
+  other wrong-font substitutions.
 
 ## Recent fixes (v4.0.80)
 

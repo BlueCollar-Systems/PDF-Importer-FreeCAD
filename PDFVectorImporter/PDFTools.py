@@ -41,6 +41,24 @@ def _err(s):
         print("ERR:", s)
 
 
+def _collect_pdf_files(folder: str, recurse: bool) -> list[str]:
+    """Enumerate real PDF files; a directory named ``*.pdf`` is not input."""
+
+    pdfs = []
+    if recurse:
+        for root, _, files in os.walk(folder):
+            for filename in files:
+                candidate = os.path.join(root, filename)
+                if filename.lower().endswith(".pdf") and os.path.isfile(candidate):
+                    pdfs.append(candidate)
+    else:
+        for filename in os.listdir(folder):
+            candidate = os.path.join(folder, filename)
+            if filename.lower().endswith(".pdf") and os.path.isfile(candidate):
+                pdfs.append(candidate)
+    return sorted(pdfs)
+
+
 def _find_python() -> str:
     """Find the real python.exe — sys.executable may point to freecad.exe."""
     exe = sys.executable
@@ -244,16 +262,7 @@ class BatchImportCommand:
                 QtWidgets.QMessageBox.No)
             == QtWidgets.QMessageBox.Yes)
 
-        pdfs = []
-        if recurse:
-            for root, _, files in os.walk(folder):
-                for f in files:
-                    if f.lower().endswith(".pdf"):
-                        pdfs.append(os.path.join(root, f))
-        else:
-            for f in os.listdir(folder):
-                if f.lower().endswith(".pdf"):
-                    pdfs.append(os.path.join(folder, f))
+        pdfs = _collect_pdf_files(folder, recurse)
 
         if not pdfs:
             _warn("No PDF files found in the selected folder.")

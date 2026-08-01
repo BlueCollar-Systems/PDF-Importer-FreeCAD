@@ -407,16 +407,19 @@ def stage_page_fonts(
         outcome: str,
         reason: str,
         exception: str = "",
+        **details: Any,
     ) -> None:
         if failures is None:
             return
-        failures.append({
+        result = {
             "xref": xref,
             "font": str(font or "").strip(),
             "outcome": outcome,
             "reason": reason,
             "exception": exception,
-        })
+        }
+        result.update(details)
+        failures.append(result)
 
     for row in rows:
         if not isinstance(row, (tuple, list)) or len(row) < 4:
@@ -427,7 +430,32 @@ def stage_page_fonts(
                 reason="embedded_font_inventory_row_invalid",
             )
             continue
+        font_type_hint = str(row[2] or "").strip()
         font_hint = str(row[3] or "").strip()
+        resource_hint = str(row[4] or "").strip() if len(row) > 4 else ""
+        if font_type_hint.lower() == "type3" and row[0] is None:
+            observed_names = []
+            for observed_name in (font_hint, resource_hint):
+                if observed_name and observed_name not in observed_names:
+                    observed_names.append(observed_name)
+            if not observed_names:
+                record_inventory_result(
+                    xref=None,
+                    font="",
+                    outcome="failed",
+                    reason="embedded_font_inventory_row_invalid",
+                )
+                continue
+            for observed_name in observed_names:
+                record_inventory_result(
+                    xref=0,
+                    font=observed_name,
+                    outcome="not_embedded",
+                    reason="embedded_type3_font_program_unavailable",
+                    inventory_xref=None,
+                    font_type=font_type_hint,
+                )
+            continue
         if not font_hint:
             record_inventory_result(
                 xref=None,
@@ -456,7 +484,7 @@ def stage_page_fonts(
         if xref == 0:
             observed_names = [font_hint]
             if len(row) > 4:
-                observed_names.append(str(row[4] or "").strip())
+                observed_names.append(resource_hint)
             seen_names = set()
             for observed_name in observed_names:
                 normalized_name = normalize_font_key(observed_name)

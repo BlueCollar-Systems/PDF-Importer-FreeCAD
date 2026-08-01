@@ -750,6 +750,11 @@ def test_completed_inventory_without_exact_observation_is_invalid_not_absence():
             ("Siwa-Regular", "woff", "TrueType", b"font-payload"),
             "embedded_font_format_unsupported",
         ),
+        (
+            [(None, "", "Type1", "Siwa-Regular", "F1")],
+            None,
+            "embedded_font_inventory_xref_invalid",
+        ),
     ],
 )
 def test_normal_return_inventory_gaps_are_recorded_and_descend_for_exact_span(
@@ -813,6 +818,58 @@ def test_normal_return_inventory_gaps_are_recorded_and_descend_for_exact_span(
         assert len(results) == 1
         assert results[0]["outcome"] == "invalid"
         assert results[0]["reason"] == expected_reason
+
+
+def test_type3_inventory_without_extractable_xref_is_proven_exact_absence(
+    monkeypatch,
+    tmp_path,
+):
+    """A standard Type3 resource has no extractable font program by design."""
+
+    class FakePage:
+        @staticmethod
+        def get_fonts(full=True):
+            assert full is True
+            return [(None, "", "Type3", "", "Type3Resource")]
+
+    class FakePdf:
+        @staticmethod
+        def extract_font(_xref):
+            raise AssertionError("Type3 without an xref must not be extracted")
+
+    monkeypatch.setattr(core, "_shapestring_font_cache_dir", lambda: tmp_path)
+    opts = core.ImportOptions(text_mode="3d_text")
+    staged = core._stage_page_shapestring_fonts(
+        FakePdf(),
+        FakePage(),
+        opts,
+        pdf_sha256=PDF_SHA_A,
+        page_number=1,
+    )
+
+    assert staged == {}
+    failure = opts._shapestring_font_staging_sessions[0]["failures"][0]
+    assert failure["font"] == "Type3Resource"
+    assert failure["outcome"] == "not_embedded"
+    assert failure["reason"] == "embedded_type3_font_program_unavailable"
+    assert failure["xref"] == 0
+    assert failure["inventory_xref"] is None
+    assert failure["font_type"] == "Type3"
+
+    path, results = core._resolve_shapestring_font_path_with_evidence(
+        "Type3Resource",
+        opts,
+        pdf_sha256=PDF_SHA_A,
+        page_number=1,
+    )
+
+    assert path is None
+    assert results[0]["source"] == "embedded_font"
+    assert results[0]["outcome"] == "not_found"
+    assert results[0]["inventory_observation"]["reason"] == (
+        "embedded_type3_font_program_unavailable"
+    )
+    assert results[1]["source"] == "system_font"
 
 
 @pytest.mark.parametrize(

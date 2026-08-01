@@ -24,6 +24,14 @@ import time
 from pathlib import Path
 
 
+def result_exit_code(result: dict, process_returncode: int) -> int:
+    """Preserve child failures and reject any terminal result other than PASS."""
+
+    if process_returncode:
+        return int(process_returncode)
+    return 0 if str(result.get("status") or "").upper() == "PASS" else 1
+
+
 def load_json(path: Optional[str]) -> dict:
     if not path:
         return {}
@@ -51,6 +59,14 @@ def build_payload(args: argparse.Namespace, cfg: dict, result_path: str, config_
         "input_pdf": normalize_path(args.input, config_dir),
         "mode": args.mode,
         "page_range": args.page_range,
+        "page_budget": max(0, int(getattr(args, "page_budget", 0) or 0)),
+        "max_page_complexity_units": max(
+            0, int(getattr(args, "complexity_budget", 0) or 0)
+        ),
+        "resume_checkpoint": normalize_path(
+            getattr(args, "resume_checkpoint", None), config_dir
+        ),
+        "package_sha256": str(getattr(args, "package_sha256", "") or "").strip().lower(),
         "output_dir": normalize_path(args.output_dir, config_dir) if args.output_dir else None,
         "result_json": result_path,
         "mod_dir": normalize_path(freecad_cfg.get("mod_dir"), config_dir),
@@ -97,6 +113,27 @@ def main() -> int:
     parser.add_argument("--notes", help="Optional notes")
     parser.add_argument("--layers-min-populated", type=int, default=0)
     parser.add_argument("--runtime-cap-seconds", type=int, default=0)
+    parser.add_argument(
+        "--page-budget",
+        type=int,
+        default=0,
+        help="Maximum pages in this QA cell; 0 keeps the explicit selection unbounded.",
+    )
+    parser.add_argument(
+        "--complexity-budget",
+        type=int,
+        default=0,
+        help="Fail before host-object creation above this page work-unit limit; 0 disables.",
+    )
+    parser.add_argument(
+        "--resume-checkpoint",
+        help="Persistent page-cell checkpoint JSON used to select the next unfinished pages.",
+    )
+    parser.add_argument(
+        "--package-sha256",
+        default="",
+        help="SHA-256 of the published package when acceptance tests packaged bytes.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Do not launch FreeCAD; emit a starter result only.")
     args = parser.parse_args()
 
@@ -152,8 +189,9 @@ def main() -> int:
         if os.path.isfile(result_path):
             try:
                 with open(result_path, "r", encoding="utf-8") as f:
-                    print(json.dumps(json.load(f), indent=2))
-                    return 0 if returncode == 0 else returncode
+                    result = json.load(f)
+                print(json.dumps(result, indent=2))
+                return result_exit_code(result, returncode)
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 pass
 

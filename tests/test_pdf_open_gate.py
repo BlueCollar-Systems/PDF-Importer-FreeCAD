@@ -5,8 +5,11 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
-from pdfcadcore.fitz_loader import PdfOpenError, safe_open
+from PDFVectorImporter.pdfcadcore import fitz_loader
+from PDFVectorImporter.pdfcadcore.fitz_loader import PdfOpenError, safe_open
 
 
 class TestPdfOpenGate(unittest.TestCase):
@@ -26,8 +29,8 @@ class TestPdfOpenGate(unittest.TestCase):
                 safe_open(str(path))
             self.assertIn(ctx.exception.reason, {"not_a_pdf", "corrupt", "empty_file"})
 
-    def test_em_dash_filename_opens_via_stream(self) -> None:
-        """Windows shop PDFs often use U+2014 in the filename; MuPDF path open can fail."""
+    def test_em_dash_filename_opens_via_normal_path_delegation(self) -> None:
+        """Modern PyMuPDF accepts Unicode paths without copying the whole PDF."""
         minimal_pdf = (
             b"%PDF-1.1\n"
             b"1 0 obj<< /Type /Catalog /Pages 2 0 R >>endobj\n"
@@ -45,6 +48,38 @@ class TestPdfOpenGate(unittest.TestCase):
                 self.assertGreaterEqual(int(doc.page_count), 1)
             finally:
                 doc.close()
+
+    def test_safe_open_reads_only_the_header_before_path_delegation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fc_open_gate_") as tmp:
+            path = Path(tmp) / "large—drawing.pdf"
+            path.write_bytes(b"%PDF-1.7\nsynthetic")
+
+            class HeaderOnly:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return None
+
+                @staticmethod
+                def read(size=-1):
+                    if size != 1024:
+                        raise AssertionError("safe_open must not read the whole PDF")
+                    return b"%PDF-1.7\n"
+
+            document = SimpleNamespace(
+                needs_pass=False,
+                is_encrypted=False,
+                page_count=1,
+            )
+            fitz = SimpleNamespace(open=Mock(return_value=document))
+            with (
+                patch("builtins.open", return_value=HeaderOnly()),
+                patch.object(fitz_loader, "import_fitz", return_value=fitz),
+            ):
+                self.assertIs(fitz_loader.safe_open(str(path)), document)
+
+            fitz.open.assert_called_once_with(str(path))
 
 
 if __name__ == "__main__":

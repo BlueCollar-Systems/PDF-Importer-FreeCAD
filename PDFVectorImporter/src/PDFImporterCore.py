@@ -127,6 +127,60 @@ def _is_heavy_vector_page(drawings, threshold: int) -> bool:
     )
 
 
+class ImportComplexityBudgetExceeded(RuntimeError):
+    """Raised before host-object creation when a page exceeds an explicit budget."""
+
+
+def _page_complexity_profile(drawings, image_count: int, raw_text_dict) -> Dict[str, int]:
+    """Return transparent work units for an opt-in dense-page safety gate."""
+
+    text_characters = 0
+    inline_images = 0
+    blocks = raw_text_dict.get("blocks", ()) if isinstance(raw_text_dict, dict) else ()
+    for block in blocks or ():
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == 1:
+            inline_images += 1
+            continue
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", ()) or ():
+            if not isinstance(line, dict):
+                continue
+            for span in line.get("spans", ()) or ():
+                if isinstance(span, dict):
+                    text_characters += len(str(span.get("text") or ""))
+    drawing_operations = _drawing_work_item_count(drawings)
+    image_instances = max(int(image_count or 0), inline_images)
+    return {
+        "drawing_operations": drawing_operations,
+        "text_characters": text_characters,
+        "image_instances": image_instances,
+        "total_units": drawing_operations + text_characters + image_instances,
+    }
+
+
+def _enforce_page_complexity_budget(
+    page_number: int,
+    profile: Dict[str, int],
+    limit: int,
+) -> None:
+    """Fail closed only when the caller explicitly configured a positive limit."""
+
+    try:
+        budget = int(limit)
+    except (TypeError, ValueError):
+        budget = 0
+    units = int((profile or {}).get("total_units", 0) or 0)
+    if budget > 0 and units > budget:
+        raise ImportComplexityBudgetExceeded(
+            f"PDF page {int(page_number)} complexity is {units} units, above the "
+            f"configured limit of {budget}; import that page separately or raise "
+            "max_page_complexity_units explicitly"
+        )
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Logging
 # ──────────────────────────────────────────────────────────────────────
@@ -521,6 +575,10 @@ class ImportOptions:
     heavy_page_threshold: int = 3000        # above this: larger batches, throttled
     #   progress updates, deferred arc fitting on polyline runs
     #   0 = never auto-engage heavy mode
+    # Optional fail-closed preflight limit. Units are reported transparently as
+    # drawing operations + text characters + image instances. Zero preserves
+    # the normal interactive importer behavior.
+    max_page_complexity_units: int = 0
     # Multi-page page placement:
     #   spread  - 20% page gap (default)
     #   compact - configurable smaller gap
@@ -881,6 +939,14 @@ def write_import_report(
         extra["resolved_scale"] = resolved_scale
     if scale_hints:
         extra["scale_hints"] = scale_hints
+    complexity_profiles = list(
+        getattr(opts, "_page_complexity_profiles", []) or []
+    )
+    if complexity_profiles:
+        extra["page_complexity_profiles"] = complexity_profiles
+        extra["max_page_complexity_units"] = int(
+            getattr(opts, "max_page_complexity_units", 0) or 0
+        )
 
     report = build_import_report(
         host_app="freecad",
@@ -2596,12 +2662,21 @@ def _resolve_shapestring_font_path_with_evidence(
                 )]
             failed_key = _canonical_font_identity(failed_name)["normalized_key"]
             if failure.get("outcome") == "not_embedded":
-                if (
-                    failure.get("reason") != "embedded_font_not_present"
-                    or type(failure.get("xref")) is not int
-                    or failure.get("xref") != 0
-                    or str(failure.get("exception") or "")
-                ):
+                ordinary_absence = bool(
+                    failure.get("reason") == "embedded_font_not_present"
+                    and type(failure.get("xref")) is int
+                    and failure.get("xref") == 0
+                    and not str(failure.get("exception") or "")
+                )
+                type3_absence = bool(
+                    failure.get("reason") == "embedded_type3_font_program_unavailable"
+                    and type(failure.get("xref")) is int
+                    and failure.get("xref") == 0
+                    and failure.get("inventory_xref") is None
+                    and str(failure.get("font_type") or "").strip().lower() == "type3"
+                    and not str(failure.get("exception") or "")
+                )
+                if not (ordinary_absence or type3_absence):
                     return None, [source_result(
                         "embedded_font",
                         "invalid",
@@ -8187,49 +8262,6 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
     scale = (MM_PER_PT if opts.scale_to_mm else 1.0) * opts.user_scale
     page_area_units = max(abs(page_w * scale * page_h * scale), 1e-9)
 
-    # Top-level group
-    top_group = None
-    if opts.create_top_group:
-        top_group = fc_doc.addObject(
-            "App::DocumentObjectGroup", f"PDF_Page_{page_num}")
-
-    # ── Layer / color grouping ──
-    use_ocg = False
-    if opts.layer_mode in ("auto", "ocg"):
-        try:
-            ocgs = pdf_doc.get_ocgs()
-            use_ocg = bool(ocgs)
-        except (RuntimeError, AttributeError, ValueError):
-            use_ocg = False
-
-    group_by_color = False
-    if opts.layer_mode == "color":
-        group_by_color = True
-    elif opts.layer_mode == "none":
-        group_by_color = False
-    elif opts.layer_mode == "ocg":
-        group_by_color = False
-    else:  # auto
-        group_by_color = opts.group_by_color and not use_ocg
-
-    color_groups: Dict[Tuple[float, float, float], object] = {}
-    layer_groups: Dict[str, object] = {}
-
-    def _parent_for(stroke_rgb, layer_name):
-        parent = top_group or fc_doc
-        if use_ocg and layer_name:
-            if layer_name not in layer_groups:
-                layer_groups[layer_name] = _make_group(parent, f"Layer_{layer_name}", fc_doc)
-            return layer_groups[layer_name]
-        if group_by_color and stroke_rgb is not None:
-            key = stroke_rgb
-            if key not in color_groups:
-                r, g, b = key
-                label = f"Color_{int(r*255):02X}{int(g*255):02X}{int(b*255):02X}"
-                color_groups[key] = _make_group(parent, label, fc_doc)
-            return color_groups[key]
-        return parent
-
     # ── Progress dialog (created early to cover all phases) ──
     _import_start = time.time()
     progress = None
@@ -8283,6 +8315,64 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         _msg(f"PDF page {page_num}: {n_drawings} drawing groups, "
              f"{n_images} embedded images found")
 
+    complexity_limit = int(getattr(opts, "max_page_complexity_units", 0) or 0)
+    if complexity_limit > 0:
+        if opts.import_text and opts.text_mode != "none":
+            _progress_update(1, "Estimating page complexity...")
+            try:
+                raw_tdict = page.get_text("dict") or {}
+            except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
+                raise ImportComplexityBudgetExceeded(
+                    f"PDF page {int(page_num)} complexity could not be bounded: {exc}"
+                ) from exc
+        complexity_profile = _page_complexity_profile(drawings, n_images, raw_tdict)
+        complexity_profile["page_number"] = int(page_num)
+        opts._page_complexity_profiles.append(complexity_profile)
+        _enforce_page_complexity_budget(page_num, complexity_profile, complexity_limit)
+
+    # Create host objects only after the explicit complexity gate passes.
+    top_group = None
+    if opts.create_top_group:
+        top_group = fc_doc.addObject(
+            "App::DocumentObjectGroup", f"PDF_Page_{page_num}")
+
+    # ── Layer / color grouping ──
+    use_ocg = False
+    if opts.layer_mode in ("auto", "ocg"):
+        try:
+            ocgs = pdf_doc.get_ocgs()
+            use_ocg = bool(ocgs)
+        except (RuntimeError, AttributeError, ValueError):
+            use_ocg = False
+
+    group_by_color = False
+    if opts.layer_mode == "color":
+        group_by_color = True
+    elif opts.layer_mode == "none":
+        group_by_color = False
+    elif opts.layer_mode == "ocg":
+        group_by_color = False
+    else:  # auto
+        group_by_color = opts.group_by_color and not use_ocg
+
+    color_groups: Dict[Tuple[float, float, float], object] = {}
+    layer_groups: Dict[str, object] = {}
+
+    def _parent_for(stroke_rgb, layer_name):
+        parent = top_group or fc_doc
+        if use_ocg and layer_name:
+            if layer_name not in layer_groups:
+                layer_groups[layer_name] = _make_group(parent, f"Layer_{layer_name}", fc_doc)
+            return layer_groups[layer_name]
+        if group_by_color and stroke_rgb is not None:
+            key = stroke_rgb
+            if key not in color_groups:
+                r, g, b = key
+                label = f"Color_{int(r*255):02X}{int(g*255):02X}{int(b*255):02X}"
+                color_groups[key] = _make_group(parent, label, fc_doc)
+            return color_groups[key]
+        return parent
+
     # ── Determine effective import mode ──
     effective_mode = opts.import_mode
     n_text_blocks = 0
@@ -8294,7 +8384,8 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 # The exact dictionary is required later for representation
                 # delivery. Keep it so a pathological page is interpreted only
                 # once for text instead of once here and again at delivery.
-                raw_tdict = page.get_text("dict") or {}
+                if raw_tdict is None:
+                    raw_tdict = page.get_text("dict") or {}
                 n_text_blocks = sum(
                     1
                     for block in raw_tdict.get("blocks", [])
@@ -9278,6 +9369,7 @@ def _reset_import_run_state(opts: ImportOptions) -> None:
     opts._pdf_sha256 = ""
     opts._defer_page_recompute = False
     opts._native_text_object_index = None
+    opts._page_complexity_profiles = []
 
 
 def _recompute_page_if_needed(fc_doc, opts: ImportOptions) -> bool:

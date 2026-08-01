@@ -58,6 +58,54 @@ def test_shared_catalog_type3_without_xref_is_item_scoped_impossibility():
     assert catalog.failure_for_span("OtherFont").reason == "no_exact_embedded_font_match"
 
 
+def test_shared_catalog_type3_with_xref_is_item_scoped_impossibility():
+    """Real Type3 fonts DO carry an xref; only the font PROGRAM is absent.
+
+    Measured on the owner's corpus: every Type3 row on
+    `Alvord TX - Garden Plan . Final_OCR.pdf` has an xref (32, 33, 42, ...), an
+    empty BaseFont name, and only a resource name. Gating the Type3 branch on
+    `xref is None` recorded all of them as `embedded_font_inventory_row_invalid`
+    -- reported as corrupt data -- and aborted the entire import. 4 of 60 corpus
+    PDFs are affected, up to 56 of 88 fonts on a single page.
+
+    PyMuPDF also names such a span "Type3 (<xref> 0 R)", which is the name that
+    arrives on the text item, so that alias must be observed too or the span
+    never matches any recorded observation.
+    """
+
+    class Document:
+        @staticmethod
+        def extract_font(_xref):
+            raise AssertionError("a Type3 font has no extractable program")
+
+    class Page:
+        parent = Document()
+
+        @staticmethod
+        def get_texttrace():
+            return []
+
+        @staticmethod
+        def get_fonts(*, full=False):
+            assert full is True
+            return [(21, "n/a", "Type3", "", "R47", "")]
+
+    catalog = embedded_fonts.EmbeddedFontCatalog.from_page(Page(), page_number=34)
+
+    assert catalog.assets == ()
+    # Reachable by the synthetic span name PyMuPDF reports...
+    synthetic = catalog.failure_for_span("Type3 (21 0 R)")
+    assert synthetic.reason == "embedded_type3_font_program_unavailable"
+    assert synthetic.proof_category == "source_specific_impossibility"
+    # ...and by the resource name carried on the inventory row.
+    assert (
+        catalog.failure_for_span("R47").reason
+        == "embedded_type3_font_program_unavailable"
+    )
+    # An unrelated font must still be an ordinary miss, not a Type3 claim.
+    assert catalog.failure_for_span("Arial").reason == "no_exact_embedded_font_match"
+
+
 def test_shared_catalog_non_type3_without_xref_remains_terminal_page_failure():
     class Document:
         @staticmethod

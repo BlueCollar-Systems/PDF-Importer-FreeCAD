@@ -24,7 +24,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Ensure bundled PyMuPDF is importable (skip namespace-only stubs in lib/)
 _lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
@@ -129,6 +129,10 @@ def _is_heavy_vector_page(drawings, threshold: int) -> bool:
 
 class ImportComplexityBudgetExceeded(RuntimeError):
     """Raised before host-object creation when a page exceeds an explicit budget."""
+
+
+class ImportCancelled(RuntimeError):
+    """Raised when the interactive caller cancels the active page."""
 
 
 def _page_complexity_profile(drawings, image_count: int, raw_text_dict) -> Dict[str, int]:
@@ -615,6 +619,42 @@ class ImportOptions:
     resolved_scale: Optional[Dict[str, Any]] = None
     scale_hints: Dict[str, Any] = field(default_factory=dict)
     phase_timings_ms: Dict[str, float] = field(default_factory=dict)
+    # Runtime-only transport controls. They are deliberately excluded from the
+    # persistent session's model-content identity.
+    progress_callback: Optional[Callable[[Dict[str, Any]], object]] = field(
+        default=None, repr=False, compare=False
+    )
+    resume_session_name: Optional[str] = None
+    import_status: str = "not_started"
+    work_plan: Optional[Dict[str, Any]] = None
+
+
+def _emit_progress(
+    opts: ImportOptions,
+    *,
+    page_number: int,
+    stage: str,
+    label: str,
+    page_percent: int,
+    completed_units: int,
+    total_units: int,
+) -> Dict[str, Any]:
+    """Publish one UI-neutral progress event and raise on explicit cancellation."""
+    event = {
+        "schema": "bcs.freecad_import_progress/1.0",
+        "page_number": int(page_number),
+        "page_index": int(getattr(opts, "_active_page_index", 0) or 0),
+        "total_pages": int(getattr(opts, "_active_page_total", 0) or 0),
+        "stage": str(stage),
+        "label": str(label),
+        "page_percent": max(0, min(100, int(page_percent))),
+        "completed_units": max(0, int(completed_units)),
+        "total_units": max(0, int(total_units)),
+    }
+    callback = getattr(opts, "progress_callback", None)
+    if callback is not None and callback(event) is False:
+        raise ImportCancelled("PDF import cancelled by user")
+    return event
 
 
 def _default_import_report_path(pdf_path: str) -> str:
@@ -7348,7 +7388,24 @@ def _render_canonical_text_items(
         "geometry": "raw_geometry_edges",
         "raster": "raster_text_patch",
     }
-    for item in items:
+    text_characters_done = 0
+    profile = getattr(opts, "_active_page_profile", {}) or {}
+    drawing_units = int(profile.get("drawing_operations", 0) or 0)
+    total_units = int(profile.get("total_units", 0) or 0)
+    for item_index, item in enumerate(items):
+        if getattr(opts, "progress_callback", None) and item_index % 25 == 0:
+            _emit_progress(
+                opts,
+                page_number=int(page_num),
+                stage="text",
+                label=f"Importing text {item_index}/{len(items)}",
+                page_percent=86 + int(8 * item_index / max(len(items), 1)),
+                completed_units=min(
+                    total_units,
+                    drawing_units + text_characters_done,
+                ),
+                total_units=total_units,
+            )
         result = _run_text_item_fallback_ladder(item, requested, deliverers, opts)
         results.append(result)
         source_item_id = str(result["source_item_id"])
@@ -7369,6 +7426,21 @@ def _render_canonical_text_items(
             list(result.get("created_entity_ids") or [])
         )
         _record_text_delivery(opts, bucket_by_type[final_type], created_count)
+        text_characters_done += len(str(item.get("text") or ""))
+
+    if items and getattr(opts, "progress_callback", None):
+        _emit_progress(
+            opts,
+            page_number=int(page_num),
+            stage="text",
+            label=f"Importing text {len(items)}/{len(items)}",
+            page_percent=94,
+            completed_units=min(
+                total_units,
+                drawing_units + text_characters_done,
+            ),
+            total_units=total_units,
+        )
 
     unique_final_types = sorted(set(final_types))
     return {
@@ -7757,6 +7829,21 @@ def _import_embedded_images_as_planes(pdf_doc, page, page_num: int,
             len(instances) > DENSE_EMBEDDED_IMAGE_INSTANCE_THRESHOLD
             and not patches_include_page_ink
         ):
+            profile = getattr(opts, "_active_page_profile", {}) or {}
+            _emit_progress(
+                opts,
+                page_number=int(page_num),
+                stage="images",
+                label=(
+                    f"Rendering {len(instances)} embedded images as one composite"
+                ),
+                page_percent=94,
+                completed_units=(
+                    int(profile.get("drawing_operations", 0) or 0)
+                    + int(profile.get("text_characters", 0) or 0)
+                ),
+                total_units=int(profile.get("total_units", 0) or 0),
+            )
             ip = None
             try:
                 dpi = _adaptive_patch_dpi(page, opts, page.rect)
@@ -7915,6 +8002,23 @@ def _import_embedded_images_as_planes(pdf_doc, page, page_num: int,
 
         placed = 0
         for idx, (rect, xref, _image_digest) in enumerate(instances, start=1):
+            profile = getattr(opts, "_active_page_profile", {}) or {}
+            total_units = int(profile.get("total_units", 0) or 0)
+            _emit_progress(
+                opts,
+                page_number=int(page_num),
+                stage="images",
+                label=f"Importing embedded image {idx}/{len(instances)}",
+                page_percent=94 + int(2 * (idx - 1) / max(len(instances), 1)),
+                completed_units=min(
+                    total_units,
+                    int(profile.get("drawing_operations", 0) or 0)
+                    + int(profile.get("text_characters", 0) or 0)
+                    + idx
+                    - 1,
+                ),
+                total_units=total_units,
+            )
             ip = None
             try:
                 dpi = _adaptive_patch_dpi(page, opts, rect)
@@ -8283,7 +8387,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         except ImportError:
             QtWidgets = None
 
-    if FreeCAD.GuiUp and QtWidgets:
+    if FreeCAD.GuiUp and QtWidgets and getattr(opts, "progress_callback", None) is None:
         try:
             progress = QtWidgets.QProgressDialog(
                 f"Importing PDF page {page_num}...", "Cancel", 0, 100)
@@ -8295,30 +8399,46 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             progress = None
 
     def _progress_check_cancel():
-        """Check if user cancelled; closes dialog and returns True if cancelled."""
+        """Raise a truthful cancellation signal from the legacy page dialog."""
         if progress and progress.wasCanceled():
             _warn("Import cancelled by user")
             progress.close()
-            return True
+            raise ImportCancelled("PDF import cancelled by user")
         return False
 
-    def _progress_update(value, label):
-        """Update progress dialog value and label, process events."""
-        if not progress:
-            return
+    def _progress_update(value, label, stage="page", completed_units=None):
+        """Update the legacy dialog and the UI-neutral progress transport."""
         elapsed = time.time() - _import_start
-        progress.setValue(value)
-        progress.setLabelText(f"{label}  [{elapsed:.1f}s]")
-        try:
-            QtWidgets.QApplication.processEvents()
-        except (AttributeError, RuntimeError):
-            pass
+        profile = getattr(opts, "_active_page_profile", {}) or {}
+        total_units = int(profile.get("total_units", 0) or 0)
+        if completed_units is None:
+            completed_units = int(total_units * max(0, min(100, int(value))) / 100)
+        _emit_progress(
+            opts,
+            page_number=int(page_num),
+            stage=stage,
+            label=label,
+            page_percent=int(value),
+            completed_units=int(completed_units),
+            total_units=total_units,
+        )
+        if progress:
+            progress.setValue(value)
+            progress.setLabelText(f"{label}  [{elapsed:.1f}s]")
+            try:
+                QtWidgets.QApplication.processEvents()
+            except (AttributeError, RuntimeError):
+                pass
+            _progress_check_cancel()
 
     raw_tdict = None
 
     # ── Vector drawings ──
     drawings, n_images = _page_visual_inventory(page, opts.import_mode)
     n_drawings = len(drawings)
+    if not getattr(opts, "_active_page_profile", None):
+        opts._active_page_profile = _page_complexity_profile(drawings, n_images, None)
+        opts._active_page_profile["page_number"] = int(page_num)
     if opts.verbose:
         _msg(f"PDF page {page_num}: {n_drawings} drawing groups, "
              f"{n_images} embedded images found")
@@ -8326,7 +8446,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
     complexity_limit = int(getattr(opts, "max_page_complexity_units", 0) or 0)
     if complexity_limit > 0:
         if opts.import_text and opts.text_mode != "none":
-            _progress_update(1, "Estimating page complexity...")
+            _progress_update(1, "Estimating page complexity...", "planning")
             try:
                 raw_tdict = page.get_text("dict") or {}
             except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
@@ -8386,7 +8506,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
     n_text_blocks = 0
     if effective_mode == "auto":
         # Auto-detect: profile the page content to choose best mode
-        _progress_update(2, "Analyzing page content...")
+        _progress_update(2, "Analyzing page content...", "analysis")
         try:
             if opts.import_text and opts.text_mode != "none":
                 # The exact dictionary is required later for representation
@@ -8725,25 +8845,19 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
     #         90-95 = batching/cleanup, 96-100 = final placement.
     if progress:
         progress.setMaximum(100)
-    _progress_update(10, f"Processing geometry... 0/{n_drawings}")
+    _progress_update(10, f"Processing geometry... 0/{n_drawings}", "geometry")
 
     for pg_idx, path_group in enumerate(drawings):
         # Throttled progress updates — every 500 on heavy pages, 100 otherwise.
         # Each processEvents() call allocates Qt timers; doing it 19k× is
         # what exhausts Windows GDI handles.
-        if progress and pg_idx % _progress_interval == 0:
+        if (progress or getattr(opts, "progress_callback", None)) and pg_idx % _progress_interval == 0:
             geo_pct = 10 + int(69 * pg_idx / max(n_drawings, 1))
             _progress_update(
                 geo_pct,
-                f"Processing geometry... {pg_idx}/{n_drawings}")
-            if progress.wasCanceled():
-                _warn("Import cancelled by user")
-                # Flush any pending batches before returning
-                if _batch_size:
-                    _flush_batch(force=True)
-                progress.close()
-                _recompute_page_if_needed(fc_doc, opts)
-                return top_group, None
+                f"Processing geometry... {pg_idx}/{n_drawings}",
+                "geometry",
+            )
 
         items = path_group.get("items", [])
         if not items:
@@ -9023,7 +9137,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         total_pending = sum(len(v) for v in _batch_shapes.values())
         n_style_keys = len([k for k, v in _batch_shapes.items() if v])
         if total_pending > 0:
-            _progress_update(80, f"Building compound 1/{n_style_keys}...")
+            _progress_update(80, f"Building compound 1/{n_style_keys}...", "geometry")
         _flush_idx = 0
         for _fk in list(_batch_shapes.keys()):
             if _batch_shapes.get(_fk):
@@ -9031,7 +9145,9 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 if n_style_keys > 1:
                     _progress_update(
                         80 + int(5 * _flush_idx / max(n_style_keys, 1)),
-                        f"Building compound {_flush_idx}/{n_style_keys}...")
+                        f"Building compound {_flush_idx}/{n_style_keys}...",
+                        "geometry",
+                    )
                 if _progress_check_cancel():
                     _recompute_page_if_needed(fc_doc, opts)
                     return top_group, None
@@ -9045,7 +9161,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
 
     # ── Text import ──
     if opts.import_text and opts.text_mode != "none":
-        _progress_update(86, "Importing text...")
+        _progress_update(86, "Importing text...", "text")
 
         if _progress_check_cancel():
             _recompute_page_if_needed(fc_doc, opts)
@@ -9288,6 +9404,8 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             obj_count += _import_embedded_images_as_planes(
                 pdf_doc, page, page_num, page_h, opts, scale,
                 top_group or fc_doc, fc_doc)
+        except ImportCancelled:
+            raise
         except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as e:
             _warn(f"Image import failed: {e}")
 
@@ -9378,6 +9496,10 @@ def _reset_import_run_state(opts: ImportOptions) -> None:
     opts._defer_page_recompute = False
     opts._native_text_object_index = None
     opts._page_complexity_profiles = []
+    opts._active_page_index = 0
+    opts._active_page_total = 0
+    opts._active_page_profile = None
+    opts.import_status = "running"
 
 
 def _recompute_page_if_needed(fc_doc, opts: ImportOptions) -> bool:
@@ -9625,6 +9747,120 @@ def _remove_post_baseline_document_objects(
     }
 
 
+def estimate_import_work(pdf_path: str, opts: Optional[ImportOptions] = None) -> Dict[str, Any]:
+    """Inspect selected pages and return transparent, content-derived work units."""
+    from PDFImportSession import build_work_plan
+    from pdfcadcore.fitz_loader import safe_open
+
+    if opts is None:
+        opts = ImportOptions(ignore_images=not IMAGE_WB)
+    profiles: List[Dict[str, int]] = []
+    with safe_open(pdf_path) as pdf_doc:
+        total_pages = len(pdf_doc)
+        pages = opts.pages or list(range(1, total_pages + 1))
+        selected_pages = [
+            int(page_number)
+            for page_number in pages
+            if 1 <= int(page_number) <= total_pages
+        ]
+        for page_index, page_number in enumerate(selected_pages, start=1):
+            opts._active_page_index = page_index
+            opts._active_page_total = len(selected_pages)
+            _emit_progress(
+                opts,
+                page_number=page_number,
+                stage="planning",
+                label=(
+                    f"Analyzing page {page_number} "
+                    f"({page_index} of {len(selected_pages)})"
+                ),
+                page_percent=0,
+                completed_units=0,
+                total_units=0,
+            )
+            page = pdf_doc.load_page(page_number - 1)
+            drawings, image_count = _page_visual_inventory(page, opts.import_mode)
+            raw_text_dict = None
+            if opts.import_text and opts.text_mode != "none":
+                raw_text_dict = page.get_text("dict") or {}
+            profile = _page_complexity_profile(drawings, image_count, raw_text_dict)
+            profile["page_number"] = int(page_number)
+            profiles.append(profile)
+            _emit_progress(
+                opts,
+                page_number=page_number,
+                stage="planning",
+                label=(
+                    f"Analyzed page {page_number}: "
+                    f"{profile['total_units']} work units"
+                ),
+                page_percent=100,
+                completed_units=int(profile["total_units"]),
+                total_units=int(profile["total_units"]),
+            )
+    plan = build_work_plan(profiles)
+    opts.work_plan = plan
+    return plan
+
+
+def _session_identity(pdf_path: str, opts: ImportOptions, pages: List[int]):
+    from PDFImportSession import build_identity
+
+    return build_identity(
+        source_sha256=str(getattr(opts, "_pdf_sha256", "") or ""),
+        source_name=os.path.basename(pdf_path),
+        opts=opts,
+        importer_version=_importer_version(),
+        requested_pages=pages,
+    )
+
+
+def _session_state_payload(session_state: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the non-host portion of a session state for import-report evidence."""
+    return {
+        "schema": session_state["schema"],
+        "source_sha256": session_state["source_sha256"],
+        "options_sha256": session_state["options_sha256"],
+        "importer_version": session_state["importer_version"],
+        "requested_pages": list(session_state["requested_pages"]),
+        "completed_pages": list(session_state["completed_pages"]),
+        "remaining_pages": [
+            page
+            for page in session_state["requested_pages"]
+            if page not in set(session_state["completed_pages"])
+        ],
+        "page_groups": dict(session_state["page_groups"]),
+        "status": session_state["status"],
+        "session_object": str(getattr(session_state["host"], "Name", "")),
+        "crash_recovery_claimed": False,
+    }
+
+
+def find_resumable_import_session(
+    pdf_path: str,
+    opts: ImportOptions,
+    fc_doc=None,
+) -> Optional[Dict[str, Any]]:
+    """Find an exact persisted cancelled/running session for an explicit page request."""
+    from PDFImportSession import find_matching_session, read_session_object
+    from pdfcadcore.fitz_loader import safe_open
+
+    document = fc_doc or _ensure_doc()
+    source_sha256 = _pdf_file_sha256(pdf_path)
+    with safe_open(pdf_path) as pdf_doc:
+        total_pages = len(pdf_doc)
+    pages = list(opts.pages or range(1, total_pages + 1))
+    pages = [page for page in pages if 1 <= int(page) <= total_pages]
+    previous_digest = getattr(opts, "_pdf_sha256", "")
+    opts._pdf_sha256 = source_sha256
+    try:
+        identity = _session_identity(pdf_path, opts, pages)
+    finally:
+        opts._pdf_sha256 = previous_digest
+    host = find_matching_session(document, identity)
+    return read_session_object(host) if host is not None else None
+
+
 @_memoized_wirestrings
 def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     """Import one or more pages from a PDF file."""
@@ -9655,7 +9891,6 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
 
     # Open PDF once to gather page count and heights (avoids triple-open + handle leaks)
     _unit_scale = (MM_PER_PT if opts.scale_to_mm else 1.0) * opts.user_scale
-    page_height_scaled = 792 * _unit_scale  # default: US Letter height in points
     page_heights_scaled: Dict[int, float] = {}
     model3d_text_evidence: List[str] = []
     collect_model3d_text = bool(
@@ -9673,8 +9908,6 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             opts._defer_page_recompute = _should_defer_item_recompute(
                 sum(1 for page_number in pages if 1 <= page_number <= total_pages)
             )
-            if total_pages > 0:
-                page_height_scaled = pdoc.load_page(0).rect.height * _unit_scale
             for p in pages:
                 if 1 <= p <= total_pages:
                     try:
@@ -9739,77 +9972,219 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         _err(f"Cannot open PDF: {e}")
         return
 
-    # Wrap entire import in a FreeCAD transaction so Ctrl+Z undoes it in one step
+    from PDFImportSession import (
+        create_session_object,
+        page_stack_offsets,
+        read_session_object,
+        remaining_pages,
+        update_session_object,
+        validate_completed_page_groups,
+    )
+
+    valid_pages = [int(page) for page in pages if 1 <= int(page) <= total_pages]
+    for page in pages:
+        if int(page) not in valid_pages:
+            _warn(f"Skipping out-of-range page {page} (PDF has {total_pages} pages)")
+    if not valid_pages:
+        pdf_doc_for_import.close()
+        raise ValueError("No selected PDF pages are in range")
+
+    identity = _session_identity(pdf_path, opts, valid_pages)
+    imported_count = 0
+    all_text_entity_info = None
+    cancelled = False
+    session_state = None
+    session_host = None
+    active_page_baseline_ids = set(baseline_object_ids)
+    active_page_baseline_names = set(baseline_object_names)
+
+    # Each invocation is one transaction. A user cancellation removes the
+    # active page, records only certified pages, and commits that resumable state.
     fc_doc.openTransaction("Import PDF")
     t_phase = time.perf_counter()
     try:
-        imported_count = 0
-        running_stack_offset = 0.0
-        page_arrangement = _normalize_page_arrangement(getattr(opts, "page_arrangement", "spread"))
-        page_gap_ratio = _normalize_page_gap_ratio(getattr(opts, "page_gap_ratio", 0.20))
-        first_page = True
-        all_text_entity_info = None
-        for p in pages:
-            if p < 1 or p > total_pages:
-                _warn(f"Skipping out-of-range page {p} (PDF has {total_pages} pages)")
-                continue
+        resume_name = str(getattr(opts, "resume_session_name", "") or "")
+        if resume_name:
+            session_host = fc_doc.getObject(resume_name)
+            if session_host is None:
+                raise ValueError(f"Resume session {resume_name!r} was not found")
+            session_state = read_session_object(session_host)
+            validate_completed_page_groups(fc_doc, session_state)
+            identity_fields = (
+                "schema",
+                "source_sha256",
+                "options_json",
+                "options_sha256",
+                "importer_version",
+                "requested_pages",
+            )
+            if any(session_state[field] != identity[field] for field in identity_fields):
+                raise ValueError(
+                    "Named resume session does not exactly match this PDF, options, "
+                    "package version, and requested page order"
+                )
+            if session_state["status"] not in {"running", "cancelled"}:
+                raise ValueError(
+                    f"Named resume session is not resumable: {session_state['status']}"
+                )
+        else:
+            session_host = create_session_object(fc_doc, identity)
+            session_state = read_session_object(session_host)
+
+        completed_pages = list(session_state["completed_pages"])
+        page_groups = {
+            int(page): str(group_name)
+            for page, group_name in session_state["page_groups"].items()
+        }
+        pages_to_import = remaining_pages(session_state)
+        imported_count = len(completed_pages)
+        arrangement = _normalize_page_arrangement(
+            getattr(opts, "page_arrangement", "spread")
+        )
+        gap_ratio = _normalize_page_gap_ratio(getattr(opts, "page_gap_ratio", 0.20))
+        offsets = page_stack_offsets(
+            valid_pages,
+            page_heights_scaled,
+            arrangement=arrangement,
+            gap_ratio=gap_ratio,
+        )
+        plan_by_page = {
+            int(profile["page_number"]): dict(profile)
+            for profile in ((getattr(opts, "work_plan", None) or {}).get("pages", []))
+        }
+
+        for work_index, page_number in enumerate(pages_to_import, start=1):
+            active_objects = _document_objects(fc_doc)
+            active_page_baseline_ids = {id(host) for host in active_objects}
+            active_page_baseline_names = {_host_object_id(host) for host in active_objects}
+            opts._active_page_index = work_index
+            opts._active_page_total = len(pages_to_import)
+            opts._active_page_profile = plan_by_page.get(page_number)
+            _emit_progress(
+                opts,
+                page_number=page_number,
+                stage="page_start",
+                label=(
+                    f"Importing PDF page {page_number} "
+                    f"({work_index} of {len(pages_to_import)})"
+                ),
+                page_percent=0,
+                completed_units=0,
+                total_units=int(
+                    (opts._active_page_profile or {}).get("total_units", 0) or 0
+                ),
+            )
+            _msg(
+                f"Importing page {page_number}/{total_pages} "
+                f"({work_index} of {len(pages_to_import)})..."
+            )
             try:
-                _msg(f"Importing page {p}/{total_pages} ({imported_count+1} of {len(pages)})...")
-                _, page_text_info = _import_pdf_page_inner(
+                page_group, page_text_info = _import_pdf_page_inner(
                     pdf_doc_for_import,
                     pdf_path,
-                    p,
+                    page_number,
                     opts,
                     fc_doc,
                 )
-                if page_text_info:
-                    if all_text_entity_info is None:
-                        all_text_entity_info = page_text_info.copy()
-                    else:
-                        all_text_entity_info["count"] += page_text_info.get("count", 0)
-                        examples = page_text_info.get("examples", [])
-                        if examples and len(all_text_entity_info["examples"]) < 3:
-                            all_text_entity_info["examples"].extend(
-                                examples[:3 - len(all_text_entity_info["examples"])]
-                            )
-                curr_page_height = page_heights_scaled.get(p, page_height_scaled)
-                # Offset each page group downward so they don't overlap.
-                # FreeCAD may rename the group (e.g., PDF_Page_2 → PDF_Page_2001)
-                # so we search for the most recently created matching group.
-                if len(pages) > 1 and not first_page:
-                    running_stack_offset += _page_stack_step(
-                        curr_page_height,
-                        page_arrangement,
-                        page_gap_ratio,
-                    )
-                    y_shift = -running_stack_offset
-                    grp = None
-                    for obj in reversed(fc_doc.Objects):
-                        if (obj.Name.startswith(f"PDF_Page_{p}") and
-                                obj.isDerivedFrom("App::DocumentObjectGroup")):
-                            grp = obj
-                            break
-                    if grp and hasattr(grp, "Group"):
-                        _msg(f"Offsetting {grp.Name} by Y={y_shift:.1f}")
-                        for child in grp.Group:
-                            try:
-                                if hasattr(child, "Placement"):
-                                    child.Placement.Base.y += y_shift
-                                if hasattr(child, "Group"):
-                                    for sub in child.Group:
-                                        if hasattr(sub, "Placement"):
-                                            sub.Placement.Base.y += y_shift
-                            except (AttributeError, RuntimeError):
-                                pass
-                first_page = False
-                imported_count += 1
             except TextRepresentationFailure:
                 raise
-            except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as e:
-                _err(f"Failed to import page {p}: {e}\n{traceback.format_exc()}")
+            except ImportCancelled:
                 raise
+            except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as exc:
+                _err(
+                    f"Failed to import page {page_number}: {exc}\n"
+                    f"{traceback.format_exc()}"
+                )
+                raise
+
+            if page_text_info:
+                if all_text_entity_info is None:
+                    all_text_entity_info = page_text_info.copy()
+                else:
+                    all_text_entity_info["count"] += page_text_info.get("count", 0)
+                    examples = page_text_info.get("examples", [])
+                    if examples and len(all_text_entity_info["examples"]) < 3:
+                        all_text_entity_info["examples"].extend(
+                            examples[: 3 - len(all_text_entity_info["examples"])]
+                        )
+
+            if page_group is None:
+                for host in reversed(_document_objects(fc_doc)):
+                    if (
+                        _host_object_id(host).startswith(f"PDF_Page_{page_number}")
+                        and host.isDerivedFrom("App::DocumentObjectGroup")
+                    ):
+                        page_group = host
+                        break
+            y_shift = float(offsets.get(page_number, 0.0) or 0.0)
+            if page_group is not None and y_shift and hasattr(page_group, "Group"):
+                _msg(f"Offsetting {page_group.Name} by Y={y_shift:.1f}")
+                for child in page_group.Group:
+                    try:
+                        if hasattr(child, "Placement"):
+                            child.Placement.Base.y += y_shift
+                        if hasattr(child, "Group") and child.Group is not None:
+                            for sub in child.Group:
+                                if hasattr(sub, "Placement"):
+                                    sub.Placement.Base.y += y_shift
+                    except (AttributeError, RuntimeError):
+                        pass
+
+            completed_pages.append(page_number)
+            imported_count = len(completed_pages)
+            if page_group is not None:
+                page_groups[page_number] = _host_object_id(page_group)
+            update_session_object(
+                session_host,
+                status="running",
+                completed_pages=completed_pages,
+                page_groups=page_groups,
+            )
+
+        update_session_object(
+            session_host,
+            status="complete",
+            completed_pages=completed_pages,
+            page_groups=page_groups,
+        )
+        session_state = read_session_object(session_host)
         fc_doc.commitTransaction()
-        opts.phase_timings_ms["pages_import_ms"] = (time.perf_counter() - t_phase) * 1000.0
+        opts.import_status = "success"
+        opts.phase_timings_ms["pages_import_ms"] = (
+            time.perf_counter() - t_phase
+        ) * 1000.0
+    except ImportCancelled as cancel:
+        cleanup = _remove_post_baseline_document_objects(
+            fc_doc,
+            active_page_baseline_ids,
+            active_page_baseline_names,
+        )
+        if not cleanup["cleanup_complete"]:
+            fc_doc.abortTransaction()
+            rollback = _remove_post_baseline_document_objects(
+                fc_doc, baseline_object_ids, baseline_object_names
+            )
+            raise RuntimeError(
+                "Cancellation could not remove the incomplete active page: "
+                f"cleanup={cleanup}, rollback={rollback}"
+            ) from cancel
+        update_session_object(
+            session_host,
+            status="cancelled",
+            completed_pages=completed_pages,
+            page_groups=page_groups,
+        )
+        session_state = read_session_object(session_host)
+        imported_count = len(session_state["completed_pages"])
+        report_extra = dict(getattr(opts, "_report_extra", {}) or {})
+        report_extra["cancel_cleanup"] = cleanup
+        opts._report_extra = report_extra
+        fc_doc.commitTransaction()
+        opts.import_status = "cancelled"
+        opts.phase_timings_ms["pages_import_ms"] = (
+            time.perf_counter() - t_phase
+        ) * 1000.0
+        cancelled = True
     except TextRepresentationFailure as failure:
         fc_doc.abortTransaction()
         rollback = _remove_post_baseline_document_objects(
@@ -9857,16 +10232,19 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         except (RuntimeError, AttributeError):
             pass
 
-    t_phase = time.perf_counter()
-    _create_semantic_model3d_members(fc_doc, opts)
-    _finalize_import_recompute(
-        fc_doc,
-        opts,
-        baseline_object_ids=baseline_object_ids,
-        baseline_object_names=baseline_object_names,
-    )
-    _autofit_import_view(fc_doc)
-    opts.phase_timings_ms["postprocess_ms"] = (time.perf_counter() - t_phase) * 1000.0
+    if not cancelled:
+        t_phase = time.perf_counter()
+        _create_semantic_model3d_members(fc_doc, opts)
+        _finalize_import_recompute(
+            fc_doc,
+            opts,
+            baseline_object_ids=baseline_object_ids,
+            baseline_object_names=baseline_object_names,
+        )
+        _autofit_import_view(fc_doc)
+        opts.phase_timings_ms["postprocess_ms"] = (
+            time.perf_counter() - t_phase
+        ) * 1000.0
 
     if opts.import_mode == "auto" and opts.auto_resolved_mode:
         _msg(
@@ -9879,7 +10257,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         from pdfcadcore.fitz_loader import safe_open as _scale_safe_open
         from pdfcadcore.resolved_scale import probe_page_scale
 
-        uncached_scale_pages = [
+        uncached_scale_pages = [] if cancelled else [
             p
             for p in pages
             if 1 <= p <= total_pages
@@ -9911,7 +10289,13 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             opts._report_extra['actual_text_entity_types'] = all_text_entity_info
         # P1-5 (SU parity): declared-vs-achieved text size telemetry.
         opts._report_extra.update(_build_text_size_crosschecks(opts))
-        opts._report_extra["result_status"] = "success"
+        opts._report_extra["result_status"] = (
+            "cancelled" if cancelled else "success"
+        )
+        if session_state is not None:
+            opts._report_extra["import_session"] = _session_state_payload(
+                session_state
+            )
         opts._report_extra.pop("terminal_failure", None)
 
         write_import_report(
@@ -9933,4 +10317,4 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     except (OSError, RuntimeError, TypeError, ValueError, ImportError) as e:
         _warn(f"Import report write failed: {e}")
 
-    return True
+    return not cancelled

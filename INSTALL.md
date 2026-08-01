@@ -67,7 +67,18 @@ $env:FREECAD_CMD = "D:\FreeCAD 1.1\bin\FreeCADCmd.exe"
 3. Run the installer (no admin required).
 4. Restart FreeCAD.
 
-Build locally: `python build_windows_installer.py` (requires [Inno Setup 6](https://jrsoftware.org/isinfo.php)).
+Reproduce the release toolchain and build locally:
+
+```powershell
+.\scripts\install_inno_toolchain.ps1 -Destination C:\TMP\inno-6.7.1
+python build_windows_installer.py `
+  --iscc C:\TMP\inno-6.7.1\ISCC.exe `
+  --toolchain-manifest installer\inno-toolchain-6.7.1.json
+```
+
+The bootstrap accepts only the committed official distribution SHA-256 and
+pinned valid Authenticode signer, then verifies every file in the portable
+compiler tree. A merely installed or same-version `ISCC.exe` is not accepted.
 
 ### Installer error 448 (untrusted mount point)
 

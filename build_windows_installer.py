@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -20,6 +22,111 @@ ADDON_DIR = REPO_ROOT / "PDFVectorImporter"
 DIST_DIR = REPO_ROOT / "dist"
 STAGE_DIR = DIST_DIR / "installer_stage"
 INNO_SCRIPT = REPO_ROOT / "installer" / "PDFVectorImporter.iss"
+INNO_TOOLCHAIN_MANIFEST = REPO_ROOT / "installer" / "inno-toolchain-6.7.1.json"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_json_bytes(payload: object) -> bytes:
+    return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def verify_inno_toolchain(
+    iscc: str | Path,
+    manifest_path: str | Path = INNO_TOOLCHAIN_MANIFEST,
+) -> dict:
+    """Verify that *iscc* belongs to the exact committed portable toolchain."""
+
+    compiler = Path(iscc).resolve()
+    manifest_file = Path(manifest_path).resolve()
+    manifest_bytes = manifest_file.read_bytes()
+    manifest = json.loads(manifest_bytes.decode("utf-8"))
+    if manifest.get("schema") != "bcs.inno_toolchain/1.0":
+        raise RuntimeError("Inno Setup toolchain manifest schema mismatch")
+    if compiler.name.lower() != "iscc.exe":
+        raise RuntimeError(f"Inno Setup toolchain compiler name mismatch: {compiler.name}")
+
+    root = compiler.parent
+    expected_paths: set[str] = set()
+    tree_records: list[dict] = []
+    for entry in manifest.get("files") or []:
+        relative = str(entry.get("path") or "").replace("\\", "/")
+        if not relative or relative.startswith("/") or ".." in Path(relative).parts:
+            raise RuntimeError(f"Inno Setup toolchain manifest path mismatch: {relative!r}")
+        expected_paths.add(relative.casefold())
+        candidate = root / Path(relative)
+        if not candidate.is_file():
+            raise RuntimeError(f"Inno Setup toolchain file mismatch: missing {relative}")
+        actual_size = candidate.stat().st_size
+        actual_hash = _sha256_file(candidate)
+        if actual_size != int(entry.get("size", -1)):
+            raise RuntimeError(f"Inno Setup toolchain size mismatch: {relative}")
+        if actual_hash != str(entry.get("sha256") or "").lower():
+            raise RuntimeError(f"Inno Setup toolchain hash mismatch: {relative}")
+        tree_records.append(
+            {"path": relative, "size": actual_size, "sha256": actual_hash}
+        )
+
+    actual_paths = {
+        path.relative_to(root).as_posix().casefold()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+    if actual_paths != expected_paths:
+        missing = sorted(expected_paths - actual_paths)
+        unexpected = sorted(actual_paths - expected_paths)
+        raise RuntimeError(
+            "Inno Setup toolchain tree mismatch: "
+            f"missing={missing!r} unexpected={unexpected!r}"
+        )
+
+    tree_records.sort(key=lambda item: item["path"].casefold())
+    return {
+        "name": str(manifest.get("name") or "Inno Setup"),
+        "version": str(manifest.get("version") or ""),
+        "source_sha256": str(manifest.get("source_sha256") or "").lower(),
+        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "tree_sha256": hashlib.sha256(_canonical_json_bytes(tree_records)).hexdigest(),
+    }
+
+
+def write_attestation(
+    output_path: str | Path,
+    *,
+    release_zip: str | Path,
+    installer_exe: str | Path,
+    toolchain_identity: dict,
+    source_commit: str,
+) -> Path:
+    """Write a deterministic artifact/toolchain binding for one Setup.exe."""
+
+    zip_path = Path(release_zip).resolve()
+    setup_path = Path(installer_exe).resolve()
+    payload = {
+        "schema": "bcs.freecad_installer_attestation/1.0",
+        "source_commit": str(source_commit or "unknown"),
+        "source_zip": {
+            "name": zip_path.name,
+            "size": zip_path.stat().st_size,
+            "sha256": _sha256_file(zip_path),
+        },
+        "installer": {
+            "name": setup_path.name,
+            "size": setup_path.stat().st_size,
+            "sha256": _sha256_file(setup_path),
+        },
+        "toolchain": dict(toolchain_identity),
+    }
+    destination = Path(output_path).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(_canonical_json_bytes(payload))
+    return destination
 
 
 def _read_package_version(package_xml: Path) -> str:
@@ -67,12 +174,19 @@ def find_iscc(explicit_path: str | None) -> Path:
     )
 
 
-def stage_release(source_zip: str | Path | None = None) -> tuple[str, Path, Path]:
+def stage_release(
+    source_zip: str | Path | None = None,
+    *,
+    dist_dir: str | Path | None = None,
+    stage_dir: str | Path | None = None,
+) -> tuple[str, Path, Path]:
     version = read_version()
-    DIST_DIR.mkdir(parents=True, exist_ok=True)
+    output_root = Path(dist_dir).resolve() if dist_dir is not None else DIST_DIR
+    stage_root = Path(stage_dir).resolve() if stage_dir is not None else STAGE_DIR
+    output_root.mkdir(parents=True, exist_ok=True)
 
     if source_zip is None:
-        zip_path = build_release.build(DIST_DIR)
+        zip_path = build_release.build(output_root)
     else:
         zip_path = Path(source_zip).resolve()
         expected_name = f"FreeCAD-PDF-Importer_v{version}.zip"
@@ -83,14 +197,14 @@ def stage_release(source_zip: str | Path | None = None) -> tuple[str, Path, Path
                 f"Canonical release ZIP must be named {expected_name}, got {zip_path.name}"
             )
 
-    if STAGE_DIR.exists():
-        shutil.rmtree(STAGE_DIR)
-    STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    if stage_root.exists():
+        shutil.rmtree(stage_root)
+    stage_root.mkdir(parents=True, exist_ok=True)
 
     with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(STAGE_DIR)
+        zf.extractall(stage_root)
 
-    source_dir = STAGE_DIR / "PDFVectorImporter"
+    source_dir = stage_root / "PDFVectorImporter"
     if not source_dir.is_dir():
         raise RuntimeError(f"Expected staged addon folder at {source_dir}")
     staged_version = _read_package_version(source_dir / "package.xml")
@@ -103,17 +217,28 @@ def stage_release(source_zip: str | Path | None = None) -> tuple[str, Path, Path
     return version, source_dir, zip_path
 
 
-def compile_installer(iscc: Path, version: str, source_dir: Path) -> Path:
+def compile_installer(
+    iscc: Path,
+    version: str,
+    source_dir: Path,
+    *,
+    output_dir: str | Path | None = None,
+) -> Path:
+    output_root = Path(output_dir).resolve() if output_dir is not None else DIST_DIR
+    output_root.mkdir(parents=True, exist_ok=True)
+    base_name = f"FreeCAD-PDF-Importer-Setup_v{version}"
     cmd = [
         str(iscc),
         str(INNO_SCRIPT),
         f"/DMyAppVersion={version}",
         f"/DSourceDir={source_dir}",
+        f"/O{output_root}",
+        f"/F{base_name}",
     ]
     print("Running:", " ".join(cmd))
     subprocess.run(cmd, check=True, cwd=REPO_ROOT)
 
-    installer_exe = DIST_DIR / f"FreeCAD-PDF-Importer-Setup_v{version}.exe"
+    installer_exe = output_root / f"{base_name}.exe"
     if not installer_exe.exists():
         raise RuntimeError(
             "Inno Setup completed but installer was not found at "
@@ -132,6 +257,28 @@ def main() -> int:
         help="Path to ISCC.exe (Inno Setup compiler). Optional if ISCC is on PATH.",
     )
     parser.add_argument(
+        "--toolchain-manifest",
+        default=str(INNO_TOOLCHAIN_MANIFEST),
+        help="Exact portable Inno Setup toolchain manifest.",
+    )
+    parser.add_argument(
+        "--verify-toolchain-only",
+        action="store_true",
+        help="Verify the selected compiler tree and exit without building.",
+    )
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--stage-dir", default=None)
+    parser.add_argument(
+        "--attestation",
+        default=None,
+        help="Write deterministic installer/toolchain attestation JSON here.",
+    )
+    parser.add_argument(
+        "--source-commit",
+        default=os.environ.get("GITHUB_SHA", "unknown"),
+        help="Exact source commit bound into the attestation.",
+    )
+    parser.add_argument(
         "--source-zip",
         default=None,
         help=(
@@ -141,9 +288,31 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    version, source_dir, zip_path = stage_release(args.source_zip)
     iscc = find_iscc(args.iscc)
-    installer_exe = compile_installer(iscc, version, source_dir)
+    toolchain_identity = verify_inno_toolchain(iscc, args.toolchain_manifest)
+    if args.verify_toolchain_only:
+        print(json.dumps(toolchain_identity, sort_keys=True))
+        return 0
+
+    version, source_dir, zip_path = stage_release(
+        args.source_zip,
+        dist_dir=args.output_dir,
+        stage_dir=args.stage_dir,
+    )
+    installer_exe = compile_installer(
+        iscc,
+        version,
+        source_dir,
+        output_dir=args.output_dir,
+    )
+    if args.attestation:
+        write_attestation(
+            args.attestation,
+            release_zip=zip_path,
+            installer_exe=installer_exe,
+            toolchain_identity=toolchain_identity,
+            source_commit=args.source_commit,
+        )
 
     print("")
     print(f"Release zip: {zip_path}")

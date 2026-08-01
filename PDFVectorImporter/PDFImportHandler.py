@@ -112,13 +112,13 @@ def _do_import(filename):
 def _import_with_dialog(filename):
     """Show the options dialog pre-filled with the dropped file."""
     try:
-        from PDFImporterCmd import ImportPDFDialog
+        from PDFImporterCmd import ImportPDFDialog, run_interactive_import
         import PDFVectorImporter.src.PDFImporterCore as core
     except ImportError:
         # Fallback: try direct import
         try:
             import PDFImporterCore as core
-            from PDFImporterCmd import ImportPDFDialog
+            from PDFImporterCmd import ImportPDFDialog, run_interactive_import
         except ImportError as e:
             FreeCAD.Console.PrintError(f"Cannot load importer: {e}\n")
             return
@@ -151,7 +151,9 @@ def _import_with_dialog(filename):
 
     opts = dlg.build_options()
     try:
-        core.import_pdf(filename, opts)
+        completed = run_interactive_import(core, filename, opts)
+        if not completed:
+            return
         FreeCAD.Console.PrintMessage("PDF import complete.\n")
 
         # Fit view
@@ -199,10 +201,10 @@ def _import_headless(filename):
 
     opts = core.ImportOptions()
     try:
-        core.import_pdf(filename, opts)
-        FreeCAD.Console.PrintMessage("PDF import complete.\n")
+        completed = core.import_pdf(filename, opts)
+        if completed:
+            FreeCAD.Console.PrintMessage("PDF import complete.\n")
     except (RuntimeError, ValueError, TypeError, OSError, AttributeError, ImportError) as e:
         import traceback
         FreeCAD.Console.PrintError(f"Import failed: {e}\n{traceback.format_exc()}")
-
 

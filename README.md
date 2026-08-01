@@ -3,7 +3,7 @@
 **BUILT. NOT BOUGHT.**
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
-![Version: 4.0.79](https://img.shields.io/badge/Version-4.0.79-blue.svg)
+![Version: 4.0.80](https://img.shields.io/badge/Version-4.0.80-blue.svg)
 ![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
 
 Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.
@@ -11,6 +11,23 @@ Import vector geometry, text, and images from PDF files into FreeCAD as editable
 Arc reconstruction, dash mapping, color grouping, OCG layer support, and reference-based scaling -- all powered by pure-Python PDF parsing via PyMuPDF.
 
 > BlueCollar Systems -- BUILT. NOT BOUGHT.
+
+## Recent fixes (v4.0.80)
+
+- Interactive imports now show content-derived work estimates and one truthful
+  whole-import progress dialog. Cancel removes the incomplete active page,
+  commits only completed pages, and records an exact resumable session in the
+  FreeCAD document; save the document to resume after restarting FreeCAD.
+- Resume requires the same PDF SHA-256, content-affecting options, importer
+  package version, and requested page order. It imports only unfinished pages
+  and derives placement from the original multi-page layout.
+- Setup.exe is built twice with the exact attested Inno Setup 6.7.1 portable
+  tree. CI verifies the official installer hash and pinned Authenticode signer,
+  then publishes the canonical ZIP, byte-reproducible Setup.exe, and their
+  deterministic attestation in one atomic release operation.
+- Existing exact tags converge safely to their missing Release object without
+  tag rewriting or asset clobbering. Post-release digest records are scoped to
+  `release-bookkeeping/` and carry `[skip release]` by construction.
 
 ## Recent fixes (v4.0.79)
 
@@ -258,7 +275,7 @@ See **[COMPATIBILITY.md](COMPATIBILITY.md)** for the full matrix. Summary:
 |----------------|--------|---------|--------|
 | 0.21.x | 3.10+ | >=1.24,<2.0 | ⚠️ Expected |
 | 1.0.x | 3.11+ | >=1.24,<2.0 | ⚠️ Expected |
-| 1.1.x | 3.11+ | >=1.24,<2.0 | ⚠️ Expected |
+| 1.1.x | 3.11+ | >=1.24,<2.0 | ✅ Verified |
 | 0.19–0.20 | 3.8–3.9 | legacy pin | ⚠️ Expected only after legacy branch testing |
 | 0.18 and earlier | | | ❌ Not supported |
 
@@ -283,9 +300,13 @@ Evidence levels:
 | Raster-only scans | Pure raster PDFs produce no vector geometry |
 | Clipped/XObject-heavy PDFs | Complex clip stacks and deeply nested form XObjects can produce partial geometry |
 | Very large PDFs | Documents with >10,000 primitives may slow the import process |
-| Embedded subset fonts | Text using embedded subset fonts may not render correctly |
-| OCG layer assignment | Extractor-level OCG mapping is validated on corpus `layered_ocg.pdf`; FreeCAD host-run grouping verification is still required in target runtime |
+| Embedded subset fonts | Valid embedded subsets are staged for native 3D Text; malformed font programs or missing/invalid character maps can still require an item-specific fallback or truthful failure |
 | Legacy hosts | FreeCAD versions older than 0.21 are not part of current validation coverage |
+
+Large interactive imports show drawing-operation, text-character, and image-instance
+counts before host-object creation. Cancellation keeps only certified pages. Resume
+is persisted in the `.FCStd` document, so saving after cancellation allows a later
+session to continue; unsaved process crashes are not claimed as recoverable.
 
 ## Import report / scale trust
 

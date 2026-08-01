@@ -5,15 +5,8 @@ on:
     branches: [main]
     # Docs-only pushes do not mint a release (board Q-08-a / ANS-09-1).
     # Release-pipeline workflow edits under .github/ are NOT ignored: they must
-    # rebuild --latest assets. The job if: guard skips chore: bump version to
-    # commits, so there is no release loop.
-    # KNOWN GAP (SWEEP-14): a release commit whose only diff is markdown
-    # (e.g. the v4.0.67 badge-URL correction, 00d158e) never triggers this
-    # workflow. The canonical escape hatch is a manual dispatch:
-    #   gh workflow run auto-release.yml
-    # (documented in README.md > Building Release Artifacts). Kept as-is
-    # rather than dropping "**/*.md" so docs-only pushes stay mint-free per
-    # the board decision above.
+    # rebuild --latest assets. The job if: guard and the bookkeeping path guard
+    # keep post-publication records from recursively minting product releases.
     paths-ignore:
       - "**/*.md"
       - "docs/**"
@@ -21,6 +14,9 @@ on:
       - "dist/_archived/**"
       - "dev_logs/**"
       - "steel_shapes/**"
+      # Digest bookkeeping is generated only after immutable publication. It
+      # must never recursively mint another product release.
+      - "release-bookkeeping/**"
   workflow_dispatch:
 
 env:
@@ -113,23 +109,56 @@ jobs:
       - name: Build release zip
         run: python build_release.py
 
-      - name: Install Inno Setup
+      - name: Install pinned Inno Setup toolchain
         shell: pwsh
-        run: choco install innosetup --yes --no-progress
-
-      - name: Build Windows installer from the same canonical ZIP
         run: |
-          set -e
-          ZIP="FreeCAD-PDF-Importer_v${{ steps.version.outputs.version }}.zip"
-          SETUP="dist/FreeCAD-PDF-Importer-Setup_v${{ steps.version.outputs.version }}.exe"
-          python build_windows_installer.py --source-zip "${ZIP}"
-          test -f "${ZIP}"
-          test -f "${SETUP}"
+          ./scripts/install_inno_toolchain.ps1 `
+            -ManifestPath installer/inno-toolchain-6.7.1.json `
+            -Destination "$env:RUNNER_TEMP\inno-6.7.1"
+
+      - name: Build and compare Windows installers from the same canonical ZIP
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $zip = "FreeCAD-PDF-Importer_v$version.zip"
+          $base = "FreeCAD-PDF-Importer-Setup_v$version"
+          $iscc = Join-Path $env:INNO_TOOLCHAIN_ROOT 'ISCC.exe'
+          $first = Join-Path 'dist/repro-a' ($base + '.exe')
+          $second = Join-Path 'dist/repro-b' ($base + '.exe')
+          $firstAttestation = Join-Path 'dist/repro-a' ($base + '.attestation.json')
+          $secondAttestation = Join-Path 'dist/repro-b' ($base + '.attestation.json')
+
+          python build_windows_installer.py --source-zip $zip --iscc $iscc `
+            --toolchain-manifest installer/inno-toolchain-6.7.1.json `
+            --output-dir dist/repro-a --stage-dir dist/stage-a `
+            --attestation $firstAttestation --source-commit $env:RELEASE_TARGET
+          if ($LASTEXITCODE -ne 0) { throw 'First installer build failed.' }
+          python build_windows_installer.py --source-zip $zip --iscc $iscc `
+            --toolchain-manifest installer/inno-toolchain-6.7.1.json `
+            --output-dir dist/repro-b --stage-dir dist/stage-b `
+            --attestation $secondAttestation --source-commit $env:RELEASE_TARGET
+          if ($LASTEXITCODE -ne 0) { throw 'Second installer build failed.' }
+
+          $firstHash = (Get-FileHash -LiteralPath $first -Algorithm SHA256).Hash
+          $secondHash = (Get-FileHash -LiteralPath $second -Algorithm SHA256).Hash
+          if ($firstHash -ne $secondHash) {
+            throw "Setup.exe is not reproducible: $firstHash != $secondHash"
+          }
+          $attestationDifference = Compare-Object `
+            (Get-Content -LiteralPath $firstAttestation -Raw) `
+            (Get-Content -LiteralPath $secondAttestation -Raw)
+          if ($attestationDifference) {
+            throw 'Installer attestations are not reproducible.'
+          }
+
+          Copy-Item -LiteralPath $first -Destination (Join-Path 'dist' ($base + '.exe'))
+          Copy-Item -LiteralPath $firstAttestation `
+            -Destination (Join-Path 'dist' ($base + '.attestation.json'))
 
       - name: Smoke release zip dependency payload
         run: python scripts/smoke_release_zip.py "FreeCAD-PDF-Importer_v*.zip"
 
-      - name: Create tag and release
+      - name: Create or verify exact tag and release
         id: mint
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -138,11 +167,21 @@ jobs:
           VERSION="v${{ steps.version.outputs.version }}"
           ZIP="FreeCAD-PDF-Importer_v${{ steps.version.outputs.version }}.zip"
           SETUP="dist/FreeCAD-PDF-Importer-Setup_v${{ steps.version.outputs.version }}.exe"
+          ATTESTATION="dist/FreeCAD-PDF-Importer-Setup_v${{ steps.version.outputs.version }}.attestation.json"
+          NOTES="Automated immutable release from main. Run $(basename "${SETUP}") for Windows setup, or extract ${ZIP} into the FreeCAD Mod folder. The attestation binds Setup.exe to the exact canonical ZIP and pinned compiler tree."
 
-          if gh release view "${VERSION}" >/dev/null 2>&1; then
-            echo "Release ${VERSION} already exists — skipping."
-            echo "minted=false" >> "$GITHUB_OUTPUT"
-            # Round 21 Task 5: stateful, bounded stranded-release audit.
+          python scripts/publish_release.py \
+            --repo "${GITHUB_REPOSITORY}" \
+            --tag "${VERSION}" \
+            --target "${RELEASE_TARGET:-$GITHUB_SHA}" \
+            --title "${VERSION} — PDF Vector Importer for FreeCAD" \
+            --notes "${NOTES}" \
+            --asset "${ZIP}" --asset "${SETUP}" --asset "${ATTESTATION}" \
+            --github-output "$GITHUB_OUTPUT"
+
+          if grep -q '^minted=false$' "$GITHUB_OUTPUT"; then
+            # Preserve the bounded stranded-release audit for already-published
+            # releases without allowing it to mutate immutable assets.
             python scripts/release_safety.py audit-existing-tag \
               --repo "${GITHUB_REPOSITORY}" \
               --tag "${VERSION}" \
@@ -152,44 +191,47 @@ jobs:
               --mode release \
               --summary "$GITHUB_STEP_SUMMARY" \
               --warnings-file .release-safety/warnings.json
+          fi
+
+      - name: Record verified release artifact digests without a release loop
+        if: steps.mint.outputs.release_verified == 'true'
+        run: |
+          set -euo pipefail
+          VERSION="v${{ steps.version.outputs.version }}"
+          ZIP="FreeCAD-PDF-Importer_v${{ steps.version.outputs.version }}.zip"
+          SETUP="dist/FreeCAD-PDF-Importer-Setup_v${{ steps.version.outputs.version }}.exe"
+          ATTESTATION="dist/FreeCAD-PDF-Importer-Setup_v${{ steps.version.outputs.version }}.attestation.json"
+          RECORD="release-bookkeeping/${VERSION}.json"
+
+          asset_identity() {
+            python -c "import hashlib,pathlib,sys; p=pathlib.Path(sys.argv[1]); print(f'{p.name}:{p.stat().st_size}:{hashlib.sha256(p.read_bytes()).hexdigest()}')" "$1"
+          }
+
+          python scripts/release_bookkeeping.py record \
+            --tag "$VERSION" \
+            --target "$RELEASE_TARGET" \
+            --asset "$(asset_identity "$ZIP")" \
+            --asset "$(asset_identity "$SETUP")" \
+            --asset "$(asset_identity "$ATTESTATION")"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$RECORD"
+          if git diff --cached --quiet -- "$RECORD"; then
+            echo "Bookkeeping already matches the verified immutable release."
             exit 0
           fi
-          TAG_LOOKUP_STATUS=0
-          git ls-remote --exit-code --tags origin "refs/tags/${VERSION}" >/dev/null 2>&1 || TAG_LOOKUP_STATUS=$?
-          if [ "${TAG_LOOKUP_STATUS}" -ne 0 ]; then
-            if [ "${TAG_LOOKUP_STATUS}" -eq 2 ]; then
-              echo "Tag ${VERSION} is absent; publication may create it at ${RELEASE_TARGET}."
-            else
-              echo "::error::Unable to determine whether tag ${VERSION} exists (git ls-remote exit ${TAG_LOOKUP_STATUS})."
-              exit 1
-            fi
-          else
-            git fetch --force origin "refs/tags/${VERSION}:refs/tags/${VERSION}"
-            TAG_TARGET="$(git rev-list -n 1 "${VERSION}")"
-            if [ "${TAG_TARGET}" != "${RELEASE_TARGET}" ]; then
-              echo "::error::Tag ${VERSION} already exists at ${TAG_TARGET}, not release target ${RELEASE_TARGET}."
-            else
-              echo "::error::Tag ${VERSION} already exists at the release target but has no GitHub release. Refusing ambiguous publication."
-            fi
+          CHANGED="$(git diff --cached --name-only)"
+          if [ "$CHANGED" != "$RECORD" ]; then
+            echo "Refusing bookkeeping commit outside $RECORD: $CHANGED" >&2
             exit 1
           fi
-          # Create the tag via the gh/releases API (GITHUB_TOKEN), NOT `git push
-          # origin <tag>`: the checkout PAT lacks `workflow` scope, so pushing a
-          # tag whose commit touches .github/workflows/ is rejected. gh creates
-          # the tag at the target commit through the API, which is not subject to
-          # that restriction.
-          # gh CLI creates a draft, uploads every supplied asset, and only then
-          # publishes. This keeps ZIP + Setup.exe atomic and compatible with
-          # repository-level immutable releases.
-          gh release create "${VERSION}" \
-            --target "${RELEASE_TARGET:-$GITHUB_SHA}" \
-            --title "${VERSION} — PDF Vector Importer for FreeCAD" \
-            --notes "Automated release from latest \`main\` commit.
-
-          **Install:** Run \`$(basename "${SETUP}")\` for the simplest Windows setup, or extract \`${ZIP}\` into your FreeCAD Mod folder and restart FreeCAD." \
-            --latest \
-            "${ZIP}" "${SETUP}"
-          echo "minted=true" >> "$GITHUB_OUTPUT"
+          SUBJECT="$(python scripts/release_bookkeeping.py subject --tag "$VERSION")"
+          git commit -m "$SUBJECT"
+          if ! git push origin HEAD:main; then
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
 
       - name: Check website dispatch token secret
         if: steps.mint.outputs.minted == 'true'

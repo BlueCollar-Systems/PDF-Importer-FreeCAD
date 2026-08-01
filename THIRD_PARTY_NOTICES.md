@@ -32,3 +32,11 @@ SHA-256) can be regenerated from the private dependency-audit tooling:
 ```
 python tools/dependency_audit.py
 ```
+
+## Inno Setup build toolchain
+
+Windows Setup.exe is compiled in CI with Inno Setup 6.7.1 from the official
+JRSoftware release. The compiler is a build-time tool and is not bundled in the
+product ZIP or Setup.exe. `installer/inno-toolchain-6.7.1.json` records the
+official distribution SHA-256, pinned Authenticode signer identity, Inno Setup
+License label, and the exact portable compiler-tree hashes used by the build.

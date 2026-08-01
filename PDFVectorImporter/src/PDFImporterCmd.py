@@ -37,6 +37,127 @@ except ImportError:
 import FreeCAD
 
 
+def format_import_work_summary(plan):
+    """Format the transparent preflight units shown before host creation."""
+    pages = list((plan or {}).get("pages", []) or [])
+    drawing = sum(int(page.get("drawing_operations", 0) or 0) for page in pages)
+    text = sum(int(page.get("text_characters", 0) or 0) for page in pages)
+    images = sum(int(page.get("image_instances", 0) or 0) for page in pages)
+    risk = str((plan or {}).get("highest_risk", "normal") or "normal").replace(
+        "_", " "
+    )
+    return (
+        f"{len(pages)} selected page(s)\n"
+        f"{drawing:,} drawing operations\n"
+        f"{text:,} text characters\n"
+        f"{images:,} image instances\n"
+        f"{int((plan or {}).get('total_units', 0) or 0):,} total work units\n"
+        f"Complexity risk: {risk}"
+    )
+
+
+class ImportProgressController:
+    """Translate core progress events into one cancellable whole-import dialog."""
+
+    def __init__(self, parent=None):
+        self.dialog = QtWidgets.QProgressDialog(
+            "Analyzing selected PDF pages...", "Cancel", 0, 1000, parent
+        )
+        self.dialog.setWindowTitle("PDF Vector Importer")
+        self.dialog.setMinimumDuration(0)
+        self.dialog.setValue(0)
+        self._page_prefix_units = {}
+        self._total_units = 0
+
+    def set_plan(self, plan):
+        running = 0
+        self._page_prefix_units = {}
+        for page in (plan or {}).get("pages", []) or []:
+            page_number = int(page["page_number"])
+            self._page_prefix_units[page_number] = running
+            running += int(page.get("total_units", 0) or 0)
+        self._total_units = running
+
+    def __call__(self, event):
+        page_number = int(event.get("page_number", 0) or 0)
+        completed = int(event.get("completed_units", 0) or 0)
+        if self._total_units > 0:
+            overall = self._page_prefix_units.get(page_number, 0) + completed
+            value = int(1000 * min(overall, self._total_units) / self._total_units)
+        else:
+            page_index = max(1, int(event.get("page_index", 1) or 1))
+            page_total = max(1, int(event.get("total_pages", 1) or 1))
+            page_fraction = int(event.get("page_percent", 0) or 0) / 100.0
+            value = int(1000 * ((page_index - 1) + page_fraction) / page_total)
+        unit_detail = ""
+        page_units = int(event.get("total_units", 0) or 0)
+        if page_units:
+            unit_detail = f" — {completed:,}/{page_units:,} work units"
+        self.dialog.setValue(max(0, min(1000, value)))
+        self.dialog.setLabelText(
+            f"{event.get('label', 'Importing PDF')}{unit_detail}"
+        )
+        try:
+            QtWidgets.QApplication.processEvents()
+        except (AttributeError, RuntimeError):
+            pass
+        return not self.dialog.wasCanceled()
+
+    def close(self):
+        self.dialog.close()
+
+
+def run_interactive_import(core, pdf_path, opts, parent=None):
+    """Plan, confirm, run, and report an interactive import truthfully."""
+    progress = ImportProgressController(parent)
+    opts.progress_callback = progress
+    try:
+        plan = core.estimate_import_work(pdf_path, opts)
+        progress.set_plan(plan)
+        resumable = core.find_resumable_import_session(pdf_path, opts)
+        summary = format_import_work_summary(plan)
+        if resumable:
+            complete = len(resumable["completed_pages"])
+            requested = len(resumable["requested_pages"])
+            prompt = (
+                f"{summary}\n\nA matching import session has {complete} of "
+                f"{requested} pages complete. Resume the remaining pages?"
+            )
+            title = "Resume PDF Import"
+        else:
+            prompt = f"{summary}\n\nStart this import?"
+            title = "PDF Import Work Estimate"
+        buttons = QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel
+        answer = QtWidgets.QMessageBox.question(
+            parent, title, prompt, buttons, QtWidgets.QMessageBox.Yes
+        )
+        if answer != QtWidgets.QMessageBox.Yes:
+            opts.import_status = "cancelled"
+            FreeCAD.Console.PrintMessage("PDF import cancelled before model changes.\n")
+            return False
+        if resumable:
+            opts.resume_session_name = resumable["host"].Name
+        completed = bool(core.import_pdf(pdf_path, opts))
+        if not completed:
+            session_info = (getattr(opts, "_report_extra", {}) or {}).get(
+                "import_session", {}
+            )
+            done = len(session_info.get("completed_pages", []) or [])
+            requested = len(session_info.get("requested_pages", []) or [])
+            FreeCAD.Console.PrintMessage(
+                f"PDF import cancelled after {done} of {requested} pages. "
+                "Completed pages are kept; save the FreeCAD document to resume later.\n"
+            )
+        return completed
+    except core.ImportCancelled:
+        opts.import_status = "cancelled"
+        FreeCAD.Console.PrintMessage("PDF import cancelled before model changes.\n")
+        return False
+    finally:
+        opts.progress_callback = None
+        progress.close()
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Options dialog
 # ──────────────────────────────────────────────────────────────────────
@@ -512,7 +633,9 @@ class ImportPDFVectorCommand:
 
         import PDFVectorImporter.src.PDFImporterCore as core
         try:
-            core.import_pdf(pdf_path, opts)
+            completed = run_interactive_import(core, pdf_path, opts)
+            if not completed:
+                return
             if opts.import_mode == "auto" and getattr(opts, "auto_resolved_mode", None):
                 reason = getattr(opts, "auto_reason", "") or ""
                 detail = f" ({reason})" if reason else ""

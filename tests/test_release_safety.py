@@ -591,13 +591,16 @@ class TestReleaseSafety:
         assert "--mode release" in workflow
         assert '--summary "$GITHUB_STEP_SUMMARY"' in workflow
         audit_at = workflow.index("release_safety.py audit-existing-tag")
-        false_at = workflow.rfind('echo "minted=false"', 0, audit_at)
+        false_at = workflow.rfind("grep -q '^minted=false$'", 0, audit_at)
         assert false_at >= 0
         token_at = workflow.index("- name: Check website dispatch token secret")
         token_block = workflow[token_at : workflow.index("- name:", token_at + 8)]
         assert "if: steps.mint.outputs.minted == 'true'" in token_block
-        assert not re.search(r"^\s*gh release upload\b", workflow, re.MULTILINE)
-        assert "--clobber" not in workflow
+        publisher = (REPO_ROOT / "scripts" / "publish_release.py").read_text(
+            encoding="utf-8"
+        )
+        assert not re.search(r"^\s*gh release upload\b", publisher, re.MULTILINE)
+        assert "--clobber" not in publisher
 
     def test_audit_workflow_runs_on_every_main_push_without_guards(self):
         # SWEEP-05: the standalone audit must fire even when the head commit
@@ -641,30 +644,25 @@ class TestReleaseSafety:
         workflow = (
             REPO_ROOT / ".github" / "workflows" / "auto-release.yml"
         ).read_text(encoding="utf-8")
-        guard_at = workflow.index('if gh release view "${VERSION}"')
-        publish_at = workflow.index("gh release create", guard_at)
-        assert guard_at < publish_at
-        assert "gh release upload" not in workflow
-        assert "--clobber" not in workflow
+        publisher = (REPO_ROOT / "scripts" / "publish_release.py").read_text(
+            encoding="utf-8"
+        )
+        assert "publish_release.py" in workflow
+        assert "release upload" not in publisher
+        assert "release delete" not in publisher
+        assert "--clobber" not in publisher
         assert "softprops/action-gh-release" not in workflow
 
-    def test_atomic_release_rejects_an_existing_tag_without_a_release(self):
-        workflow = (
-            REPO_ROOT / ".github" / "workflows" / "auto-release.yml"
-        ).read_text(encoding="utf-8")
-        release_guard_at = workflow.index('if gh release view "${VERSION}"')
-        tag_guard_at = workflow.index("TAG_LOOKUP_STATUS=0", release_guard_at)
-        publish_at = workflow.index("gh release create", tag_guard_at)
-        guarded = workflow[tag_guard_at:publish_at]
-        assert tag_guard_at < publish_at
-        assert 'TAG_LOOKUP_STATUS=0' in guarded
-        assert 'git ls-remote --exit-code --tags origin "refs/tags/${VERSION}"' in guarded
-        assert '|| TAG_LOOKUP_STATUS=$?' in guarded
-        assert '"${TAG_LOOKUP_STATUS}" -eq 2' in guarded
-        assert '"${TAG_LOOKUP_STATUS}" -ne 0' in guarded
-        assert 'git rev-list -n 1 "${VERSION}"' in guarded
-        assert '"${TAG_TARGET}" != "${RELEASE_TARGET}"' in guarded
-        assert "exit 1" in guarded
+    def test_atomic_release_recovers_only_an_exact_existing_orphan_tag(self):
+        publisher = (REPO_ROOT / "scripts" / "publish_release.py").read_text(
+            encoding="utf-8"
+        )
+        assert 'peeled = direct + "^{}"' in publisher
+        assert "tag_target != config.target.lower()" in publisher
+        assert 'command.append("--verify-tag")' in publisher
+        assert 'command.extend(["--target", config.target])' in publisher
+        assert "release delete" not in publisher
+        assert "tag --delete" not in publisher
 
     def test_atomic_release_publishes_complete_asset_set(self):
         workflow = (
@@ -672,7 +670,8 @@ class TestReleaseSafety:
         ).read_text(encoding="utf-8")
         assert 'ZIP="FreeCAD-PDF-Importer_v' in workflow
         assert 'SETUP="dist/FreeCAD-PDF-Importer-Setup_v' in workflow
-        assert '"${ZIP}" "${SETUP}"' in workflow
+        assert 'ATTESTATION="dist/FreeCAD-PDF-Importer-Setup_v' in workflow
+        assert '--asset "${ZIP}" --asset "${SETUP}" --asset "${ATTESTATION}"' in workflow
 
     def test_steel_shapes_release_never_overwrites_existing_assets(self):
         workflow = (

@@ -1,7 +1,7 @@
 # PDF Vector Importer for FreeCAD
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Version: 4.0.79](https://img.shields.io/badge/Version-4.0.79-green.svg)
+![Version: 4.0.80](https://img.shields.io/badge/Version-4.0.80-green.svg)
 ![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
 
 **Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.**
@@ -11,6 +11,17 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 > **BlueCollar Systems** -- BUILT. NOT BOUGHT.
 
 ---
+
+## Recent fixes (v4.0.80)
+
+- Interactive imports preflight transparent work units and report real page,
+  geometry, text, and image progress through one responsive Cancel control.
+- Cancel removes the incomplete active page and persists completed-page state
+  in the FreeCAD document. After saving/reopening, an exact matching PDF,
+  options, package version, and page order resumes only the unfinished pages.
+- Windows releases use a hash- and Authenticode-pinned Inno Setup 6.7.1 tree,
+  prove two Setup.exe builds byte-identical, and publish a deterministic
+  ZIP/Setup/toolchain attestation without tag rewriting or asset clobbering.
 
 ## Recent fixes (v4.0.79)
 

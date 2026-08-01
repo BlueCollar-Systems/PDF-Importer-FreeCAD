@@ -43,3 +43,8 @@ def test_auto_release_ignores_bookkeeping_path_and_keeps_message_guard():
     assert "steps.mint.outputs.release_verified == 'true'" in workflow
     assert "python scripts/release_bookkeeping.py record" in workflow
     assert 'git add -- "$RECORD"' in workflow
+    assert "token: ${{ secrets.GITHUB_TOKEN }}" in workflow
+    assert "secrets.RELEASE_BUMP_TOKEN" not in workflow
+    assert 'BRANCH="automation/release-bookkeeping-${VERSION}"' in workflow
+    assert 'git push origin "HEAD:refs/heads/$BRANCH"' in workflow
+    assert 'gh pr create --base main --head "$BRANCH"' in workflow

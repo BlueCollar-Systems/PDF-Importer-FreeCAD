@@ -44,8 +44,8 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
-          # GITHUB_TOKEN always authenticates checkout; RELEASE_BUMP_TOKEN is used
-          # only when pushing the version-bump commit past branch protection.
+          # Keep checkout on the job-scoped token. Bookkeeping follows branch
+          # protection through a narrowly scoped pull request below.
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
@@ -195,6 +195,8 @@ jobs:
 
       - name: Record verified release artifact digests without a release loop
         if: steps.mint.outputs.release_verified == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           VERSION="v${{ steps.version.outputs.version }}"
@@ -228,9 +230,32 @@ jobs:
           fi
           SUBJECT="$(python scripts/release_bookkeeping.py subject --tag "$VERSION")"
           git commit -m "$SUBJECT"
-          if ! git push origin HEAD:main; then
-            git pull --rebase origin main
-            git push origin HEAD:main
+
+          # Never bypass main's protection. A stable, release-specific branch
+          # makes reruns convergent and the bookkeeping-only main push cannot
+          # recursively mint another release because of paths-ignore above.
+          BRANCH="automation/release-bookkeeping-${VERSION}"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch --no-tags origin "$BRANCH"
+            REMOTE_RECORD="$(mktemp)"
+            git show "FETCH_HEAD:$RECORD" > "$REMOTE_RECORD"
+            if ! cmp -- "$RECORD" "$REMOTE_RECORD"; then
+              echo "Existing $BRANCH has a different $RECORD; refusing to overwrite it." >&2
+              exit 1
+            fi
+          else
+            git switch -c "$BRANCH"
+            git push origin "HEAD:refs/heads/$BRANCH"
+          fi
+
+          PR_STATE="$(gh pr view "$BRANCH" --json state --jq .state 2>/dev/null || true)"
+          if [ -z "$PR_STATE" ]; then
+            gh pr create --base main --head "$BRANCH" \
+              --title "$SUBJECT" \
+              --body "Records the already-verified immutable ${VERSION} artifact identities. This bookkeeping-only change is release-loop-safe."
+          elif [ "$PR_STATE" != "OPEN" ] && [ "$PR_STATE" != "MERGED" ]; then
+            echo "Bookkeeping PR for $BRANCH is $PR_STATE; refusing to create a duplicate." >&2
+            exit 1
           fi
 
       - name: Check website dispatch token secret

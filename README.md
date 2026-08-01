@@ -3,7 +3,7 @@
 **BUILT. NOT BOUGHT.**
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
-![Version: 4.0.76](https://img.shields.io/badge/Version-4.0.76-blue.svg)
+![Version: 4.0.77](https://img.shields.io/badge/Version-4.0.77-blue.svg)
 ![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
 
 Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.
@@ -12,7 +12,12 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 
 > BlueCollar Systems -- BUILT. NOT BOUGHT.
 
-## Recent fixes (v4.0.76)
+## Recent fixes (v4.0.77)
+
+- SVG glyph and geometry text now recover thin or tall shop-drawing glyphs
+  whose outlines fall just outside the extractor's source bounds. Recovery is
+  bounded to one small source-box expansion, while distant outlines remain
+  explicitly unmatched instead of being assigned by proximity.
 
 - Windows ZIP and Setup.exe assets are now built from one canonical payload
   and published together, allowing future releases to be immutable without a

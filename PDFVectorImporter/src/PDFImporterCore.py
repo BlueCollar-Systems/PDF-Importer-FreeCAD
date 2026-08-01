@@ -2672,7 +2672,15 @@ def _resolve_shapestring_font_path_with_evidence(
                     failure.get("reason") == "embedded_type3_font_program_unavailable"
                     and type(failure.get("xref")) is int
                     and failure.get("xref") == 0
-                    and failure.get("inventory_xref") is None
+                    and (
+                        failure.get("inventory_xref") is None
+                        # A Type3 row may legitimately carry its own xref: the font
+                        # OBJECT exists, only the font PROGRAM is absent. Requiring
+                        # None alone rejected every real-world Type3 font as a
+                        # malformed observation and aborted the entire import.
+                        or (type(failure.get("inventory_xref")) is int
+                            and failure.get("inventory_xref") > 0)
+                    )
                     and str(failure.get("font_type") or "").strip().lower() == "type3"
                     and not str(failure.get("exception") or "")
                 )

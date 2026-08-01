@@ -1,7 +1,7 @@
 # PDF Vector Importer for FreeCAD
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Version: 4.0.78](https://img.shields.io/badge/Version-4.0.78-green.svg)
+![Version: 4.0.79](https://img.shields.io/badge/Version-4.0.79-green.svg)
 ![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
 
 **Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.**
@@ -11,6 +11,18 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 > **BlueCollar Systems** -- BUILT. NOT BOUGHT.
 
 ---
+
+## Recent fixes (v4.0.79)
+
+- Type3 font-program absence is now an exact item-level fallback condition;
+  unrelated page text remains importable while malformed font inventory still
+  fails closed.
+- Unicode PDF paths use bounded header validation and path-based PyMuPDF open,
+  avoiding an unnecessary full-file memory copy.
+- Heavy-page acceptance adds pre-host complexity limits and source-bound page
+  checkpoints with explicit remaining-page reporting.
+- Packaging rejects private or dirty inputs and builds a fresh hash-locked
+  runtime in isolation instead of reusing stale local dependency bytes.
 
 ## Recent fixes (v4.0.78)
 

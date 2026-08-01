@@ -3,7 +3,7 @@
 **BUILT. NOT BOUGHT.**
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
-![Version: 4.0.78](https://img.shields.io/badge/Version-4.0.78-blue.svg)
+![Version: 4.0.79](https://img.shields.io/badge/Version-4.0.79-blue.svg)
 ![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
 
 Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.
@@ -11,6 +11,20 @@ Import vector geometry, text, and images from PDF files into FreeCAD as editable
 Arc reconstruction, dash mapping, color grouping, OCG layer support, and reference-based scaling -- all powered by pure-Python PDF parsing via PyMuPDF.
 
 > BlueCollar Systems -- BUILT. NOT BOUGHT.
+
+## Recent fixes (v4.0.79)
+
+- Type3 fonts with no extractable embedded program now produce an exact,
+  item-scoped fallback reason without poisoning unrelated text on the page;
+  malformed non-Type3 font records still fail closed.
+- Unicode Windows paths are delegated directly to PyMuPDF after a bounded
+  header check, avoiding a second whole-PDF memory copy on older hardware.
+- Heavy-page QA runs are complexity-gated before host objects are created and
+  use source-bound page checkpoints, so acceptance cannot report unfinished
+  pages as complete.
+- Release builds now reject private PDF/CAD/model/report/archive artifacts,
+  dirty or untracked package inputs, and stale checkout dependencies. Every
+  ZIP vendors fresh hash-locked runtime wheels in an isolated staging tree.
 
 ## Recent fixes (v4.0.78)
 

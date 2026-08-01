@@ -933,6 +933,60 @@ def test_type3_inventory_without_extractable_xref_is_proven_exact_absence(
     assert results[1]["source"] == "system_font"
 
 
+def test_type3_inventory_with_font_object_xref_proves_program_absence(
+    monkeypatch,
+    tmp_path,
+):
+    """A real Type3 font object has an xref but no extractable font program."""
+
+    class FakePage:
+        @staticmethod
+        def get_fonts(full=True):
+            assert full is True
+            return [(32, "", "Type3", "", "R104")]
+
+    class FakePdf:
+        @staticmethod
+        def extract_font(_xref):
+            raise AssertionError("Type3 font programs must not be extracted")
+
+    monkeypatch.setattr(core, "_shapestring_font_cache_dir", lambda: tmp_path)
+    opts = core.ImportOptions(text_mode="3d_text")
+    staged = core._stage_page_shapestring_fonts(
+        FakePdf(),
+        FakePage(),
+        opts,
+        pdf_sha256=PDF_SHA_A,
+        page_number=1,
+    )
+
+    assert staged == {}
+    failures = opts._shapestring_font_staging_sessions[0]["failures"]
+    assert {failure["font"] for failure in failures} == {
+        "Type3 (32 0 R)",
+        "R104",
+    }
+    assert all(
+        failure["reason"] == "embedded_type3_font_program_unavailable"
+        and failure["inventory_xref"] == 32
+        and failure["font_type"] == "Type3"
+        for failure in failures
+    )
+
+    path, results = core._resolve_shapestring_font_path_with_evidence(
+        "Type3 (32 0 R)",
+        opts,
+        pdf_sha256=PDF_SHA_A,
+        page_number=1,
+    )
+
+    assert path is None
+    assert results[0]["source"] == "embedded_font"
+    assert results[0]["outcome"] == "not_found"
+    assert results[0]["inventory_observation"]["inventory_xref"] == 32
+    assert results[1]["source"] == "system_font"
+
+
 @pytest.mark.parametrize(
     "exception_text",
     ["RuntimeError: extraction failed", "OSError: font file unavailable"],

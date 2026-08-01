@@ -433,9 +433,29 @@ def stage_page_fonts(
         font_type_hint = str(row[2] or "").strip()
         font_hint = str(row[3] or "").strip()
         resource_hint = str(row[4] or "").strip() if len(row) > 4 else ""
-        if font_type_hint.lower() == "type3" and row[0] is None:
+        if font_type_hint.lower() == "type3":
+            # A Type3 font never has an extractable font program: its glyphs are
+            # PDF content streams referenced by the font dictionary, not a TTF or
+            # CFF payload. That is true whether or not the inventory row carries
+            # an xref, and real documents DO carry one -- measured on the owner's
+            # corpus, all 14 Type3 rows on `Alvord TX - Garden Plan . Final_OCR`
+            # have xrefs (32, 33, 42, ...) with an empty BaseFont name and only a
+            # resource name (R104, R110, ...). Gating this branch on
+            # `row[0] is None` meant those rows fell through to the empty-name
+            # check below and were recorded as `embedded_font_inventory_row_invalid`
+            # -- reported as corrupt data, which aborted the whole import. Type3
+            # affects 4 of the 60 corpus PDFs, up to 56 of 88 fonts on a page.
             observed_names = []
-            for observed_name in (font_hint, resource_hint):
+            # PyMuPDF names an unnamed Type3 font synthetically as
+            # "Type3 (<xref> 0 R)" and that is the name that arrives on the text
+            # span. The inventory row only carries the resource name (R47), so
+            # without this alias the span's font identity never matches any
+            # recorded observation, the resolver reports
+            # `font_not_observed_in_completed_inventory`, and the import aborts.
+            synthetic_type3_name = (
+                "Type3 (%d 0 R)" % row[0] if isinstance(row[0], int) else ""
+            )
+            for observed_name in (synthetic_type3_name, font_hint, resource_hint):
                 if observed_name and observed_name not in observed_names:
                     observed_names.append(observed_name)
             if not observed_names:
@@ -446,13 +466,17 @@ def stage_page_fonts(
                     reason="embedded_font_inventory_row_invalid",
                 )
                 continue
+            inventory_xref = row[0] if isinstance(row[0], int) else None
             for observed_name in observed_names:
                 record_inventory_result(
                     xref=0,
                     font=observed_name,
                     outcome="not_embedded",
                     reason="embedded_type3_font_program_unavailable",
-                    inventory_xref=None,
+                    # Report the real inventory xref when the PDF has one rather
+                    # than a blanket None; the absence being proven is of a font
+                    # PROGRAM, not of the font object.
+                    inventory_xref=inventory_xref,
                     font_type=font_type_hint,
                 )
             continue

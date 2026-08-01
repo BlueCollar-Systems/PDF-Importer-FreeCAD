@@ -2293,6 +2293,37 @@ def _stage_page_shapestring_fonts(
     return staged
 
 
+# MuPDF caps the font name it reports on a text span at 24 characters, so a
+# longer BaseFont arrives truncated -- e.g. the inventory's
+# "JAAAAA+NotoSansSymbols-Regular-Subsetted" reaches the span as
+# "NotoSansSymbols-Regular-" (exactly 24 chars). The normalized keys then differ
+# and the exact-font lookup reports `font_not_observed_in_completed_inventory`,
+# aborting the import even though the font WAS staged successfully.
+_MUPDF_SPAN_FONT_NAME_LIMIT = 24
+
+
+def _unique_truncated_font_key(raw_name, key, candidate_keys):
+    """Resolve a MuPDF-truncated span font name to its one staged key.
+
+    Deliberately conservative, because a loose prefix rule would substitute the
+    WRONG font -- "Arial" is a prefix of "ArialNarrow". Two guards:
+
+    * the raw span name must be at the truncation limit, so names that were
+      never truncated still have to match exactly;
+    * exactly one candidate may extend the key. Zero or several means the
+      identity is not proven and the caller keeps its existing behaviour.
+    """
+    if len(str(raw_name or "")) < _MUPDF_SPAN_FONT_NAME_LIMIT:
+        return None
+    if not key:
+        return None
+    matches = [
+        candidate for candidate in candidate_keys
+        if candidate != key and str(candidate).startswith(key)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _canonical_font_identity(font_name: str) -> Dict[str, str]:
     """Bind a stripped PDF font name to the shared exact normalization key."""
     from PDFEmbeddedFonts import normalize_font_key
@@ -2561,7 +2592,15 @@ def _resolve_shapestring_font_path_with_evidence(
                 reason="malformed_staged_font_lookup",
             )]
         record_present = key in embedded
-        record = embedded[key] if record_present else None
+        lookup_key = key
+        if not record_present:
+            truncated_key = _unique_truncated_font_key(
+                font_identity.get("raw_name"), key, embedded.keys()
+            )
+            if truncated_key is not None:
+                lookup_key = truncated_key
+                record_present = True
+        record = embedded[lookup_key] if record_present else None
     except Exception as exc:
         return None, [source_result(
             "embedded_font",

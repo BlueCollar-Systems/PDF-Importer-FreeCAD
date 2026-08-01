@@ -20,6 +20,7 @@ for path in (str(SRC_DIR), str(MOD_ROOT)):
 
 import PDFImporterCore as core  # noqa: E402
 from PDFVectorImporter.pdfcadcore import embedded_fonts  # noqa: E402
+import PDFEmbeddedFonts as staging_fonts  # noqa: E402
 
 
 PDF_SHA_A = "a" * 64
@@ -133,6 +134,49 @@ def test_shared_catalog_non_type3_without_xref_remains_terminal_page_failure():
     assert page_failure.reason == "invalid_page_font_record"
     assert page_failure.proof_category == "source_inventory_invalid_for_page"
     assert catalog.failure_for_span("Siwa-Regular").reason == "invalid_page_font_record"
+
+
+def test_truncated_span_font_name_resolves_to_its_one_staged_font():
+    """MuPDF truncates a span's font name at 24 chars; the staged font is real.
+
+    Measured: `JAAAAA+NotoSansSymbols-Regular-Subsetted` is staged successfully,
+    but the span reports "NotoSansSymbols-Regular-" (exactly 24 characters), so
+    the normalized keys differ and the exact lookup reported
+    `font_not_observed_in_completed_inventory` and aborted the import.
+    """
+    truncated = "NotoSansSymbols-Regular-"
+    assert len(truncated) == core._MUPDF_SPAN_FONT_NAME_LIMIT
+    key = staging_fonts.normalize_font_key(truncated)
+    staged = staging_fonts.normalize_font_key("NotoSansSymbols-Regular-Subsetted")
+
+    assert key != staged
+    assert core._unique_truncated_font_key(truncated, key, [staged]) == staged
+
+
+def test_truncated_span_font_name_refuses_an_ambiguous_match():
+    """Two candidates means the identity is unproven -- never guess."""
+    truncated = "NotoSansSymbols-Regular-"
+    key = staging_fonts.normalize_font_key(truncated)
+    candidates = [
+        staging_fonts.normalize_font_key("NotoSansSymbols-Regular-Subsetted"),
+        staging_fonts.normalize_font_key("NotoSansSymbols-Regular-Condensed"),
+    ]
+
+    assert core._unique_truncated_font_key(truncated, key, candidates) is None
+
+
+def test_short_span_font_name_still_requires_an_exact_match():
+    """A name that was never truncated must not prefix-match a longer font.
+
+    Without this guard "Arial" would silently resolve to "ArialNarrow" -- a
+    wrong-font substitution, which is worse than failing to resolve at all.
+    """
+    short = "Arial"
+    assert len(short) < core._MUPDF_SPAN_FONT_NAME_LIMIT
+    key = staging_fonts.normalize_font_key(short)
+    candidates = [staging_fonts.normalize_font_key("ArialNarrow")]
+
+    assert core._unique_truncated_font_key(short, key, candidates) is None
 
 
 def test_cmap_repair_adds_host_safe_names_to_anonymous_subset_font():

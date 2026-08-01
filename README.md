@@ -103,6 +103,16 @@ See **[INSTALL.md](INSTALL.md)** for Windows FreeCAD 1.1 paths, dev junction ins
 python build_release.py
 ```
 
+Release builds are fail-closed and must run from a Git checkout. Every
+shippable addon source file must be tracked and byte-identical to the Git
+index; private PDF/CAD/model inputs, generated import reports, corpus folders,
+and nested archives abort the build. The ignored `PDFVectorImporter/src/lib`
+tree is deleted and rebuilt on every release build from the exact wheel hashes
+in `requirements-release.lock`, so an importable but stale local runtime cannot
+enter the ZIP. Use a Windows CPython 3.11 interpreter and an available pip
+cache/network path for the reviewed wheels. `--no-vendor-deps` intentionally
+refuses release creation because ignored runtime bytes are not commit-bound.
+
 ### Build Windows Installer (.exe)
 1. Install [Inno Setup 6](https://jrsoftware.org/isinfo.php)
 2. Run:

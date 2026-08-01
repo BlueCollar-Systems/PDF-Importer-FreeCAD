@@ -104,8 +104,9 @@ private **PyMuPDF** copy under:
 
 That means release users do not need system Python, pip, or any operating
 system Python packages. The **Install / Update PyMuPDF** command remains as a
-source/dev fallback if you install directly from a checkout or intentionally
-build with `--no-vendor-deps`.
+source/dev fallback if you install directly from a checkout. Release builds
+intentionally reject `--no-vendor-deps`: ignored local `src/lib` bytes are not
+commit-bound, so the release builder regenerates them from the hashed lock.
 
 Manual fallback install:
 

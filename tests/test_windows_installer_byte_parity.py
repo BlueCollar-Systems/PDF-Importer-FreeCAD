@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import zipfile
 from pathlib import Path
 
@@ -99,3 +100,51 @@ def test_obsolete_second_stage_windows_release_workflow_is_removed():
     )
     assert "workflow `windows-release`" not in readme
     assert "`auto-release` workflow builds and publishes both artifacts" in readme
+
+
+def test_completion_message_never_blocks_silent_installers():
+    script = (
+        Path(build_windows_installer.REPO_ROOT)
+        / "installer"
+        / "PDFVectorImporter.iss"
+    ).read_text(encoding="utf-8")
+    event = re.search(
+        r"procedure\s+CurStepChanged\s*\([^)]*\);(?P<body>.*?)\nend;",
+        script,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert event is not None, "installer completion event is missing"
+    body = event.group("body")
+    completion_condition = re.search(
+        r"if\s*\(\s*CurStep\s*=\s*ssPostInstall\s*\)\s*"
+        r"and\s*\(?\s*not\s+WizardSilent\s*\)?\s*then",
+        body,
+        flags=re.IGNORECASE,
+    )
+    assert completion_condition is not None, (
+        "interactive completion UI must be gated by not WizardSilent so "
+        "/SILENT and /VERYSILENT installs can terminate unattended"
+    )
+    assert body.count("MsgBox(") == 1
+    prompt_offset = body.index("MsgBox(")
+    assert completion_condition.end() < prompt_offset, (
+        "the scripted completion prompt must remain inside the non-silent gate"
+    )
+
+
+def test_installer_payload_does_not_embed_staging_timestamps():
+    script = (
+        Path(build_windows_installer.REPO_ROOT)
+        / "installer"
+        / "PDFVectorImporter.iss"
+    ).read_text(encoding="utf-8")
+    payload_entry = next(
+        line
+        for line in script.splitlines()
+        if line.startswith('Source: "{#SourceDir}\\*";')
+    )
+    flags = payload_entry.split("Flags:", 1)[1].split()
+    assert "notimestamp" in flags, (
+        "installer payload entries must omit extraction-time metadata so two "
+        "canonical ZIP stages compile to identical Setup.exe bytes"
+    )

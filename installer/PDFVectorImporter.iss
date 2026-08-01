@@ -33,7 +33,7 @@ SetupLogging=yes
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
-Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion notimestamp
 
 [Code]
 const
@@ -267,7 +267,7 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
-  if CurStep = ssPostInstall then
+  if (CurStep = ssPostInstall) and (not WizardSilent) then
   begin
     MsgBox(
       'PDF Vector Importer was installed to:' + #13#10 + ExpandConstant('{app}') + #13#10#13#10 +

@@ -436,15 +436,11 @@ def stage_page_fonts(
         if font_type_hint.lower() == "type3":
             # A Type3 font never has an extractable font program: its glyphs are
             # PDF content streams referenced by the font dictionary, not a TTF or
-            # CFF payload. That is true whether or not the inventory row carries
-            # an xref, and real documents DO carry one -- measured on the owner's
-            # corpus, all 14 Type3 rows on `Alvord TX - Garden Plan . Final_OCR`
-            # have xrefs (32, 33, 42, ...) with an empty BaseFont name and only a
-            # resource name (R104, R110, ...). Gating this branch on
-            # `row[0] is None` meant those rows fell through to the empty-name
-            # check below and were recorded as `embedded_font_inventory_row_invalid`
-            # -- reported as corrupt data, which aborted the whole import. Type3
-            # affects 4 of the 60 corpus PDFs, up to 56 of 88 fonts on a page.
+            # CFF payload. Valid inventory rows may still carry an object xref
+            # while BaseFont is empty and only a resource name is available.
+            # Gating this branch on `row[0] is None` sends those rows through
+            # empty-name validation, misclassifies valid Type3 resources as
+            # corrupt, and aborts the import.
             observed_names = []
             # PyMuPDF names an unnamed Type3 font synthetically as
             # "Type3 (<xref> 0 R)" and that is the name that arrives on the text

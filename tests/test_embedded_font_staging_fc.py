@@ -60,14 +60,11 @@ def test_shared_catalog_type3_without_xref_is_item_scoped_impossibility():
 
 
 def test_shared_catalog_type3_with_xref_is_item_scoped_impossibility():
-    """Real Type3 fonts DO carry an xref; only the font PROGRAM is absent.
+    """A Type3 resource may carry an xref although no font program exists.
 
-    Measured on the owner's corpus: every Type3 row on
-    `Alvord TX - Garden Plan . Final_OCR.pdf` has an xref (32, 33, 42, ...), an
-    empty BaseFont name, and only a resource name. Gating the Type3 branch on
-    `xref is None` recorded all of them as `embedded_font_inventory_row_invalid`
-    -- reported as corrupt data -- and aborted the entire import. 4 of 60 corpus
-    PDFs are affected, up to 56 of 88 fonts on a single page.
+    A valid row can have an empty BaseFont name and only a resource name.
+    Gating the Type3 branch on ``xref is None`` misclassifies that row as an
+    invalid inventory record and can abort the entire import.
 
     PyMuPDF also names such a span "Type3 (<xref> 0 R)", which is the name that
     arrives on the text item, so that alias must be observed too or the span

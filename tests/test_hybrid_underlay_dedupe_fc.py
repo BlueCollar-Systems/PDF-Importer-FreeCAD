@@ -6,8 +6,8 @@ Hybrid pages deliver vectors and text NATIVELY — the raster layer may only
 carry the page's genuine embedded images, one ``Image::ImagePlane`` per
 embedded image instance, bbox-matched to that image block. A full-page
 ``page.get_pixmap`` underlay rasterizes text + linework + images and makes
-every item exist twice (double-render, confirmed in-host on the owner
-Welding chart: coverage_frac 1.0 with text ink in the underlay PNG).
+every item exist twice (double-render, confirmed by a private host fixture;
+the public regression below uses independently synthetic geometry).
 
 Locks (per the accepted dedupe spec):
 1. hybrid fixture (1 embedded image + text + vectors) → exactly one

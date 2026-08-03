@@ -7,8 +7,6 @@ qa_config_local_*.json
 PDFVectorImporter/qa_config_local_*.json
 
 # Sample/test PDFs
-TX_Alvord*
-PDFVectorImporter/TX_Alvord*
 *.pdf
 
 # Binary documents (not diffable in git)

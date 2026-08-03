@@ -61,6 +61,7 @@ class FakeVertex:
 class FakeShape:
     def __init__(self, *, solid=False, width=12.0, height=5.0, angle=0.0):
         self.Faces = [object()]
+        self.Wires = []
         self.Solids = [object()] if solid else []
         self.Volume = 10.0 if solid else 0.0
         radians = math.radians(float(angle))
@@ -72,6 +73,14 @@ class FakeShape:
         ys = [point[1] for point in points]
         self.BoundBox = FakeBoundBox(max(xs) - min(xs), max(ys) - min(ys))
         self.Vertexes = [FakeVertex(x, y) for x, y in points]
+
+    def isNull(self):
+        return False
+
+
+class FakeZeroGeometryShape:
+    Faces = []
+    Wires = []
 
     def isNull(self):
         return False
@@ -331,6 +340,18 @@ def _found_font_resolution(item, path="C:/fonts/arial.ttf"):
         "page_number": item["page_number"],
         "staging_complete": True,
     }]
+
+
+def _force_zero_shapestring_geometry(document):
+    original_recompute = document.recompute
+
+    def recompute(*args):
+        original_recompute(*args)
+        for host_obj in document.Objects:
+            if str(getattr(host_obj, "TypeId", "")) == "Part::Part2DObjectPython":
+                host_obj.Shape = FakeZeroGeometryShape()
+
+    document.recompute = recompute
 
 
 def _absent_font_resolution(item):
@@ -691,6 +712,7 @@ def test_new_import_run_clears_prior_representation_evidence_without_changing_re
     assert opts._shapestring_font_paths == {}
     assert opts._shapestring_font_staging_sessions == []
     assert opts._report_extra == {}
+    assert opts._svg_source_snapshot_cache == {}
 
 
 def test_source_items_preserve_original_identity_and_transform():
@@ -860,6 +882,345 @@ def test_exact_font_exhaustion_raises_fully_bound_text_item_impossible(
     ) == proof
 
 
+def _raise_complete_zero_outline_impossibility(monkeypatch):
+    document, draft, group = _install_host(monkeypatch)
+    _force_zero_shapestring_geometry(document)
+    item = _canonical_3d_item("UNMAPPED")
+    resolution = _found_font_resolution(item)
+    monkeypatch.setattr(
+        core,
+        "_resolve_shapestring_font_path_with_evidence",
+        lambda *_args, **_kwargs: resolution,
+    )
+
+    class ZeroOutlinePart:
+        @staticmethod
+        def makeWireString(source_text, font_path, size, tracking):
+            assert font_path == resolution[0]
+            assert (size, tracking) == (1.0, 0)
+            return [[] for _character in source_text]
+
+    monkeypatch.setattr(core, "Part", ZeroOutlinePart)
+    monkeypatch.setattr(
+        core,
+        "_create_verified_compound_text3d_entity",
+        lambda _doc, **kwargs: core._build_exact_text3d_outline_template(
+            kwargs["source_text"], kwargs["font_path"]
+        ),
+    )
+
+    with pytest.raises(core.TextItemImpossible) as raised:
+        core._deliver_text_item_3d(
+            item,
+            "3d_text",
+            core.ImportOptions(text_mode="3d_text"),
+            text_group=group,
+            page_h=100.0,
+            scale=1.0,
+        )
+
+    return item, resolution, raised.value, document, draft
+
+
+def test_zero_part_outlines_use_exact_shapestring_before_cross_mode_fallback(
+    monkeypatch,
+):
+    document, draft, group = _install_host(monkeypatch)
+    item = _canonical_3d_item("TEXT")
+    resolution = _found_font_resolution(item)
+    monkeypatch.setattr(
+        core,
+        "_resolve_shapestring_font_path_with_evidence",
+        lambda *_args, **_kwargs: resolution,
+    )
+
+    class ZeroOutlinePart:
+        @staticmethod
+        def makeWireString(source_text, _font_path, _size, _tracking):
+            return [[] for _character in source_text]
+
+    monkeypatch.setattr(core, "Part", ZeroOutlinePart)
+    monkeypatch.setattr(
+        core,
+        "_create_verified_compound_text3d_entity",
+        lambda _doc, **kwargs: core._build_exact_text3d_outline_template(
+            kwargs["source_text"], kwargs["font_path"]
+        ),
+    )
+
+    result = core._deliver_text_item_3d(
+        item,
+        "3d_text",
+        core.ImportOptions(text_mode="3d_text"),
+        text_group=group,
+        page_h=100.0,
+        scale=1.0,
+    )
+
+    assert result["outcome"] == "verified"
+    assert result["final_type"] == "3d_text"
+    assert result["evidence"]["implementation"] == (
+        "parametric_shapestring_fallback_v1"
+    )
+    assert draft.calls == [(item["text"], resolution[0])]
+    assert len(document.Objects) == 3
+
+
+def test_complete_zero_outline_exact_font_item_has_a_bound_private_proof(monkeypatch):
+    item, resolution, impossible, document, draft = (
+        _raise_complete_zero_outline_impossibility(monkeypatch)
+    )
+    proof = impossible.proof
+
+    assert impossible.attempt["outcome"] == "proven_impossible"
+    assert impossible.attempt["reason_code"] == (
+        "text3d_exact_font_outlines_unavailable"
+    )
+    assert proof["reason_code"] == "text3d_exact_font_outlines_unavailable"
+    assert proof["importer_identity"] == core.FREECAD_TEXT_IMPORTER_IDENTITY
+    assert proof["pdf_sha256"] == item["pdf_sha256"]
+    assert proof["page_number"] == item["page_number"]
+    assert proof["source_item_id"] == item["source_item_id"]
+    assert proof["requested_type"] == "3d_text"
+    assert proof["attempted_type"] == "3d_text"
+    assert proof["font_identity"] == item["font_identity"]
+    assert len(proof["attempted_source_results"]) == 1
+    assert proof["attempted_source_results"][0]["source"] == "embedded_font"
+    assert proof["attempted_source_results"][0]["outcome"] == "found"
+    assert proof["attempted_source_results"][0]["sha256"] == "b" * 64
+    assert "path" not in proof["attempted_source_results"][0]
+    assert proof["attempted_sources_complete"] is True
+    assert proof["created_entity_ids"] == ["ShapeString_0"]
+    assert proof["removed_entity_ids"] == ["ShapeString_0"]
+    assert proof["cleanup_complete"] is True
+    evidence = proof["evidence"]
+    assert evidence["source_text_sha256"] == core.hashlib.sha256(
+        b"UNMAPPED"
+    ).hexdigest()
+    assert evidence["font_sha256"] == "b" * 64
+    assert evidence["font_source"] == "embedded_font"
+    assert [result["implementation"] for result in evidence["exact_3d_path_results"]] == [
+        "part_make_wire_string",
+        "draft_shapestring",
+    ]
+    assert all(
+        result["outcome"] == "zero_geometry"
+        for result in evidence["exact_3d_path_results"]
+    )
+    assert evidence["exact_3d_path_results"][1]["recompute_completed"] is True
+    assert evidence["exact_3d_path_results"][1]["face_count"] == 0
+    assert evidence["exact_3d_path_results"][1]["wire_count"] == 0
+    assert item["text"] not in repr(proof)
+    assert resolution[0] not in repr(proof)
+    assert "font_path" not in repr(proof)
+    assert core._validate_item_impossibility_proof(
+        item, "3d_text", "3d_text", proof
+    ) == proof
+    assert document.Objects == []
+    assert draft.calls == [(item["text"], resolution[0])]
+
+
+def test_system_font_zero_outline_proof_hashes_once_and_binds_that_digest(monkeypatch):
+    document, draft, group = _install_host(monkeypatch)
+    _force_zero_shapestring_geometry(document)
+    item = _canonical_3d_item("UNMAPPED")
+    identity = dict(item["font_identity"])
+    font_path = "C:/fonts/arial.ttf"
+    resolution = (
+        font_path,
+        [
+            {
+                "source": "embedded_font",
+                "outcome": "not_found",
+                "font_identity": dict(identity),
+                "pdf_sha256": item["pdf_sha256"],
+                "page_number": item["page_number"],
+                "staging_complete": True,
+            },
+            {
+                "source": "system_font",
+                "outcome": "found",
+                "font_identity": dict(identity),
+                "path": font_path,
+                "pdf_sha256": item["pdf_sha256"],
+                "page_number": item["page_number"],
+                "staging_complete": True,
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        core,
+        "_resolve_shapestring_font_path_with_evidence",
+        lambda *_args, **_kwargs: resolution,
+    )
+    hash_calls = []
+    monkeypatch.setattr(
+        core,
+        "_path_sha256",
+        lambda path: hash_calls.append(path) or "c" * 64,
+    )
+
+    class ZeroOutlinePart:
+        @staticmethod
+        def makeWireString(source_text, _font_path, _size, _tracking):
+            return [[] for _character in source_text]
+
+    monkeypatch.setattr(core, "Part", ZeroOutlinePart)
+    monkeypatch.setattr(
+        core,
+        "_create_verified_compound_text3d_entity",
+        lambda _doc, **kwargs: core._build_exact_text3d_outline_template(
+            kwargs["source_text"], kwargs["font_path"]
+        ),
+    )
+
+    with pytest.raises(core.TextItemImpossible) as raised:
+        core._deliver_text_item_3d(
+            item,
+            "3d_text",
+            core.ImportOptions(text_mode="3d_text"),
+            text_group=group,
+            page_h=100.0,
+            scale=1.0,
+        )
+
+    proof = raised.value.proof
+    assert hash_calls == [Path(font_path)]
+    assert proof["evidence"]["font_sha256"] == "c" * 64
+    assert proof["evidence"]["font_source"] == "system_font"
+    assert proof["attempted_source_results"][-1]["sha256"] == "c" * 64
+    assert "path" not in proof["attempted_source_results"][-1]
+    assert font_path not in repr(proof)
+    assert core._validate_item_impossibility_proof(
+        item, "3d_text", "3d_text", proof
+    ) == proof
+    assert document.Objects == []
+    assert draft.calls == [(item["text"], font_path)]
+
+
+def test_zero_outline_impossibility_rejects_every_mutated_binding(monkeypatch):
+    item, _resolution, impossible, _document, _draft = (
+        _raise_complete_zero_outline_impossibility(monkeypatch)
+    )
+    mutations = [
+        lambda proof: proof["evidence"].__setitem__("source_text_sha256", "c" * 64),
+        lambda proof: proof["evidence"].__setitem__("source_text_length", 7),
+        lambda proof: proof["evidence"].__setitem__(
+            "non_whitespace_character_count", 7
+        ),
+        lambda proof: proof["evidence"].__setitem__("glyph_inventory_length", 7),
+        lambda proof: proof["evidence"].__setitem__("glyph_outline_count", 1),
+        lambda proof: proof["evidence"].__setitem__("font_source", "system_font"),
+        lambda proof: proof["evidence"].__setitem__("font_sha256", "c" * 64),
+        lambda proof: proof["evidence"]["exact_3d_path_results"].pop(),
+        lambda proof: proof["attempted_source_results"][-1].__setitem__(
+            "outcome", "not_found"
+        ),
+        lambda proof: proof.__setitem__("cleanup_complete", False),
+    ]
+
+    for mutate in mutations:
+        changed = copy.deepcopy(impossible.proof)
+        mutate(changed)
+        with pytest.raises(ValueError):
+            core._validate_item_impossibility_proof(
+                item, "3d_text", "3d_text", changed
+            )
+
+
+def test_nonclosed_compound_failure_plus_zero_shapestring_is_terminal(monkeypatch):
+    document, draft, group = _install_host(monkeypatch)
+    _force_zero_shapestring_geometry(document)
+    item = _canonical_3d_item("TEXT")
+    resolution = _found_font_resolution(item)
+    monkeypatch.setattr(
+        core,
+        "_resolve_shapestring_font_path_with_evidence",
+        lambda *_args, **_kwargs: resolution,
+    )
+    monkeypatch.setattr(
+        core,
+        "_create_verified_compound_text3d_entity",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("source glyph inventory does not match source text")
+        ),
+    )
+
+    with pytest.raises(core.TextRepresentationFailure) as raised:
+        core._deliver_text_item_3d(
+            item,
+            "3d_text",
+            core.ImportOptions(text_mode="3d_text"),
+            text_group=group,
+            page_h=100.0,
+            scale=1.0,
+        )
+
+    assert raised.value.attempt["outcome"] == "failed"
+    assert raised.value.attempt["reason"] == "calibration_extrusion_failed"
+    assert draft.calls == [(item["text"], resolution[0])]
+    assert document.Objects == []
+
+
+def test_zero_outline_proof_advances_to_glyphs_without_relabeling_requested_mode(
+    monkeypatch,
+):
+    item, _resolution, impossible, _document, _draft = (
+        _raise_complete_zero_outline_impossibility(monkeypatch)
+    )
+    opts = core.ImportOptions(text_mode="3d_text")
+    calls = []
+
+    def impossible_3d(_item, attempted_type, _opts):
+        calls.append(attempted_type)
+        raise core.TextItemImpossible(
+            str(impossible),
+            attempt=impossible.attempt,
+            proof=impossible.proof,
+        )
+
+    def verified_glyphs(_item, attempted_type, _opts):
+        calls.append(attempted_type)
+        return {
+            "outcome": "verified",
+            "source_item_id": item["source_item_id"],
+            "attempted_type": "glyphs",
+            "final_type": "glyphs",
+            "created_entity_ids": ["Glyphs001"],
+            "delivery_entity_ids": ["Glyphs001"],
+            "support_entity_ids": [],
+            "removed_entity_ids": [],
+            "cleanup_complete": True,
+            "evidence": {"host_entity_verified": True},
+        }
+
+    result = core._run_text_item_fallback_ladder(
+        item,
+        "3d_text",
+        {
+            "3d_text": impossible_3d,
+            "glyphs": verified_glyphs,
+        },
+        opts,
+    )
+
+    assert calls == ["3d_text", "glyphs"]
+    assert result["requested_type"] == "3d_text"
+    assert result["attempted_type"] == "glyphs"
+    assert result["final_type"] == "glyphs"
+    assert result["attempted_types"] == ["3d_text", "glyphs"]
+    assert [proof["reason_code"] for proof in result["proof_chain"]] == [
+        "text3d_exact_font_outlines_unavailable"
+    ]
+    assert len(opts.text_mode_fallbacks) == 1
+    fallback = opts.text_mode_fallbacks[0]
+    assert fallback["requested"] == "3d_text"
+    assert fallback["delivered"] == "glyphs"
+    assert fallback["reason"] == (
+        "proof_gated:3d_text:text3d_exact_font_outlines_unavailable"
+    )
+
+
 def test_later_3d_rung_success_preserves_original_requested_type(monkeypatch):
     document, _draft, group = _install_host(monkeypatch)
     item = _canonical_3d_item("TEXT", requested_type="labels")
@@ -883,6 +1244,58 @@ def test_later_3d_rung_success_preserves_original_requested_type(monkeypatch):
     assert result["attempted_type"] == "3d_text"
     assert result["final_type"] == "3d_text"
     assert set(result["created_entity_ids"]) == {obj.Name for obj in document.Objects}
+
+
+def test_successful_system_font_3d_delivery_does_not_hash_font_per_item(monkeypatch):
+    document, _draft, group = _install_host(monkeypatch)
+    item = _canonical_3d_item("TEXT")
+    identity = dict(item["font_identity"])
+    resolution = (
+        "C:/fonts/arial.ttf",
+        [
+            {
+                "source": "embedded_font",
+                "outcome": "not_found",
+                "font_identity": dict(identity),
+                "pdf_sha256": item["pdf_sha256"],
+                "page_number": item["page_number"],
+                "staging_complete": True,
+            },
+            {
+                "source": "system_font",
+                "outcome": "found",
+                "font_identity": dict(identity),
+                "path": "C:/fonts/arial.ttf",
+                "pdf_sha256": item["pdf_sha256"],
+                "page_number": item["page_number"],
+                "staging_complete": True,
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        core,
+        "_resolve_shapestring_font_path_with_evidence",
+        lambda *_args, **_kwargs: resolution,
+    )
+    hash_calls = []
+    monkeypatch.setattr(
+        core,
+        "_path_sha256",
+        lambda path: hash_calls.append(path) or "c" * 64,
+    )
+
+    result = core._deliver_text_item_3d(
+        item,
+        "3d_text",
+        core.ImportOptions(text_mode="3d_text"),
+        text_group=group,
+        page_h=100.0,
+        scale=1.0,
+    )
+
+    assert result["outcome"] == "verified"
+    assert hash_calls == []
+    assert document.Objects
 
 
 @pytest.mark.parametrize("error_type", [RuntimeError, OSError])

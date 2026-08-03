@@ -1,7 +1,7 @@
 # PDF Vector Importer for FreeCAD
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Version: 4.0.81](https://img.shields.io/badge/Version-4.0.81-green.svg)
+![Version: 4.0.83](https://img.shields.io/badge/Version-4.0.83-green.svg)
 ![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
 
 **Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.**
@@ -11,6 +11,30 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 > **BlueCollar Systems** -- BUILT. NOT BOUGHT.
 
 ---
+
+## Recent fixes (v4.0.83)
+
+- Exact 3D Text preserves leading/trailing whitespace with FreeCAD-native pen
+  advance and ink-origin verification, and exhausts both same-mode construction
+  paths before an evidence-backed cross-mode fallback.
+- Glyphs now stores ordered per-character subshapes inside one source-item
+  compound with glyph identity metadata, avoiding oversized FCStd archives;
+  per-glyph editing moves from tree objects to compound subshapes.
+- SVG conversion renders every selected page from one verified immutable
+  import-run PDF snapshot.
+- Windows releases select exact CPython 3.10/3.11 fontTools payloads beside one
+  shared PyMuPDF runtime.
+- `HEAD`-bound packaging fails closed on private paths, generated artifacts,
+  and project identifiers supplied only through the masked external denylist.
+- Import reports always publish a validated `ok` or `warn` scale evaluation;
+  missing or malformed evaluations remain fail closed for consumers.
+
+## Recent fixes (v4.0.82)
+
+- Unique staged-font recovery is restricted to MuPDF's measured 24-character
+  span-name truncation boundary. Longer names remain exact-match only, while a
+  genuine unique truncation resolves through completed font staging before 3D
+  text delivery.
 
 ## Recent fixes (v4.0.81)
 
@@ -92,7 +116,7 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 
 2. Restart FreeCAD.
 3. Switch to the **PDF Vector Importer** workbench from the workbench selector.
-4. Release ZIP/Setup installs include private PyMuPDF and fontTools runtimes under `PDFVectorImporter/src/lib`; source checkouts can stage both with `python build_release.py` or **PDF Vector Importer > Install / Update PDF Dependencies**.
+4. Release ZIP/Setup installs include shared PyMuPDF under `src/lib/common` and exact CPython 3.10/3.11 fontTools payloads under `src/lib/cp310` and `src/lib/cp311`. FreeCAD selects only its matching ABI tree. Source checkouts can use **PDF Vector Importer > Install / Update PDF Dependencies** for the current user.
 
 ---
 
@@ -100,9 +124,9 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 
 | Dependency | Required | Notes |
 |---|---|---|
-| **FreeCAD** | 0.21+ | Tested through 1.0 |
-| **PyMuPDF** | Yes | Bundled in release ZIP/Setup installs (`>=1.24,<2.0`); source checkouts can stage it locally |
-| **fontTools** | Yes | Bundled (`>=4.50,<5.0`) to preserve embedded PDF fonts and Unicode mappings for native 3D Text |
+| **FreeCAD** | 0.21+ | Offline bundle supports embedded CPython 3.10 and 3.11; 1.1 installer smoke verified |
+| **PyMuPDF** | Yes | Version 1.28.0 bundled once in the shared stable-ABI tree |
+| **fontTools** | Yes | Version 4.63.0 bundled separately for cp310 and cp311 to preserve embedded fonts and Unicode mappings |
 | **pdftocairo** | Optional | Preferred SVG renderer for text-as-geometry; bundled PyMuPDF is used when Poppler is absent |
 
 ---

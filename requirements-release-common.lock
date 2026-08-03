@@ -1,0 +1,4 @@
+# Windows x86-64 CPython 3.10+ stable-ABI release-runtime wheel.
+# The exact reviewed PyMuPDF wheel is shared by the cp310 and cp311 payloads.
+PyMuPDF==1.28.0 \
+    --hash=sha256:e01e90fd86abfeb37ceb921eddb951f988a11d45ff6ce6b7664f2039849068ec

@@ -14,9 +14,17 @@ from __future__ import annotations
 import os
 import sys
 
-_lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
-if _lib_dir not in sys.path:
-    sys.path.insert(0, _lib_dir)
+_addon_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _addon_root not in sys.path:
+    sys.path.insert(0, _addon_root)
+try:
+    from PDFVectorImporter.runtime_paths import activate_bundled_runtime_if_available
+except ModuleNotFoundError as exc:
+    if exc.name not in {"PDFVectorImporter", "PDFVectorImporter.runtime_paths"}:
+        raise
+    from runtime_paths import activate_bundled_runtime_if_available
+
+activate_bundled_runtime_if_available(_addon_root)
 
 try:
     import pymupdf as fitz  # PyMuPDF >= 1.24 preferred name

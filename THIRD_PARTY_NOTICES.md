@@ -8,10 +8,10 @@ preserve these notices and comply with the applicable terms.
 ## PyMuPDF / MuPDF
 
 - Project: PyMuPDF (bindings) over MuPDF (Artifex)
-- Bundled version: PyMuPDF 1.27.2.3 (vendored at `PDFVectorImporter/src/lib/`)
+- Bundled version: PyMuPDF 1.28.0 (shared stable-ABI payload at `PDFVectorImporter/src/lib/common/`)
 - Upstream: https://github.com/pymupdf/PyMuPDF
 - License model: **AGPL-3.0-or-later OR Artifex commercial license**
-  (verified in `PDFVectorImporter/src/lib/pymupdf-*.dist-info/METADATA`:
+  (verified in `PDFVectorImporter/src/lib/common/pymupdf-*.dist-info/METADATA`:
   "Dual Licensed - GNU AFFERO GPL 3.0 or Artifex Commercial License")
 - Note: AGPL-3.0 carries source-availability obligations on distribution. Either
   obtain the Artifex commercial license, or ensure corresponding source for the
@@ -21,8 +21,15 @@ preserve these notices and comply with the applicable terms.
 
 For complete metadata in this package, see:
 
-- `PDFVectorImporter/src/lib/pymupdf-*.dist-info/METADATA`
-- `PDFVectorImporter/src/lib/pymupdf-*.dist-info/` (license/COPYING files)
+- `PDFVectorImporter/src/lib/common/pymupdf-*.dist-info/METADATA`
+- `PDFVectorImporter/src/lib/common/pymupdf-*.dist-info/` (license/COPYING files)
+
+## fontTools
+
+- Project: fontTools 4.63.0
+- Bundled payloads: exact Windows cp310 and cp311 wheels under
+  `PDFVectorImporter/src/lib/cp310/` and `src/lib/cp311/`
+- License: MIT (preserve the license metadata shipped in each wheel)
 
 ## Auditing what is bundled
 

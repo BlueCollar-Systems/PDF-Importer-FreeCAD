@@ -2,6 +2,7 @@
 """SVG text renderer fallback coverage for clean-PC installs."""
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -124,6 +125,66 @@ def test_svg_size_guard_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None
 
     monkeypatch.setenv("BC_FC_SVG_TEXT_MAX_BYTES", "bad")
     assert not renderer._svg_too_large("012345678")
+
+
+def test_pdftocairo_oversized_temp_file_is_rejected_before_read_and_removed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    svg_path = tmp_path / "oversized.svg"
+
+    def make_temp(**_kwargs):
+        fd = os.open(str(svg_path), os.O_CREAT | os.O_RDWR)
+        return fd, str(svg_path)
+
+    def render_file(_cmd, **_kwargs):
+        svg_path.write_bytes(b"012345678")
+
+    monkeypatch.setenv("BC_FC_SVG_TEXT_MAX_BYTES", "8")
+    monkeypatch.setattr(renderer.tempfile, "mkstemp", make_temp)
+    monkeypatch.setattr(renderer.subprocess, "run", render_file)
+    monkeypatch.setattr(
+        renderer,
+        "open",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("oversized SVG must not be read")
+        ),
+        raising=False,
+    )
+
+    with pytest.raises(renderer.TextRepresentationRenderError) as raised:
+        renderer._render_svg_with_pdftocairo("pdftocairo", "fixture.pdf", 1)
+
+    assert raised.value.reason == "svg_payload_too_large"
+    assert raised.value.evidence == {
+        "renderer": "pdftocairo",
+        "svg_bytes": 9,
+        "max_svg_bytes": 8,
+    }
+    assert not svg_path.exists()
+
+
+def test_pdftocairo_temp_file_at_exact_limit_is_read_and_removed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    svg_path = tmp_path / "at-limit.svg"
+
+    def make_temp(**_kwargs):
+        fd = os.open(str(svg_path), os.O_CREAT | os.O_RDWR)
+        return fd, str(svg_path)
+
+    def render_file(_cmd, **_kwargs):
+        svg_path.write_bytes(b"01234567")
+
+    monkeypatch.setenv("BC_FC_SVG_TEXT_MAX_BYTES", "8")
+    monkeypatch.setattr(renderer.tempfile, "mkstemp", make_temp)
+    monkeypatch.setattr(renderer.subprocess, "run", render_file)
+
+    assert renderer._render_svg_with_pdftocairo(
+        "pdftocairo", "fixture.pdf", 1
+    ) == "01234567"
+    assert not svg_path.exists()
 
 
 def test_pymupdf_svg_fallback_exports_text_as_paths(tmp_path: Path) -> None:

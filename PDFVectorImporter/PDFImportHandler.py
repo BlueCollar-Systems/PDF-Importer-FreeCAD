@@ -13,7 +13,7 @@ import sys
 
 import FreeCAD
 
-# Ensure our src and lib directories are importable
+# Ensure our source and ABI-matched runtime directories are importable.
 _candidates = []
 for root in (FreeCAD.getUserAppDataDir(), FreeCAD.getResourceDir()):
     d = os.path.join(root, "Mod", "PDFVectorImporter")
@@ -23,7 +23,6 @@ for root in (FreeCAD.getUserAppDataDir(), FreeCAD.getResourceDir()):
 
 for _base in _candidates:
     _src = os.path.join(_base, "src")
-    _lib = os.path.join(_src, "lib")
     for _p in (os.path.dirname(_base), _base, _src):
         if not _p:
             continue
@@ -33,13 +32,9 @@ for _base in _candidates:
         except (AttributeError, ValueError):
             pass
         sys.path.insert(0, _p)
-    if os.path.isdir(_lib):
-        try:
-            while _lib in sys.path:
-                sys.path.remove(_lib)
-        except (AttributeError, ValueError):
-            pass
-        sys.path.insert(0, _lib)
+    from PDFVectorImporter.runtime_paths import activate_bundled_runtime_if_available
+
+    activate_bundled_runtime_if_available(_base)
 
 
 def open(filename, docname=None):
@@ -207,4 +202,3 @@ def _import_headless(filename):
     except (RuntimeError, ValueError, TypeError, OSError, AttributeError, ImportError) as e:
         import traceback
         FreeCAD.Console.PrintError(f"Import failed: {e}\n{traceback.format_exc()}")
-

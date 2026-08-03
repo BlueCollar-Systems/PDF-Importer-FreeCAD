@@ -60,14 +60,11 @@ def test_shared_catalog_type3_without_xref_is_item_scoped_impossibility():
 
 
 def test_shared_catalog_type3_with_xref_is_item_scoped_impossibility():
-    """Real Type3 fonts DO carry an xref; only the font PROGRAM is absent.
+    """A Type3 resource may carry an xref although no font program exists.
 
-    Measured on the owner's corpus: every Type3 row on
-    `Alvord TX - Garden Plan . Final_OCR.pdf` has an xref (32, 33, 42, ...), an
-    empty BaseFont name, and only a resource name. Gating the Type3 branch on
-    `xref is None` recorded all of them as `embedded_font_inventory_row_invalid`
-    -- reported as corrupt data -- and aborted the entire import. 4 of 60 corpus
-    PDFs are affected, up to 56 of 88 fonts on a single page.
+    A valid row can have an empty BaseFont name and only a resource name.
+    Gating the Type3 branch on ``xref is None`` misclassifies that row as an
+    invalid inventory record and can abort the entire import.
 
     PyMuPDF also names such a span "Type3 (<xref> 0 R)", which is the name that
     arrives on the text item, so that alias must be observed too or the span
@@ -136,6 +133,45 @@ def test_shared_catalog_non_type3_without_xref_remains_terminal_page_failure():
     assert catalog.failure_for_span("Siwa-Regular").reason == "invalid_page_font_record"
 
 
+def test_truncated_span_font_name_resolves_through_completed_staging(tmp_path):
+    """A unique 24-character MuPDF span name must bind to its staged font."""
+    import hashlib
+    import PDFEmbeddedFonts as staging_fonts
+
+    full_name = "SyntheticExactFontFamily-Regular"
+    truncated_name = full_name[:24]
+    assert len(truncated_name) == 24
+    staged_path = tmp_path / "synthetic-exact-font.ttf"
+    staged_payload = b"generic staged font fixture"
+    staged_path.write_bytes(staged_payload)
+    opts = core.ImportOptions(text_mode="3d_text")
+    staged_key = staging_fonts.normalize_font_key(full_name)
+    _set_completed_font_session(
+        opts,
+        records={
+            staged_key: {
+                "path": str(staged_path),
+                "sha256": hashlib.sha256(staged_payload).hexdigest(),
+                "source": "pdf_embedded",
+                "xref": 17,
+            }
+        },
+    )
+
+    path, results = core._resolve_shapestring_font_path_with_evidence(
+        truncated_name,
+        opts,
+        pdf_sha256=PDF_SHA_A,
+        page_number=1,
+    )
+
+    assert path == str(staged_path)
+    assert len(results) == 1
+    assert results[0]["source"] == "embedded_font"
+    assert results[0]["outcome"] == "found"
+    assert results[0]["staging_complete"] is True
+
+
 def test_truncated_span_font_name_resolves_to_its_one_staged_font():
     """MuPDF truncates a span's font name at 24 chars; the staged font is real.
 
@@ -177,6 +213,15 @@ def test_short_span_font_name_still_requires_an_exact_match():
     candidates = [staging_fonts.normalize_font_key("ArialNarrow")]
 
     assert core._unique_truncated_font_key(short, key, candidates) is None
+
+
+def test_longer_than_mupdf_span_limit_still_requires_an_exact_match():
+    """Only the measured 24-character boundary proves truncation occurred."""
+    raw_name = "X" * (core._MUPDF_SPAN_FONT_NAME_LIMIT + 1)
+    key = staging_fonts.normalize_font_key(raw_name)
+    candidate = staging_fonts.normalize_font_key(raw_name + "-Extended")
+
+    assert core._unique_truncated_font_key(raw_name, key, [candidate]) is None
 
 
 def test_cmap_repair_adds_host_safe_names_to_anonymous_subset_font():

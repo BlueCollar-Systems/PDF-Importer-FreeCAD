@@ -41,7 +41,7 @@ class TestPdfOpenGate(unittest.TestCase):
             b"trailer<< /Size 4 /Root 1 0 R >>\nstartxref\n196\n%%EOF\n"
         )
         with tempfile.TemporaryDirectory(prefix="fc_open_gate_") as tmp:
-            path = Path(tmp) / "Alvord\u2014Garden Map.pdf"
+            path = Path(tmp) / "unicode\u2014map.pdf"
             path.write_bytes(minimal_pdf)
             doc = safe_open(str(path))
             try:

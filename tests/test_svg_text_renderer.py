@@ -73,7 +73,7 @@ def test_load_fitz_uses_validated_loader(monkeypatch):
 
     assert renderer._load_fitz() == "fitz-module"
     assert calls
-    assert str(calls[0]).endswith(str(Path("PDFVectorImporter") / "src" / "lib"))
+    assert calls[0] is None
 
 
 class _FakeVector:

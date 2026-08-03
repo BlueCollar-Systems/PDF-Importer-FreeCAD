@@ -20,7 +20,7 @@ from pdfcadcore.text_scale import effective_span_font_size_pt  # noqa: E402
 
 class TestPdfImporterTextReconstruction(unittest.TestCase):
     def test_descender_correction_targets_only_real_descenders(self) -> None:
-        self.assertAlmostEqual(_effective_descender("p1052", -0.2), -0.2)
+        self.assertAlmostEqual(_effective_descender("p9003", -0.2), -0.2)
         self.assertAlmostEqual(_effective_descender("W12X30", -0.2), -0.004)
 
     def test_raster_background_uses_effective_import_scale(self) -> None:

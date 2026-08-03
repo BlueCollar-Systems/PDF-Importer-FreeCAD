@@ -3,7 +3,7 @@
 **BUILT. NOT BOUGHT.**
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
-![Version: 4.0.81](https://img.shields.io/badge/Version-4.0.81-blue.svg)
+![Version: 4.0.83](https://img.shields.io/badge/Version-4.0.83-blue.svg)
 ![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
 
 Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.
@@ -11,6 +11,32 @@ Import vector geometry, text, and images from PDF files into FreeCAD as editable
 Arc reconstruction, dash mapping, color grouping, OCG layer support, and reference-based scaling -- all powered by pure-Python PDF parsing via PyMuPDF.
 
 > BlueCollar Systems -- BUILT. NOT BOUGHT.
+
+## Recent fixes (v4.0.83)
+
+- Exact 3D Text preserves leading/trailing whitespace with FreeCAD-native pen
+  advance and ink-origin verification. It tries the optimized compound path and
+  the ShapeString path before any evidence-backed cross-mode fallback.
+- Glyphs now stores ordered per-character subshapes inside one source-item
+  compound, with glyph IDs/count/grouping in metadata. This prevents oversized
+  FCStd archives; individual glyphs remain addressable as subshapes rather than
+  separate tree objects.
+- SVG text conversion renders every selected page from one verified immutable
+  import-run PDF snapshot, so source changes cannot mix bytes between pages.
+- Windows releases bundle one shared PyMuPDF payload plus exact CPython 3.10 and
+  3.11 fontTools runtimes; the host activates only its matching ABI tree.
+- Release packaging is `HEAD`-bound and fails closed on private paths,
+  generated corpus artifacts, and identifiers supplied through the masked
+  external private denylist.
+- Import reports now publish an explicit `ok` or `warn` scale evaluation;
+  missing or malformed scale evaluations remain fail closed for consumers.
+
+## Recent fixes (v4.0.82)
+
+- MuPDF's measured 24-character span-font truncation is now the only prefix
+  case eligible for unique staged-font recovery. Longer untruncated names must
+  match exactly, preserving fail-closed font identity while completed staging
+  resolves genuine truncation before 3D text delivery.
 
 ## Recent fixes (v4.0.81)
 
@@ -132,25 +158,36 @@ See **[INSTALL.md](INSTALL.md)** for Windows FreeCAD 1.1 paths, dev junction ins
    - **Windows (FreeCAD 0.21):** `%APPDATA%\FreeCAD\Mod\`
    - **macOS:** `~/Library/Application Support/FreeCAD/Mod/`
    - **Linux:** `~/.local/share/FreeCAD/Mod/`
-3. Release ZIP/Setup installs bundle PyMuPDF and fontTools under `PDFVectorImporter/src/lib`. For source checkouts, run `python build_release.py` to stage both private runtime dependencies, or use **PDF Vector Importer > Install / Update PDF Dependencies** after loading the workbench.
+3. Release ZIP/Setup installs bundle an offline runtime matrix under `PDFVectorImporter/src/lib`: shared PyMuPDF in `common/` and ABI-specific fontTools in `cp310/` and `cp311/`. Source checkouts can use **PDF Vector Importer > Install / Update PDF Dependencies** for the current FreeCAD user.
 4. Restart FreeCAD
 
 ## Building Release Artifacts
 
 ### Build Addon ZIP
 ```bash
-python build_release.py
+python build_release.py --python310 C:\path\to\python310.exe --python311 C:\path\to\python311.exe
 ```
 
 Release builds are fail-closed and must run from a Git checkout. Every
-shippable addon source file must be tracked and byte-identical to the Git
-index; private PDF/CAD/model inputs, generated import reports, corpus folders,
-and nested archives abort the build. The ignored `PDFVectorImporter/src/lib`
+shippable addon source file must be tracked and byte-identical to `HEAD`;
+private PDF/CAD/model inputs, generated import reports, corpus folders, and
+nested archives abort the build. Set the masked
+`BCS_PRIVATE_RELEASE_DENYLIST_B64` environment value to the project-owned
+base64 JSON denylist before a local build; automation reads it from the
+`FREECAD_PRIVATE_RELEASE_DENYLIST_B64` repository secret and fails closed when
+it is absent or malformed. The ignored `PDFVectorImporter/src/lib`
 tree is deleted and rebuilt on every release build from the exact wheel hashes
-in `requirements-release.lock`, so an importable but stale local runtime cannot
-enter the ZIP. Use a Windows CPython 3.11 interpreter and an available pip
-cache/network path for the reviewed wheels. `--no-vendor-deps` intentionally
+in `requirements-release-common.lock` and the `cp310`/`cp311` locks, so an
+importable but stale local runtime cannot enter the ZIP. Supply exact Windows
+CPython 3.10 and 3.11 interpreters; the builder validates each before installing
+its ABI-specific wheel. `--no-vendor-deps` intentionally
 refuses release creation because ignored runtime bytes are not commit-bound.
+
+The secret decodes to this schema; use only synthetic values in documentation:
+
+```json
+{"schema":"bcs.private-release-denylist/1.0","terms":["SYNTHETIC-PRIVATE-DRAWING-ID"]}
+```
 
 ### Build Windows Installer (.exe)
 1. Install [Inno Setup 6](https://jrsoftware.org/isinfo.php)
@@ -229,7 +266,7 @@ types, not in quality tier.
 |--------|--------|
 | **Labels** | FreeCAD-native text objects, editable as text |
 | **3D Text** | Extruded geometric text (Draft ShapeString) |
-| **Glyphs** | Per-character vector glyphs |
+| **Glyphs** | Per-character vector glyph subshapes grouped by source text item |
 | **Geometry** | Text converted to non-editable geometry |
 
 Plus a separate **Import text** toggle to skip text entirely.
@@ -259,10 +296,10 @@ Authorized order after item-specific proof (left rung first):
 | **Raster** | terminal — always achievable |
 
 Notes:
-- **Glyphs and Geometry are distinct deliverables.** Glyphs preserve one
-  grouped outline object per placed character; Geometry exposes the raw edge
-  entities. Sharing an SVG source does not make the host representations
-  interchangeable.
+- **Glyphs and Geometry are distinct deliverables.** Glyphs preserve ordered
+  per-character outline subshapes and identity metadata inside one source-item
+  compound; Geometry exposes raw edge entities. Sharing an SVG source does not
+  make the host representations interchangeable.
 - Renderer or font failures stop the transaction unless the failed source item
   has item-specific impossibility evidence and an implemented, verified next
   rung. They never authorize a whole-page or whole-mode substitution.
@@ -281,9 +318,10 @@ See **[COMPATIBILITY.md](COMPATIBILITY.md)** for the full matrix. Summary:
 
 | FreeCAD Version | Python | PyMuPDF | Status |
 |----------------|--------|---------|--------|
-| 0.21.x | 3.10+ | >=1.24,<2.0 | ⚠️ Expected |
-| 1.0.x | 3.11+ | >=1.24,<2.0 | ⚠️ Expected |
-| 1.1.x | 3.11+ | >=1.24,<2.0 | ✅ Verified |
+| 0.21.x | 3.10 | 1.28.0 bundled offline | ⚠️ Expected |
+| 1.0.x | 3.11 | 1.28.0 bundled offline | ⚠️ Expected |
+| 1.1.x | 3.11 | 1.28.0 bundled offline | ✅ Verified |
+| Any host using 3.12+ | 3.12+ | System/user install only | ⚠️ No bundled offline runtime |
 | 0.19–0.20 | 3.8–3.9 | legacy pin | ⚠️ Expected only after legacy branch testing |
 | 0.18 and earlier | | | ❌ Not supported |
 
@@ -295,9 +333,9 @@ Evidence levels:
 ## Requirements
 
 - **FreeCAD** 0.21 or later
-- **Python** 3.10+ (adapters use PEP 604 union types)
-- **PyMuPDF** `>=1.24,<2.0` (bundled in release ZIP/Setup installs under `PDFVectorImporter/src/lib`; source checkouts can stage it with `python build_release.py` or the workbench installer). When Poppler/pdftocairo is absent, bundled PyMuPDF also backs Glyphs/Geometry text rendering.
-- **fontTools** `>=4.50,<5.0` (bundled and installed through the same paths as PyMuPDF). It preserves embedded PDF font outlines and Unicode mappings for native 3D Text instead of substituting a visually similar font.
+- **Python** 3.10 or 3.11 for the bundled offline Windows runtime. Other source hosts may use compatible system/user packages.
+- **PyMuPDF** `1.28.0` in the release runtime’s shared `src/lib/common` tree. When Poppler/pdftocairo is absent, it also backs Glyphs/Geometry text rendering.
+- **fontTools** `4.63.0` in the exact `src/lib/cp310` or `src/lib/cp311` tree selected from FreeCAD’s embedded Python ABI. The incompatible sibling tree is never added to `sys.path`.
 
 ## Known Limitations
 

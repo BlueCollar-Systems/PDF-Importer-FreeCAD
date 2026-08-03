@@ -16,7 +16,7 @@ Professional import — maximum fidelity; Auto picks vector, raster, or hybrid p
 - **3D text** = ShapeString extrusion where supported.
 - Scale is detected from title blocks when possible. If `import_report.json` shows a **scale note** in `human_summary` or `extra.scale_crosscheck`, verify one known dimension before takeoff.
 
-**Offline install:** The Windows installer EXE from GitHub Releases works without internet after download — PyMuPDF runtime is bundled. Source/dev installs may run `preflight_check.py --install` once (requires network if `lib/` is empty).
+**Offline install:** The Windows installer EXE works without internet after download when FreeCAD embeds CPython 3.10 or 3.11. It bundles PyMuPDF and fontTools for both ABIs. Other Python versions need compatible system/user packages.
 
 ## Upgrading / skipping versions
 
@@ -106,26 +106,29 @@ Setup builds from this repo resolve/remove Mod junctions before copying files an
 2. Search **PDF Vector Importer**
 3. **Install** → restart FreeCAD
 
-## PyMuPDF dependency
+## PDF runtime dependencies
 
 Release ZIPs and `FreeCAD-PDF-Importer-Setup_vX.Y.Z.exe` are built with a
-private **PyMuPDF** copy under:
+private ABI-selected runtime under:
 
-`…\Mod\PDFVectorImporter\src\lib`
+`…\Mod\PDFVectorImporter\src\lib\common` (PyMuPDF 1.28.0)
+
+`…\Mod\PDFVectorImporter\src\lib\cp310` or `cp311` (fontTools 4.63.0)
 
 That means release users do not need system Python, pip, or any operating
-system Python packages. The **Install / Update PyMuPDF** command remains as a
-source/dev fallback if you install directly from a checkout. Release builds
+system Python packages on CPython 3.10/3.11. The **Install / Update PDF
+Dependencies** command installs compatible packages into FreeCAD's user site as
+a source/dev fallback. Release builds
 intentionally reject `--no-vendor-deps`: ignored local `src/lib` bytes are not
-commit-bound, so the release builder regenerates them from the hashed lock.
+commit-bound, so the release builder regenerates them from three hashed locks.
 
 Manual fallback install:
 
 ```powershell
-& "C:\Program Files\FreeCAD 1.1\bin\python.exe" -m pip install --target "%APPDATA%\FreeCAD\v1-1\Mod\PDFVectorImporter\src\lib" "PyMuPDF>=1.24,<2.0"
+& "C:\Program Files\FreeCAD 1.1\bin\python.exe" -m pip install --user "PyMuPDF>=1.24,<2.0" "fonttools>=4.50,<5.0"
 ```
 
-(Adjust `python.exe` and `lib` path for your FreeCAD version.)
+(Adjust `python.exe` for your FreeCAD version.)
 
 ## Preflight (before first import)
 

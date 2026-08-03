@@ -38,6 +38,11 @@ jobs:
   version-build-release:
     if: "!startsWith(github.event.head_commit.message, 'chore: bump version to') && !contains(github.event.head_commit.message, 'automation/version-bump') && !contains(github.event.head_commit.message, '[skip release]')"
     runs-on: windows-latest
+    env:
+      # Private identifiers stay in a masked repository secret and never enter
+      # source control, logs, packages, or attestations. The builder fails closed
+      # when this value is absent or malformed.
+      BCS_PRIVATE_RELEASE_DENYLIST_B64: ${{ secrets.FREECAD_PRIVATE_RELEASE_DENYLIST_B64 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -48,10 +53,21 @@ jobs:
           # protection through a narrowly scoped pull request below.
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up Python
+      - name: Set up Python 3.10 runtime builder
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Capture Python 3.10 interpreter
+        run: echo "PYTHON310=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
+
+      - name: Set up Python 3.11 release driver
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+
+      - name: Capture Python 3.11 interpreter
+        run: echo "PYTHON311=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
 
       - name: Install release gate dependencies
         run: |
@@ -66,7 +82,7 @@ jobs:
           # test_diagnostics_reports_bundled_pymupdf require the bundled runtime,
           # and src/lib is gitignored/empty on a fresh checkout (vendoring otherwise
           # only happens later in build_release.py). Idempotent - build reuses it.
-          python -c "import build_release; build_release.ensure_runtime_dependencies()"
+          python -c "import os,pathlib,build_release; build_release.ensure_runtime_dependencies(python310=pathlib.Path(os.environ['PYTHON310']), python311=pathlib.Path(os.environ['PYTHON311']))"
           python -m pytest tests/ -q --basetemp "$RUNNER_TEMP/pytest-freecad"
 
       - name: Read committed version
@@ -107,7 +123,7 @@ jobs:
           echo "RELEASE_TARGET=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Build release zip
-        run: python build_release.py
+        run: python build_release.py --python310 "$PYTHON310" --python311 "$PYTHON311"
 
       - name: Install pinned Inno Setup toolchain
         shell: pwsh
@@ -156,7 +172,7 @@ jobs:
             -Destination (Join-Path 'dist' ($base + '.attestation.json'))
 
       - name: Smoke release zip dependency payload
-        run: python scripts/smoke_release_zip.py "FreeCAD-PDF-Importer_v*.zip"
+        run: python scripts/smoke_release_zip.py "FreeCAD-PDF-Importer_v*.zip" --python310 "$PYTHON310" --python311 "$PYTHON311"
 
       - name: Create or verify exact tag and release
         id: mint

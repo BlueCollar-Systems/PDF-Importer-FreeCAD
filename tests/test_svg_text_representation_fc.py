@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import os
 import sys
 import re
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +18,9 @@ for path in (REPO_ROOT, REPO_ROOT / "PDFVectorImporter" / "src"):
 
 from PDFVectorImporter.src import PDFSvgTextRenderer as renderer  # noqa: E402
 from PDFVectorImporter.src import PDFImporterCore as core  # noqa: E402
+
+
+PRODUCTION_CREATE_PDF_SNAPSHOT = renderer._create_pdf_snapshot
 
 
 SVG = """
@@ -78,8 +84,9 @@ class FakeEdge:
 
 
 class FakeShape:
-    def __init__(self, edges, bounds=(0.0, -5.0, 5.0, 0.0)):
+    def __init__(self, edges, bounds=(0.0, -5.0, 5.0, 0.0), children=None):
         self.Edges = list(edges)
+        self._children = list(children or [])
         self._bounds = tuple(float(value) for value in bounds)
         self.BoundBox = SimpleNamespace(
             XMin=self._bounds[0],
@@ -90,6 +97,9 @@ class FakeShape:
 
     def isNull(self):
         return False
+
+    def childShapes(self):
+        return list(self._children)
 
     def translated(self, vector):
         x0, y0, x1, y1 = self._bounds
@@ -173,19 +183,31 @@ class FakeFreeCAD:
 class FakePart:
     @staticmethod
     def makeCompound(edges):
+        children = list(edges)
         flattened = []
-        for edge_or_shape in edges:
+        for edge_or_shape in children:
             if isinstance(edge_or_shape, FakeShape):
                 flattened.extend(edge_or_shape.Edges)
             else:
                 flattened.append(edge_or_shape)
-        return FakeShape(flattened)
+        return FakeShape(flattened, children=children)
 
 
 class SmallGlyphPart:
     @staticmethod
     def makeCompound(edges):
-        return FakeShape(edges, bounds=(0.0, -0.75, 0.75, 0.0))
+        children = list(edges)
+        flattened = []
+        for edge_or_shape in children:
+            if isinstance(edge_or_shape, FakeShape):
+                flattened.extend(edge_or_shape.Edges)
+            else:
+                flattened.append(edge_or_shape)
+        return FakeShape(
+            flattened,
+            bounds=(0.0, -0.75, 0.75, 0.0),
+            children=children,
+        )
 
 
 def test_global_assignment_rebalances_overlapping_fraction_spans():
@@ -412,6 +434,39 @@ def _install_renderer(monkeypatch):
     monkeypatch.setattr(renderer, "Vector", FakeVector)
     monkeypatch.setattr(renderer, "find_pdftocairo", lambda: None)
     monkeypatch.setattr(renderer, "_render_svg_with_pymupdf", lambda *_args: SVG)
+    def create_test_snapshot(pdf_path):
+        source_path = Path(pdf_path)
+        if source_path.is_file():
+            snapshot_bytes = source_path.read_bytes()
+            digest = hashlib.sha256(snapshot_bytes).hexdigest()
+        else:
+            snapshot_bytes = b"synthetic-pdf-snapshot"
+            digest = "a" * 64
+        file_descriptor, snapshot_path = tempfile.mkstemp(
+            prefix="bcs-svg-test-", suffix=".pdf"
+        )
+        os.close(file_descriptor)
+        Path(snapshot_path).write_bytes(snapshot_bytes)
+        return snapshot_path, digest
+
+    monkeypatch.setattr(
+        renderer,
+        "_create_pdf_snapshot",
+        create_test_snapshot,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        renderer,
+        "_pdf_file_signature",
+        lambda _path: {
+            "size": 123,
+            "mtime_ns": 456,
+            "ctime_ns": 456,
+            "device": 1,
+            "inode": 2,
+        },
+        raising=False,
+    )
     monkeypatch.setattr(
         renderer,
         "_svg_path_to_edges",
@@ -579,6 +634,608 @@ def test_page_svg_cache_is_source_bound_rendered_once_and_claims_each_placement(
     assert cache["claimed_placement_indices"] == {0, 1}
 
 
+def test_oversized_page_svg_is_negatively_cached_across_items_and_rungs(
+    monkeypatch,
+):
+    _install_renderer(monkeypatch)
+    monkeypatch.setenv("BC_FC_SVG_TEXT_MAX_BYTES", "8")
+    render_calls = []
+
+    def render_oversized(*_args):
+        render_calls.append(True)
+        return "012345678"
+
+    monkeypatch.setattr(renderer, "_render_svg_with_pymupdf", render_oversized)
+    cache = {}
+    first_item = _source_item(
+        bbox=(8.0, 18.0, 18.0, 27.0),
+        requested_type="geometry",
+        source_item_id="p1:b0:l0:s0",
+    )
+    second_item = _source_item(
+        bbox=(28.0, 18.0, 38.0, 27.0),
+        requested_type="geometry",
+        source_item_id="p1:b0:l0:s1",
+    )
+
+    observations = []
+    for source_item, attempted_type in (
+        (first_item, "geometry"),
+        (first_item, "glyphs"),
+        (second_item, "geometry"),
+    ):
+        with pytest.raises(renderer.TextRepresentationRenderError) as raised:
+            renderer.render_text(
+                "fixture.pdf",
+                1,
+                100.0,
+                1.0,
+                page_w=100.0,
+                fc_doc=FakeDocument(),
+                parent_group=FakeGroup(),
+                representation=attempted_type,
+                source_item=source_item,
+                requested_representation="geometry",
+                render_cache=cache,
+            )
+        observations.append((source_item, attempted_type, raised.value))
+
+    mismatched_item = _source_item(
+        bbox=(28.0, 18.0, 38.0, 27.0),
+        requested_type="geometry",
+        source_item_id="p1:b0:l0:s1",
+    )
+    mismatched_item["pdf_sha256"] = "b" * 64
+    with pytest.raises(renderer.TextRepresentationRenderError) as mismatch:
+        renderer.render_text(
+            "fixture.pdf",
+            1,
+            100.0,
+            1.0,
+            page_w=100.0,
+            fc_doc=FakeDocument(),
+            parent_group=FakeGroup(),
+            representation="geometry",
+            source_item=mismatched_item,
+            requested_representation="geometry",
+            render_cache=cache,
+        )
+
+    assert len(render_calls) == 1
+    assert mismatch.value.reason == "svg_cache_source_mismatch"
+    assert "svg" not in cache
+    marker = cache["terminal_render_error"]
+    assert marker["source_binding"] == cache["source_binding"]
+    assert marker["reason"] == "svg_payload_too_large"
+    assert marker["renderer"] == "pymupdf"
+    assert marker["svg_bytes"] == 9
+    assert marker["max_svg_bytes"] == 8
+    assert "012345678" not in repr(marker)
+    for source_item, attempted_type, error in observations:
+        assert error.reason == "svg_payload_too_large"
+        assert error.evidence == {
+            "requested_type": "geometry",
+            "attempted_type": attempted_type,
+            "source_item_id": source_item["source_item_id"],
+            "renderer": "pymupdf",
+            "pdf_sha256": "a" * 64,
+            "svg_bytes": 9,
+            "max_svg_bytes": 8,
+            "created_entity_ids": [],
+            "removed_entity_ids": [],
+            "cleanup_complete": True,
+        }
+
+
+def test_pdftocairo_oversize_error_is_rebuilt_and_cached_for_each_item(monkeypatch):
+    _install_renderer(monkeypatch)
+    monkeypatch.setenv("BC_FC_SVG_TEXT_MAX_BYTES", "8")
+    monkeypatch.setattr(renderer, "find_pdftocairo", lambda: "pdftocairo")
+    render_calls = []
+
+    def reject_before_read(*_args):
+        render_calls.append(True)
+        raise renderer.TextRepresentationRenderError(
+            "svg_payload_too_large",
+            {
+                "renderer": "pdftocairo",
+                "svg_bytes": 9,
+                "max_svg_bytes": 8,
+            },
+        )
+
+    monkeypatch.setattr(
+        renderer,
+        "_render_svg_with_pdftocairo",
+        reject_before_read,
+    )
+    cache = {}
+    items = [
+        _source_item(
+            bbox=(8.0, 18.0, 18.0, 27.0),
+            requested_type="geometry",
+            source_item_id="p1:b0:l0:s0",
+        ),
+        _source_item(
+            bbox=(28.0, 18.0, 38.0, 27.0),
+            requested_type="geometry",
+            source_item_id="p1:b0:l0:s1",
+        ),
+    ]
+
+    errors = []
+    for source_item in items:
+        with pytest.raises(renderer.TextRepresentationRenderError) as raised:
+            renderer.render_text(
+                "fixture.pdf",
+                1,
+                100.0,
+                1.0,
+                page_w=100.0,
+                fc_doc=FakeDocument(),
+                parent_group=FakeGroup(),
+                representation="geometry",
+                source_item=source_item,
+                requested_representation="geometry",
+                render_cache=cache,
+            )
+        errors.append(raised.value)
+
+    assert len(render_calls) == 1
+    assert [error.reason for error in errors] == [
+        "svg_payload_too_large",
+        "svg_payload_too_large",
+    ]
+    assert [error.evidence["source_item_id"] for error in errors] == [
+        items[0]["source_item_id"],
+        items[1]["source_item_id"],
+    ]
+    assert all(error.evidence["renderer"] == "pdftocairo" for error in errors)
+    assert cache["terminal_render_error"]["source_binding"] == cache["source_binding"]
+
+
+def test_svg_cache_verifies_rendered_pdf_digest_then_rejects_later_mutation(
+    monkeypatch,
+    tmp_path,
+):
+    _install_renderer(monkeypatch)
+    monkeypatch.setenv("BC_FC_SVG_TEXT_MAX_BYTES", "8")
+    pdf_path = tmp_path / "source.pdf"
+    initial_bytes = b"first-pdf"
+    pdf_path.write_bytes(initial_bytes)
+    initial_digest = hashlib.sha256(initial_bytes).hexdigest()
+    render_calls = []
+
+    def file_signature(path):
+        stat = Path(path).stat()
+        return {
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "ctime_ns": stat.st_ctime_ns,
+            "device": stat.st_dev,
+            "inode": stat.st_ino,
+        }
+
+    def render_oversized(*_args):
+        render_calls.append(True)
+        return "012345678"
+
+    monkeypatch.setattr(
+        renderer,
+        "_pdf_file_signature",
+        file_signature,
+        raising=False,
+    )
+    monkeypatch.setattr(renderer, "_render_svg_with_pymupdf", render_oversized)
+    cache = {}
+    items = [
+        _source_item(
+            bbox=(8.0, 18.0, 18.0, 27.0),
+            requested_type="geometry",
+            source_item_id="p1:b0:l0:s0",
+        ),
+        _source_item(
+            bbox=(28.0, 18.0, 38.0, 27.0),
+            requested_type="geometry",
+            source_item_id="p1:b0:l0:s1",
+        ),
+    ]
+    for item in items:
+        item["pdf_sha256"] = initial_digest
+        with pytest.raises(renderer.TextRepresentationRenderError) as raised:
+            renderer.render_text(
+                str(pdf_path),
+                1,
+                100.0,
+                1.0,
+                page_w=100.0,
+                fc_doc=FakeDocument(),
+                parent_group=FakeGroup(),
+                representation="geometry",
+                source_item=item,
+                requested_representation="geometry",
+                render_cache=cache,
+            )
+        assert raised.value.reason == "svg_payload_too_large"
+        assert raised.value.evidence["pdf_sha256"] == initial_digest
+
+    pdf_path.write_bytes(b"mutated-pdf-with-a-different-size")
+    mutated_item = _source_item(
+        bbox=(48.0, 18.0, 58.0, 27.0),
+        requested_type="geometry",
+        source_item_id="p1:b0:l0:s2",
+    )
+    mutated_item["pdf_sha256"] = initial_digest
+    with pytest.raises(renderer.TextRepresentationRenderError) as mutated:
+        renderer.render_text(
+            str(pdf_path),
+            1,
+            100.0,
+            1.0,
+            page_w=100.0,
+            fc_doc=FakeDocument(),
+            parent_group=FakeGroup(),
+            representation="geometry",
+            source_item=mutated_item,
+            requested_representation="geometry",
+            render_cache=cache,
+        )
+
+    assert len(render_calls) == 1
+    assert mutated.value.reason == "svg_cache_source_mutated"
+
+
+def test_svg_snapshot_rejects_equal_size_mutation_hidden_by_file_metadata(
+    monkeypatch,
+    tmp_path,
+):
+    """Snapshot bytes must retain the SHA binding even when stat data is unchanged."""
+    _install_renderer(monkeypatch)
+    pdf_path = tmp_path / "source.pdf"
+    initial_bytes = b"first-pdf"
+    mutated_bytes = b"other-pdf"
+    assert len(initial_bytes) == len(mutated_bytes)
+    pdf_path.write_bytes(initial_bytes)
+    initial_digest = hashlib.sha256(initial_bytes).hexdigest()
+    stable_signature = {
+        "size": len(initial_bytes),
+        "mtime_ns": 100,
+        "ctime_ns": 200,
+        "device": 1,
+        "inode": 2,
+    }
+
+    monkeypatch.setattr(
+        renderer,
+        "_pdf_file_signature",
+        lambda _path: dict(stable_signature),
+    )
+    def snapshot_after_hidden_mutation(path):
+        pdf_path.write_bytes(mutated_bytes)
+        return PRODUCTION_CREATE_PDF_SNAPSHOT(path)
+
+    monkeypatch.setattr(
+        renderer,
+        "_create_pdf_snapshot",
+        snapshot_after_hidden_mutation,
+    )
+    render_calls = []
+    monkeypatch.setattr(
+        renderer,
+        "_render_svg_with_pymupdf",
+        lambda *_args: render_calls.append(True) or SVG,
+    )
+    item = _source_item(bbox=(8.0, 18.0, 18.0, 27.0))
+    item["pdf_sha256"] = initial_digest
+
+    with pytest.raises(renderer.TextRepresentationRenderError) as raised:
+        renderer.render_text(
+            str(pdf_path),
+            1,
+            100.0,
+            1.0,
+            page_w=100.0,
+            fc_doc=FakeDocument(),
+            parent_group=FakeGroup(),
+            representation="glyphs",
+            source_item=item,
+            requested_representation="glyphs",
+            render_cache={},
+        )
+
+    assert raised.value.reason == "svg_source_digest_mismatch"
+    assert raised.value.evidence["created_entity_ids"] == []
+    assert raised.value.evidence["cleanup_complete"] is True
+    assert render_calls == []
+
+
+def test_svg_renderer_reads_verified_immutable_snapshot_and_cleans_it(
+    monkeypatch,
+    tmp_path,
+):
+    _install_renderer(monkeypatch)
+    pdf_path = tmp_path / "source.pdf"
+    initial_bytes = b"first-pdf"
+    transient_bytes = b"other-pdf"
+    assert len(initial_bytes) == len(transient_bytes)
+    pdf_path.write_bytes(initial_bytes)
+    initial_digest = hashlib.sha256(initial_bytes).hexdigest()
+    rendered_paths = []
+    monkeypatch.setattr(
+        renderer,
+        "_create_pdf_snapshot",
+        PRODUCTION_CREATE_PDF_SNAPSHOT,
+    )
+
+    def render_snapshot(snapshot_path, _page_num):
+        snapshot = Path(snapshot_path)
+        rendered_paths.append(snapshot)
+        assert snapshot.resolve() != pdf_path.resolve()
+        assert snapshot.read_bytes() == initial_bytes
+        pdf_path.write_bytes(transient_bytes)
+        pdf_path.write_bytes(initial_bytes)
+        return SVG
+
+    monkeypatch.setattr(renderer, "_render_svg_with_pymupdf", render_snapshot)
+    item = _source_item(bbox=(8.0, 18.0, 18.0, 27.0))
+    item["pdf_sha256"] = initial_digest
+
+    created = renderer.render_text(
+        str(pdf_path),
+        1,
+        100.0,
+        1.0,
+        page_w=100.0,
+        fc_doc=FakeDocument(),
+        parent_group=FakeGroup(),
+        representation="glyphs",
+        source_item=item,
+        requested_representation="glyphs",
+        render_cache={},
+    )
+
+    assert created
+    assert len(rendered_paths) == 1
+    assert not rendered_paths[0].exists()
+    assert pdf_path.read_bytes() == initial_bytes
+
+
+def test_owned_snapshot_cleanup_failure_is_deferred_and_retried(
+    monkeypatch,
+    tmp_path,
+):
+    _install_renderer(monkeypatch)
+    pdf_path = tmp_path / "source.pdf"
+    pdf_bytes = b"private-pdf"
+    pdf_path.write_bytes(pdf_bytes)
+    item = _source_item(bbox=(8.0, 18.0, 18.0, 27.0))
+    item["pdf_sha256"] = hashlib.sha256(pdf_bytes).hexdigest()
+    rendered_paths = []
+    real_remove = renderer.os.remove
+    renderer._DEFERRED_PDF_SNAPSHOT_CACHES.clear()
+    monkeypatch.setattr(
+        renderer,
+        "_create_pdf_snapshot",
+        PRODUCTION_CREATE_PDF_SNAPSHOT,
+    )
+    monkeypatch.setattr(
+        renderer,
+        "_render_svg_with_pymupdf",
+        lambda snapshot_path, _page_num: rendered_paths.append(Path(snapshot_path))
+        or SVG,
+    )
+    monkeypatch.setattr(
+        renderer.os,
+        "remove",
+        lambda _path: (_ for _ in ()).throw(PermissionError("still in use")),
+    )
+
+    try:
+        with pytest.raises(renderer.TextRepresentationRenderError) as raised:
+            renderer.render_text(
+                str(pdf_path),
+                1,
+                100.0,
+                1.0,
+                page_w=100.0,
+                fc_doc=FakeDocument(),
+                parent_group=FakeGroup(),
+                representation="glyphs",
+                source_item=item,
+                requested_representation="glyphs",
+                render_cache={},
+            )
+
+        assert raised.value.reason == "svg_source_snapshot_cleanup_failed"
+        assert raised.value.evidence["retry_registered"] is True
+        assert len(rendered_paths) == 1
+        assert rendered_paths[0].exists()
+        assert len(renderer._DEFERRED_PDF_SNAPSHOT_CACHES) == 1
+        snapshot_cache = renderer._DEFERRED_PDF_SNAPSHOT_CACHES[0]
+        assert Path(snapshot_cache["snapshot_path"]) == rendered_paths[0]
+
+        monkeypatch.setattr(renderer.os, "remove", real_remove)
+        renderer._cleanup_deferred_pdf_snapshots()
+
+        assert not rendered_paths[0].exists()
+        assert snapshot_cache == {}
+        assert renderer._DEFERRED_PDF_SNAPSHOT_CACHES == []
+    finally:
+        monkeypatch.setattr(renderer.os, "remove", real_remove)
+        for snapshot_cache in tuple(renderer._DEFERRED_PDF_SNAPSHOT_CACHES):
+            snapshot_path = snapshot_cache.get("snapshot_path")
+            if snapshot_path:
+                try:
+                    real_remove(snapshot_path)
+                except FileNotFoundError:
+                    pass
+        renderer._DEFERRED_PDF_SNAPSHOT_CACHES.clear()
+
+
+def test_svg_shared_snapshot_is_created_once_across_pages_and_cleaned_explicitly(
+    monkeypatch,
+    tmp_path,
+):
+    """One import-run snapshot must serve every page without rehashing the source."""
+    _install_renderer(monkeypatch)
+    monkeypatch.setenv("BC_FC_SVG_TEXT_MAX_BYTES", "8")
+    pdf_path = tmp_path / "source.pdf"
+    source_bytes = b"shared-run-pdf"
+    pdf_path.write_bytes(source_bytes)
+    source_digest = hashlib.sha256(source_bytes).hexdigest()
+    create_calls = []
+    rendered_paths = []
+
+    def create_snapshot(path):
+        create_calls.append(path)
+        return PRODUCTION_CREATE_PDF_SNAPSHOT(path)
+
+    def render_oversized(snapshot_path, _page_num):
+        rendered_paths.append(Path(snapshot_path))
+        return "012345678"
+
+    monkeypatch.setattr(renderer, "_create_pdf_snapshot", create_snapshot)
+    monkeypatch.setattr(
+        renderer,
+        "_sha256_pdf_path",
+        lambda _path: pytest.fail("shared snapshots must not pre-hash the source"),
+        raising=False,
+    )
+    monkeypatch.setattr(renderer, "_render_svg_with_pymupdf", render_oversized)
+    shared_snapshot = {}
+
+    for page_number in (1, 2):
+        item = _source_item(
+            bbox=(8.0, 18.0, 18.0, 27.0),
+            requested_type="geometry",
+            source_item_id=f"p{page_number}:b0:l0:s0",
+        )
+        item["page_number"] = page_number
+        item["pdf_sha256"] = source_digest
+        with pytest.raises(renderer.TextRepresentationRenderError) as raised:
+            renderer.render_text(
+                str(pdf_path),
+                page_number,
+                100.0,
+                1.0,
+                page_w=100.0,
+                fc_doc=FakeDocument(),
+                parent_group=FakeGroup(),
+                representation="geometry",
+                source_item=item,
+                requested_representation="geometry",
+                render_cache={"source_snapshot_cache": shared_snapshot},
+            )
+        assert raised.value.reason == "svg_payload_too_large"
+        if page_number == 1:
+            pdf_path.write_bytes(b"pathname-replaced-after-snapshot")
+
+    assert len(create_calls) == 1
+    assert len(rendered_paths) == 2
+    assert rendered_paths[0] == rendered_paths[1]
+    assert rendered_paths[0].exists()
+    renderer.cleanup_pdf_snapshot_cache(shared_snapshot)
+    assert not rendered_paths[0].exists()
+    assert shared_snapshot == {}
+
+
+def test_snapshot_cleanup_failure_retains_retry_handle(monkeypatch, tmp_path):
+    snapshot_path = tmp_path / "locked-snapshot.pdf"
+    snapshot_path.write_bytes(b"private-source-snapshot")
+    snapshot_cache = {
+        "snapshot_path": str(snapshot_path),
+        "pdf_sha256": "a" * 64,
+    }
+
+    monkeypatch.setattr(
+        renderer.os,
+        "remove",
+        lambda _path: (_ for _ in ()).throw(PermissionError("still in use")),
+    )
+
+    with pytest.raises(PermissionError, match="still in use"):
+        renderer.cleanup_pdf_snapshot_cache(snapshot_cache)
+
+    assert snapshot_cache["snapshot_path"] == str(snapshot_path)
+    assert snapshot_cache["pdf_sha256"] == "a" * 64
+
+
+def test_deferred_snapshot_cleanup_retries_once_and_forgets_deleted_file(tmp_path):
+    snapshot_path = tmp_path / "deferred-snapshot.pdf"
+    snapshot_path.write_bytes(b"private-source-snapshot")
+    snapshot_cache = {"snapshot_path": str(snapshot_path)}
+    renderer._DEFERRED_PDF_SNAPSHOT_CACHES.clear()
+    try:
+        assert renderer.defer_pdf_snapshot_cleanup(snapshot_cache) is True
+        assert renderer.defer_pdf_snapshot_cleanup(snapshot_cache) is True
+        assert renderer._DEFERRED_PDF_SNAPSHOT_CACHES == [snapshot_cache]
+
+        renderer._cleanup_deferred_pdf_snapshots()
+
+        assert not snapshot_path.exists()
+        assert snapshot_cache == {}
+        assert renderer._DEFERRED_PDF_SNAPSHOT_CACHES == []
+    finally:
+        renderer._DEFERRED_PDF_SNAPSHOT_CACHES.clear()
+
+
+def test_svg_cache_rejects_supplied_digest_that_does_not_match_pdf_bytes(
+    monkeypatch,
+    tmp_path,
+):
+    _install_renderer(monkeypatch)
+    pdf_path = tmp_path / "source.pdf"
+    pdf_path.write_bytes(b"actual-pdf-bytes")
+    render_calls = []
+    monkeypatch.setattr(renderer, "_render_svg_with_pymupdf", lambda *_args: render_calls.append(True) or SVG)
+    item = _source_item(bbox=(8.0, 18.0, 18.0, 27.0))
+    item["pdf_sha256"] = "b" * 64
+
+    with pytest.raises(renderer.TextRepresentationRenderError) as raised:
+        renderer.render_text(
+            str(pdf_path),
+            1,
+            100.0,
+            1.0,
+            page_w=100.0,
+            fc_doc=FakeDocument(),
+            parent_group=FakeGroup(),
+            representation="glyphs",
+            source_item=item,
+            requested_representation="glyphs",
+            render_cache={},
+        )
+
+    assert render_calls == []
+    assert raised.value.reason == "svg_source_digest_mismatch"
+
+
+def test_svg_source_item_requires_canonical_lowercase_pdf_digest(monkeypatch):
+    _install_renderer(monkeypatch)
+    render_calls = []
+    monkeypatch.setattr(renderer, "_render_svg_with_pymupdf", lambda *_args: render_calls.append(True) or SVG)
+    item = _source_item(bbox=(8.0, 18.0, 18.0, 27.0))
+    item["pdf_sha256"] = "A" * 64
+
+    with pytest.raises(renderer.TextRepresentationRenderError) as raised:
+        renderer.render_text(
+            "fixture.pdf",
+            1,
+            100.0,
+            1.0,
+            page_w=100.0,
+            fc_doc=FakeDocument(),
+            parent_group=FakeGroup(),
+            representation="glyphs",
+            source_item=item,
+            requested_representation="glyphs",
+            render_cache={},
+        )
+
+    assert render_calls == []
+    assert raised.value.reason == "invalid_svg_source_item_filter"
+
+
 def test_global_assignment_is_stable_when_identical_items_are_rendered_out_of_order(
     monkeypatch,
 ):
@@ -649,7 +1306,7 @@ def test_global_assignment_is_stable_when_identical_items_are_rendered_out_of_or
     assert cache["claimed_placement_indices"] == {0, 1, 2, 3}
 
 
-def test_glyphs_create_one_verified_host_entity_per_placed_glyph(monkeypatch):
+def test_glyphs_create_one_verified_compound_with_one_child_per_glyph(monkeypatch):
     _install_renderer(monkeypatch)
     doc = FakeDocument()
     group = FakeGroup()
@@ -668,11 +1325,70 @@ def test_glyphs_create_one_verified_host_entity_per_placed_glyph(monkeypatch):
     assert result["outcome"] == "verified"
     assert result["entity_type"] == "glyphs"
     assert result["glyphs"] == 2
-    assert result["entities"] == 2
-    assert len(result["created_entity_ids"]) == 2
-    assert [obj.PDFSourceItemId for obj in group.objects] == ["p1:g0", "p1:g1"]
+    assert result["entities"] == 1
+    assert len(result["created_entity_ids"]) == 1
+    assert [obj.PDFSourceItemId for obj in group.objects] == ["p1:glyphs"]
     assert all(obj.PDFRepresentation == "glyphs" for obj in group.objects)
     assert all(isinstance(obj.Shape, FakeShape) for obj in group.objects)
+    assert len(group.objects[0].Shape.childShapes()) == 2
+    assert group.objects[0].PDFGlyphCount == 2
+    assert group.objects[0].PDFGlyphSourceItemIds == ["p1:g0", "p1:g1"]
+    assert group.objects[0].PDFGlyphGrouping == "source_item_compound_v1"
+
+
+def test_high_glyph_source_item_uses_one_provenance_compound(monkeypatch):
+    _install_renderer(monkeypatch)
+    glyph_count = 4096
+    uses = "\n".join(
+        '<use href="#glyph-1" x="10" y="20" />' for _ in range(glyph_count)
+    )
+    high_glyph_svg = f"""
+    <svg width="100" height="100" viewBox="0 0 100 100">
+      <defs><path id="glyph-1" d="M 0 0 L 5 0 L 5 5 Z" /></defs>
+      {uses}
+    </svg>
+    """
+    monkeypatch.setattr(
+        renderer,
+        "_render_svg_with_pymupdf",
+        lambda *_args: high_glyph_svg,
+    )
+    doc = FakeDocument()
+    group = FakeGroup()
+    item = _source_item(bbox=(0.0, 0.0, 100.0, 100.0))
+    item["text"] = "X" * glyph_count
+    item["span"]["text"] = item["text"]
+
+    result = renderer.render_text(
+        "fixture.pdf",
+        1,
+        100.0,
+        1.0,
+        page_w=100.0,
+        fc_doc=doc,
+        parent_group=group,
+        representation="glyphs",
+        source_item=item,
+        requested_representation="glyphs",
+    )
+
+    expected_glyph_ids = [
+        f"{item['source_item_id']}:g{index}" for index in range(glyph_count)
+    ]
+    assert result["outcome"] == "verified"
+    assert result["glyphs"] == glyph_count
+    assert result["entities"] == 1
+    assert doc.created == 1
+    assert len(group.objects) == 1
+    host = group.objects[0]
+    assert len(host.Shape.childShapes()) == glyph_count
+    assert host.PDFGlyphCount == glyph_count
+    assert host.PDFGlyphSourceItemIds == expected_glyph_ids
+    assert host.PDFGlyphGrouping == "source_item_compound_v1"
+    assert result["delivery_attempts"][0]["delivery_count"] == glyph_count
+    assert result["delivery_attempts"][0]["evidence"][
+        "glyph_source_item_ids"
+    ] == expected_glyph_ids
 
 
 def test_geometry_groups_all_raw_edges_into_one_distinct_page_geometry_entity(monkeypatch):
@@ -765,7 +1481,7 @@ def test_source_annotation_failure_is_not_reported_as_verified(monkeypatch):
     assert [obj.Name for obj in doc.Objects] == ["UserObject"]
     assert caught.value.reason == "host_entity_verification_failed"
     assert caught.value.evidence["cleanup_complete"] is True
-    assert caught.value.evidence["created_entity_ids"] == ["Text_Glyph_p1_g0_0"]
+    assert caught.value.evidence["created_entity_ids"] == ["Text_Glyphs_p1_0"]
 
 
 def test_item_filter_creates_only_glyphs_intersecting_exact_source_bbox(monkeypatch):
@@ -796,6 +1512,9 @@ def test_item_filter_creates_only_glyphs_intersecting_exact_source_bbox(monkeypa
         item["source_item_id"]
     ]
     assert [obj.PDFSourceItemId for obj in group.objects] == [
+        item["source_item_id"] + ":glyphs"
+    ]
+    assert group.objects[0].PDFGlyphSourceItemIds == [
         item["source_item_id"] + ":g0"
     ]
 
@@ -859,6 +1578,7 @@ def test_real_rotated_page_item_filters_never_cross_relabel(tmp_path, monkeypatc
     page_h = float(page.rect.height)
     pdf_doc.save(str(pdf_path))
     pdf_doc.close()
+    pdf_sha256 = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
 
     assert [entry[3] for entry in canonical_spans] == ["ONE", "TWO"]
     assert page_rotation_matrix == (0.0, 1.0, -1.0, 0.0, 100.0, 0.0)
@@ -870,6 +1590,7 @@ def test_real_rotated_page_item_filters_never_cross_relabel(tmp_path, monkeypatc
             f"p1:b{block_index}:l{line_index}:s{span_index}"
         )
         item = _source_item(bbox=bbox, source_item_id=source_item_id)
+        item["pdf_sha256"] = pdf_sha256
         item["text"] = text
         item["span"] = {"text": text, "bbox": bbox}
         items.append(item)
@@ -912,7 +1633,7 @@ def test_real_rotated_page_item_filters_never_cross_relabel(tmp_path, monkeypatc
         assert result["source_item_id"] == item["source_item_id"]
         assert all(
             child_id.startswith(item["source_item_id"] + ":g")
-            for child_id in result["evidence"]["child_source_item_ids"]
+            for child_id in result["evidence"]["glyph_source_item_ids"]
         )
 
 
@@ -940,11 +1661,13 @@ def test_item_filtered_entities_keep_parent_and_unique_child_ids(monkeypatch):
     )
 
     child_ids = [obj.PDFSourceItemId for obj in group.objects]
-    assert child_ids == [
+    glyph_ids = [
         item["source_item_id"] + ":g0",
         item["source_item_id"] + ":g1",
     ]
-    assert len(set(child_ids)) == 2
+    assert child_ids == [item["source_item_id"] + ":glyphs"]
+    assert group.objects[0].PDFGlyphSourceItemIds == glyph_ids
+    assert group.objects[0].PDFGlyphCount == 2
     assert all(
         obj.PDFParentSourceItemId == item["source_item_id"]
         for obj in group.objects
@@ -964,6 +1687,7 @@ def test_item_filtered_entities_keep_parent_and_unique_child_ids(monkeypatch):
             "delivery_count": 2,
             "evidence": {
                 "renderer": "pymupdf",
+                "pdf_sha256": "a" * 64,
                 "host_entity_type": "Part::Feature",
                 "raw_edge_count": None,
                     "source_item_bbox": item["bbox"],
@@ -971,6 +1695,9 @@ def test_item_filtered_entities_keep_parent_and_unique_child_ids(monkeypatch):
                     "matched_placement_indices": [0, 1],
                     "assignment_method": "bounded_greedy_item_filter",
                     "child_source_item_ids": child_ids,
+                    "glyph_count": 2,
+                    "glyph_source_item_ids": glyph_ids,
+                    "glyph_grouping": "source_item_compound_v1",
             },
         }
     ]
@@ -1213,18 +1940,20 @@ def test_core_item_svg_rejects_duplicate_live_child_identity_claims(monkeypatch)
     group = FakeGroup()
 
     def duplicate_live_ids(*_args, fc_doc, parent_group, **_kwargs):
-        child_ids = [
+        glyph_ids = [
             item["source_item_id"] + ":g0",
-            item["source_item_id"] + ":g1",
+            item["source_item_id"] + ":g0",
         ]
-        created = []
-        for index in range(2):
-            host_obj = fc_doc.addObject("Part::Feature", f"Duplicate_{index}")
-            host_obj.PDFSourceItemId = child_ids[0]
-            host_obj.PDFParentSourceItemId = item["source_item_id"]
-            host_obj.PDFRepresentation = "glyphs"
-            parent_group.addObject(host_obj)
-            created.append(host_obj.Name)
+        child_ids = [item["source_item_id"] + ":glyphs"]
+        host_obj = fc_doc.addObject("Part::Feature", "DuplicateGlyphIdentity")
+        host_obj.PDFSourceItemId = child_ids[0]
+        host_obj.PDFParentSourceItemId = item["source_item_id"]
+        host_obj.PDFRepresentation = "glyphs"
+        host_obj.PDFGlyphCount = 2
+        host_obj.PDFGlyphSourceItemIds = glyph_ids
+        host_obj.PDFGlyphGrouping = "source_item_compound_v1"
+        parent_group.addObject(host_obj)
+        created = [host_obj.Name]
         evidence = {
             "renderer": "adversarial",
             "host_entity_type": "Part::Feature",
@@ -1233,6 +1962,9 @@ def test_core_item_svg_rejects_duplicate_live_child_identity_claims(monkeypatch)
             "host_filter_bbox": (8.0, 73.0, 38.0, 82.0),
             "matched_placement_indices": [0, 1],
             "child_source_item_ids": child_ids,
+            "glyph_count": 2,
+            "glyph_source_item_ids": glyph_ids,
+            "glyph_grouping": "source_item_compound_v1",
         }
         attempt = {
             "source_item_id": item["source_item_id"],
@@ -1245,13 +1977,14 @@ def test_core_item_svg_rejects_duplicate_live_child_identity_claims(monkeypatch)
             "support_entity_ids": [],
             "removed_entity_ids": [],
             "cleanup_complete": True,
+            "delivery_count": 2,
             "evidence": evidence,
         }
         return {
             "outcome": "verified",
             "glyphs": 2,
             "raw_edges": 0,
-            "entities": 2,
+            "entities": 1,
             "entity_type": "glyphs",
             "created_entity_ids": created,
             "delivery_attempts": [attempt],

@@ -5,17 +5,21 @@
 # Renders text as vector glyph outlines using pdftocairo, or bundled PyMuPDF
 # when Poppler is absent.
 # Each unique glyph outline is built once as a Part.Shape, then translated.
-# Glyphs mode preserves each placed glyph as its own host entity. Geometry mode
-# deliberately exposes the placed outline edges as raw Part::Feature entities.
+# Glyphs mode preserves ordered placed-glyph subshapes inside one source-item
+# compound. Geometry mode deliberately exposes the placed outline edges as raw
+# Part::Feature entities.
 # A renderer failure is explicit; choosing a different representation belongs
 # to a separately proven, item-specific fallback policy in the caller.
 
 from __future__ import annotations
 
+import atexit
+import hashlib
 import os
 import math
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -107,6 +111,124 @@ class TextRepresentationRenderError(RuntimeError):
         super().__init__(self.reason)
 
 
+def _create_pdf_snapshot(pdf_path: str) -> Tuple[str, str]:
+    """Copy the source once into an immutable render input and hash those bytes."""
+    file_descriptor, snapshot_path = tempfile.mkstemp(
+        prefix="bcs-pdf-render-", suffix=".pdf"
+    )
+    digest = hashlib.sha256()
+    try:
+        with open(pdf_path, "rb") as source, os.fdopen(
+            file_descriptor, "wb"
+        ) as snapshot:
+            file_descriptor = -1
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+                snapshot.write(chunk)
+            snapshot.flush()
+            os.fsync(snapshot.fileno())
+    except Exception:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        try:
+            os.remove(snapshot_path)
+        except OSError:
+            pass
+        raise
+    os.chmod(snapshot_path, stat.S_IREAD)
+    return os.path.normcase(os.path.realpath(snapshot_path)), digest.hexdigest()
+
+
+_DEFERRED_PDF_SNAPSHOT_CACHES: List[dict] = []
+
+
+def cleanup_pdf_snapshot_cache(snapshot_cache: dict) -> None:
+    """Remove one import-run render snapshot and clear its opaque cache."""
+    if not isinstance(snapshot_cache, dict):
+        raise TypeError("snapshot cache must be a dictionary")
+    snapshot_path = snapshot_cache.get("snapshot_path")
+    if isinstance(snapshot_path, str) and snapshot_path:
+        try:
+            os.chmod(snapshot_path, stat.S_IREAD | stat.S_IWRITE)
+        except OSError:
+            pass
+        try:
+            os.remove(snapshot_path)
+        except FileNotFoundError:
+            pass
+    # Do not forget a snapshot that still exists: callers need the retained
+    # path for a later retry. Reaching this line proves deletion succeeded or
+    # another actor already removed the file.
+    snapshot_cache.clear()
+    _DEFERRED_PDF_SNAPSHOT_CACHES[:] = [
+        pending
+        for pending in _DEFERRED_PDF_SNAPSHOT_CACHES
+        if pending is not snapshot_cache
+    ]
+
+
+def defer_pdf_snapshot_cleanup(snapshot_cache: dict) -> bool:
+    """Retain one failed cleanup for a best-effort application-exit retry."""
+    if not isinstance(snapshot_cache, dict):
+        raise TypeError("snapshot cache must be a dictionary")
+    snapshot_path = snapshot_cache.get("snapshot_path")
+    if not isinstance(snapshot_path, str) or not snapshot_path:
+        return False
+    if all(pending is not snapshot_cache for pending in _DEFERRED_PDF_SNAPSHOT_CACHES):
+        _DEFERRED_PDF_SNAPSHOT_CACHES.append(snapshot_cache)
+    return True
+
+
+def _cleanup_deferred_pdf_snapshots() -> None:
+    """Retry retained snapshots without making application shutdown fail."""
+    for snapshot_cache in tuple(_DEFERRED_PDF_SNAPSHOT_CACHES):
+        try:
+            cleanup_pdf_snapshot_cache(snapshot_cache)
+        except OSError:
+            # The retained cache remains available for another explicit retry;
+            # OS temporary-file cleanup is the final fallback at process exit.
+            continue
+
+
+atexit.register(_cleanup_deferred_pdf_snapshots)
+
+
+def _pdf_file_signature(pdf_path: str) -> dict:
+    stat_result = os.stat(pdf_path)
+    return {
+        "size": int(stat_result.st_size),
+        "mtime_ns": int(stat_result.st_mtime_ns),
+        "ctime_ns": int(stat_result.st_ctime_ns),
+        "device": int(stat_result.st_dev),
+        "inode": int(stat_result.st_ino),
+    }
+
+
+def _oversized_svg_call_evidence(
+    *,
+    representation: str,
+    item_filter: Optional[dict],
+    renderer_name: str,
+    pdf_sha256: str,
+    svg_bytes: int,
+    max_svg_bytes: int,
+) -> dict:
+    return {
+        "requested_type": (
+            item_filter["requested_type"] if item_filter else representation
+        ),
+        "attempted_type": representation,
+        "source_item_id": item_filter["source_item_id"] if item_filter else None,
+        "renderer": renderer_name,
+        "pdf_sha256": pdf_sha256,
+        "svg_bytes": int(svg_bytes),
+        "max_svg_bytes": int(max_svg_bytes),
+        "created_entity_ids": [],
+        "removed_entity_ids": [],
+        "cleanup_complete": True,
+    }
+
+
 def _host_object_id(obj) -> str:
     try:
         return str(getattr(obj, "Name", "") or getattr(obj, "Label", "") or "")
@@ -191,6 +313,21 @@ def _shape_edge_count(shape) -> int:
             pass
     try:
         return len(list(getattr(shape, "Edges", []) or []))
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return 0
+
+
+def _shape_child_count(shape) -> int:
+    if shape is None:
+        return 0
+    child_shapes = getattr(shape, "childShapes", None)
+    if callable(child_shapes):
+        try:
+            return len(child_shapes())
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+    try:
+        return len(list(getattr(shape, "SubShapes", []) or []))
     except (AttributeError, RuntimeError, TypeError, ValueError):
         return 0
 
@@ -726,10 +863,10 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                  defer_recompute: bool = False) -> dict:
     """Render and verify the explicitly requested SVG text representation.
 
-    Glyphs creates one placed-outline entity per glyph. Geometry preserves
-    every raw outline edge in one source-item compound. The different object
-    boundaries keep the two modes distinct without making large text pages
-    create hundreds of thousands of individual FreeCAD document objects.
+    Glyphs preserves every placed outline as an ordered child of one
+    source-item compound. Geometry preserves every raw outline edge in one
+    source-item compound. The different subshape semantics keep the two modes
+    distinct while bounding the number of FreeCAD document objects.
     """
     representation = str(representation or "").strip().lower()
     if representation not in {"glyphs", "geometry"}:
@@ -741,12 +878,14 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
         source_item is not None or requested_representation is not None
     )
     item_filter = None
+    supplied_pdf_sha256 = None
     if item_filter_requested:
         requested_type = str(requested_representation or "").strip().lower()
         try:
             item_page = source_item.get("page_number")
             source_item_id = source_item.get("source_item_id")
             item_requested_type = source_item.get("requested_type")
+            supplied_pdf_sha256 = source_item.get("pdf_sha256")
             raw_bbox = source_item.get("bbox")
             source_bbox = tuple(float(value) for value in raw_bbox)
             rotation_matrix = (
@@ -781,6 +920,14 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
             or not all(math.isfinite(value) for value in rotation_matrix)
             or source_bbox[2] <= source_bbox[0]
             or source_bbox[3] <= source_bbox[1]
+            or (
+                supplied_pdf_sha256 is not None
+                and (
+                    not isinstance(supplied_pdf_sha256, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", supplied_pdf_sha256)
+                    is None
+                )
+            )
         ):
             raise TextRepresentationRenderError(
                 "invalid_svg_source_item_filter",
@@ -799,47 +946,239 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
             "page_rotation_matrix": rotation_matrix,
         }
     cache = None
-    if render_cache is not None:
-        if not isinstance(render_cache, dict):
-            raise TextRepresentationRenderError(
-                "invalid_svg_render_cache",
-                {"requested_type": representation},
-            )
-        cache = render_cache
-        source_digest = (
-            str(source_item.get("pdf_sha256") or "")
-            if isinstance(source_item, dict)
-            else ""
+    if render_cache is not None and not isinstance(render_cache, dict):
+        raise TextRepresentationRenderError(
+            "invalid_svg_render_cache",
+            {"requested_type": representation},
         )
-        cache_binding = {
-            "pdf_path": os.path.normcase(os.path.abspath(str(pdf_path))),
-            "pdf_sha256": source_digest,
-            "page_number": int(page_num),
-            "page_height": float(page_h),
-            "page_width": float(page_w) if page_w is not None else None,
-            "scale": float(scale),
-            "flip_y": bool(flip_y),
-            "page_rotation_matrix": (
-                tuple(float(value) for value in page_rotation_matrix)
-                if page_rotation_matrix is not None
-                else (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    if isinstance(render_cache, dict):
+        cache = render_cache
+
+    shared_snapshot_cache = (
+        cache.get("source_snapshot_cache") if cache is not None else None
+    )
+    if shared_snapshot_cache is not None and not isinstance(
+        shared_snapshot_cache, dict
+    ):
+        raise TextRepresentationRenderError(
+            "invalid_svg_render_cache",
+            {"requested_type": representation},
+        )
+    owns_snapshot = shared_snapshot_cache is None
+    snapshot_cache = shared_snapshot_cache if not owns_snapshot else {}
+
+    def source_binding_error(reason: str, **extra_evidence) -> None:
+        evidence = {
+            "requested_type": (
+                item_filter["requested_type"] if item_filter else representation
             ),
+            "attempted_type": representation,
+            "source_item_id": (
+                item_filter["source_item_id"] if item_filter else None
+            ),
+            "created_entity_ids": [],
+            "removed_entity_ids": [],
+            "cleanup_complete": True,
         }
-        prior_binding = cache.get("source_binding")
-        if prior_binding is not None and prior_binding != cache_binding:
-            raise TextRepresentationRenderError(
-                "svg_cache_source_mismatch",
-                {
-                    "requested_type": representation,
-                    "source_item_id": (
-                        item_filter["source_item_id"] if item_filter else None
-                    ),
-                    "created_entity_ids": [],
-                    "removed_entity_ids": [],
-                    "cleanup_complete": True,
-                },
+        evidence.update(extra_evidence)
+        raise TextRepresentationRenderError(reason, evidence)
+
+    def valid_file_signature(signature) -> bool:
+        return bool(
+            isinstance(signature, dict)
+            and set(signature)
+            == {"size", "mtime_ns", "ctime_ns", "device", "inode"}
+            and all(type(value) is int and value >= 0 for value in signature.values())
+        )
+
+    def discard_snapshot_path(snapshot_path: Optional[str]) -> None:
+        if not snapshot_path:
+            return
+        try:
+            os.chmod(snapshot_path, stat.S_IREAD | stat.S_IWRITE)
+        except OSError:
+            pass
+        try:
+            os.remove(snapshot_path)
+        except OSError:
+            pass
+
+    canonical_pdf_path = os.path.normcase(
+        os.path.realpath(os.path.abspath(str(pdf_path)))
+    )
+
+    def ensure_verified_snapshot() -> dict:
+        required_snapshot_keys = {
+            "canonical_pdf_path",
+            "pdf_sha256",
+            "source_file_signature",
+            "snapshot_path",
+            "snapshot_file_signature",
+        }
+        if snapshot_cache:
+            snapshot_path = snapshot_cache.get("snapshot_path")
+            if (
+                set(snapshot_cache) != required_snapshot_keys
+                or snapshot_cache.get("canonical_pdf_path") != canonical_pdf_path
+                or not isinstance(snapshot_cache.get("pdf_sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", snapshot_cache["pdf_sha256"])
+                is None
+                or not valid_file_signature(
+                    snapshot_cache.get("source_file_signature")
+                )
+                or not isinstance(snapshot_path, str)
+                or not snapshot_path
+                or not valid_file_signature(
+                    snapshot_cache.get("snapshot_file_signature")
+                )
+            ):
+                source_binding_error("invalid_svg_source_snapshot_cache")
+            if (
+                supplied_pdf_sha256 is not None
+                and supplied_pdf_sha256 != snapshot_cache["pdf_sha256"]
+            ):
+                source_binding_error("svg_source_digest_mismatch")
+            try:
+                observed_snapshot_signature = _pdf_file_signature(snapshot_path)
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                source_binding_error(
+                    "svg_source_snapshot_mutated",
+                    exception=f"{exc.__class__.__name__}: {exc}",
+                )
+            if observed_snapshot_signature != snapshot_cache["snapshot_file_signature"]:
+                source_binding_error("svg_source_snapshot_mutated")
+            return snapshot_cache
+
+        snapshot_path = None
+        try:
+            signature_before_snapshot = _pdf_file_signature(canonical_pdf_path)
+            snapshot_path, snapshot_digest = _create_pdf_snapshot(canonical_pdf_path)
+            signature_after_snapshot = _pdf_file_signature(canonical_pdf_path)
+            snapshot_signature = _pdf_file_signature(snapshot_path)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            discard_snapshot_path(snapshot_path)
+            source_binding_error(
+                "svg_source_file_unavailable",
+                exception=f"{exc.__class__.__name__}: {exc}",
             )
-        cache["source_binding"] = cache_binding
+        if (
+            not valid_file_signature(signature_before_snapshot)
+            or not valid_file_signature(signature_after_snapshot)
+            or signature_before_snapshot != signature_after_snapshot
+            or not valid_file_signature(snapshot_signature)
+        ):
+            discard_snapshot_path(snapshot_path)
+            source_binding_error("svg_source_mutated_during_snapshot")
+        if (
+            not isinstance(snapshot_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", snapshot_digest) is None
+        ):
+            discard_snapshot_path(snapshot_path)
+            source_binding_error("svg_source_digest_invalid")
+        if (
+            supplied_pdf_sha256 is not None
+            and supplied_pdf_sha256 != snapshot_digest
+        ):
+            discard_snapshot_path(snapshot_path)
+            source_binding_error("svg_source_digest_mismatch")
+        snapshot_cache.update(
+            {
+                "canonical_pdf_path": canonical_pdf_path,
+                "pdf_sha256": snapshot_digest,
+                "source_file_signature": signature_after_snapshot,
+                "snapshot_path": snapshot_path,
+                "snapshot_file_signature": snapshot_signature,
+            }
+        )
+        return snapshot_cache
+    binding_options = {
+        "pdf_path": canonical_pdf_path,
+        "page_number": int(page_num),
+        "page_height": float(page_h),
+        "page_width": float(page_w) if page_w is not None else None,
+        "scale": float(scale),
+        "flip_y": bool(flip_y),
+        "page_rotation_matrix": (
+            tuple(float(value) for value in page_rotation_matrix)
+            if page_rotation_matrix is not None
+            else (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        ),
+        "max_svg_bytes": _max_svg_text_bytes(),
+    }
+    prior_binding = cache.get("source_binding") if cache is not None else None
+    if prior_binding is not None:
+        required_binding_keys = set(binding_options) | {
+            "pdf_sha256",
+            "pdf_file_signature",
+        }
+        if (
+            not isinstance(prior_binding, dict)
+            or set(prior_binding) != required_binding_keys
+            or any(
+                prior_binding.get(key) != value
+                for key, value in binding_options.items()
+            )
+            or not isinstance(prior_binding.get("pdf_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", prior_binding["pdf_sha256"])
+            is None
+            or not valid_file_signature(prior_binding.get("pdf_file_signature"))
+        ):
+            source_binding_error("svg_cache_source_mismatch")
+        verified_pdf_sha256 = prior_binding["pdf_sha256"]
+        if (
+            supplied_pdf_sha256 is not None
+            and supplied_pdf_sha256 != verified_pdf_sha256
+        ):
+            source_binding_error("svg_cache_source_mismatch")
+        if not owns_snapshot:
+            snapshot_state = ensure_verified_snapshot()
+            if snapshot_state["pdf_sha256"] != verified_pdf_sha256:
+                source_binding_error("svg_cache_source_mismatch")
+        else:
+            try:
+                current_signature = _pdf_file_signature(canonical_pdf_path)
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                source_binding_error(
+                    "svg_cache_source_mutated",
+                    exception=f"{exc.__class__.__name__}: {exc}",
+                )
+            if (
+                not valid_file_signature(current_signature)
+                or current_signature != prior_binding["pdf_file_signature"]
+            ):
+                source_binding_error("svg_cache_source_mutated")
+        cache_binding = dict(prior_binding)
+    else:
+        snapshot_state = ensure_verified_snapshot()
+        verified_pdf_sha256 = snapshot_state["pdf_sha256"]
+        cache_binding = {
+            **binding_options,
+            "pdf_sha256": verified_pdf_sha256,
+            "pdf_file_signature": snapshot_state["source_file_signature"],
+        }
+        if cache is not None:
+            cache["source_binding"] = cache_binding
+
+    def require_bound_source_unchanged(reason: str) -> None:
+        if not owns_snapshot:
+            snapshot_state = ensure_verified_snapshot()
+            if snapshot_state["pdf_sha256"] != cache_binding["pdf_sha256"]:
+                source_binding_error(reason)
+            return
+        try:
+            observed_signature = _pdf_file_signature(canonical_pdf_path)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            source_binding_error(
+                reason,
+                exception=f"{exc.__class__.__name__}: {exc}",
+            )
+        if (
+            not valid_file_signature(observed_signature)
+            or observed_signature != cache_binding["pdf_file_signature"]
+        ):
+            source_binding_error(reason)
+
+    if cache is not None:
         claimed = cache.setdefault("claimed_placement_indices", set())
         if not isinstance(claimed, set) or any(
             type(index) is not int or index < 0 for index in claimed
@@ -878,6 +1217,82 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
             },
         ) from exc
 
+    def raise_oversized_svg(
+        renderer_name: str,
+        svg_bytes: int,
+        max_svg_bytes: int,
+        *,
+        cause=None,
+    ) -> None:
+        if cache is not None:
+            cache["terminal_render_error"] = {
+                "source_binding": dict(cache_binding),
+                "reason": "svg_payload_too_large",
+                "renderer": renderer_name,
+                "svg_bytes": int(svg_bytes),
+                "max_svg_bytes": int(max_svg_bytes),
+            }
+        error = TextRepresentationRenderError(
+            "svg_payload_too_large",
+            _oversized_svg_call_evidence(
+                representation=representation,
+                item_filter=item_filter,
+                renderer_name=renderer_name,
+                pdf_sha256=verified_pdf_sha256,
+                svg_bytes=svg_bytes,
+                max_svg_bytes=max_svg_bytes,
+            ),
+        )
+        if cause is not None:
+            raise error from cause
+        raise error
+
+    cached_terminal = (
+        cache.get("terminal_render_error") if cache is not None else None
+    )
+    if cached_terminal is not None:
+        required_marker_keys = {
+            "source_binding",
+            "reason",
+            "renderer",
+            "svg_bytes",
+            "max_svg_bytes",
+        }
+        if (
+            not isinstance(cached_terminal, dict)
+            or set(cached_terminal) != required_marker_keys
+            or cached_terminal.get("source_binding") != cache_binding
+            or cached_terminal.get("reason") != "svg_payload_too_large"
+            or cached_terminal.get("renderer") not in {"pdftocairo", "pymupdf"}
+            or type(cached_terminal.get("svg_bytes")) is not int
+            or type(cached_terminal.get("max_svg_bytes")) is not int
+            or cached_terminal.get("max_svg_bytes") <= 0
+            or cached_terminal.get("max_svg_bytes")
+            != cache_binding.get("max_svg_bytes")
+            or cached_terminal.get("svg_bytes")
+            <= cached_terminal.get("max_svg_bytes")
+            or "svg" in cache
+        ):
+            raise TextRepresentationRenderError(
+                "invalid_svg_render_cache",
+                {
+                    "requested_type": (
+                        item_filter["requested_type"]
+                        if item_filter
+                        else representation
+                    ),
+                    "attempted_type": representation,
+                    "source_item_id": (
+                        item_filter["source_item_id"] if item_filter else None
+                    ),
+                },
+            )
+        raise_oversized_svg(
+            cached_terminal["renderer"],
+            cached_terminal["svg_bytes"],
+            cached_terminal["max_svg_bytes"],
+        )
+
     svg = cache.get("svg") if cache is not None else None
     exe = None
     renderer_name = (
@@ -886,38 +1301,134 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
         else "pymupdf"
     )
     if svg is not None:
+        # The page SVG was created from the verified immutable snapshot bound
+        # above. Reusing it keeps every item in this import on the same source
+        # bytes even if another process later changes the pathname on disk.
         pass
     else:
         exe = find_pdftocairo()
         renderer_name = "pdftocairo" if exe else "pymupdf"
-        if exe:
-            svg = _render_svg_with_pdftocairo(exe, pdf_path, page_num)
-        else:
-            if FreeCAD:
-                FreeCAD.Console.PrintMessage(
-                    "PDFSvgTextRenderer: pdftocairo not found — using bundled "
-                    "PyMuPDF SVG text fallback.\n"
+        source_mutation_reason = (
+            "svg_cache_source_mutated"
+            if prior_binding is not None
+            else "svg_source_snapshot_mutated"
+        )
+        require_bound_source_unchanged(source_mutation_reason)
+        snapshot_state = ensure_verified_snapshot()
+        pdf_snapshot_path = snapshot_state["snapshot_path"]
+        try:
+            signature_before_render = _pdf_file_signature(pdf_snapshot_path)
+            if signature_before_render != snapshot_state["snapshot_file_signature"]:
+                source_binding_error(source_mutation_reason)
+            if exe:
+                svg = _render_svg_with_pdftocairo(
+                    exe, pdf_snapshot_path, page_num
                 )
-            svg = _render_svg_with_pymupdf(pdf_path, page_num)
+            else:
+                if FreeCAD:
+                    FreeCAD.Console.PrintMessage(
+                        "PDFSvgTextRenderer: pdftocairo not found — using bundled "
+                        "PyMuPDF SVG text fallback.\n"
+                    )
+                svg = _render_svg_with_pymupdf(pdf_snapshot_path, page_num)
+            signature_after_render = _pdf_file_signature(pdf_snapshot_path)
+            if signature_after_render != signature_before_render:
+                source_binding_error(source_mutation_reason)
+        except TextRepresentationRenderError as exc:
+            if exc.reason != "svg_payload_too_large":
+                raise
+            oversized_evidence = dict(exc.evidence or {})
+            svg_bytes = oversized_evidence.get("svg_bytes")
+            max_svg_bytes = oversized_evidence.get("max_svg_bytes")
+            evidence_renderer = oversized_evidence.get("renderer")
+            if (
+                evidence_renderer != renderer_name
+                or type(svg_bytes) is not int
+                or type(max_svg_bytes) is not int
+                or max_svg_bytes <= 0
+                or svg_bytes <= max_svg_bytes
+                or (
+                    cache_binding is not None
+                    and max_svg_bytes != cache_binding.get("max_svg_bytes")
+                )
+            ):
+                raise TextRepresentationRenderError(
+                    "invalid_svg_oversize_evidence",
+                    {
+                        "requested_type": (
+                            item_filter["requested_type"]
+                            if item_filter
+                            else representation
+                        ),
+                        "attempted_type": representation,
+                        "renderer": renderer_name,
+                    },
+                ) from exc
+            if FreeCAD:
+                FreeCAD.Console.PrintWarning(
+                    f"PDFSvgTextRenderer: page {page_num} SVG text payload is too large — "
+                    "requested representation was not created.\n"
+                )
+            raise_oversized_svg(
+                renderer_name,
+                svg_bytes,
+                max_svg_bytes,
+                cause=exc,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            source_binding_error(
+                source_mutation_reason,
+                exception=f"{exc.__class__.__name__}: {exc}",
+            )
+        finally:
+            if owns_snapshot:
+                try:
+                    cleanup_pdf_snapshot_cache(snapshot_cache)
+                except OSError as exc:
+                    retry_registered = defer_pdf_snapshot_cleanup(snapshot_cache)
+                    raise TextRepresentationRenderError(
+                        "svg_source_snapshot_cleanup_failed",
+                        {
+                            "requested_type": (
+                                item_filter["requested_type"]
+                                if item_filter
+                                else representation
+                            ),
+                            "attempted_type": representation,
+                            "source_item_id": (
+                                item_filter["source_item_id"]
+                                if item_filter
+                                else None
+                            ),
+                            "created_entity_ids": [],
+                            "removed_entity_ids": [],
+                            "cleanup_complete": False,
+                            "retry_registered": retry_registered,
+                            "exception": f"{exc.__class__.__name__}: {exc}",
+                        },
+                    ) from exc
 
     if not svg:
         raise TextRepresentationRenderError(
             "svg_renderer_unavailable",
             {"requested_type": representation, "renderer": renderer_name},
         )
-    if _svg_too_large(svg):
+    max_svg_bytes = (
+        cache_binding["max_svg_bytes"]
+        if cache_binding is not None
+        else _max_svg_text_bytes()
+    )
+    svg_bytes = len(svg.encode("utf-8", "ignore"))
+    if svg_bytes > max_svg_bytes:
         if FreeCAD:
             FreeCAD.Console.PrintWarning(
                 f"PDFSvgTextRenderer: page {page_num} SVG text payload is too large — "
                 "requested representation was not created.\n"
             )
-        raise TextRepresentationRenderError(
-            "svg_payload_too_large",
-            {
-                "requested_type": representation,
-                "renderer": renderer_name,
-                "svg_bytes": len(svg.encode("utf-8", "ignore")),
-            },
+        raise_oversized_svg(
+            renderer_name,
+            svg_bytes,
+            max_svg_bytes,
         )
     if cache is not None:
         cache["svg"] = svg
@@ -1387,6 +1898,9 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
     child_source_ids: List[str] = []
     attempts: List[dict] = []
     raw_edge_count = 0
+    glyph_edge_count = 0
+    glyph_compound_shapes: List[object] = []
+    glyph_source_ids: List[str] = []
     geometry_shapes: List[object] = []
     creation_started = False
 
@@ -1409,29 +1923,12 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 if parent_source_item_id is not None
                 else f"p{int(page_num)}:g{glyph_index}"
             )
-            glyph_created_ids: List[str] = []
             if representation == "glyphs":
                 if not _shape_nonempty(placed_shape, require_edges=True):
                     raise RuntimeError("placed glyph shape is empty")
-                creation_started = True
-                obj = doc.addObject(
-                    "Part::Feature",
-                    f"Text_Glyph_p{int(page_num)}_g{glyph_index}",
-                )
-                claim_new_object(obj, "glyph")
-                obj.Shape = placed_shape
-                if not _shape_nonempty(getattr(obj, "Shape", None), require_edges=True):
-                    raise RuntimeError("host glyph entity failed shape verification")
-                _annotate_text_entity(
-                    obj,
-                    glyph_source_id,
-                    representation,
-                    parent_source_item_id=parent_source_item_id,
-                )
-                glyph_created_ids.append(_host_object_id(obj))
-                child_source_ids.append(glyph_source_id)
-                if parent_group is not None:
-                    parent_group.addObject(obj)
+                glyph_compound_shapes.append(placed_shape)
+                glyph_source_ids.append(glyph_source_id)
+                glyph_edge_count += _shape_edge_count(placed_shape)
             else:
                 placed_edge_count = _shape_edge_count(placed_shape)
                 if placed_edge_count <= 0:
@@ -1439,28 +1936,100 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 geometry_shapes.append(placed_shape)
                 raw_edge_count += placed_edge_count
 
-            created_ids.extend(glyph_created_ids)
-            if item_filter is None and representation == "glyphs":
+        if representation == "glyphs":
+            if (
+                not glyph_compound_shapes
+                or glyph_edge_count <= 0
+                or len(glyph_compound_shapes) != len(glyph_source_ids)
+            ):
+                raise RuntimeError("glyph compound collection is incomplete")
+            parent_source_item_id = (
+                item_filter["source_item_id"] if item_filter is not None else None
+            )
+            glyph_compound_source_id = (
+                f"{parent_source_item_id}:glyphs"
+                if parent_source_item_id is not None
+                else f"p{int(page_num)}:glyphs"
+            )
+            creation_started = True
+            obj = doc.addObject(
+                "Part::Feature",
+                f"Text_Glyphs_p{int(page_num)}",
+            )
+            claim_new_object(obj, "source-item glyph compound")
+            obj.Shape = Part.makeCompound(glyph_compound_shapes)
+            stored_shape = getattr(obj, "Shape", None)
+            if (
+                not _shape_nonempty(stored_shape, require_edges=True)
+                or _shape_edge_count(stored_shape) != glyph_edge_count
+                or _shape_child_count(stored_shape) != len(glyph_source_ids)
+            ):
+                raise RuntimeError("host glyph compound lost placed outlines")
+            _annotate_text_entity(
+                obj,
+                glyph_compound_source_id,
+                representation,
+                parent_source_item_id=parent_source_item_id,
+            )
+            add_property = getattr(obj, "addProperty", None)
+            glyph_metadata = (
+                ("App::PropertyInteger", "PDFGlyphCount", len(glyph_source_ids)),
+                (
+                    "App::PropertyStringList",
+                    "PDFGlyphSourceItemIds",
+                    list(glyph_source_ids),
+                ),
+                (
+                    "App::PropertyString",
+                    "PDFGlyphGrouping",
+                    "source_item_compound_v1",
+                ),
+            )
+            for property_type, property_name, property_value in glyph_metadata:
+                if not hasattr(obj, property_name):
+                    if not callable(add_property):
+                        raise RuntimeError(
+                            f"host cannot store required {property_name} metadata"
+                        )
+                    add_property(property_type, property_name, "PDF Import")
+                setattr(obj, property_name, property_value)
+                stored_value = getattr(obj, property_name, None)
+                if property_name == "PDFGlyphCount":
+                    verified = int(stored_value) == int(property_value)
+                elif property_name == "PDFGlyphSourceItemIds":
+                    verified = list(stored_value or []) == property_value
+                else:
+                    verified = str(stored_value or "") == str(property_value)
+                if not verified:
+                    raise RuntimeError(
+                        f"host did not preserve required {property_name} metadata"
+                    )
+            glyph_created_id = _host_object_id(obj)
+            created_ids.append(glyph_created_id)
+            child_source_ids.append(glyph_compound_source_id)
+            if parent_group is not None:
+                parent_group.addObject(obj)
+            if item_filter is None:
                 attempts.append(
                     {
-                        "source_item_id": glyph_source_id,
+                        "source_item_id": glyph_compound_source_id,
                         "requested_type": representation,
                         "attempted_type": representation,
                         "final_type": representation,
                         "outcome": "verified",
                         "reason": f"requested {representation} delivered",
-                        "created_entity_ids": glyph_created_ids,
+                        "created_entity_ids": [glyph_created_id],
                         "support_entity_ids": [],
                         "removed_entity_ids": [],
                         "cleanup_complete": True,
+                        "delivery_count": len(glyph_source_ids),
                         "evidence": {
                             "renderer": renderer_name,
                             "host_entity_type": "Part::Feature",
-                            "raw_edge_count": (
-                                len(glyph_created_ids)
-                                if representation == "geometry"
-                                else None
-                            ),
+                            "child_source_item_ids": [glyph_compound_source_id],
+                            "glyph_count": len(glyph_source_ids),
+                            "glyph_source_item_ids": list(glyph_source_ids),
+                            "glyph_grouping": "source_item_compound_v1",
                         },
                     }
                 )
@@ -1624,10 +2193,31 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                     raise RuntimeError(
                         "stored geometry compound raw edge count is invalid"
                     )
+            else:
+                refreshed_shape = getattr(host_obj, "Shape", None)
+                try:
+                    declared_glyph_count = int(host_obj.PDFGlyphCount)
+                    declared_glyph_ids = list(host_obj.PDFGlyphSourceItemIds or [])
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    declared_glyph_count = -1
+                    declared_glyph_ids = []
+                if (
+                    not _shape_nonempty(refreshed_shape, require_edges=True)
+                    or _shape_edge_count(refreshed_shape) != glyph_edge_count
+                    or _shape_child_count(refreshed_shape) != len(glyph_source_ids)
+                    or declared_glyph_count != len(glyph_source_ids)
+                    or declared_glyph_ids != glyph_source_ids
+                    or str(getattr(host_obj, "PDFGlyphGrouping", "") or "")
+                    != "source_item_compound_v1"
+                ):
+                    raise RuntimeError(
+                        "stored glyph compound identity or outline count is invalid"
+                    )
 
         if item_filter is not None:
             attempt_evidence = {
                 "renderer": renderer_name,
+                "pdf_sha256": verified_pdf_sha256,
                 "host_entity_type": "Part::Feature",
                 "raw_edge_count": (
                     raw_edge_count if representation == "geometry" else None
@@ -1635,6 +2225,14 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 **item_filter_evidence,
                 "child_source_item_ids": list(child_source_ids),
             }
+            if representation == "glyphs":
+                attempt_evidence.update(
+                    {
+                        "glyph_count": len(glyph_source_ids),
+                        "glyph_source_item_ids": list(glyph_source_ids),
+                        "glyph_grouping": "source_item_compound_v1",
+                    }
+                )
             attempts.append(
                 {
                     "source_item_id": item_filter["source_item_id"],
@@ -1650,7 +2248,9 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                     "removed_entity_ids": [],
                     "cleanup_complete": True,
                     "delivery_count": (
-                        raw_edge_count if representation == "geometry" else len(created_ids)
+                        raw_edge_count
+                        if representation == "geometry"
+                        else len(glyph_source_ids)
                     ),
                     "evidence": attempt_evidence,
                 }
@@ -1737,6 +2337,17 @@ def _render_svg_with_pdftocairo(exe: str, pdf_path: str, page_num: int) -> Optio
                     os.remove(svg_path)
                 subprocess.run(cmd, check=True, timeout=90, capture_output=True, **kw)
                 if os.path.isfile(svg_path):
+                    svg_bytes = os.path.getsize(svg_path)
+                    max_svg_bytes = _max_svg_text_bytes()
+                    if svg_bytes > max_svg_bytes:
+                        raise TextRepresentationRenderError(
+                            "svg_payload_too_large",
+                            {
+                                "renderer": "pdftocairo",
+                                "svg_bytes": int(svg_bytes),
+                                "max_svg_bytes": int(max_svg_bytes),
+                            },
+                        )
                     with open(svg_path, "r", encoding="utf-8") as f:
                         svg = f.read()
                     if svg:
@@ -1786,8 +2397,23 @@ def _load_fitz():
             return None
 
     try:
-        lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
-        return import_fitz(prefer_lib_dir=lib_dir)
+        addon_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if addon_root not in sys.path:
+            sys.path.insert(0, addon_root)
+        try:
+            from PDFVectorImporter.runtime_paths import (
+                activate_bundled_runtime_if_available,
+            )
+        except ModuleNotFoundError as exc:
+            if exc.name not in {
+                "PDFVectorImporter",
+                "PDFVectorImporter.runtime_paths",
+            }:
+                raise
+            from runtime_paths import activate_bundled_runtime_if_available
+
+        activate_bundled_runtime_if_available(addon_root)
+        return import_fitz()
     except Exception as e:
         if FreeCAD:
             FreeCAD.Console.PrintWarning(

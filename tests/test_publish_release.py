@@ -101,6 +101,26 @@ def test_absent_tag_creates_complete_release_in_one_command(tmp_path):
     assert "--verify-tag" not in create
 
 
+def test_non_product_release_is_explicitly_not_latest(tmp_path):
+    base = _config(tmp_path)
+    config = publish_release.PublishConfig(
+        repo=base.repo,
+        tag=base.tag,
+        target=base.target,
+        title="Steel Shapes steel-v1.0.1",
+        notes=base.notes,
+        assets=base.assets,
+        latest=False,
+    )
+
+    remote = FakeRemote()
+    result = publish_release.publish(config, run=remote)
+
+    assert result.minted is True
+    create = next(cmd for cmd in remote.commands if cmd[:3] == ["gh", "release", "create"])
+    assert "--latest=false" in create
+
+
 def test_exact_orphan_tag_is_recovered_without_rewrite(tmp_path):
     config = _config(tmp_path)
     remote = FakeRemote(tag_target=TARGET)

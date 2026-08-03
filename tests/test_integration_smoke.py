@@ -74,9 +74,13 @@ class TestIntegrationSmoke:
 
     def test_fraction_extraction_with_test_pdf(self):
         """Test fraction extraction on real PDF data."""
-        pdf_path = resolve_manifest_entry("PRIVATE-01")
+        manifest_entry_id = os.environ.get("BCS_PRIVATE_INTEGRATION_MANIFEST_ID", "")
+        pdf_path = resolve_manifest_entry(manifest_entry_id) if manifest_entry_id else None
         if pdf_path is None or not os.path.exists(pdf_path):
-            pytest.skip("Corpus manifest entry PRIVATE-01 not available (set BCS_PRIVATE_VALIDATION_ROOT)")
+            pytest.skip(
+                "Private integration manifest entry not configured "
+                "(set BCS_PRIVATE_INTEGRATION_MANIFEST_ID)"
+            )
         pdf_path = str(pdf_path)
         
         try:

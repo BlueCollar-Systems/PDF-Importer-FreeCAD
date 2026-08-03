@@ -1,0 +1,3 @@
+# Windows x86-64 CPython 3.11 ABI-specific release-runtime wheel.
+fonttools==4.63.0 \
+    --hash=sha256:063e08bd17bd5a90127a14123de0d6a952dbc847695fd98b63c043d58057f90c

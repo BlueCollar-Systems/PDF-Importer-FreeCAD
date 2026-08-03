@@ -300,6 +300,7 @@ class InstallPyMuPDFCommand:
         return True
 
     def Activated(self):
+        import site
         import subprocess
 
         base = _wb_base()
@@ -307,12 +308,10 @@ class InstallPyMuPDFCommand:
             _err("Cannot find workbench directory!")
             return
 
-        target = os.path.join(base, "src", "lib")
-        os.makedirs(target, exist_ok=True)
-
         py = _find_python()
+        target = site.getusersitepackages()
 
-        _msg(f"Installing PDF runtime dependencies to: {target}")
+        _msg(f"Installing PDF runtime dependencies for this FreeCAD user: {target}")
         _msg(f"Using Python: {py}")
 
         _kw = {}
@@ -329,11 +328,10 @@ class InstallPyMuPDFCommand:
         try:
             subprocess.check_call(
                 [py, "-m", "pip", "install", "--upgrade",
-                 "--only-binary", ":all:", "--target", target,
+                 "--only-binary", ":all:", "--user",
                  "PyMuPDF>=1.24,<2.0", "fonttools>=4.50,<5.0"],
                 timeout=300, **_kw)
-            if target not in sys.path:
-                sys.path.insert(0, target)
+            site.addsitedir(target)
             try:
                 import pymupdf as fitz  # noqa: F401
             except ImportError:
@@ -352,7 +350,7 @@ class InstallPyMuPDFCommand:
                     None, "Install Failed",
                     f"pip install PDF dependencies failed:\n{e}\n\n"
                     "Try running manually in a terminal:\n"
-                    f'  "{py}" -m pip install --target "{target}" '
+                    f'  "{py}" -m pip install --user '
                     '"PyMuPDF>=1.24,<2.0" "fonttools>=4.50,<5.0"')
         except (subprocess.SubprocessError, OSError, RuntimeError, ValueError) as e:
             _err(f"Installer error: {e}\n{traceback.format_exc()}")

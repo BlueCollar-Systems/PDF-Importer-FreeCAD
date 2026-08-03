@@ -271,7 +271,7 @@ begin
   begin
     MsgBox(
       'PDF Vector Importer was installed to:' + #13#10 + ExpandConstant('{app}') + #13#10#13#10 +
-      'Restart FreeCAD. This installer includes the private PyMuPDF runtime under src\lib.',
+      'Restart FreeCAD. This installer includes offline PyMuPDF plus exact CPython 3.10 and 3.11 fontTools runtimes under src\lib.',
       mbInformation, MB_OK
     );
   end;

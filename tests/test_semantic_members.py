@@ -19,13 +19,13 @@ needs_catalog = pytest.mark.skipif(
 
 
 @needs_catalog
-def test_plan_semantic_members_from_tier1_intent():
+def test_plan_semantic_members_from_synthetic_intent():
     intent = {
         "feasible": True,
         "members": [
-            {"designation": "W12X30", "family": "W", "mark": "w1025", "length_in": 167.25, "count": 1},
-            {"designation": "W8X15", "family": "W", "mark": "w1023", "length_in": 47.75, "count": 1},
-            {"designation": "L3X3X3/8", "family": "L", "mark": "a1005", "count": 1},
+            {"designation": "W10X22", "family": "W", "mark": "w9005", "length_in": 138.5, "count": 1},
+            {"designation": "W6X9", "family": "W", "mark": "w9004", "length_in": 50.5, "count": 1},
+            {"designation": "L2X2X1/4", "family": "L", "mark": "a9006", "count": 1},
         ],
         "plates": [],
     }
@@ -33,14 +33,14 @@ def test_plan_semantic_members_from_tier1_intent():
     assert result.enabled is True
     assert result.members_created >= 2
     assert len(result.plans) == 3
-    w12 = next(p for p in result.plans if p.designation == "W12X30")
-    assert w12.profile_found is True
-    assert w12.profile is not None
-    assert w12.profile.get("family") == "W"
+    wide_flange = next(p for p in result.plans if p.designation == "W10X22")
+    assert wide_flange.profile_found is True
+    assert wide_flange.profile is not None
+    assert wide_flange.profile.get("family") == "W"
 
 
 def test_semantic_members_off_by_default():
-    result = plan_semantic_members({"feasible": True, "members": [{"designation": "W12X30"}]}, enabled=False)
+    result = plan_semantic_members({"feasible": True, "members": [{"designation": "W10X22"}]}, enabled=False)
     assert result.enabled is False
     assert result.members_created == 0
 

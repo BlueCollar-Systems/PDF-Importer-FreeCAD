@@ -13,10 +13,65 @@ sys.path.insert(0, str(ROOT / "PDFVectorImporter"))
 from pdfcadcore.import_report import (
     build_actual_text_entity_types,
     build_font_embedding_hints,
+    build_import_contract_ready,
     build_import_report,
     build_pdf_interactive_note,
     build_text_mode_fallback,
 )
+
+
+def test_clean_scale_evaluation_is_explicit_and_contract_ready():
+    report = build_import_report(
+        host_app="freecad",
+        importer_version="4.0.83",
+        pdf_path="drawing.pdf",
+        mode="vector",
+        pages=1,
+        primitive_count=40,
+        import_text=False,
+        text_mode="none",
+        extra={
+            "resolved_scale": {
+                "factor": 24.0,
+                "notation": '1/2" = 1\'-0"',
+                "source": "titleblock",
+                "confidence": 0.98,
+                "fallback_reason": "",
+            },
+            "scale_hints": {
+                "title_block_detected": True,
+                "dimension_count": 4,
+                "alternate_scale_factors": [24.0],
+            },
+        },
+    )
+
+    extra = report.to_dict()["extra"]
+    assert extra["scale_crosscheck"] == {
+        "level": "ok",
+        "reasons": [],
+        "messages": [],
+    }
+    assert extra["import_contract_ready"]["ready"] is True
+    assert extra["import_contract_ready"]["checks"]["scale_crosscheck"] is True
+
+
+def test_malformed_scale_evaluation_remains_fail_closed():
+    report = build_import_report(
+        host_app="freecad",
+        importer_version="4.0.83",
+        pdf_path="drawing.pdf",
+        mode="vector",
+        primitive_count=40,
+        import_text=False,
+        text_mode="none",
+    )
+    report.extra["scale_crosscheck"] = None
+
+    ready = build_import_contract_ready(report)
+
+    assert ready["ready"] is False
+    assert ready["checks"]["scale_crosscheck"] is False
 
 
 def test_build_import_report_includes_text_mode_in_extra():

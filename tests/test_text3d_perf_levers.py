@@ -4,8 +4,7 @@ P1: a span tessellates exactly once — the ShapeString host is constructed
 without the Draft factory's default-Size recompute, and every custom property
 write lands BEFORE the object's only recompute so the page-end document
 recompute has nothing left to re-execute (post-recompute writes re-touch
-objects; measured as a full second tessellation pass on the owner's dense
-chart).
+objects and cause another tessellation pass).
 """
 from __future__ import annotations
 
@@ -318,7 +317,7 @@ def test_wires_only_supports_pass_verification(monkeypatch):
 
 
 def test_empty_support_geometry_still_fails_closed(monkeypatch):
-    """P2 keeps the fail-closed gate: no faces AND no wires is a failure."""
+    """No faces and no wires yields the typed same-mode zero-geometry proof."""
     log = EventLog()
     doc = FakeDoc(log)
     group = FakeGroup(doc)
@@ -329,10 +328,19 @@ def test_empty_support_geometry_still_fails_closed(monkeypatch):
     shape_string.Shape.Wires = []
     doc.Objects.append(shape_string)
 
-    with pytest.raises(RuntimeError, match="face or wire geometry"):
+    with pytest.raises(core.Text3DExactFontOutlinesUnavailable) as raised:
         core._create_verified_text3d_entity(
             shape_string, **_entity_kwargs(group)
         )
+    assert raised.value.evidence == {
+        "implementation": "draft_shapestring",
+        "outcome": "zero_geometry",
+        "recompute_completed": True,
+        "shape_present": True,
+        "shape_is_null": False,
+        "face_count": 0,
+        "wire_count": 0,
+    }
 
 
 class FakeWire:

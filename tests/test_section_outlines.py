@@ -27,21 +27,20 @@ def _bbox(points):
 
 
 @needs_catalog
-def test_w12x30_outline_matches_aisc_dims():
-    prof = resolve_profile("W12X30")
+def test_w10x22_outline_matches_aisc_dims():
+    prof = resolve_profile("W10X22")
     assert prof and prof["family"] == "W"
     out = section_outline(prof)
     assert out["kind"] == "polygon" and out["idealized"] is True
     x0, y0, x1, y1 = _bbox(out["outer"])
-    assert abs((x1 - x0) - prof["bf"]) < 1e-9   # width == flange width 6.52
-    assert abs((y1 - y0) - prof["d"]) < 1e-9    # height == depth 12.3
+    assert abs((x1 - x0) - prof["bf"]) < 1e-9
+    assert abs((y1 - y0) - prof["d"]) < 1e-9
     assert len(out["outer"]) == 12 and out["holes"] == []
 
 
 @needs_catalog
-def test_tier1_user_drawing_members_all_resolve_to_outlines():
-    # Every rolled shape the private validation user drawing needs must produce geometry.
-    for desig in ("W12X30", "W8X15", "L3X3X3/8"):
+def test_synthetic_profile_mix_resolves_to_outlines():
+    for desig in ("W10X22", "W6X9", "L2X2X1/4"):
         out = section_outline(resolve_profile(desig))
         assert out is not None, desig
         assert out["kind"] == "polygon"
@@ -49,9 +48,9 @@ def test_tier1_user_drawing_members_all_resolve_to_outlines():
 
 @needs_catalog
 def test_angle_geometry():
-    out = section_outline(resolve_profile("L3X3X3/8"))
+    out = section_outline(resolve_profile("L2X2X1/4"))
     x0, y0, x1, y1 = _bbox(out["outer"])
-    assert (round(x1 - x0, 6), round(y1 - y0, 6)) == (3.0, 3.0)
+    assert (round(x1 - x0, 6), round(y1 - y0, 6)) == (2.0, 2.0)
     assert len(out["outer"]) == 6
 
 

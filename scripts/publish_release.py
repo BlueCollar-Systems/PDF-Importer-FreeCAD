@@ -182,6 +182,8 @@ def _create_command(
         command.extend(["--target", config.target])
     if config.latest:
         command.append("--latest")
+    else:
+        command.append("--latest=false")
     command.extend(str(local_assets[path.name]["path"]) for path in config.assets)
     return command
 

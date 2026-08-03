@@ -673,16 +673,19 @@ class TestReleaseSafety:
         assert 'ATTESTATION="dist/FreeCAD-PDF-Importer-Setup_v' in workflow
         assert '--asset "${ZIP}" --asset "${SETUP}" --asset "${ATTESTATION}"' in workflow
 
-    def test_steel_shapes_release_never_overwrites_existing_assets(self):
+    def test_steel_shapes_release_is_exact_and_never_overwrites_assets(self):
         workflow = (
             REPO_ROOT / ".github" / "workflows" / "steel-shapes-release.yml"
         ).read_text(encoding="utf-8")
-        publish_at = workflow.index("- name: Publish GitHub release")
-        publish_block = workflow[publish_at:]
-        assert "uses: softprops/action-gh-release@v2" in publish_block
-        assert re.search(
-            r"^\s+overwrite_files:\s*false\s*$", publish_block, re.MULTILINE
+        publish_at = workflow.index(
+            "- name: Publish exact non-product-latest release"
         )
+        publish_block = workflow[publish_at:]
+        assert "scripts/publish_release.py" in publish_block
+        assert '--target "$GITHUB_SHA"' in publish_block
+        assert "--no-latest" in publish_block
+        assert "softprops/action-gh-release" not in publish_block
+        assert "--clobber" not in publish_block
 
     def test_acknowledge_rejects_past_deferral(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -18,31 +18,32 @@ def test_fraction_parsing_exact():
     assert parse_fraction_inches("0/0") is None
 
 
-def test_tier1_user_bom_rows_detect_plates_and_members():
-    # Representative BOM rows from private validation user fabrication drawing (PRIVATE-01).
+def test_synthetic_bom_rows_detect_plates_and_members():
+    # Deliberately synthetic fabrication rows; private validation identifiers
+    # must remain outside the public repository.
     rows = [
-        'p1016 PL3/8"X6 7/8"',
-        'p1019 PL3/8"X7 3/4"',
-        'p1052 PL3/4"X7"',
-        "w1023 W8X15 3'-11 3/4\"",
-        "w1025 W12X30 13'-11 1/4\"",
-        "a1005 L3X3X3/8",
-        "1017FR1 W12X30",
+        'p9001 PL1/2"X5 1/2"',
+        'p9002 PL5/8"X8 1/4"',
+        'p9003 PL1"X9"',
+        "w9004 W6X9 4'-2 1/2\"",
+        "w9005 W10X22 11'-6 1/2\"",
+        "a9006 L2X2X1/4",
+        "9007FR9 W10X22",
     ]
     intent = analyze_model3d_intent(rows)
     assert intent.feasible is True
 
     plates = {p.callout: p for p in intent.plates}
-    assert plates['PL3/8"X67/8"'.upper()].thickness_in == 0.375
-    assert plates['PL3/8"X67/8"'.upper()].width_in == 6.875
-    assert plates['PL3/8"X67/8"'.upper()].mark == "p1016"
-    assert plates['PL3/4"X7"'].thickness_in == 0.75
+    assert plates['PL1/2"X51/2"'.upper()].thickness_in == 0.5
+    assert plates['PL1/2"X51/2"'.upper()].width_in == 5.5
+    assert plates['PL1/2"X51/2"'.upper()].mark == "p9001"
+    assert plates['PL1"X9"'].thickness_in == 1.0
 
     members = {m.designation: m for m in intent.members}
-    assert members["W8X15"].family == "W"
-    assert abs(members["W8X15"].length_in - (3 * 12 + 11.75)) < 1e-6
-    assert members["W12X30"].count == 2  # w1025 row + 1017FR1 assembly row
-    assert members["L3X3X3/8"].family == "L"
+    assert members["W6X9"].family == "W"
+    assert abs(members["W6X9"].length_in - 50.5) < 1e-6
+    assert members["W10X22"].count == 2  # beam row + synthetic assembly row
+    assert members["L2X2X1/4"].family == "L"
 
 
 def test_hss_pipe_and_channel_designations():

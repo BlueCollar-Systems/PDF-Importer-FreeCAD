@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""P0 extract_page golden for private/web/stacked_fraction_spacing.pdf (PRIVATE-11)."""
+"""P0 extract_page golden supplied only by the private validation manifest."""
 
 from __future__ import annotations
 
@@ -33,7 +33,10 @@ def _golden() -> dict:
 
 def test_stacked_fraction_spacing_extract_page_matches_golden() -> None:
     golden = _golden()
-    pdf_path = require_manifest_pdf(str(golden.get("manifest_entry_id") or "PRIVATE-11"), p0=True)
+    manifest_entry_id = str(golden.get("manifest_entry_id") or "").strip()
+    if not manifest_entry_id:
+        pytest.skip("private golden does not declare a manifest entry")
+    pdf_path = require_manifest_pdf(manifest_entry_id, p0=True)
     doc = fitz.open(str(pdf_path))
     try:
         page_data = extract_page(doc[0], int(golden.get("page") or 1))

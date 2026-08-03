@@ -353,6 +353,55 @@ def test_named_resume_fails_closed_when_identity_does_not_match(monkeypatch, tmp
         core.import_pdf("fixture.pdf", opts)
 
 
+def test_committed_import_survives_snapshot_cleanup_failure_and_defers_retry(
+    monkeypatch, tmp_path
+):
+    from PDFVectorImporter.src import PDFSvgTextRenderer as renderer
+
+    document = Document()
+    reports = []
+    deferred = []
+
+    def import_page(_pdf, _path, page_number, opts, doc):
+        opts._svg_source_snapshot_cache.update(
+            {"snapshot_path": str(tmp_path / "locked.pdf"), "pdf_sha256": "a" * 64}
+        )
+        return doc.addObject(
+            "App::DocumentObjectGroup", f"PDF_Page_{page_number}"
+        ), None
+
+    _install_import_fakes(monkeypatch, document, import_page, reports)
+    monkeypatch.setattr(
+        renderer,
+        "cleanup_pdf_snapshot_cache",
+        lambda _cache: (_ for _ in ()).throw(PermissionError("still in use")),
+    )
+    monkeypatch.setattr(
+        renderer,
+        "defer_pdf_snapshot_cleanup",
+        lambda cache: deferred.append(cache) or True,
+    )
+    opts = core.ImportOptions(
+        pages=[1],
+        import_text=False,
+        model3d_mode="off",
+        import_report_path=str(tmp_path / "complete.json"),
+    )
+
+    assert core.import_pdf("fixture.pdf", opts) is True
+    assert document.commits == 1
+    assert document.aborts == 0
+    assert opts.import_status == "success"
+    assert deferred == [opts._svg_source_snapshot_cache]
+    assert opts._svg_source_snapshot_cache["snapshot_path"].endswith("locked.pdf")
+    cleanup = reports[-1]["extra"]["svg_snapshot_cleanup"]
+    assert cleanup == {
+        "status": "deferred",
+        "exception_type": "PermissionError",
+        "retry_registered": True,
+    }
+
+
 def test_requested_page_order_is_persisted_for_resume_offsets():
     opts = core.ImportOptions(pages=[3, 1])
     identity = session.build_identity(

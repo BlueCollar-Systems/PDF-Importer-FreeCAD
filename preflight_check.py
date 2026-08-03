@@ -11,39 +11,37 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 ADDON_ROOT = ROOT / "PDFVectorImporter"
-VENDORED_LIB = ADDON_ROOT / "src" / "lib"
 
 sys.path.insert(0, str(ADDON_ROOT))
 
 from pdfcadcore.preflight_copy import preflight_paragraph  # noqa: E402
+from PDFVectorImporter.runtime_paths import (  # noqa: E402
+    activate_bundled_runtime_if_available,
+)
 
 
 def _pymupdf_status() -> tuple[bool, str]:
-    """Return whether bundled PyMuPDF imports from the add-on vendor path."""
-
-    if not VENDORED_LIB.is_dir():
-        return False, f"vendored library folder missing: {VENDORED_LIB}"
-
-    inserted = False
-    vendor_path = str(VENDORED_LIB)
-    if vendor_path not in sys.path:
-        sys.path.insert(0, vendor_path)
-        inserted = True
+    """Return whether the exact ABI-matched bundled runtime imports."""
+    saved_path = list(sys.path)
     try:
+        runtime = activate_bundled_runtime_if_available(ADDON_ROOT)
+        if runtime is None:
+            return False, "no compatible bundled runtime for this Python host"
         try:
             import pymupdf as fitz  # type: ignore
         except ImportError:
             import fitz  # type: ignore
+        import fontTools  # type: ignore
         version = getattr(fitz, "__version__", "") or getattr(fitz, "VersionBind", "")
-        return True, f"bundled PyMuPDF import OK ({version or 'version unknown'})"
+        return True, (
+            f"bundled {runtime.runtime_tag} runtime import OK "
+            f"(PyMuPDF {version or 'version unknown'}, "
+            f"fontTools {getattr(fontTools, '__version__', 'version unknown')})"
+        )
     except Exception as exc:  # noqa: BLE001 - diagnostic command should report exact import failure.
-        return False, f"bundled PyMuPDF import failed: {exc}"
+        return False, f"bundled runtime import failed: {exc}"
     finally:
-        if inserted:
-            try:
-                sys.path.remove(vendor_path)
-            except ValueError:
-                pass
+        sys.path[:] = saved_path
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -56,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--diagnostics",
         action="store_true",
-        help="Also verify bundled PyMuPDF imports from PDFVectorImporter/src/lib",
+        help="Also verify the ABI-matched bundled PyMuPDF/fontTools runtime",
     )
     args = parser.parse_args(argv)
 

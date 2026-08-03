@@ -80,6 +80,177 @@ class FakeGroup:
         self.objects.append(obj)
 
 
+class BoundedGeometry:
+    def __init__(
+        self,
+        x_min,
+        x_max,
+        *,
+        face_count=0,
+        solid_count=0,
+        volume=0.0,
+    ):
+        self.BoundBox = SimpleNamespace(
+            XMin=float(x_min),
+            XMax=float(x_max),
+            XLength=float(x_max) - float(x_min),
+        )
+        self.Faces = [object() for _ in range(face_count)]
+        self.Solids = [object() for _ in range(solid_count)]
+        self.Volume = float(volume)
+
+    def isNull(self):
+        return False
+
+    def copy(self):
+        return BoundedGeometry(
+            self.BoundBox.XMin,
+            self.BoundBox.XMax,
+            face_count=len(self.Faces),
+            solid_count=len(self.Solids),
+            volume=self.Volume,
+        )
+
+    def transformGeometry(self, matrix):
+        return BoundedGeometry(
+            self.BoundBox.XMin * float(matrix.A11),
+            self.BoundBox.XMax * float(matrix.A11),
+            face_count=len(self.Faces),
+        )
+
+    def extrude(self, _vector):
+        return BoundedGeometry(
+            self.BoundBox.XMin,
+            self.BoundBox.XMax,
+            face_count=len(self.Faces),
+            solid_count=1,
+            volume=12.5,
+        )
+
+
+class BoundedPart:
+    @staticmethod
+    def Compound(shapes):
+        shapes = list(shapes)
+        return BoundedGeometry(
+            min(shape.BoundBox.XMin for shape in shapes),
+            max(shape.BoundBox.XMax for shape in shapes),
+            face_count=sum(len(getattr(shape, "Faces", [])) for shape in shapes),
+            solid_count=sum(len(getattr(shape, "Solids", [])) for shape in shapes),
+            volume=sum(float(getattr(shape, "Volume", 0.0)) for shape in shapes),
+        )
+
+
+def test_outer_spaces_use_zero_kern_probe_for_full_pen_advance(monkeypatch):
+    import fontTools.ttLib as ttlib
+
+    fixtures = {
+        " A ": [[], [BoundedGeometry(3.0, 5.0)], []],
+        " A A": [
+            [],
+            [BoundedGeometry(3.0, 5.0)],
+            [],
+            [BoundedGeometry(9.0, 11.0)],
+        ],
+        " A M": [
+            [],
+            [BoundedGeometry(3.0, 5.0)],
+            [],
+            [BoundedGeometry(11.0, 13.0)],
+        ],
+        "A": [[BoundedGeometry(0.5, 2.5)]],
+        "M": [[BoundedGeometry(2.0, 4.0)]],
+    }
+
+    class FakePart(BoundedPart):
+        @staticmethod
+        def makeWireString(source_text, font_path, size, tracking):
+            assert font_path == "C:/fonts/source.ttf"
+            assert (size, tracking) == (1.0, 0)
+            return fixtures[source_text]
+
+    class FakeFont:
+        def getBestCmap(self):
+            return {32: "space", 65: "A", 77: "M"}
+
+        def __contains__(self, table_name):
+            return table_name in {"cmap", "kern"}
+
+        def __getitem__(self, table_name):
+            assert table_name == "kern"
+            return SimpleNamespace(
+                kernTables=[
+                    SimpleNamespace(
+                        kernTable={
+                            ("space", "A"): -50,
+                            ("space", "M"): 0,
+                        }
+                    )
+                ]
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(core, "Part", FakePart)
+    monkeypatch.setattr(ttlib, "TTFont", lambda *_args, **_kwargs: FakeFont())
+    monkeypatch.setattr(
+        core,
+        "_text3d_faces_for_outlines",
+        lambda outlines: [
+            BoundedGeometry(
+                min(outline.BoundBox.XMin for outline in outlines),
+                max(outline.BoundBox.XMax for outline in outlines),
+                face_count=1,
+            )
+        ],
+    )
+
+    face_template, native_advance, visible_count = (
+        core._build_exact_text3d_outline_template(
+            " A ",
+            "C:/fonts/source.ttf",
+        )
+    )
+
+    assert visible_count == 1
+    assert face_template.BoundBox.XMin == pytest.approx(3.0)
+    assert face_template.BoundBox.XMax == pytest.approx(5.0)
+    assert native_advance == pytest.approx(9.0)
+
+
+def test_compound_scales_pen_advance_without_stretching_inset_ink(monkeypatch):
+    class FakeMatrix:
+        def __init__(self):
+            self.A11 = 1.0
+            self.A22 = 1.0
+
+    monkeypatch.setattr(core, "Part", BoundedPart)
+    monkeypatch.setattr(core, "FreeCAD", SimpleNamespace(Matrix=FakeMatrix))
+    monkeypatch.setattr(core, "Vector", lambda x, y, z: (x, y, z))
+    monkeypatch.setattr(
+        core,
+        "_build_exact_text3d_outline_template",
+        lambda *_args: (BoundedGeometry(2.0, 6.0, face_count=1), 10.0, 1),
+    )
+
+    compound, horizontal_scale, native_advance, verified_advance = (
+        core._build_exact_text3d_compound_shape(
+            source_text=" A ",
+            font_path="C:/fonts/source.ttf",
+            font_size_fc=3.0,
+            depth=0.3,
+            target_advance_fc=15.0,
+        )
+    )
+
+    assert horizontal_scale == pytest.approx(0.5)
+    assert native_advance == pytest.approx(30.0)
+    assert compound.BoundBox.XMin == pytest.approx(3.0)
+    assert compound.BoundBox.XMax == pytest.approx(9.0)
+    assert verified_advance == pytest.approx(15.0)
+
+
 def test_compound_3d_text_is_one_verified_host_object_without_recompute(monkeypatch):
     document = FakeDocument()
     group = FakeGroup(document)
@@ -190,3 +361,82 @@ def test_text3d_outline_memo_returns_fresh_shapes_and_tracks_hits():
     assert first[0] is not second[0]
     assert first[1:] == second[1:] == (4.0, 3)
     assert third[1:] == (4.0, 3)
+
+
+def test_complete_nonspace_item_with_zero_exact_font_outlines_is_typed_and_private(
+    monkeypatch,
+):
+    class ZeroOutlinePart:
+        @staticmethod
+        def makeWireString(source_text, font_path, size, tracking):
+            assert (source_text, font_path, size, tracking) == (
+                "AB",
+                "C:/fonts/source.ttf",
+                1.0,
+                0,
+            )
+            return [[], []]
+
+    monkeypatch.setattr(core, "Part", ZeroOutlinePart)
+
+    with pytest.raises(RuntimeError) as raised:
+        core._build_exact_text3d_outline_template("AB", "C:/fonts/source.ttf")
+
+    assert raised.value.__class__.__name__ == (
+        "Text3DExactFontOutlinesUnavailable"
+    )
+    assert raised.value.evidence == {
+        "implementation": "part_make_wire_string",
+        "outcome": "zero_geometry",
+        "source_text_sha256": core.hashlib.sha256(b"AB").hexdigest(),
+        "source_text_length": 2,
+        "non_whitespace_character_count": 2,
+        "glyph_inventory_length": 2,
+        "glyph_outline_count": 0,
+        "wire_string_completed": True,
+    }
+    assert "AB" not in str(raised.value)
+    assert "AB" not in repr(raised.value.evidence)
+
+
+def test_partial_exact_font_outline_loss_remains_an_unproven_runtime_failure(
+    monkeypatch,
+):
+    class PartialOutlinePart:
+        @staticmethod
+        def makeWireString(*_args):
+            return [[object()], []]
+
+    monkeypatch.setattr(core, "Part", PartialOutlinePart)
+
+    with pytest.raises(RuntimeError, match="source glyph produced no outline geometry") as raised:
+        core._build_exact_text3d_outline_template("AB", "C:/fonts/source.ttf")
+
+    assert raised.value.__class__ is RuntimeError
+
+
+@pytest.mark.parametrize(
+    "wire_result,error_message",
+    [
+        ([[]], "source glyph inventory does not match source text"),
+        (RuntimeError("synthetic font API failure"), "synthetic font API failure"),
+    ],
+)
+def test_malformed_or_failed_exact_font_api_is_never_closed_impossibility(
+    monkeypatch,
+    wire_result,
+    error_message,
+):
+    class BrokenPart:
+        @staticmethod
+        def makeWireString(*_args):
+            if isinstance(wire_result, Exception):
+                raise wire_result
+            return wire_result
+
+    monkeypatch.setattr(core, "Part", BrokenPart)
+
+    with pytest.raises(RuntimeError, match=error_message) as raised:
+        core._build_exact_text3d_outline_template("AB", "C:/fonts/source.ttf")
+
+    assert raised.value.__class__ is RuntimeError

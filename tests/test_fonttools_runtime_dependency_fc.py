@@ -53,17 +53,29 @@ def test_release_builder_verifies_and_vendors_both_runtime_dependencies():
         "PyMuPDF==1.28.0",
         "fonttools==4.63.0",
     )
-    lock = (REPO_ROOT / "requirements-release.lock").read_text(encoding="utf-8")
-    assert "PyMuPDF==1.28.0" in lock
-    assert "sha256:e01e90fd86abfeb37ceb921eddb951f988a11d45ff6ce6b7664f2039849068ec" in lock
-    assert "fonttools==4.63.0" in lock
-    assert "sha256:063e08bd17bd5a90127a14123de0d6a952dbc847695fd98b63c043d58057f90c" in lock
+    common_lock = (REPO_ROOT / "requirements-release-common.lock").read_text(
+        encoding="utf-8"
+    )
+    cp310_lock = (REPO_ROOT / "requirements-release-cp310.lock").read_text(
+        encoding="utf-8"
+    )
+    cp311_lock = (REPO_ROOT / "requirements-release-cp311.lock").read_text(
+        encoding="utf-8"
+    )
+    assert "PyMuPDF==1.28.0" in common_lock
+    assert "sha256:e01e90fd86abfeb37ceb921eddb951f988a11d45ff6ce6b7664f2039849068ec" in common_lock
+    assert "fonttools==4.63.0" in cp310_lock
+    assert "sha256:0c18358a155d75034911c5ee397a5b44cd19dd325dbb8b35fb60bf421d6a72ac" in cp310_lock
+    assert "fonttools==4.63.0" in cp311_lock
+    assert "sha256:063e08bd17bd5a90127a14123de0d6a952dbc847695fd98b63c043d58057f90c" in cp311_lock
+    assert not (REPO_ROOT / "requirements-release.lock").exists()
     source = (REPO_ROOT / "build_release.py").read_text(encoding="utf-8")
     assert "import fontTools" in source
     assert '"--require-hashes"' in source
     assert '"--only-binary"' in source
-    assert "RUNTIME_DEPENDENCY_LOCK" in source
-    assert "py_version != (3, 11)" in source
+    assert "RUNTIME_DEPENDENCY_LOCKS" in source
+    assert "cp310-cp310-win_amd64" in source
+    assert "cp311-cp311-win_amd64" in source
 
 
 def test_both_interactive_setup_paths_install_and_verify_fonttools():

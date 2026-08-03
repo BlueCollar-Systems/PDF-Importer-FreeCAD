@@ -51,8 +51,8 @@ jobs:
           fi
 
   # Source-compat guard for FreeCAD 0.19/0.20 hosts (Python 3.8/3.9).
-  # Syntax-only: the vendored PyMuPDF wheel is cp310-abi3, so the full
-  # dependency suite runs on >=3.10 (D5 ABI floor).
+  # Syntax-only: release runtimes are shipped only for CPython 3.10/3.11,
+  # so legacy 3.8/3.9 hosts remain outside the offline bundle.
   legacy-syntax:
     name: syntax-check (${{ matrix.python-version }})
     runs-on: ubuntu-latest
@@ -70,6 +70,27 @@ jobs:
 
       - name: Compile all Python modules (legacy floor)
         run: python -m compileall PDFVectorImporter
+
+  windows-runtime-selection:
+    name: bundled-runtime contract (CPython ${{ matrix.python-version }})
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test driver
+        run: python -m pip install --editable . pytest
+
+      - name: Verify runtime selection and release matrix contracts
+        run: python -m pytest tests/test_runtime_path_selection_fc.py tests/test_release_runtime_matrix_fc.py -q --basetemp "${{ runner.temp }}/pytest-runtime-matrix"
 
   syntax-check:
     runs-on: ubuntu-latest

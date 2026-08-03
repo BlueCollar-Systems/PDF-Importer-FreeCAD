@@ -60,6 +60,12 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
                 except KeyError:
                     pass
 
+    def _activate_bundled_runtime(self, base):
+        """Select only the dependency tree matching FreeCAD's Python ABI."""
+        from PDFVectorImporter.runtime_paths import activate_bundled_runtime_if_available
+
+        return activate_bundled_runtime_if_available(base)
+
     def Initialize(self):
         # Find workbench root again (Initialize runs in a different context)
         base = ""
@@ -74,12 +80,10 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
             return
 
         src = os.path.join(base, "src")
-        lib = os.path.join(src, "lib")
 
         # Ensure paths are importable
         self._prioritize_paths([os.path.dirname(base), base, src])
-        if os.path.isdir(lib):
-            self._prioritize_paths([lib])
+        self._activate_bundled_runtime(base)
         self._evict_stale_modules(base)
 
         # Register commands — each in its own try/except
@@ -136,10 +140,8 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
                 break
         if base:
             src = os.path.join(base, "src")
-            lib = os.path.join(src, "lib")
             self._prioritize_paths([os.path.dirname(base), base, src])
-            if os.path.isdir(lib):
-                self._prioritize_paths([lib])
+            self._activate_bundled_runtime(base)
             self._evict_stale_modules(base)
 
         # Check every dependency required for exact PDF text/font delivery.
@@ -169,6 +171,7 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
             self._offer_install(base, missing)
 
     def _offer_install(self, base, missing):
+        import site
         try:
             from PySide6 import QtWidgets
         except ImportError:
@@ -188,10 +191,9 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
 
         import subprocess
 
-        target = os.path.join(base, "src", "lib") if base else ""
-        if not target:
+        if not base:
             return
-        os.makedirs(target, exist_ok=True)
+        target = site.getusersitepackages()
 
         # Find real python.exe (sys.executable may be freecad.exe)
         py = sys.executable
@@ -217,12 +219,10 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
 
             subprocess.check_call(
                 [py, "-m", "pip", "install", "--upgrade",
-                 "--only-binary", ":all:", "--target", target,
+                 "--only-binary", ":all:", "--user",
                  "PyMuPDF>=1.24,<2.0", "fonttools>=4.50,<5.0"],
                 timeout=300, **kw)
-
-            if target not in sys.path:
-                sys.path.insert(0, target)
+            site.addsitedir(target)
 
             # Test if it loaded
             try:
@@ -247,8 +247,8 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
                 None, "Install Failed",
                 "Automatic install failed.\n\n"
                 "Try manually in a terminal:\n"
-                '  "' + py + '" -m pip install --target "' + target
-                + '" "PyMuPDF>=1.24,<2.0" "fonttools>=4.50,<5.0"')
+                '  "' + py + '" -m pip install --user '
+                '"PyMuPDF>=1.24,<2.0" "fonttools>=4.50,<5.0"')
         except (subprocess.SubprocessError, OSError, RuntimeError, ValueError) as e:
             FreeCAD.Console.PrintError("Install error: " + str(e) + "\n")
 

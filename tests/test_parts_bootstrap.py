@@ -25,25 +25,25 @@ from pdfcadcore.parts_bootstrap import (  # noqa: E402
 
 class PartsBootstrapTest(unittest.TestCase):
     BOM_LINES = [
-        'p1016 PL3/8"X6 7/8"',
-        'p1019 PL3/8"X7 3/4"',
-        'p1052 PL3/4"X7"',
-        "w1023 W8X15 3'-11 3/4\"",
-        "w1025 W12X30 13'-11 1/4\"",
-        "a1005 L3X3X3/8",
-        "1017FR1 W12X30",
+        'p9001 PL1/2"X5 1/2"',
+        'p9002 PL5/8"X8 1/4"',
+        'p9003 PL1"X9"',
+        "w9004 W6X9 4'-2 1/2\"",
+        "w9005 W10X22 11'-6 1/2\"",
+        "a9006 L2X2X1/4",
+        "9007FR9 W10X22",
     ]
 
     def test_extract_bootstrap_rows_from_tier1_bom(self):
         items = [{"text": line, "page": 1} for line in self.BOM_LINES]
         rows = extract_bootstrap_rows(items)
         marks = {row["piece_mark"].lower() for row in rows}
-        self.assertIn("p1016", marks)
-        self.assertIn("w1025", marks)
-        self.assertIn("a1005", marks)
-        w1025 = next(r for r in rows if r["piece_mark"] == "w1025")
-        self.assertEqual(w1025["profile_hint"], "W12X30")
-        self.assertAlmostEqual(w1025["length_in"], 167.25, places=2)
+        self.assertIn("p9001", marks)
+        self.assertIn("w9005", marks)
+        self.assertIn("a9006", marks)
+        beam = next(r for r in rows if r["piece_mark"] == "w9005")
+        self.assertEqual(beam["profile_hint"], "W10X22")
+        self.assertAlmostEqual(beam["length_in"], 138.5, places=2)
 
     def test_extract_bootstrap_rows_from_sequential_bom_lines(self):
         lines = [
@@ -52,27 +52,27 @@ class PartsBootstrapTest(unittest.TestCase):
             "MARK",
             "DESCRIPTION",
             "LENGTH",
-            "1017FR1",
+            "9007FR9",
             "1",
-            "W12X30",
-            "13'-11 1/4\"",
-            "417",
+            "W10X22",
+            "11'-6 1/2\"",
+            "346",
             "GALV.",
             "A992",
-            "p1016",
+            "p9001",
             "3",
-            "PL3/8\"X6 7/8\"",
-            "0'-7 3/4\"",
-            "17",
+            "PL1/2\"X5 1/2\"",
+            "0'-6 1/2\"",
+            "14",
             "GALV.",
             "A36",
         ]
         rows = extract_bootstrap_rows({"text": line, "page": 1} for line in lines)
         self.assertEqual(2, len(rows))
-        self.assertEqual("1017FR1", rows[0]["piece_mark"])
-        self.assertEqual("W12X30", rows[0]["profile_hint"])
-        self.assertAlmostEqual(167.25, rows[0]["length_in"], places=2)
-        self.assertEqual("p1016", rows[1]["piece_mark"])
+        self.assertEqual("9007FR9", rows[0]["piece_mark"])
+        self.assertEqual("W10X22", rows[0]["profile_hint"])
+        self.assertAlmostEqual(138.5, rows[0]["length_in"], places=2)
+        self.assertEqual("p9001", rows[1]["piece_mark"])
         self.assertEqual(3, rows[1]["quantity"])
         self.assertEqual("plate", rows[1]["kind"])
 

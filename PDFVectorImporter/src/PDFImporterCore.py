@@ -26,17 +26,24 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-# Ensure bundled PyMuPDF is importable (skip namespace-only stubs in lib/)
-_lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
-if _lib_dir not in sys.path:
-    sys.path.insert(0, _lib_dir)
-
 _mod_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _mod_root not in sys.path:
     sys.path.insert(0, _mod_root)
+try:
+    from PDFVectorImporter.runtime_paths import activate_bundled_runtime_if_available
+except ModuleNotFoundError as exc:
+    # FreeCAD and legacy host harnesses also import this file as the top-level
+    # `PDFImporterCore` module with the add-on root (not its parent) on sys.path.
+    # Preserve that supported entry point without masking a missing dependency
+    # raised from inside runtime_paths itself.
+    if exc.name not in {"PDFVectorImporter", "PDFVectorImporter.runtime_paths"}:
+        raise
+    from runtime_paths import activate_bundled_runtime_if_available
+
+activate_bundled_runtime_if_available(_mod_root)
 from pdfcadcore.fitz_loader import import_fitz as _import_fitz
 
-fitz = _import_fitz(prefer_lib_dir=_lib_dir)
+fitz = _import_fitz()
 
 # FreeCAD modules — lazy import for IDE friendliness outside FreeCAD
 try:
@@ -3134,6 +3141,18 @@ class TextItemImpossible(RuntimeError):
         self.proof = dict(proof or {})
 
 
+class Text3DExactFontOutlinesUnavailable(RuntimeError):
+    """A complete exact-font wire build returned no item outline geometry."""
+
+    reason_code = "text3d_exact_font_outlines_unavailable"
+
+    def __init__(self, evidence: Dict[str, Any]):
+        self.evidence = dict(evidence or {})
+        super().__init__(
+            "exact font produced no outlines for the complete 3D text item"
+        )
+
+
 def _raise_nul_source_text_impossible(
     item: Dict[str, Any],
     requested: str,
@@ -3393,8 +3412,11 @@ def _validate_item_impossibility_proof(
 
     if attempted != "3d_text":
         raise ValueError("representation has no closed impossibility predicate")
-    if reason_code != "exact_font_unavailable":
-        raise ValueError("proof reason is not the closed exact-font predicate")
+    if reason_code not in {
+        "exact_font_unavailable",
+        Text3DExactFontOutlinesUnavailable.reason_code,
+    }:
+        raise ValueError("proof reason is not a closed exact-font predicate")
 
     font_identity = proof.get("font_identity")
     item_font_identity = item.get("font_identity")
@@ -3416,6 +3438,203 @@ def _validate_item_impossibility_proof(
         or normalized_key != _canonical_font_identity(raw_name)["normalized_key"]
     ):
         raise ValueError("proof font identity lacks an exact normalized binding")
+
+    if reason_code == Text3DExactFontOutlinesUnavailable.reason_code:
+        source_text = item.get("text")
+        source_text_sha256 = (
+            hashlib.sha256(
+                source_text.encode("utf-8", errors="surrogatepass")
+            ).hexdigest()
+            if isinstance(source_text, str)
+            else ""
+        )
+        source_text_length = len(source_text) if isinstance(source_text, str) else -1
+        non_whitespace_count = (
+            sum(not character.isspace() for character in source_text)
+            if isinstance(source_text, str)
+            else -1
+        )
+        evidence = proof.get("evidence")
+        required_evidence_keys = {
+            "source_text_sha256",
+            "source_text_length",
+            "non_whitespace_character_count",
+            "glyph_inventory_length",
+            "glyph_outline_count",
+            "wire_string_completed",
+            "font_sha256",
+            "font_source",
+            "exact_3d_path_results",
+        }
+        font_sha256 = (
+            evidence.get("font_sha256") if isinstance(evidence, dict) else None
+        )
+        font_source = (
+            evidence.get("font_source") if isinstance(evidence, dict) else None
+        )
+        exact_path_results = (
+            evidence.get("exact_3d_path_results")
+            if isinstance(evidence, dict)
+            else None
+        )
+        part_result = (
+            exact_path_results[0]
+            if isinstance(exact_path_results, list) and len(exact_path_results) == 2
+            else None
+        )
+        shapestring_result = (
+            exact_path_results[1]
+            if isinstance(exact_path_results, list) and len(exact_path_results) == 2
+            else None
+        )
+        if (
+            not isinstance(source_text, str)
+            or not source_text
+            or source_text.isspace()
+            or not isinstance(evidence, dict)
+            or set(evidence) != required_evidence_keys
+            or evidence.get("source_text_sha256") != source_text_sha256
+            or type(evidence.get("source_text_length")) is not int
+            or evidence.get("source_text_length") != source_text_length
+            or type(evidence.get("non_whitespace_character_count")) is not int
+            or evidence.get("non_whitespace_character_count")
+            != non_whitespace_count
+            or type(evidence.get("glyph_inventory_length")) is not int
+            or evidence.get("glyph_inventory_length") != source_text_length
+            or type(evidence.get("glyph_outline_count")) is not int
+            or evidence.get("glyph_outline_count") != 0
+            or evidence.get("wire_string_completed") is not True
+            or not isinstance(font_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", font_sha256) is None
+            or font_source not in {"embedded_font", "system_font"}
+            or not isinstance(part_result, dict)
+            or set(part_result)
+            != {
+                "implementation",
+                "outcome",
+                "source_text_sha256",
+                "source_text_length",
+                "non_whitespace_character_count",
+                "glyph_inventory_length",
+                "glyph_outline_count",
+                "wire_string_completed",
+            }
+            or part_result.get("implementation") != "part_make_wire_string"
+            or part_result.get("outcome") != "zero_geometry"
+            or part_result.get("source_text_sha256") != source_text_sha256
+            or type(part_result.get("source_text_length")) is not int
+            or part_result.get("source_text_length") != source_text_length
+            or type(part_result.get("non_whitespace_character_count")) is not int
+            or part_result.get("non_whitespace_character_count")
+            != non_whitespace_count
+            or type(part_result.get("glyph_inventory_length")) is not int
+            or part_result.get("glyph_inventory_length") != source_text_length
+            or type(part_result.get("glyph_outline_count")) is not int
+            or part_result.get("glyph_outline_count") != 0
+            or part_result.get("wire_string_completed") is not True
+            or not isinstance(shapestring_result, dict)
+            or set(shapestring_result)
+            != {
+                "implementation",
+                "outcome",
+                "recompute_completed",
+                "shape_present",
+                "shape_is_null",
+                "face_count",
+                "wire_count",
+            }
+            or shapestring_result.get("implementation") != "draft_shapestring"
+            or shapestring_result.get("outcome") != "zero_geometry"
+            or shapestring_result.get("recompute_completed") is not True
+            or shapestring_result.get("shape_present") is not True
+            or type(shapestring_result.get("shape_is_null")) is not bool
+            or type(shapestring_result.get("face_count")) is not int
+            or shapestring_result.get("face_count") != 0
+            or type(shapestring_result.get("wire_count")) is not int
+            or shapestring_result.get("wire_count") != 0
+        ):
+            raise ValueError("zero-outline exact-font evidence is incomplete")
+
+        attempted_source_results = proof.get("attempted_source_results")
+        allowed_source_orders = (
+            ["embedded_font"],
+            ["embedded_font", "system_font"],
+        )
+        source_order = (
+            [
+                result.get("source") if isinstance(result, dict) else None
+                for result in attempted_source_results
+            ]
+            if isinstance(attempted_source_results, list)
+            else []
+        )
+        found_indices = (
+            [
+                index
+                for index, result in enumerate(attempted_source_results)
+                if isinstance(result, dict) and result.get("outcome") == "found"
+            ]
+            if isinstance(attempted_source_results, list)
+            else []
+        )
+        allowed_result_keys = {
+            "source",
+            "outcome",
+            "font_identity",
+            "pdf_sha256",
+            "page_number",
+            "staging_complete",
+            "sha256",
+        }
+        if (
+            not isinstance(attempted_source_results, list)
+            or source_order not in allowed_source_orders
+            or found_indices != [len(attempted_source_results) - 1]
+            or any(
+                not isinstance(result, dict)
+                or result.get("font_identity") != font_identity
+                or result.get("pdf_sha256") != pdf_sha256
+                or result.get("page_number") != page_number
+                or result.get("staging_complete") is not True
+                or not set(result).issubset(allowed_result_keys)
+                or set(result)
+                != (
+                    allowed_result_keys
+                    if result.get("outcome") == "found"
+                    else allowed_result_keys - {"sha256"}
+                )
+                or "path" in result
+                or (
+                    index < len(attempted_source_results) - 1
+                    and result.get("outcome") != "not_found"
+                )
+                for index, result in enumerate(attempted_source_results)
+            )
+            or attempted_source_results[-1].get("sha256") != font_sha256
+            or attempted_source_results[-1].get("source") != font_source
+            or proof.get("attempted_sources_complete") is not True
+        ):
+            raise ValueError("zero-outline exact-font source results are incomplete")
+
+        created_ids = _validated_entity_ids(
+            proof.get("created_entity_ids"),
+            field_name="created_entity_ids",
+            allow_empty=True,
+        )
+        removed_ids = _validated_entity_ids(
+            proof.get("removed_entity_ids"),
+            field_name="removed_entity_ids",
+            allow_empty=True,
+        )
+        if (
+            not created_ids
+            or proof.get("cleanup_complete") is not True
+            or set(created_ids) != set(removed_ids)
+        ):
+            raise ValueError(
+                "zero-outline impossibility did not clean its exact-font host"
+            )
+        return dict(proof)
 
     evidence = proof.get("evidence")
     if (
@@ -4462,6 +4681,115 @@ class _Text3DOutlineMemo:
 _ACTIVE_TEXT3D_OUTLINE_MEMO: Optional[_Text3DOutlineMemo] = None
 
 
+def _text3d_zero_kern_probe_candidates(
+    source_text: str, font_path: str
+) -> List[str]:
+    """Return visible font glyphs that cannot kern with the source tail."""
+    if not isinstance(source_text, str) or not source_text:
+        raise RuntimeError("source font tail glyph could not be verified")
+    try:
+        from fontTools.ttLib import TTFont
+
+        font = TTFont(font_path, lazy=True, recalcTimestamp=False)
+    except Exception as exc:
+        raise RuntimeError(
+            "source font classic kerning could not be verified"
+        ) from exc
+
+    try:
+        cmap = font.getBestCmap()
+        if not isinstance(cmap, dict) or not cmap:
+            raise RuntimeError("source font character map could not be verified")
+        left_glyph = cmap.get(ord(source_text[-1]))
+        if not isinstance(left_glyph, str) or not left_glyph:
+            raise RuntimeError("source font tail glyph could not be verified")
+
+        kern_tables = []
+        if "kern" in font:
+            kern_tables = getattr(font["kern"], "kernTables", None)
+            if not isinstance(kern_tables, (list, tuple)):
+                raise RuntimeError(
+                    "source font classic kerning table is malformed"
+                )
+            for table in kern_tables:
+                if not isinstance(getattr(table, "kernTable", None), dict):
+                    raise RuntimeError(
+                        "source font classic kerning table is malformed"
+                    )
+
+        candidate_characters = []
+        for character in (*source_text, "M", "I", "0", "|", "."):
+            if character.isspace() or character in candidate_characters:
+                continue
+            candidate_characters.append(character)
+
+        verified_candidates = []
+        for character in candidate_characters:
+            right_glyph = cmap.get(ord(character))
+            if not isinstance(right_glyph, str) or not right_glyph:
+                continue
+            pair_is_zero = True
+            for table in kern_tables:
+                raw_value = table.kernTable.get((left_glyph, right_glyph), 0)
+                try:
+                    kern_value = float(raw_value)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "source font classic kerning value is malformed"
+                    ) from exc
+                if not math.isfinite(kern_value):
+                    raise RuntimeError(
+                        "source font classic kerning value is malformed"
+                    )
+                if kern_value != 0.0:
+                    pair_is_zero = False
+                    break
+            if pair_is_zero:
+                verified_candidates.append(character)
+        if not verified_candidates:
+            raise RuntimeError("source font has no verified zero-kern advance probe")
+        return verified_candidates
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            "source font classic kerning could not be verified"
+        ) from exc
+    finally:
+        close = getattr(font, "close", None)
+        if callable(close):
+            close()
+
+
+def _measure_text3d_pen_advance(source_text: str, font_path: str) -> float:
+    """Measure the source pen advance without folding outer whitespace into ink."""
+    for probe in _text3d_zero_kern_probe_candidates(source_text, font_path):
+        try:
+            standalone = Part.makeWireString(probe, font_path, 1.0, 0)
+            appended = Part.makeWireString(source_text + probe, font_path, 1.0, 0)
+            if (
+                not isinstance(standalone, (list, tuple))
+                or len(standalone) != 1
+                or not isinstance(appended, (list, tuple))
+                or len(appended) != len(source_text) + 1
+            ):
+                continue
+            standalone_wires = list(standalone[0] or [])
+            appended_wires = list(appended[-1] or [])
+            if not standalone_wires or not appended_wires:
+                continue
+            standalone_probe = Part.Compound(standalone_wires)
+            appended_probe = Part.Compound(appended_wires)
+            standalone_origin = float(standalone_probe.BoundBox.XMin)
+            appended_origin = float(appended_probe.BoundBox.XMin)
+            native_advance = appended_origin - standalone_origin
+        except Exception:
+            continue
+        if math.isfinite(native_advance) and native_advance > 1e-9:
+            return native_advance
+    raise RuntimeError("source font pen advance could not be measured")
+
+
 def _build_exact_text3d_outline_template(source_text: str, font_path: str):
     """Build exact counter-aware faces once at unit font size."""
     characters = Part.makeWireString(source_text, font_path, 1.0, 0)
@@ -4469,6 +4797,7 @@ def _build_exact_text3d_outline_template(source_text: str, font_path: str):
         raise RuntimeError("source glyph inventory does not match source text")
     outlines: List[Any] = []
     visible_character_count = 0
+    missing_visible_outline = False
     for source_character, character_wires in zip(
         source_text, characters, strict=True
     ):
@@ -4477,16 +4806,29 @@ def _build_exact_text3d_outline_template(source_text: str, font_path: str):
         visible_character_count += 1
         character_outlines = list(character_wires or [])
         if not character_outlines:
-            raise RuntimeError("source glyph produced no outline geometry")
+            missing_visible_outline = True
+            continue
         outlines.extend(character_outlines)
-    if visible_character_count <= 0 or not outlines:
+    if visible_character_count <= 0:
         raise RuntimeError("source font produced no visible glyph outlines")
-    outline_compound = Part.Compound(outlines)
-    native_advance = float(
-        getattr(outline_compound.BoundBox, "XLength", 0.0) or 0.0
-    )
-    if not math.isfinite(native_advance) or native_advance <= 1e-9:
-        raise RuntimeError("source glyph baseline extent could not be measured")
+    if not outlines:
+        raise Text3DExactFontOutlinesUnavailable(
+            {
+                "implementation": "part_make_wire_string",
+                "outcome": "zero_geometry",
+                "source_text_sha256": hashlib.sha256(
+                    source_text.encode("utf-8", errors="surrogatepass")
+                ).hexdigest(),
+                "source_text_length": len(source_text),
+                "non_whitespace_character_count": visible_character_count,
+                "glyph_inventory_length": len(characters),
+                "glyph_outline_count": 0,
+                "wire_string_completed": True,
+            }
+        )
+    if missing_visible_outline:
+        raise RuntimeError("source glyph produced no outline geometry")
+    native_advance = _measure_text3d_pen_advance(source_text, font_path)
     faces = _text3d_faces_for_outlines(outlines)
     face_compound = Part.Compound(faces)
     if (
@@ -4529,6 +4871,18 @@ def _build_exact_text3d_compound_shape(
                 (source_text, font_path), build_template
             )
         )
+    try:
+        unit_ink_min = float(face_template.BoundBox.XMin)
+        unit_ink_max = float(face_template.BoundBox.XMax)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError("source glyph ink bounds could not be measured") from exc
+    if (
+        not math.isfinite(unit_ink_min)
+        or not math.isfinite(unit_ink_max)
+        or unit_ink_max <= unit_ink_min
+    ):
+        raise RuntimeError("source glyph ink bounds could not be measured")
+
     native_advance = unit_advance * numeric_values[0]
     horizontal_scale = numeric_values[2] / native_advance
     if (
@@ -4541,8 +4895,9 @@ def _build_exact_text3d_compound_shape(
     matrix_factory = getattr(FreeCAD, "Matrix", None)
     if not callable(matrix_factory):
         raise RuntimeError("FreeCAD affine matrix API unavailable")
+    pen_scale = float(numeric_values[2] / unit_advance)
     matrix = matrix_factory()
-    matrix.A11 = float(numeric_values[2] / unit_advance)
+    matrix.A11 = pen_scale
     matrix.A22 = float(numeric_values[0])
     transformed_faces = face_template.transformGeometry(matrix)
     if (
@@ -4563,15 +4918,24 @@ def _build_exact_text3d_compound_shape(
     compound = Part.Compound([extruded])
     solid_count = _shape_solid_count(compound)
     volume = float(getattr(compound, "Volume", 0.0) or 0.0)
-    verified_advance = float(
-        getattr(compound.BoundBox, "XLength", 0.0) or 0.0
-    )
+    try:
+        verified_ink_min = float(compound.BoundBox.XMin)
+        verified_ink_max = float(compound.BoundBox.XMax)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError("3D Text compound geometry verification failed") from exc
+    expected_ink_min = unit_ink_min * pen_scale
+    expected_ink_max = unit_ink_max * pen_scale
+    verified_advance = unit_advance * pen_scale
     tolerance = max(0.05, numeric_values[2] * 0.03)
     if (
         bool(getattr(compound, "isNull", lambda: True)())
         or solid_count <= 0
         or not math.isfinite(volume)
         or volume <= 0.0
+        or not math.isfinite(verified_ink_min)
+        or not math.isfinite(verified_ink_max)
+        or abs(verified_ink_min - expected_ink_min) > tolerance
+        or abs(verified_ink_max - expected_ink_max) > tolerance
         or not math.isfinite(verified_advance)
         or abs(verified_advance - numeric_values[2]) > tolerance
     ):
@@ -4693,15 +5057,34 @@ def _create_verified_text3d_entity(
         doc.recompute()
 
     support_shape = getattr(shape_string, "Shape", None)
-    if (
-        support_shape is None
-        or bool(getattr(support_shape, "isNull", lambda: True)())
-        or not (
-            list(getattr(support_shape, "Faces", []) or [])
-            or list(getattr(support_shape, "Wires", []) or [])
-        )
-    ):
+    if support_shape is None:
         raise RuntimeError("ShapeString did not produce face or wire geometry")
+    is_null = getattr(support_shape, "isNull", None)
+    if not callable(is_null):
+        raise RuntimeError("ShapeString shape null-state API is unavailable")
+    raw_shape_is_null = is_null()
+    if type(raw_shape_is_null) is not bool:
+        raise RuntimeError("ShapeString shape null-state result is malformed")
+    shape_is_null = raw_shape_is_null
+    # FreeCAD's real Part shapes expose both collections. Keep the verification
+    # tolerant of older/test host proxies that omit an empty collection while
+    # still requiring at least one concrete face or wire before extrusion.
+    support_faces = list(getattr(support_shape, "Faces", ()) or ())
+    support_wires = list(getattr(support_shape, "Wires", ()) or ())
+    if not support_faces and not support_wires:
+        raise Text3DExactFontOutlinesUnavailable(
+            {
+                "implementation": "draft_shapestring",
+                "outcome": "zero_geometry",
+                "recompute_completed": True,
+                "shape_present": True,
+                "shape_is_null": shape_is_null,
+                "face_count": 0,
+                "wire_count": 0,
+            }
+        )
+    if shape_is_null:
+        raise RuntimeError("ShapeString produced a null shape with geometry")
 
     native_advance = _shape_baseline_extent(support_shape, baseline_angle_deg)
     if native_advance is None or native_advance <= 1e-9:
@@ -6000,6 +6383,22 @@ def _deliver_text_item_3d(
             {"attempted_source_results": source_results},
         )
     font_source_result = copy.deepcopy(found_results[0])
+    raw_font_digest = font_source_result.get("sha256")
+    if raw_font_digest in (None, "") and font_source_result.get("source") == "system_font":
+        font_digest = ""
+    elif (
+        not isinstance(raw_font_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", raw_font_digest) is None
+    ):
+        terminal_failure(
+            "exact_font_resolution_invalid",
+            {
+                "attempted_source_results": source_results,
+                "font_path": font_path,
+            },
+        )
+    else:
+        font_digest = raw_font_digest
 
     if (
         Draft is None
@@ -6077,8 +6476,8 @@ def _deliver_text_item_3d(
     depth = max(font_size_fc * 0.12, 0.05)
     source_color = _span_source_color(span)
     normalized_font = _normalize_pdf_font_name(source_font)
-    font_digest = str(font_source_result.get("sha256") or "")
     compound_failure_evidence: Optional[Dict[str, Any]] = None
+    compound_zero_outline_evidence: Optional[Dict[str, Any]] = None
     stage = "host_annotation"
 
     def _configure_item_host(host_obj):
@@ -6273,6 +6672,25 @@ def _deliver_text_item_3d(
                 == "gui_view_and_app_metadata",
             },
         }
+    except Text3DExactFontOutlinesUnavailable as exc:
+        collection_error = collect_owned()
+        if collection_error or owned:
+            terminal_failure(
+                "text3d_zero_outline_proof_ownership_invalid",
+                {
+                    "attempted_source_results": source_results,
+                    "font_path": font_path,
+                    "outline_evidence": dict(exc.evidence),
+                    "ownership_collection_error": collection_error,
+                },
+            )
+        compound_zero_outline_evidence = dict(exc.evidence)
+        compound_failure_evidence = {
+            "stage": stage,
+            "reason_code": Text3DExactFontOutlinesUnavailable.reason_code,
+        }
+        owned.clear()
+        creation_started = False
     except Exception as exc:
         compound_failure_evidence = {
             "stage": stage,
@@ -6314,9 +6732,19 @@ def _deliver_text_item_3d(
 
     try:
         creation_started = True
-        shape_string = _make_shapestring_host(
-            _text_host_document(None, text_group), source_text, font_path
-        )
+        if compound_zero_outline_evidence is not None:
+            make_shapestring = getattr(
+                Draft,
+                "make_shapestring",
+                getattr(Draft, "makeShapeString", None),
+            )
+            if not callable(make_shapestring):
+                raise AttributeError("Draft ShapeString API unavailable")
+            shape_string = make_shapestring(source_text, font_path)
+        else:
+            shape_string = _make_shapestring_host(
+                _text_host_document(None, text_group), source_text, font_path
+            )
         if shape_string is None:
             raise RuntimeError("Draft ShapeString returned no host object")
         add_owned(shape_string)
@@ -6456,6 +6884,138 @@ def _deliver_text_item_3d(
             > max(0.05, target_advance_fc * 0.03)
         ):
             raise RuntimeError("3D Text host evidence could not be verified")
+    except Text3DExactFontOutlinesUnavailable as exc:
+        shapestring_zero_outline_evidence = dict(exc.evidence)
+        if compound_zero_outline_evidence is None:
+            terminal_failure(
+                "%s_failed" % stage,
+                {
+                    "attempted_source_results": source_results,
+                    "font_path": font_path,
+                    "exception": "%s: %s" % (exc.__class__.__name__, exc),
+                },
+            )
+
+        cleanup_failure = None
+        try:
+            terminal_failure(
+                "text3d_zero_outline_cleanup",
+                {
+                    "exact_3d_path_results": [
+                        dict(compound_zero_outline_evidence),
+                        dict(shapestring_zero_outline_evidence),
+                    ],
+                },
+            )
+        except TextRepresentationFailure as caught_cleanup:
+            cleanup_failure = caught_cleanup
+        if cleanup_failure is None or not cleanup_failure.attempt.get(
+            "cleanup_complete"
+        ):
+            if cleanup_failure is not None:
+                raise cleanup_failure from exc
+            raise RuntimeError(
+                "zero-outline cleanup did not produce evidence"
+            ) from exc
+
+        cleanup_attempt = dict(cleanup_failure.attempt)
+        created_ids = list(cleanup_attempt.get("created_entity_ids") or [])
+        removed_ids = list(cleanup_attempt.get("removed_entity_ids") or [])
+        owned.clear()
+        creation_started = False
+
+        proof_font_digest = font_digest
+        if not proof_font_digest:
+            try:
+                proof_font_digest = _path_sha256(Path(font_path))
+            except Exception as hash_error:
+                terminal_failure(
+                    "exact_font_hash_failed",
+                    {
+                        "font_source": font_source_result.get("source"),
+                        "exception": "%s: %s"
+                        % (hash_error.__class__.__name__, hash_error),
+                    },
+                )
+        if (
+            not isinstance(proof_font_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", proof_font_digest) is None
+        ):
+            terminal_failure(
+                "exact_font_hash_invalid",
+                {"font_source": font_source_result.get("source")},
+            )
+
+        proof_source_results: List[Dict[str, Any]] = []
+        for source_result in source_results:
+            public_result = {
+                "source": source_result.get("source"),
+                "outcome": source_result.get("outcome"),
+                "font_identity": copy.deepcopy(source_result.get("font_identity")),
+                "pdf_sha256": source_result.get("pdf_sha256"),
+                "page_number": source_result.get("page_number"),
+                "staging_complete": source_result.get("staging_complete"),
+            }
+            if source_result.get("outcome") == "found":
+                public_result["sha256"] = proof_font_digest
+            proof_source_results.append(public_result)
+
+        part_path_result = dict(compound_zero_outline_evidence)
+        shapestring_path_result = dict(shapestring_zero_outline_evidence)
+        proof_evidence = {
+            "source_text_sha256": part_path_result.get("source_text_sha256"),
+            "source_text_length": part_path_result.get("source_text_length"),
+            "non_whitespace_character_count": part_path_result.get(
+                "non_whitespace_character_count"
+            ),
+            "glyph_inventory_length": part_path_result.get(
+                "glyph_inventory_length"
+            ),
+            "glyph_outline_count": part_path_result.get("glyph_outline_count"),
+            "wire_string_completed": part_path_result.get("wire_string_completed"),
+            "font_sha256": proof_font_digest,
+            "font_source": font_source_result.get("source"),
+            "exact_3d_path_results": [
+                part_path_result,
+                shapestring_path_result,
+            ],
+        }
+        proof = {
+            "item_specific_proven_impossible": True,
+            "importer_identity": FREECAD_TEXT_IMPORTER_IDENTITY,
+            "pdf_sha256": pdf_sha256,
+            "page_number": page_number,
+            "source_item_id": source_item_id,
+            "requested_type": requested_type,
+            "attempted_type": "3d_text",
+            "reason_code": Text3DExactFontOutlinesUnavailable.reason_code,
+            "font_identity": dict(font_identity),
+            "evidence": proof_evidence,
+            "attempted_source_results": proof_source_results,
+            "attempted_sources_complete": True,
+            "created_entity_ids": created_ids,
+            "removed_entity_ids": removed_ids,
+            "cleanup_complete": True,
+        }
+        attempt = {
+            "source_item_id": source_item_id,
+            "requested_type": requested_type,
+            "attempted_type": "3d_text",
+            "final_type": None,
+            "outcome": "proven_impossible",
+            "reason": Text3DExactFontOutlinesUnavailable.reason_code,
+            "reason_code": Text3DExactFontOutlinesUnavailable.reason_code,
+            "created_entity_ids": created_ids,
+            "removed_entity_ids": removed_ids,
+            "cleanup_complete": True,
+            "evidence": dict(proof_evidence),
+            "proof": proof,
+        }
+        raise TextItemImpossible(
+            "Exact source font produced no 3D outlines for %s" % source_item_id,
+            attempt=attempt,
+            proof=proof,
+        ) from exc
     except Exception as exc:
         terminal_failure(
             "%s_failed" % stage,
@@ -7205,9 +7765,25 @@ def _deliver_text_item_svg(
         item_filter_evidence = result.get("item_filter")
         attempt_evidence = attempt.get("evidence")
         child_ids = attempt_evidence.get("child_source_item_ids")
+        matched_indices = (
+            item_filter_evidence.get("matched_placement_indices")
+            if isinstance(item_filter_evidence, dict)
+            else None
+        )
+        glyph_ids = (
+            attempt_evidence.get("glyph_source_item_ids")
+            if attempted_type == "glyphs"
+            else None
+        )
+        expected_glyph_ids = (
+            ["%s:g%d" % (source_item_id, index) for index in matched_indices]
+            if isinstance(matched_indices, list)
+            and all(type(index) is int and index >= 0 for index in matched_indices)
+            else None
+        )
         child_id_pattern = re.compile(
             re.escape(source_item_id)
-            + (r":geometry" if attempted_type == "geometry" else r":g\d+")
+            + (r":geometry" if attempted_type == "geometry" else r":glyphs")
         )
         if (
             not isinstance(result, dict)
@@ -7250,6 +7826,20 @@ def _deliver_text_item_svg(
                 for child_id in child_ids
             )
             or len(set(child_ids)) != entity_count
+            or (
+                attempted_type == "glyphs"
+                and (
+                    entity_count != 1
+                    or child_ids != [source_item_id + ":glyphs"]
+                    or not isinstance(glyph_ids, list)
+                    or glyph_ids != expected_glyph_ids
+                    or len(glyph_ids) != delivery_count
+                    or len(set(glyph_ids)) != delivery_count
+                    or attempt_evidence.get("glyph_count") != delivery_count
+                    or attempt_evidence.get("glyph_grouping")
+                    != "source_item_compound_v1"
+                )
+            )
         ):
             raise ValueError("item-filtered SVG result contract is invalid")
 
@@ -7264,12 +7854,27 @@ def _deliver_text_item_svg(
             getattr(host_obj, "PDFSourceItemId", None)
             for host_obj in delivered_objects
         ]
+        glyph_host_metadata_valid = True
+        if attempted_type == "glyphs":
+            glyph_host_metadata_valid = False
+            if len(delivered_objects) == 1:
+                glyph_host = delivered_objects[0]
+                try:
+                    glyph_host_metadata_valid = (
+                        int(glyph_host.PDFGlyphCount) == delivery_count
+                        and list(glyph_host.PDFGlyphSourceItemIds or []) == glyph_ids
+                        and str(glyph_host.PDFGlyphGrouping or "")
+                        == "source_item_compound_v1"
+                    )
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    glyph_host_metadata_valid = False
         if (
             len(delivered_objects) != entity_count
             or set(delivered_ids) != set(created_ids)
             or len(live_child_ids) != entity_count
             or len(set(live_child_ids)) != entity_count
             or set(live_child_ids) != set(child_ids)
+            or not glyph_host_metadata_valid
             or any(
                 str(getattr(host_obj, "TypeId", "") or "") != "Part::Feature"
                 or getattr(host_obj, "PDFParentSourceItemId", None) != source_item_id
@@ -7326,6 +7931,9 @@ def _render_canonical_text_items(
 
     font_stage_complete = False
     svg_render_cache: Dict[str, Any] = {
+        "source_snapshot_cache": getattr(
+            opts, "_svg_source_snapshot_cache", {}
+        ),
         "source_item_manifest": [
             {
                 "source_order": source_order,
@@ -8241,8 +8849,8 @@ def _autofit_import_view(fc_doc) -> None:
 class _WireStringMemo:
     """Per-import memo for Part.makeWireString.
 
-    Dense pages repeat identical (text, font, size) spans (369 -> 266 unique
-    on the owner's dense chart, P3) and Draft's ShapeString.execute
+    Dense pages commonly repeat identical (text, font, size) spans, and
+    Draft's ShapeString.execute
     re-tessellates the "M" cap-height probe — plus the sticky-font "L" probe
     on faces paths — on every execute (P4). FreeType tessellation is
     deterministic for a given (string, font file, size, tracking), so repeat
@@ -9532,6 +10140,7 @@ def _reset_import_run_state(opts: ImportOptions) -> None:
     opts._bootstrap_preflight_pages = set()
     opts._scale_cached_pages = set()
     opts._pdf_sha256 = ""
+    opts._svg_source_snapshot_cache = {}
     opts._defer_page_recompute = False
     opts._native_text_object_index = None
     opts._page_complexity_profiles = []
@@ -10270,6 +10879,28 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             pdf_doc_for_import.close()
         except (RuntimeError, AttributeError):
             pass
+        snapshot_cache = getattr(opts, "_svg_source_snapshot_cache", None)
+        if isinstance(snapshot_cache, dict) and snapshot_cache:
+            from PDFVectorImporter.src.PDFSvgTextRenderer import (
+                cleanup_pdf_snapshot_cache,
+                defer_pdf_snapshot_cleanup,
+            )
+
+            try:
+                cleanup_pdf_snapshot_cache(snapshot_cache)
+            except OSError as cleanup_error:
+                retry_registered = defer_pdf_snapshot_cleanup(snapshot_cache)
+                report_extra = dict(getattr(opts, "_report_extra", {}) or {})
+                report_extra["svg_snapshot_cleanup"] = {
+                    "status": "deferred",
+                    "exception_type": cleanup_error.__class__.__name__,
+                    "retry_registered": bool(retry_registered),
+                }
+                opts._report_extra = report_extra
+                _err(
+                    "Temporary PDF render snapshot cleanup was deferred until "
+                    "application exit."
+                )
 
     if not cancelled:
         t_phase = time.perf_counter()

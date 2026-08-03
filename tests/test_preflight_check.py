@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -31,18 +32,31 @@ def test_preflight_prints_freecad_guidance(capsys) -> None:
 
 def test_diagnostics_reports_bundled_pymupdf(capsys, monkeypatch, tmp_path) -> None:
     module = _load_preflight_module()
-    vendored_lib = tmp_path / "lib"
-    pymupdf_pkg = vendored_lib / "pymupdf"
+    common = tmp_path / "common"
+    abi = tmp_path / "cp311"
+    pymupdf_pkg = common / "pymupdf"
+    fonttools_pkg = abi / "fontTools"
     pymupdf_pkg.mkdir(parents=True)
+    fonttools_pkg.mkdir(parents=True)
     (pymupdf_pkg / "__init__.py").write_text("__version__ = 'test-vendored'\n", encoding="utf-8")
+    (fonttools_pkg / "__init__.py").write_text("__version__ = 'test-fonttools'\n", encoding="utf-8")
 
-    monkeypatch.setattr(module, "VENDORED_LIB", vendored_lib)
+    @dataclass
+    class Runtime:
+        runtime_tag: str = "cp311"
+
+    def activate(_root):
+        sys.path[:0] = [str(abi), str(common)]
+        return Runtime()
+
+    monkeypatch.setattr(module, "activate_bundled_runtime_if_available", activate)
     monkeypatch.delitem(sys.modules, "pymupdf", raising=False)
     monkeypatch.delitem(sys.modules, "fitz", raising=False)
+    monkeypatch.delitem(sys.modules, "fontTools", raising=False)
 
     result = module.main(["--diagnostics"])
 
     captured = capsys.readouterr()
     output = captured.out + captured.err
     assert result == 0
-    assert "bundled PyMuPDF import OK" in output
+    assert "bundled cp311 runtime import OK" in output

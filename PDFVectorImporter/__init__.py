@@ -11,11 +11,11 @@ except NameError:
     _base = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "PDFVectorImporter")
 
 _src = os.path.join(_base, "src")
-_lib = os.path.join(_src, "lib")
 
-for _p in (_base, _src, _lib):
+for _p in (_base, _src):
     if os.path.isdir(_p) and _p not in sys.path:
         sys.path.insert(0, _p)
 
+from .runtime_paths import activate_bundled_runtime_if_available
 
-
+_bundled_runtime = activate_bundled_runtime_if_available(_base)

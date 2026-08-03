@@ -26,6 +26,8 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
   shared PyMuPDF runtime.
 - `HEAD`-bound packaging fails closed on private paths, generated artifacts,
   and project identifiers supplied only through the masked external denylist.
+- Import reports always publish a validated `ok` or `warn` scale evaluation;
+  missing or malformed evaluations remain fail closed for consumers.
 
 ## Recent fixes (v4.0.82)
 

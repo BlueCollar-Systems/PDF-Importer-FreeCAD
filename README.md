@@ -28,6 +28,8 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 - Release packaging is `HEAD`-bound and fails closed on private paths,
   generated corpus artifacts, and identifiers supplied through the masked
   external private denylist.
+- Import reports now publish an explicit `ok` or `warn` scale evaluation;
+  missing or malformed scale evaluations remain fail closed for consumers.
 
 ## Recent fixes (v4.0.82)
 

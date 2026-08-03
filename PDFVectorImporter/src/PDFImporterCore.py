@@ -958,18 +958,49 @@ def write_import_report(
             "outlines": "glyphs",
         }.get(delivered_mode, delivered_mode)
         delivered_count = int(entity_dict.get("count") or 0)
-    proven_pair = bool(
-        text_fallback
-        and str(text_fallback.get("requested") or "").strip().lower() == requested_mode
-        and str(text_fallback.get("delivered") or "").strip().lower() == delivered_mode
-    )
+    delivered_mode_by_bucket = {
+        "native_label": "labels",
+        "native_text": "text",
+        "native_3d_text": "3d_text",
+        "glyph_curve": "glyphs",
+        "geometry_mesh": "geometry",
+        "raster_patch": "raster",
+        "outline_curve_or_mesh": "glyphs",
+        "raw_geometry_edges": "geometry",
+        "raster_text_patch": "raster",
+        "dxf_text": "text",
+        "raster_image": "raster",
+        "fallback_geometry": "geometry",
+    }
+    delivered_modes = {
+        delivered_mode_by_bucket[bucket]
+        for bucket, count in delivered_counts.items()
+        if bucket in delivered_mode_by_bucket and int(count or 0) > 0
+    }
+    if not delivered_modes and delivered_mode:
+        # A legacy/custom report may provide only the aggregate type. Preserve
+        # fail-closed behavior for an unexplained aggregate ``mixed`` value.
+        delivered_modes.add(delivered_mode)
+    proven_fallback_modes = {
+        {
+            "label": "labels",
+            "text3d": "3d_text",
+            "outlines": "glyphs",
+        }.get(str(event.get("delivered") or "").strip().lower(),
+              str(event.get("delivered") or "").strip().lower())
+        for event in text_fallback_events
+        if str(event.get("requested") or "").strip().lower() == requested_mode
+    }
+    unproven_delivered_modes = delivered_modes - {
+        requested_mode,
+        *proven_fallback_modes,
+    }
     if (
         requested_mode
         and requested_mode != "none"
         and delivered_mode
         and delivered_count > 0
-        and requested_mode != delivered_mode
-        and not proven_pair
+        and bool(unproven_delivered_modes)
     ):
         extra["representation_contract_violation"] = {
             "requested_type": requested_mode,

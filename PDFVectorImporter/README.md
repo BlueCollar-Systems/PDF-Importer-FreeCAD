@@ -1,7 +1,7 @@
 # PDF Vector Importer for FreeCAD
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Version: 4.0.83](https://img.shields.io/badge/Version-4.0.83-green.svg)
+![Version: 4.0.84](https://img.shields.io/badge/Version-4.0.84-green.svg)
 ![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
 
 **Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.**
@@ -11,6 +11,12 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 > **BlueCollar Systems** -- BUILT. NOT BOUGHT.
 
 ---
+
+## Recent fixes (v4.0.84)
+
+- Import reports reconcile every concrete type inside aggregate `mixed` text
+  delivery. Requested types and item-proven fallbacks pass; an unproven subtype
+  still fails closed instead of being hidden by the aggregate.
 
 ## Recent fixes (v4.0.83)
 

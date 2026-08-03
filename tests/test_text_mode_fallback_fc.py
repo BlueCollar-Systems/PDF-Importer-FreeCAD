@@ -225,6 +225,119 @@ def test_report_includes_exact_attempt_ledger_and_proven_fallback(tmp_path):
     assert report["extra"]["text_delivery_attempts"] == opts.text_delivery_attempts
 
 
+def test_report_accepts_mixed_requested_and_proven_fallback_delivery(tmp_path):
+    opts = core.ImportOptions(text_mode="glyphs")
+    opts.text_delivered_counts.update({
+        "outline_curve_or_mesh": 5,
+        "raster_text_patch": 2,
+    })
+    core._record_text_mode_fallback(
+        opts,
+        requested="glyphs",
+        delivered="raster",
+        reason="two exact source items have no usable outline",
+        count=2,
+        source_item_id="p1:b0:l0:s0",
+        proof={
+            "item_specific_proven_impossible": True,
+            "evidence": "exact source outline inspection returned no geometry",
+            "attempted_types": ["glyphs"],
+        },
+    )
+
+    report = _write_report(
+        tmp_path,
+        opts,
+        {
+            "entity_type": "glyphs",
+            "count": 7,
+            "font_rendered": False,
+            "examples": [],
+        },
+    )
+
+    actual = report["extra"]["actual_text_entity_types"]
+    assert actual["entity_type"] == "mixed"
+    assert actual["outline_curve_or_mesh"] == 5
+    assert actual["raster_text_patch"] == 2
+    assert "representation_contract_violation" not in report["extra"]
+
+
+def test_report_rejects_mixed_delivery_with_any_unproven_type(tmp_path):
+    opts = core.ImportOptions(text_mode="glyphs")
+    opts.text_delivered_counts.update({
+        "raw_geometry_edges": 5,
+        "raster_text_patch": 2,
+    })
+    core._record_text_mode_fallback(
+        opts,
+        requested="glyphs",
+        delivered="raster",
+        reason="two exact source items have no usable outline",
+        count=2,
+        source_item_id="p1:b0:l0:s0",
+        proof={
+            "item_specific_proven_impossible": True,
+            "evidence": "exact source outline inspection returned no geometry",
+            "attempted_types": ["glyphs"],
+        },
+    )
+
+    report = _write_report(
+        tmp_path,
+        opts,
+        {
+            "entity_type": "glyphs",
+            "count": 7,
+            "font_rendered": False,
+            "examples": [],
+        },
+    )
+
+    assert report["extra"]["representation_contract_violation"] == {
+        "requested_type": "glyphs",
+        "delivered_type": "mixed",
+        "delivered_count": 7,
+        "reason": "unproven_representation_substitution",
+    }
+
+
+def test_report_accepts_multiple_proven_fallback_types_without_requested_type(tmp_path):
+    opts = core.ImportOptions(text_mode="3d_text")
+    opts.text_delivered_counts.update({
+        "outline_curve_or_mesh": 5,
+        "native_text": 2,
+    })
+    for index, delivered in enumerate(("glyphs", "text")):
+        core._record_text_mode_fallback(
+            opts,
+            requested="3d_text",
+            delivered=delivered,
+            reason=f"exact source item requires {delivered}",
+            count=5 if delivered == "glyphs" else 2,
+            source_item_id=f"p1:b0:l0:s{index}",
+            proof={
+                "item_specific_proven_impossible": True,
+                "evidence": "exact source font inspection proved native 3D unavailable",
+                "attempted_types": ["3d_text"],
+            },
+        )
+
+    report = _write_report(
+        tmp_path,
+        opts,
+        {
+            "entity_type": "3d_text",
+            "count": 7,
+            "font_rendered": True,
+            "examples": [],
+        },
+    )
+
+    assert report["extra"]["actual_text_entity_types"]["entity_type"] == "mixed"
+    assert "representation_contract_violation" not in report["extra"]
+
+
 def test_terminal_representation_failure_writes_a_failure_report(tmp_path):
     opts = core.ImportOptions(text_mode="geometry")
     opts.import_report_path = str(tmp_path / "terminal_failure.json")

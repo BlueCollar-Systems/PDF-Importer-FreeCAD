@@ -118,6 +118,13 @@ def _install_import_fakes(monkeypatch, document, page_importer, reports):
             {
                 "pages_imported": kwargs["pages_imported"],
                 "extra": dict(kwargs["opts"]._report_extra),
+                "text_mode_fallbacks": list(kwargs["opts"].text_mode_fallbacks),
+                "text_delivered_counts": dict(
+                    kwargs["opts"].text_delivered_counts
+                ),
+                "text_delivery_attempts": list(
+                    kwargs["opts"].text_delivery_attempts
+                ),
             }
         )
         return kwargs["output_path"]
@@ -260,11 +267,33 @@ def test_cancel_commits_certified_pages_and_exact_resume_imports_only_remainder(
     reports = []
     calls = []
 
-    def first_import(_pdf, _path, page_number, _opts, doc):
+    def first_import(_pdf, _path, page_number, page_opts, doc):
         calls.append(page_number)
         if page_number == 1:
+            page_opts.text_delivered_counts["native_label"] = 1
+            page_opts.text_delivery_attempts.append(
+                {"source_item_id": "p1:kept", "outcome": "success"}
+            )
             group = doc.addObject("App::DocumentObjectGroup", "PDF_Page_1")
-            return group, None
+            return group, {
+                "entity_type": "labels",
+                "count": 1,
+                "source_item_count": 1,
+                "source_item_ids": ["p1:kept"],
+                "examples": [],
+            }
+        page_opts.text_delivered_counts["raster_fallback"] = 1
+        page_opts.text_delivery_attempts.append(
+            {"source_item_id": "p2:rolled-back", "outcome": "success"}
+        )
+        page_opts.text_mode_fallbacks.append(
+            {
+                "source_item_id": "p2:rolled-back",
+                "requested_type": "labels",
+                "delivered_type": "raster",
+            }
+        )
+        page_opts._report_extra["active_page_only"] = "p2:rolled-back"
         doc.addObject("Part::Feature", "Partial_Page_2")
         raise core.ImportCancelled("PDF import cancelled by user")
 
@@ -294,6 +323,31 @@ def test_cancel_commits_certified_pages_and_exact_resume_imports_only_remainder(
     assert reports[-1]["pages_imported"] == 1
     assert reports[-1]["extra"]["result_status"] == "cancelled"
     assert reports[-1]["extra"]["import_session"]["remaining_pages"] == [2]
+    assert reports[-1]["text_delivered_counts"] == {"native_label": 1}
+    assert reports[-1]["text_delivery_attempts"] == [
+        {"source_item_id": "p1:kept", "outcome": "success"}
+    ]
+    assert reports[-1]["text_mode_fallbacks"] == []
+    assert reports[-1]["extra"]["actual_text_entity_types"] == {
+        "entity_type": "labels",
+        "count": 1,
+        "source_item_count": 1,
+        "source_item_ids": ["p1:kept"],
+        "examples": [],
+    }
+    assert "p2:rolled-back" not in repr(reports[-1])
+    assert reports[-1]["extra"]["representation_contract_scope"] == {
+        "schema": "bcs.representation_contract_scope/1.0",
+        "scope": "current_invocation",
+        "coverage_status": "full_session_to_date",
+        "requested_pages": [1, 2],
+        "evaluated_pages": [1, 2],
+        "current_invocation_completed_pages": [1],
+        "rolled_back_pages": [2],
+        "previously_certified_pages_excluded": [],
+        "session_completed_pages": [1],
+        "complete_session_telemetry": True,
+    }
 
     calls.clear()
 
@@ -320,6 +374,120 @@ def test_cancel_commits_certified_pages_and_exact_resume_imports_only_remainder(
     assert completed["status"] == "complete"
     assert reports[-1]["pages_imported"] == 2
     assert reports[-1]["extra"]["result_status"] == "success"
+    assert reports[-1]["extra"]["representation_contract_scope"] == {
+        "schema": "bcs.representation_contract_scope/1.0",
+        "scope": "current_invocation",
+        "coverage_status": "current_invocation_only",
+        "requested_pages": [1, 2],
+        "evaluated_pages": [2],
+        "current_invocation_completed_pages": [2],
+        "rolled_back_pages": [],
+        "previously_certified_pages_excluded": [1],
+        "session_completed_pages": [1, 2],
+        "complete_session_telemetry": False,
+    }
+
+
+def test_terminal_failure_reports_fresh_invocation_pages_as_rolled_back(
+    monkeypatch, tmp_path
+):
+    document = Document()
+    reports = []
+
+    def page_importer(_pdf, _path, page_number, _opts, doc):
+        if page_number == 1:
+            return doc.addObject("App::DocumentObjectGroup", "PDF_Page_1"), None
+        raise core.TextRepresentationFailure(
+            "terminal representation failure",
+            {"page_number": page_number, "outcome": "failed"},
+        )
+
+    _install_import_fakes(monkeypatch, document, page_importer, reports)
+    opts = core.ImportOptions(
+        pages=[1, 2],
+        import_text=False,
+        model3d_mode="off",
+        import_report_path=str(tmp_path / "failed.json"),
+    )
+
+    with pytest.raises(core.TextRepresentationFailure):
+        core.import_pdf("fixture.pdf", opts)
+
+    assert document.Objects == []
+    assert reports[-1]["pages_imported"] == 0
+    assert reports[-1]["extra"]["result_status"] == "failed"
+    assert reports[-1]["extra"]["representation_contract_scope"] == {
+        "schema": "bcs.representation_contract_scope/1.0",
+        "scope": "current_invocation",
+        "coverage_status": "full_session_to_date",
+        "requested_pages": [1, 2],
+        "evaluated_pages": [1, 2],
+        "current_invocation_completed_pages": [],
+        "rolled_back_pages": [1, 2],
+        "previously_certified_pages_excluded": [],
+        "session_completed_pages": [],
+        "complete_session_telemetry": True,
+    }
+
+
+def test_terminal_failure_preserves_only_prior_certified_resume_pages(
+    monkeypatch, tmp_path
+):
+    document = Document()
+    reports = []
+
+    def first_import(_pdf, _path, page_number, _opts, doc):
+        if page_number == 1:
+            return doc.addObject("App::DocumentObjectGroup", "PDF_Page_1"), None
+        raise core.ImportCancelled("PDF import cancelled by user")
+
+    _install_import_fakes(monkeypatch, document, first_import, reports)
+    initial_opts = core.ImportOptions(
+        pages=[1, 2],
+        import_text=False,
+        model3d_mode="off",
+        import_report_path=str(tmp_path / "cancelled.json"),
+    )
+    assert core.import_pdf("fixture.pdf", initial_opts) is False
+    session_host = next(
+        host
+        for host in document.Objects
+        if getattr(host, "PDFImportSessionSchema", "") == session.SESSION_SCHEMA
+    )
+
+    def resumed_failure(_pdf, _path, page_number, _opts, _doc):
+        raise core.TextRepresentationFailure(
+            "terminal representation failure",
+            {"page_number": page_number, "outcome": "failed"},
+        )
+
+    monkeypatch.setattr(core, "_import_pdf_page_inner", resumed_failure)
+    resumed_opts = core.ImportOptions(
+        pages=[1, 2],
+        import_text=False,
+        model3d_mode="off",
+        import_report_path=str(tmp_path / "resume-failed.json"),
+        resume_session_name=session_host.Name,
+    )
+
+    with pytest.raises(core.TextRepresentationFailure):
+        core.import_pdf("fixture.pdf", resumed_opts)
+
+    assert session.read_session_object(session_host)["completed_pages"] == [1]
+    assert reports[-1]["pages_imported"] == 1
+    assert reports[-1]["extra"]["result_status"] == "failed"
+    assert reports[-1]["extra"]["representation_contract_scope"] == {
+        "schema": "bcs.representation_contract_scope/1.0",
+        "scope": "current_invocation",
+        "coverage_status": "current_invocation_only",
+        "requested_pages": [1, 2],
+        "evaluated_pages": [2],
+        "current_invocation_completed_pages": [],
+        "rolled_back_pages": [2],
+        "previously_certified_pages_excluded": [1],
+        "session_completed_pages": [1],
+        "complete_session_telemetry": False,
+    }
 
 
 def test_named_resume_fails_closed_when_identity_does_not_match(monkeypatch, tmp_path):

@@ -183,8 +183,14 @@ def activate_runtime_paths(
     """Prepend only the selected ABI and shared dependency roots."""
     target = search_path if search_path is not None else sys.path
     lib_root = runtime.manifest_path.parent
+
+    def windows_path_identity(path: Path | str) -> str:
+        # Bundled runtimes are Windows-only. Keep Windows' case-insensitive
+        # path identity even when this contract is exercised by Linux CI.
+        return os.path.abspath(str(path)).replace("\\", "/").casefold()
+
     vendor_candidates = {
-        os.path.normcase(os.path.abspath(str(path)))
+        windows_path_identity(path)
         for path in (
             lib_root,
             lib_root / "common",
@@ -195,7 +201,7 @@ def activate_runtime_paths(
     target[:] = [
         entry
         for entry in target
-        if os.path.normcase(os.path.abspath(str(entry))) not in vendor_candidates
+        if windows_path_identity(entry) not in vendor_candidates
     ]
     for dependency_path in reversed(runtime.dependency_paths):
         target.insert(0, str(dependency_path))

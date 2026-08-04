@@ -3104,12 +3104,11 @@ def _resolve_shapestring_font_path_with_evidence(
         #
         # Reporting it as "invalid" made absence indistinguishable from an I/O
         # fault, so 3D Text -- the only mode that requires an exact font to
-        # extrude outlines -- aborted the whole cell instead of descending. Four
-        # corpus cells failed this way while text/labels/glyphs/geometry/raster
-        # all passed on the same documents: alvord-2009, TX_Alvord_20160309_TM_geo
-        # (font genuinely not staged) and CMJ Report 3306-25-01 Geotech, whose
-        # page carried corrupt-cmap staging failures that named no font and so
-        # could not be attributed to the span requesting one.
+        # extrude outlines -- aborted the whole cell instead of descending,
+        # while text/labels/glyphs/geometry/raster all succeeded on the same
+        # document. Two distinct situations reach here: a font that was never
+        # staged at all, and a page whose staging failures named other fonts and
+        # so could not be attributed to the span requesting this one.
         embedded_absence_details["absent_from_completed_inventory"] = True
         # Keep the proof honest: if the page had staging failures that could not
         # be attributed to this font, say so rather than implying a clean page.

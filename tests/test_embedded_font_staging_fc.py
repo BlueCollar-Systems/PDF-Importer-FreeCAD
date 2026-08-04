@@ -1722,7 +1722,7 @@ def test_font_absent_from_completed_inventory_is_a_clean_miss_not_a_fault():
     _set_completed_font_session(opts, records={}, failures=[])
 
     path, results = core._resolve_shapestring_font_path_with_evidence(
-        "Univers-CondensedLightOb",  # the real 24-char truncated corpus name
+        "Condensed-LightOblique24",  # 24 chars: MuPDF's span-name cap
         opts,
         pdf_sha256=PDF_SHA_A,
         page_number=1,
@@ -1740,10 +1740,10 @@ def test_font_absent_from_completed_inventory_is_a_clean_miss_not_a_fault():
 
 
 def test_corrupt_embedded_font_remains_a_runtime_fault_not_proven_absence():
-    """The CMJ Report shape, with the record shape the stager actually emits.
+    """A corrupt embedded font, with the record shape the stager actually emits.
 
-    Reproduced from `CMJ Report 3306-25-01 Geotech.pdf` p31: the font IS present
-    and its name resolves (`JANCBI+Arial,Italic` -> `arialitalic`), but staging
+    Reproduced from a corrupt embedded-font fixture: the font IS present
+    and its name resolves (`ABCDEF+Arial,Italic` -> `arialitalic`), but staging
     its embedded program raises `AssertionError: corrupt cmap table format 4`.
 
     This is deliberately NOT promoted to proven absence. `_PROVEN_EXACT_FONT_
@@ -1762,7 +1762,7 @@ def test_corrupt_embedded_font_remains_a_runtime_fault_not_proven_absence():
         failures=[
             {
                 # exactly the keys stage_page_fonts emits
-                "font": "JANCBI+Arial,Italic",
+                "font": "ABCDEF+Arial,Italic",
                 "outcome": "failed",
                 "reason": "embedded_font_staging_failed",
                 "xref": 699,
@@ -1800,7 +1800,7 @@ def test_incomplete_staging_session_is_still_a_runtime_fault():
     )
 
     path, results = core._resolve_shapestring_font_path_with_evidence(
-        "Univers-CondensedLightOb",
+        "Condensed-LightOblique24",
         opts,
         pdf_sha256=PDF_SHA_A,
         page_number=1,
@@ -1821,7 +1821,7 @@ def test_malformed_failure_record_is_still_a_runtime_fault():
     _set_completed_font_session(opts, records={}, failures=["not-a-dict"])
 
     path, results = core._resolve_shapestring_font_path_with_evidence(
-        "Univers-CondensedLightOb",
+        "Condensed-LightOblique24",
         opts,
         pdf_sha256=PDF_SHA_A,
         page_number=1,
@@ -1845,7 +1845,7 @@ def test_absence_records_unattributed_page_failures_so_the_proof_is_honest():
         records={},
         failures=[
             {
-                "font": "JANCIH+Arial,Bold",  # a DIFFERENT font from the one wanted
+                "font": "ABCDEG+Arial,Bold",  # a DIFFERENT font from the one wanted
                 "outcome": "failed",
                 "reason": "embedded_font_staging_failed",
                 "xref": 700,
@@ -1858,7 +1858,7 @@ def test_absence_records_unattributed_page_failures_so_the_proof_is_honest():
     )
 
     path, results = core._resolve_shapestring_font_path_with_evidence(
-        "Univers-CondensedLightOb",
+        "Condensed-LightOblique24",
         opts,
         pdf_sha256=PDF_SHA_A,
         page_number=1,

@@ -900,7 +900,7 @@ def test_exact_font_resolver_reports_deterministic_embedded_and_system_absence(
     assert core._resolve_shapestring_font_path("Helvetica", opts) is None
 
 
-def test_completed_inventory_without_exact_observation_is_invalid_not_absence():
+def test_completed_inventory_without_exact_observation_descends_to_system_font():
     opts = core.ImportOptions()
     _set_completed_font_session(opts)
 
@@ -912,11 +912,13 @@ def test_completed_inventory_without_exact_observation_is_invalid_not_absence():
     )
 
     assert path is None
-    assert len(results) == 1
+    assert len(results) == 2
     assert results[0]["source"] == "embedded_font"
-    assert results[0]["outcome"] == "invalid"
-    assert results[0]["reason"] == "font_not_observed_in_completed_inventory"
+    assert results[0]["outcome"] == "not_found"
+    assert results[0]["absent_from_completed_inventory"] is True
     assert results[0]["staging_complete"] is True
+    assert results[1]["source"] == "system_font"
+    assert results[1]["outcome"] == "not_found"
 
 
 @pytest.mark.parametrize(
@@ -1696,3 +1698,174 @@ def test_malformed_resolver_results_are_terminal(monkeypatch):
             scale=1.0,
         )
     assert malformed.value.attempt["reason"] == "exact_font_resolution_invalid"
+
+
+# --- proven absence vs runtime fault -----------------------------------------
+#
+# 3D Text is the only mode that needs an exact font (it extrudes real outlines),
+# so it is the only mode with no route out when one is unavailable. Four corpus
+# cells aborted on `exact_font_resolution_invalid` while text, labels, glyphs,
+# geometry and raster all PASSED on the same documents -- because a font that is
+# simply absent from a completed staging inventory was reported as a runtime
+# fault instead of the clean miss the resolver's contract describes. Only a
+# `not_found` pair reaches the `exhaustive_absence` branch that raises
+# TextItemImpossible and lets the ladder descend.
+#
+# Both directions matter. Widening this too far would launder a genuine I/O or
+# corruption fault into "proof the font is absent", which is exactly what the
+# `invalid` outcome exists to prevent.
+
+
+def test_font_absent_from_completed_inventory_is_a_clean_miss_not_a_fault():
+    """Staging completed and the font is not in it -> proven absence."""
+    opts = core.ImportOptions(text_mode="3d_text")
+    _set_completed_font_session(opts, records={}, failures=[])
+
+    path, results = core._resolve_shapestring_font_path_with_evidence(
+        "Univers-CondensedLightOb",  # the real 24-char truncated corpus name
+        opts,
+        pdf_sha256=PDF_SHA_A,
+        page_number=1,
+    )
+
+    assert path is None
+    embedded = results[0]
+    assert embedded["source"] == "embedded_font"
+    assert embedded["outcome"] == "not_found", (
+        "a completed inventory that does not contain the font is a clean miss; "
+        "reporting it as 'invalid' stops 3D Text from descending the ladder"
+    )
+    assert embedded["absent_from_completed_inventory"] is True
+    assert embedded["staging_complete"] is True
+
+
+def test_corrupt_embedded_font_remains_a_runtime_fault_not_proven_absence():
+    """The CMJ Report shape, with the record shape the stager actually emits.
+
+    Reproduced from `CMJ Report 3306-25-01 Geotech.pdf` p31: the font IS present
+    and its name resolves (`JANCBI+Arial,Italic` -> `arialitalic`), but staging
+    its embedded program raises `AssertionError: corrupt cmap table format 4`.
+
+    This is deliberately NOT promoted to proven absence. `_PROVEN_EXACT_FONT_
+    ABSENCE_REASONS` requires the failure to carry no exception, which is what
+    keeps a thrown fault from being laundered into ladder descent. A corrupt
+    source payload is arguably the same practical class as the already-whitelisted
+    `embedded_font_has_no_unicode_cmap`, but promoting an exception-bearing
+    failure weakens that guard, so it stays an owner-visible decision rather than
+    something widened in passing. This test pins the current behaviour so the
+    choice is explicit and any future change is deliberate.
+    """
+    opts = core.ImportOptions(text_mode="3d_text")
+    _set_completed_font_session(
+        opts,
+        records={},
+        failures=[
+            {
+                # exactly the keys stage_page_fonts emits
+                "font": "JANCBI+Arial,Italic",
+                "outcome": "failed",
+                "reason": "embedded_font_staging_failed",
+                "xref": 699,
+                "exception": (
+                    "AssertionError: corrupt cmap table format 4 "
+                    "(data length: 74, header length: 80)"
+                ),
+            }
+        ],
+    )
+
+    path, results = core._resolve_shapestring_font_path_with_evidence(
+        "Arial,Italic",
+        opts,
+        pdf_sha256=PDF_SHA_A,
+        page_number=1,
+    )
+
+    assert path is None
+    embedded = results[0]
+    assert embedded["outcome"] == "invalid"
+    assert embedded["reason"] == "embedded_font_staging_failed"
+    assert "corrupt cmap" in embedded["exception"]
+    assert "absent_from_completed_inventory" not in embedded, (
+        "a font that IS in the inventory but failed to stage must not be "
+        "reported as absent from it"
+    )
+
+
+def test_incomplete_staging_session_is_still_a_runtime_fault():
+    """The other direction: absence was never established, so it is not proof."""
+    opts = core.ImportOptions(text_mode="3d_text")
+    _set_completed_font_session(
+        opts, records={}, failures=[], staging_complete=False
+    )
+
+    path, results = core._resolve_shapestring_font_path_with_evidence(
+        "Univers-CondensedLightOb",
+        opts,
+        pdf_sha256=PDF_SHA_A,
+        page_number=1,
+    )
+
+    assert path is None
+    embedded = results[0]
+    assert embedded["outcome"] == "invalid", (
+        "staging that never completed cannot prove a font is absent; treating "
+        "it as absence would launder a runtime fault into ladder descent"
+    )
+    assert "absent_from_completed_inventory" not in embedded
+
+
+def test_malformed_failure_record_is_still_a_runtime_fault():
+    """A failures list we cannot parse is a fault, never proof of absence."""
+    opts = core.ImportOptions(text_mode="3d_text")
+    _set_completed_font_session(opts, records={}, failures=["not-a-dict"])
+
+    path, results = core._resolve_shapestring_font_path_with_evidence(
+        "Univers-CondensedLightOb",
+        opts,
+        pdf_sha256=PDF_SHA_A,
+        page_number=1,
+    )
+
+    assert path is None
+    assert results[0]["outcome"] == "invalid"
+    assert "absent_from_completed_inventory" not in results[0]
+
+
+def test_absence_records_unattributed_page_failures_so_the_proof_is_honest():
+    """Absent font on a page whose OTHER fonts failed to stage.
+
+    The wanted font is genuinely absent, so this is proven absence -- but the
+    page was not clean. The proof records that, rather than implying a page
+    where everything staged fine.
+    """
+    opts = core.ImportOptions(text_mode="3d_text")
+    _set_completed_font_session(
+        opts,
+        records={},
+        failures=[
+            {
+                "font": "JANCIH+Arial,Bold",  # a DIFFERENT font from the one wanted
+                "outcome": "failed",
+                "reason": "embedded_font_staging_failed",
+                "xref": 700,
+                "exception": (
+                    "AssertionError: corrupt cmap table format 4 "
+                    "(data length: 122, header length: 128)"
+                ),
+            }
+        ],
+    )
+
+    path, results = core._resolve_shapestring_font_path_with_evidence(
+        "Univers-CondensedLightOb",
+        opts,
+        pdf_sha256=PDF_SHA_A,
+        page_number=1,
+    )
+
+    assert path is None
+    embedded = results[0]
+    assert embedded["outcome"] == "not_found"
+    assert embedded["absent_from_completed_inventory"] is True
+    assert embedded["unattributed_page_staging_failures"] == 1

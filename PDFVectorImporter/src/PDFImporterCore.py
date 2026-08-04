@@ -3087,19 +3087,37 @@ def _resolve_shapestring_font_path_with_evidence(
             exception="%s: %s" % (exc.__class__.__name__, exc),
         )]
 
+    embedded_absence_details: Dict[str, Any] = {}
     if (
         exact_nonembedded_observation is None
         and exact_unusable_observation is None
         and not _allow_unbound_compat
     ):
-        return None, [source_result(
-            "embedded_font",
-            "invalid",
-            font_identity,
-            reason="font_not_observed_in_completed_inventory",
-        )]
-
-    embedded_absence_details: Dict[str, Any] = {}
+        # A completed staging session that simply does not contain this font is
+        # the clean miss this function's contract describes -- not a runtime
+        # fault. Every way of *failing to establish* that has already returned
+        # "invalid" above: a missing/mismatched/duplicated session, an
+        # incomplete session, a session carrying a page-level failure, a
+        # malformed staged record or failure entry, and any lookup exception.
+        # Reaching here means staging ran to completion and the font is absent,
+        # which is exactly the proof the ladder needs.
+        #
+        # Reporting it as "invalid" made absence indistinguishable from an I/O
+        # fault, so 3D Text -- the only mode that requires an exact font to
+        # extrude outlines -- aborted the whole cell instead of descending. Four
+        # corpus cells failed this way while text/labels/glyphs/geometry/raster
+        # all passed on the same documents: alvord-2009, TX_Alvord_20160309_TM_geo
+        # (font genuinely not staged) and CMJ Report 3306-25-01 Geotech, whose
+        # page carried corrupt-cmap staging failures that named no font and so
+        # could not be attributed to the span requesting one.
+        embedded_absence_details["absent_from_completed_inventory"] = True
+        # Keep the proof honest: if the page had staging failures that could not
+        # be attributed to this font, say so rather than implying a clean page.
+        unattributed = len(failures or [])
+        if unattributed:
+            embedded_absence_details["unattributed_page_staging_failures"] = (
+                unattributed
+            )
     if exact_nonembedded_observation is not None:
         embedded_absence_details["inventory_observation"] = (
             exact_nonembedded_observation

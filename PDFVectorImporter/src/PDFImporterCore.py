@@ -2636,6 +2636,31 @@ _PROVEN_EXACT_FONT_ABSENCE_REASONS = frozenset({
 })
 
 
+def _embedded_font_program_unusable(exception_text: Any) -> bool:
+    """True when embedded staging failed because the font program itself is unusable.
+
+    Corrupt cmap / broken SFNT tables mean the embedded bytes cannot drive
+    ShapeString. That is an embedded-source miss, but requested 3D Text must
+    still try the exact Windows family/style alias (e.g. Arial Italic →
+    ariali.ttf) before aborting or descending the ladder.
+    """
+    text = str(exception_text or "").strip().lower()
+    if not text:
+        return False
+    needles = (
+        "corrupt cmap",
+        "cmap table format",
+        "not a truetype",
+        "not a valid ttf",
+        "bad sfnt",
+        "invalid sfnt",
+        "ttferror",
+        "ttlib.ttliberror",
+        "ttliberror",
+    )
+    return any(needle in text for needle in needles)
+
+
 def _resolve_shapestring_font_path_with_evidence(
     font_name: str,
     opts: Optional[ImportOptions] = None,
@@ -3053,10 +3078,15 @@ def _resolve_shapestring_font_path_with_evidence(
                     failure.get("reason") or "embedded_font_staging_failed"
                 )
                 failure_exception = str(failure.get("exception") or "")
-                if (
+                proven_absence = (
                     failure_reason in _PROVEN_EXACT_FONT_ABSENCE_REASONS
                     and not failure_exception
-                ):
+                )
+                unusable_program = (
+                    failure_reason == "embedded_font_staging_failed"
+                    and _embedded_font_program_unusable(failure_exception)
+                )
+                if proven_absence or unusable_program:
                     if (
                         failure.get("outcome") != "failed"
                         or type(failure.get("xref")) is not int

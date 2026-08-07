@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import itertools
 import json
-import os
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,49 @@ from PDFVectorImporter.candidate_manifest import (
 SOURCE_COMMIT = "a" * 40
 PACKAGE_VERSION = "7.8.9"
 ARTIFACT_NAME = f"FreeCAD-PDF-Importer_v{PACKAGE_VERSION}.zip"
+ERROR_CODES = {
+    "MANIFEST_INVALID_DOCUMENT",
+    "MANIFEST_INVALID_IDENTITY",
+    "MANIFEST_INVALID_UTF8",
+    "MANIFEST_DUPLICATE_KEY",
+    "MANIFEST_INVALID_JSON",
+    "MANIFEST_NONFINITE_NUMBER",
+    "MANIFEST_NONCANONICAL_BYTES",
+    "MANIFEST_INVALID_PATH",
+    "MANIFEST_MEMBER_COLLISION",
+    "MANIFEST_MEMBER_SET_MISMATCH",
+    "MANIFEST_MEMBER_SIZE_MISMATCH",
+    "MANIFEST_MEMBER_DIGEST_MISMATCH",
+    "MANIFEST_TREE_UNSAFE",
+    "MANIFEST_IO_ERROR",
+}
+
+
+class _ExplodingMapping(Mapping[str, bytes]):
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def __getitem__(self, key: str) -> bytes:
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return 1
+
+    def items(self):
+        raise self.error
+
+
+class _ExplodingDocument(dict):
+    def get(self, _key, _default=None):
+        raise RuntimeError("sensitive-token")
+
+
+class _ExplodingPath:
+    def __fspath__(self) -> str:
+        raise RuntimeError("sensitive-token")
 
 
 def _members() -> dict[str, bytes]:
@@ -74,14 +118,14 @@ def test_manifest_constants_are_closed_public_identity() -> None:
 
 def test_build_is_deterministic_across_mapping_order_and_sorts_paths_by_utf8() -> None:
     members = _members()
-    reverse_members = dict(reversed(list(members.items())))
+    documents = [
+        _build(dict(order)) for order in itertools.permutations(members.items())
+    ]
+    first = documents[0]
 
-    first = _build(members)
-    second = _build(reverse_members)
-
-    assert first == second
-    assert canonical_candidate_manifest_bytes(first) == canonical_candidate_manifest_bytes(second)
-    assert candidate_manifest_sha256(first) == candidate_manifest_sha256(second)
+    assert all(document == first for document in documents)
+    assert len({canonical_candidate_manifest_bytes(document) for document in documents}) == 1
+    assert len({candidate_manifest_sha256(document) for document in documents}) == 1
     assert [entry["path"] for entry in first["files"]] == sorted(
         (name.removeprefix(f"{PAYLOAD_ROOT}/") for name in members),
         key=lambda value: value.encode("utf-8"),
@@ -127,6 +171,21 @@ def test_canonical_bytes_have_one_exact_compact_utf8_encoding() -> None:
     assert canonical_candidate_manifest_bytes(reordered) == expected
 
 
+def test_canonical_bytes_emit_nfc_as_utf8_not_json_unicode_escapes() -> None:
+    document = build_candidate_file_manifest(
+        {f"{PAYLOAD_ROOT}/caf\u00e9.py": b"x"},
+        source_commit=SOURCE_COMMIT,
+        package_version=PACKAGE_VERSION,
+        artifact_name=ARTIFACT_NAME,
+    )
+
+    payload = canonical_candidate_manifest_bytes(document)
+
+    assert "café.py".encode("utf-8") in payload
+    assert b"caf\\u00e9.py" not in payload
+    assert payload.decode("utf-8").encode("utf-8") == payload
+
+
 def test_parser_accepts_only_strict_canonical_manifest_bytes() -> None:
     document = _build()
     payload = canonical_candidate_manifest_bytes(document)
@@ -166,6 +225,56 @@ def test_parser_rejects_noncanonical_but_semantically_equal_json() -> None:
 
 
 @pytest.mark.parametrize(
+    "variant",
+    [
+        "missing_lf",
+        "double_lf",
+        "crlf",
+        "top_level_order",
+        "nested_record_order",
+        "escaped_unicode",
+    ],
+)
+def test_parser_rejects_every_noncanonical_encoding_variant(variant: str) -> None:
+    document = build_candidate_file_manifest(
+        {f"{PAYLOAD_ROOT}/caf\u00e9.py": b"x"},
+        source_commit=SOURCE_COMMIT,
+        package_version=PACKAGE_VERSION,
+        artifact_name=ARTIFACT_NAME,
+    )
+    canonical = canonical_candidate_manifest_bytes(document)
+    if variant == "missing_lf":
+        payload = canonical[:-1]
+    elif variant == "double_lf":
+        payload = canonical + b"\n"
+    elif variant == "crlf":
+        payload = canonical[:-1] + b"\r\n"
+    elif variant == "top_level_order":
+        payload = (
+            json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+    elif variant == "nested_record_order":
+        reordered = {key: document[key] for key in sorted(document)}
+        record = document["files"][0]
+        reordered["files"] = [
+            {"size": record["size"], "sha256": record["sha256"], "path": record["path"]}
+        ]
+        payload = (
+            json.dumps(reordered, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+    else:
+        payload = (
+            json.dumps(document, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+
+    parsed, problems = parse_candidate_file_manifest(payload)
+
+    assert parsed is None
+    assert "MANIFEST_NONCANONICAL_BYTES" in problems
+
+
+@pytest.mark.parametrize(
     "document",
     [
         None,
@@ -195,6 +304,17 @@ def test_cyclic_python_document_never_raises() -> None:
     assert problems == sorted(set(problems))
     assert "MANIFEST_INVALID_DOCUMENT" in problems
     assert canonical_candidate_manifest_bytes(cyclic) == b""
+
+
+def test_hostile_dict_subclass_never_escapes_an_exception_or_value() -> None:
+    document = _ExplodingDocument(_build())
+
+    first = validate_candidate_file_manifest(document)
+    second = validate_candidate_file_manifest(document)
+
+    assert first == second == ["MANIFEST_INVALID_DOCUMENT"]
+    assert "sensitive-token" not in " ".join(first)
+    assert canonical_candidate_manifest_bytes(document) == b""
 
 
 @pytest.mark.parametrize(
@@ -251,7 +371,10 @@ def test_document_and_file_records_are_closed_and_exact(mutation: dict) -> None:
         "Q:drive.py",
         "//server/share.py",
         "\\\\?\\Q:\\device.py",
+        "\\\\?\\Volume{00000000-0000-0000-0000-000000000000}\\file.py",
+        "\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1\\file.py",
         "\\\\.\\PIPE\\channel",
+        "\\??\\Q:\\device.py",
         "src:stream.py",
         "a//b.py",
         "a/./b.py",
@@ -309,14 +432,43 @@ def test_builder_rejects_nonportable_private_or_reserved_paths(relative_path: st
     ],
 )
 def test_builder_rejects_invalid_member_names(member_name: object) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as raised:
         _build({member_name: b"x"})  # type: ignore[dict-item]
+    assert str(raised.value) in ERROR_CODES
 
 
 @pytest.mark.parametrize("members", [{}, {f"{PAYLOAD_ROOT}/a.py": "not-bytes"}])
 def test_builder_rejects_empty_or_nonbyte_member_maps(members: dict) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as raised:
         _build(members)  # type: ignore[arg-type]
+    assert str(raised.value) in ERROR_CODES
+
+
+@pytest.mark.parametrize("error", [RuntimeError("sensitive-token"), OSError("sensitive-token")])
+def test_builder_converts_hostile_mapping_failures_to_closed_value_error(
+    error: Exception,
+) -> None:
+    with pytest.raises(ValueError) as raised:
+        build_candidate_file_manifest(
+            _ExplodingMapping(error),
+            source_commit=SOURCE_COMMIT,
+            package_version=PACKAGE_VERSION,
+            artifact_name=ARTIFACT_NAME,
+        )
+
+    assert str(raised.value) in ERROR_CODES
+    assert "sensitive-token" not in str(raised.value)
+
+
+@pytest.mark.parametrize("error", [RuntimeError("sensitive-token"), OSError("sensitive-token")])
+def test_archive_validator_converts_hostile_mapping_failures_to_codes(
+    error: Exception,
+) -> None:
+    problems = validate_candidate_archive_members(_build(), _ExplodingMapping(error))
+
+    assert "MANIFEST_INVALID_DOCUMENT" in problems
+    assert problems == sorted(set(problems))
+    assert "sensitive-token" not in " ".join(problems)
 
 
 def test_nfc_and_windows_casefold_aliases_never_overwrite() -> None:
@@ -371,6 +523,27 @@ def test_manifest_digest_binds_every_identity_and_member_byte() -> None:
             package_version=PACKAGE_VERSION,
             artifact_name="different.zip",
         )
+
+    one = build_candidate_file_manifest(
+        {f"{PAYLOAD_ROOT}/one.py": b"one"},
+        source_commit=SOURCE_COMMIT,
+        package_version=PACKAGE_VERSION,
+        artifact_name=ARTIFACT_NAME,
+    )
+    changed_size = copy.deepcopy(one)
+    changed_size["files"][0]["size"] += 1
+    changed_path = copy.deepcopy(one)
+    changed_path["files"][0]["path"] = "renamed.py"
+    assert candidate_manifest_sha256(changed_size) != candidate_manifest_sha256(one)
+    assert candidate_manifest_sha256(changed_path) != candidate_manifest_sha256(one)
+
+    renamed_member = build_candidate_file_manifest(
+        {f"{PAYLOAD_ROOT}/renamed.py": b"one"},
+        source_commit=SOURCE_COMMIT,
+        package_version=PACKAGE_VERSION,
+        artifact_name=ARTIFACT_NAME,
+    )
+    assert candidate_manifest_sha256(renamed_member) != candidate_manifest_sha256(one)
 
 
 def test_file_records_must_remain_in_canonical_utf8_path_order() -> None:
@@ -455,6 +628,12 @@ def test_archive_rejects_case_alias_even_when_expected_members_exist() -> None:
 
     assert "MANIFEST_MEMBER_COLLISION" in problems
     assert "MANIFEST_MEMBER_SET_MISMATCH" in problems
+
+
+def test_archive_validation_never_raises_for_hostile_document_subclass() -> None:
+    problems = validate_candidate_archive_members(_ExplodingDocument(_build()), {})
+
+    assert problems == ["MANIFEST_INVALID_DOCUMENT"]
 
 
 def test_installed_tree_matches_the_archive_derived_manifest(tmp_path: Path) -> None:
@@ -545,6 +724,24 @@ def test_installed_tree_rejects_injected_reparse_detection(
     assert "MANIFEST_TREE_UNSAFE" in validate_installed_candidate_tree(document, root)
 
 
+def test_installed_tree_rejects_a_nonregular_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    members = _members()
+    document = _build(members)
+    root = tmp_path / PAYLOAD_ROOT
+    _write_installed_tree(root, document, members)
+    original_is_regular = candidate_manifest.stat.S_ISREG
+
+    monkeypatch.setattr(candidate_manifest.stat, "S_ISREG", lambda _mode: False)
+    try:
+        problems = validate_installed_candidate_tree(document, root)
+    finally:
+        monkeypatch.setattr(candidate_manifest.stat, "S_ISREG", original_is_regular)
+
+    assert "MANIFEST_TREE_UNSAFE" in problems
+
+
 def test_installed_tree_io_and_diagnostics_never_expose_the_caller_root(
     tmp_path: Path,
 ) -> None:
@@ -558,6 +755,13 @@ def test_installed_tree_io_and_diagnostics_never_expose_the_caller_root(
     assert "MANIFEST_IO_ERROR" in first
     assert str(root) not in " ".join(first)
     assert "sensitive-token" not in " ".join(first)
+
+
+def test_installed_tree_rejects_hostile_pathlike_without_raising() -> None:
+    problems = validate_installed_candidate_tree(_build(), _ExplodingPath())  # type: ignore[arg-type]
+
+    assert problems == ["MANIFEST_IO_ERROR"]
+    assert "sensitive-token" not in " ".join(problems)
 
 
 def test_archive_and_tree_validation_of_invalid_documents_never_raise(
@@ -575,26 +779,10 @@ def test_archive_and_tree_validation_of_invalid_documents_never_raise(
 
 
 def test_error_vocabulary_is_closed() -> None:
-    allowed = {
-        "MANIFEST_INVALID_DOCUMENT",
-        "MANIFEST_INVALID_IDENTITY",
-        "MANIFEST_INVALID_UTF8",
-        "MANIFEST_DUPLICATE_KEY",
-        "MANIFEST_INVALID_JSON",
-        "MANIFEST_NONFINITE_NUMBER",
-        "MANIFEST_NONCANONICAL_BYTES",
-        "MANIFEST_INVALID_PATH",
-        "MANIFEST_MEMBER_COLLISION",
-        "MANIFEST_MEMBER_SET_MISMATCH",
-        "MANIFEST_MEMBER_SIZE_MISMATCH",
-        "MANIFEST_MEMBER_DIGEST_MISMATCH",
-        "MANIFEST_TREE_UNSAFE",
-        "MANIFEST_IO_ERROR",
-    }
     documents = [None, {}, {"files": []}, _build()]
     observed = set()
     for document in documents:
         observed.update(validate_candidate_file_manifest(document))
         observed.update(validate_candidate_archive_members(document, {}))
 
-    assert observed <= allowed
+    assert observed <= ERROR_CODES

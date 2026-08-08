@@ -62,7 +62,9 @@ def test_release_omits_environment_bound_launchers_and_is_reproducible(
         build_release, "ensure_runtime_dependencies", provide_locked_runtime
     )
     monkeypatch.setattr(
-        build_release, "_require_commit_bound_sources", lambda _snapshot: None
+        build_release,
+        "_require_commit_bound_sources",
+        lambda _snapshot, *, source_commit: None,
     )
 
     first = build_release.build(tmp_path / "first")
@@ -103,7 +105,9 @@ def test_release_archives_verified_runtime_snapshot_not_later_mutation(
         build_release, "VENDORED_LIB_DIR", addon / "src" / "lib"
     )
     monkeypatch.setattr(
-        build_release, "_require_commit_bound_sources", lambda _snapshot: None
+        build_release,
+        "_require_commit_bound_sources",
+        lambda _snapshot, *, source_commit: None,
     )
 
     def provide_runtime(*, runtime_dir, **_kwargs):

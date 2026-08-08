@@ -74,7 +74,7 @@ def test_external_private_denylist_blocks_bare_identifier_without_echoing_it(
     monkeypatch.setattr(
         build_release,
         "_require_commit_bound_sources",
-        lambda _snapshot: None,
+        lambda _snapshot, *, source_commit: None,
     )
 
     with pytest.raises(RuntimeError) as raised:
@@ -332,7 +332,7 @@ def test_release_build_fails_closed_on_private_artifact_candidates(
     monkeypatch.setattr(
         build_release,
         "_require_commit_bound_sources",
-        lambda _snapshot: None,
+        lambda _snapshot, *, source_commit: None,
         raising=False,
     )
 
@@ -371,7 +371,8 @@ def test_release_build_fails_closed_on_private_source_content(
         build_release, "ensure_runtime_dependencies", lambda **_kwargs: Path("python")
     )
     monkeypatch.setattr(
-        build_release, "_require_commit_bound_sources", lambda _snapshot: None
+        build_release, "_require_commit_bound_sources",
+        lambda _snapshot, *, source_commit: None
     )
 
     with pytest.raises(RuntimeError, match="private corpus content"):
@@ -403,7 +404,8 @@ def test_release_content_gate_allows_generic_public_corpus_documentation(
         build_release, "ensure_runtime_dependencies", lambda **_kwargs: Path("python")
     )
     monkeypatch.setattr(
-        build_release, "_require_commit_bound_sources", lambda _snapshot: None
+        build_release, "_require_commit_bound_sources",
+        lambda _snapshot, *, source_commit: None
     )
 
     archive = build_release.build(tmp_path / "out")
@@ -563,7 +565,8 @@ def test_release_content_gate_detects_private_utf16_text(
         build_release, "ensure_runtime_dependencies", lambda **_kwargs: Path("python")
     )
     monkeypatch.setattr(
-        build_release, "_require_commit_bound_sources", lambda _snapshot: None
+        build_release, "_require_commit_bound_sources",
+        lambda _snapshot, *, source_commit: None
     )
 
     with pytest.raises(RuntimeError, match="private corpus content"):
@@ -589,7 +592,8 @@ def test_release_content_gate_allows_generic_utf16_documentation(
         build_release, "ensure_runtime_dependencies", lambda **_kwargs: Path("python")
     )
     monkeypatch.setattr(
-        build_release, "_require_commit_bound_sources", lambda _snapshot: None
+        build_release, "_require_commit_bound_sources",
+        lambda _snapshot, *, source_commit: None
     )
 
     assert build_release.build(tmp_path / "out").is_file()
@@ -616,7 +620,8 @@ def test_release_content_gate_does_not_treat_control_heavy_binary_as_utf16_text(
         build_release, "ensure_runtime_dependencies", lambda **_kwargs: Path("python")
     )
     monkeypatch.setattr(
-        build_release, "_require_commit_bound_sources", lambda _snapshot: None
+        build_release, "_require_commit_bound_sources",
+        lambda _snapshot, *, source_commit: None
     )
 
     assert build_release.build(tmp_path / "out").is_file()
@@ -644,7 +649,8 @@ def test_release_rejects_selected_file_symlink_before_archive(
         build_release, "ensure_runtime_dependencies", lambda **_kwargs: Path("python")
     )
     monkeypatch.setattr(
-        build_release, "_require_commit_bound_sources", lambda _snapshot: None
+        build_release, "_require_commit_bound_sources",
+        lambda _snapshot, *, source_commit: None
     )
 
     with pytest.raises(RuntimeError, match="linked or reparse"):
@@ -678,7 +684,8 @@ def test_release_rejects_selected_directory_junction_before_archive(
         build_release, "ensure_runtime_dependencies", lambda **_kwargs: Path("python")
     )
     monkeypatch.setattr(
-        build_release, "_require_commit_bound_sources", lambda _snapshot: None
+        build_release, "_require_commit_bound_sources",
+        lambda _snapshot, *, source_commit: None
     )
 
     with pytest.raises(RuntimeError, match="linked or reparse"):

@@ -54,6 +54,15 @@ def _commit_fixture(repo: Path) -> None:
     )
 
 
+def _head_oid(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
 def test_release_rejects_untracked_shippable_source(monkeypatch, tmp_path):
     repo = tmp_path / "repo"
     addon = repo / "PDFVectorImporter"
@@ -133,7 +142,9 @@ def test_release_requires_a_real_head_commit(monkeypatch, tmp_path):
     snapshot, _skipped = build_release._capture_first_party_files()
 
     with pytest.raises(RuntimeError, match="HEAD commit"):
-        build_release._require_commit_bound_sources(snapshot)
+        build_release._require_commit_bound_sources(
+            snapshot, source_commit="0" * 40
+        )
 
 
 def test_release_rejects_staged_source_that_differs_from_head(
@@ -160,7 +171,9 @@ def test_release_rejects_staged_source_that_differs_from_head(
     snapshot, _skipped = build_release._capture_first_party_files()
 
     with pytest.raises(RuntimeError, match="differs from HEAD"):
-        build_release._require_commit_bound_sources(snapshot)
+        build_release._require_commit_bound_sources(
+            snapshot, source_commit=_head_oid(repo)
+        )
 
 
 def test_release_rejects_staged_only_change_when_snapshot_matches_head(
@@ -200,7 +213,9 @@ def test_release_rejects_staged_only_change_when_snapshot_matches_head(
     snapshot, _skipped = build_release._capture_first_party_files()
 
     with pytest.raises(RuntimeError, match="staged changes relative to HEAD"):
-        build_release._require_commit_bound_sources(snapshot)
+        build_release._require_commit_bound_sources(
+            snapshot, source_commit=_head_oid(repo)
+        )
 
 
 def test_release_rejects_staged_new_source_absent_from_head(
@@ -225,7 +240,9 @@ def test_release_rejects_staged_new_source_absent_from_head(
     snapshot, _skipped = build_release._capture_first_party_files()
 
     with pytest.raises(RuntimeError, match="not present in HEAD"):
-        build_release._require_commit_bound_sources(snapshot)
+        build_release._require_commit_bound_sources(
+            snapshot, source_commit=_head_oid(repo)
+        )
 
 
 def test_release_rejects_dependency_lock_that_differs_from_index(
@@ -257,7 +274,9 @@ def test_release_rejects_dependency_lock_that_differs_from_index(
 
     snapshot, _skipped = build_release._capture_first_party_files()
     with pytest.raises(RuntimeError, match="release build input differs"):
-        build_release._require_commit_bound_sources(snapshot)
+        build_release._require_commit_bound_sources(
+            snapshot, source_commit=_head_oid(repo)
+        )
 
 
 def test_build_vendors_from_verified_immutable_dependency_lock_snapshot(
@@ -314,8 +333,8 @@ def test_build_vendors_from_verified_immutable_dependency_lock_snapshot(
 
     original_verifier = build_release._require_commit_bound_sources
 
-    def verify_then_replace_worktree_locks(snapshot):
-        captured = original_verifier(snapshot)
+    def verify_then_replace_worktree_locks(snapshot, *, source_commit):
+        captured = original_verifier(snapshot, source_commit=source_commit)
         for lock_path in original_lock_bytes:
             lock_path.write_bytes(b"late unreviewed replacement hash\n")
         return captured

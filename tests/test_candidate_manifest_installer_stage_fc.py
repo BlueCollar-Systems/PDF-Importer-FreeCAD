@@ -239,6 +239,32 @@ def test_task5b_failure_codes_block_staging_pathlessly(monkeypatch, tmp_path, co
     assert not any(re.fullmatch(r"[0-9a-f]{64}", path.name) for path in (tmp_path / "stages").iterdir())
 
 
+def test_hostile_or_raising_zip_validator_cannot_leak_private_diagnostics(
+    monkeypatch, tmp_path
+):
+    source_zip, _document, _members = _valid_zip(tmp_path)
+    monkeypatch.setattr(
+        build_windows_installer,
+        "validate_release_zip_manifest",
+        lambda _snapshot: ["C:/private/account/owner.pdf"],
+    )
+    with pytest.raises(RuntimeError) as caught:
+        _stage(monkeypatch, tmp_path, source_zip)
+    assert _assert_pathless(caught.value, tmp_path) == (
+        "INSTALLER_SOURCE_ZIP_INVALID: RELEASE_ZIP_IO_ERROR"
+    )
+
+    def raise_private(_snapshot):
+        raise OSError("C:/private/account/owner.pdf")
+
+    monkeypatch.setattr(
+        build_windows_installer, "validate_release_zip_manifest", raise_private
+    )
+    with pytest.raises(RuntimeError) as caught:
+        _stage(monkeypatch, tmp_path, source_zip)
+    assert _assert_pathless(caught.value, tmp_path) == "INSTALLER_SOURCE_IO_ERROR"
+
+
 @pytest.mark.parametrize(
     ("bad_name", "expected_code"),
     [
@@ -619,6 +645,43 @@ def test_attestation_rejects_hardlinked_setup_and_preserves_existing_bytes(
     assert output.read_bytes() == b"preserve existing attestation"
 
 
+def test_attestation_detects_setup_path_replacement_before_publication(
+    monkeypatch, tmp_path
+):
+    staged = _stage(monkeypatch, tmp_path)
+    setup = tmp_path / "Setup.exe"
+    setup.write_bytes(b"original setup")
+    output = tmp_path / "attestation.json"
+    output.write_bytes(b"preserve existing attestation")
+    real_capture = build_windows_installer._capture_regular_file
+    setup_captures = 0
+
+    def replace_after_first_setup_capture(path: Path) -> bytes:
+        nonlocal setup_captures
+        payload = real_capture(path)
+        if Path(path) == setup:
+            setup_captures += 1
+            if setup_captures == 1:
+                setup.unlink()
+                setup.write_bytes(b"replacement setup")
+        return payload
+
+    monkeypatch.setattr(
+        build_windows_installer, "_capture_regular_file", replace_after_first_setup_capture
+    )
+    with pytest.raises(RuntimeError) as caught:
+        build_windows_installer.write_attestation(
+            output,
+            staged_release=staged,
+            installer_exe=setup,
+            toolchain_identity={"version": "synthetic"},
+        )
+
+    assert setup_captures >= 2
+    assert _assert_pathless(caught.value, tmp_path) == "INSTALLER_SETUP_CHANGED"
+    assert output.read_bytes() == b"preserve existing attestation"
+
+
 def test_attestation_publication_failure_preserves_existing_bytes_and_cleans_temp(
     monkeypatch, tmp_path
 ):
@@ -730,4 +793,3 @@ def test_stage_identity_normalizes_only_exact_canonical_json(monkeypatch, tmp_pa
     ).hexdigest()
     assert staged.stage_identity_sha256 == expected
     assert unicodedata.normalize("NFC", staged.stage_root.name) == staged.stage_root.name
-

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import stat
 import zipfile
 from pathlib import Path
 
@@ -19,12 +20,31 @@ TOOLCHAIN_MANIFEST = (
 
 
 def _write_release_zip(path: Path, *, package_version: str = "4.0.72") -> None:
+    members = {
+        "PDFVectorImporter/package.xml": (
+            f"<package><version>{package_version}</version></package>"
+        ).encode("utf-8"),
+        "PDFVectorImporter/payload.bin": b"canonical-release-bytes",
+    }
+    contract = build_windows_installer._CANDIDATE_MANIFEST
+    document = contract.build_candidate_file_manifest(
+        members,
+        source_commit="d" * 40,
+        package_version=package_version,
+        artifact_name=f"FreeCAD-PDF-Importer_v{package_version}.zip",
+    )
+    archive_members = {
+        contract.MANIFEST_MEMBER: contract.canonical_candidate_manifest_bytes(document),
+        **members,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr(
-            "PDFVectorImporter/package.xml",
-            f"<package><version>{package_version}</version></package>",
-        )
-        archive.writestr("PDFVectorImporter/payload.bin", b"canonical-release-bytes")
+        for name, payload in archive_members.items():
+            info = zipfile.ZipInfo(name)
+            info.create_system = 3
+            info.external_attr = (stat.S_IFREG | 0o644) << 16
+            info.compress_type = zipfile.ZIP_STORED
+            archive.writestr(info, payload)
 
 
 def test_stage_release_uses_canonical_zip_without_rebuilding(monkeypatch, tmp_path):
@@ -45,14 +65,17 @@ def test_stage_release_uses_canonical_zip_without_rebuilding(monkeypatch, tmp_pa
 
     monkeypatch.setattr(build_windows_installer.build_release, "build", fail_rebuild)
 
-    actual_version, source_dir, actual_zip = (
-        build_windows_installer.stage_release(source_zip)
-    )
+    staged_release = build_windows_installer.stage_release(source_zip)
 
-    assert actual_version == version
-    assert actual_zip == source_zip.resolve()
+    assert isinstance(staged_release, build_windows_installer.InstallerStage)
+    assert staged_release.version == version
+    assert staged_release.source_zip_name == source_zip.name
+    assert staged_release.source_zip_snapshot != source_zip
     assert source_zip.read_bytes() == source_hash_before
-    assert (source_dir / "payload.bin").read_bytes() == b"canonical-release-bytes"
+    assert staged_release.source_zip_snapshot.read_bytes() == source_hash_before
+    assert (staged_release.source_dir / "payload.bin").read_bytes() == (
+        b"canonical-release-bytes"
+    )
 
 
 def test_stage_release_rejects_payload_with_wrong_package_version(
@@ -69,7 +92,10 @@ def test_stage_release_rejects_payload_with_wrong_package_version(
     )
     monkeypatch.setattr(build_windows_installer, "read_version", lambda: version)
 
-    with pytest.raises(RuntimeError, match="Staged package version mismatch"):
+    with pytest.raises(
+        RuntimeError,
+        match=r"^INSTALLER_SOURCE_ZIP_INVALID: RELEASE_ZIP_ARTIFACT_NAME_MISMATCH$",
+    ):
         build_windows_installer.stage_release(source_zip)
 
 
@@ -158,10 +184,11 @@ def test_toolchain_verification_is_exact_and_fails_closed(tmp_path):
         build_windows_installer.verify_inno_toolchain(root / "ISCC.exe", manifest_path)
 
 
-def test_attestation_is_canonical_and_binds_zip_setup_toolchain(tmp_path):
-    release_zip = tmp_path / "payload.zip"
+def test_attestation_is_canonical_and_binds_zip_setup_toolchain(monkeypatch, tmp_path):
+    version = "4.0.72"
+    release_zip = tmp_path / f"FreeCAD-PDF-Importer_v{version}.zip"
     setup = tmp_path / "setup.exe"
-    release_zip.write_bytes(b"zip")
+    _write_release_zip(release_zip, package_version=version)
     setup.write_bytes(b"setup")
     identity = {
         "name": "Inno Setup",
@@ -172,27 +199,39 @@ def test_attestation_is_canonical_and_binds_zip_setup_toolchain(tmp_path):
     }
     first = tmp_path / "first.json"
     second = tmp_path / "second.json"
+    monkeypatch.setattr(build_windows_installer, "read_version", lambda: version)
+    staged_release = build_windows_installer.stage_release(
+        release_zip,
+        stage_dir=tmp_path / "stage",
+    )
 
     build_windows_installer.write_attestation(
         first,
-        release_zip=release_zip,
+        staged_release=staged_release,
         installer_exe=setup,
         toolchain_identity=identity,
-        source_commit="d" * 40,
     )
     build_windows_installer.write_attestation(
         second,
-        release_zip=release_zip,
+        staged_release=staged_release,
         installer_exe=setup,
         toolchain_identity=identity,
-        source_commit="d" * 40,
     )
 
     assert first.read_bytes() == second.read_bytes()
     payload = json.loads(first.read_text(encoding="utf-8"))
-    assert payload["schema"] == "bcs.freecad_installer_attestation/1.0"
-    assert payload["source_zip"]["sha256"] == hashlib.sha256(b"zip").hexdigest()
+    assert payload["schema"] == "bcs.freecad_installer_attestation/1.1"
+    assert payload["source_commit"] == "d" * 40
+    assert payload["source_zip"]["sha256"] == hashlib.sha256(
+        release_zip.read_bytes()
+    ).hexdigest()
     assert payload["installer"]["sha256"] == hashlib.sha256(b"setup").hexdigest()
+    assert payload["payload_manifest"] == {
+        "schema": "bcs.freecad_candidate_file_manifest/1.0",
+        "member": "PDFVectorImporter/candidate-file-manifest.json",
+        "sha256": staged_release.installed_manifest_sha256,
+    }
+    assert payload["stage_identity_sha256"] == staged_release.stage_identity_sha256
     assert payload["toolchain"] == identity
 
 

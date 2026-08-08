@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import builtins
 import hashlib
 import importlib.util
+import io
 import stat
 import subprocess
 import sys
@@ -649,6 +651,438 @@ def test_smoke_never_raises_and_reports_corrupt_io_or_artifact_name(tmp_path):
     assert smoke_release_zip.validate_release_zip_manifest(mismatch) == [
         "RELEASE_ZIP_ARTIFACT_NAME_MISMATCH"
     ]
+
+
+class _BytesSubclass(bytes):
+    pass
+
+
+class _StringSubclass(str):
+    pass
+
+
+class _HostileProtocolValue:
+    def __init__(self) -> None:
+        self.touched = False
+
+    def _reject(self):
+        self.touched = True
+        raise RuntimeError("SENSITIVE_PROTOCOL_SENTINEL")
+
+    def __bytes__(self):
+        return self._reject()
+
+    def __fspath__(self):
+        return self._reject()
+
+    def __iter__(self):
+        return self._reject()
+
+    def __repr__(self):
+        return self._reject()
+
+    def __str__(self):
+        return self._reject()
+
+    def read(self, *_args, **_kwargs):
+        return self._reject()
+
+
+def _validate_zip_bytes(payload: bytes, *, artifact_name: str = ZIP_NAME) -> list[str]:
+    return smoke_release_zip.validate_release_zip_manifest_bytes(
+        payload, artifact_name=artifact_name
+    )
+
+
+def test_smoke_exposes_immutable_release_zip_byte_validator(tmp_path):
+    validator = getattr(smoke_release_zip, "validate_release_zip_manifest_bytes", None)
+    assert callable(validator), "missing immutable release ZIP byte validator"
+    path = _write_manifest_zip(tmp_path / "immutable-api.zip")
+
+    assert validator(path.read_bytes(), artifact_name=path.name) == []
+    assert validator(path.read_bytes(), artifact_name="different.zip") == [
+        "RELEASE_ZIP_ARTIFACT_NAME_MISMATCH"
+    ]
+
+
+def _write_smoke_mutation(tmp_path: Path, kind: str) -> tuple[Path, list[str]]:
+    if kind == "valid":
+        return _write_manifest_zip(tmp_path / "valid.zip"), []
+    if kind == "missing-manifest":
+        path = tmp_path / ZIP_NAME
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
+            archive.writestr(_regular_info("PDFVectorImporter/payload.bin"), b"alpha")
+        return path, ["RELEASE_ZIP_MANIFEST_MISSING"]
+    if kind in {"duplicate-manifest", "duplicate-member"}:
+        path = _write_manifest_zip(tmp_path / f"{kind}.zip")
+        member = MANIFEST_MEMBER if kind == "duplicate-manifest" else "PDFVectorImporter/payload.bin"
+        content = b"duplicate" if kind == "duplicate-manifest" else b"alpha"
+        with pytest.warns(UserWarning):
+            with zipfile.ZipFile(path, "a", compression=zipfile.ZIP_STORED) as archive:
+                archive.writestr(_regular_info(member), content)
+        expected = ["RELEASE_ZIP_DUPLICATE_MEMBER"]
+        if kind == "duplicate-manifest":
+            expected.append("RELEASE_ZIP_MANIFEST_DUPLICATE")
+        return path, expected
+    if kind in {"case-alias", "nfc-alias"}:
+        if kind == "case-alias":
+            extras = ((_regular_info("PDFVectorImporter/PAYLOAD.bin"), b"alias"),)
+        else:
+            extras = (
+                (_regular_info("PDFVectorImporter/caf\N{LATIN SMALL LETTER E WITH ACUTE}.bin"), b"one"),
+                (_regular_info("PDFVectorImporter/cafe\N{COMBINING ACUTE ACCENT}.bin"), b"two"),
+            )
+        return _write_manifest_zip(tmp_path / f"{kind}.zip", extras=extras), [
+            "RELEASE_ZIP_MEMBER_ALIAS"
+        ]
+    if kind == "noncanonical-manifest":
+        source = _write_manifest_zip(tmp_path / "canonical-source.zip")
+        canonical = _read_zip_members(source)[MANIFEST_MEMBER]
+        return _write_manifest_zip(
+            tmp_path / f"{kind}.zip", manifest_payload=canonical + b"\n"
+        ), ["MANIFEST_NONCANONICAL_BYTES"]
+    if kind == "mismatched-manifest":
+        document = candidate_manifest.build_candidate_file_manifest(
+            {"PDFVectorImporter/payload.bin": b"bravo"},
+            source_commit=SOURCE_COMMIT_A,
+            package_version=PACKAGE_VERSION,
+            artifact_name=ZIP_NAME,
+        )
+        return _write_manifest_zip(
+            tmp_path / f"{kind}.zip",
+            manifest_payload=candidate_manifest.canonical_candidate_manifest_bytes(document),
+        ), ["MANIFEST_MEMBER_DIGEST_MISMATCH"]
+    if kind == "missing-member":
+        return _write_manifest_zip(
+            tmp_path / f"{kind}.zip", include_payload=False
+        ), ["MANIFEST_MEMBER_SET_MISMATCH"]
+    if kind == "extra-member":
+        return _write_manifest_zip(
+            tmp_path / f"{kind}.zip",
+            extras=((_regular_info("PDFVectorImporter/extra.bin"), b"extra"),),
+        ), ["MANIFEST_MEMBER_SET_MISMATCH"]
+    if kind == "renamed-member":
+        return _write_manifest_zip(
+            tmp_path / f"{kind}.zip",
+            include_payload=False,
+            extras=((_regular_info("PDFVectorImporter/renamed.bin"), b"alpha"),),
+        ), ["MANIFEST_MEMBER_SET_MISMATCH"]
+    if kind == "changed-member":
+        source = _write_manifest_zip(tmp_path / "changed-source.zip")
+        canonical = _read_zip_members(source)[MANIFEST_MEMBER]
+        return _write_manifest_zip(
+            tmp_path / f"{kind}.zip", payload=b"omega", manifest_payload=canonical
+        ), ["MANIFEST_MEMBER_DIGEST_MISMATCH"]
+    if kind == "posix-directory":
+        return _write_manifest_zip(
+            tmp_path / f"{kind}.zip",
+            extras=((_regular_info("PDFVectorImporter/directory/", mode=stat.S_IFDIR | 0o755), b""),),
+        ), ["RELEASE_ZIP_NONREGULAR_MEMBER"]
+    if kind == "posix-nonregular":
+        return _write_manifest_zip(
+            tmp_path / f"{kind}.zip",
+            extras=((_regular_info("PDFVectorImporter/link", mode=stat.S_IFLNK | 0o644), b"x"),),
+        ), ["RELEASE_ZIP_NONREGULAR_MEMBER"]
+    if kind == "dos-directory":
+        path, _members, _document = _write_dos_directory_manifest_zip(tmp_path / kind)
+        return path, ["RELEASE_ZIP_NONREGULAR_MEMBER"]
+    if kind == "encrypted":
+        path = _write_manifest_zip(tmp_path / f"{kind}.zip")
+        _mark_first_entry_encrypted(path)
+        return path, ["RELEASE_ZIP_ENCRYPTED_MEMBER"]
+    if kind == "unsafe":
+        return _write_manifest_zip(
+            tmp_path / f"{kind}.zip",
+            extras=((_regular_info("../unsafe.txt"), b"unsafe"),),
+        ), ["RELEASE_ZIP_UNSAFE_MEMBER"]
+    if kind == "compressed":
+        return _write_manifest_zip(
+            tmp_path / f"{kind}.zip",
+            extras=((_regular_info("PDFVectorImporter/compressed.bin", compression=zipfile.ZIP_DEFLATED), b"x"),),
+        ), ["RELEASE_ZIP_UNSUPPORTED_COMPRESSION"]
+    if kind == "artifact-mismatch":
+        path = _write_manifest_zip(tmp_path / "artifact-source.zip")
+        renamed = path.with_name("different.zip")
+        path.replace(renamed)
+        return renamed, ["RELEASE_ZIP_ARTIFACT_NAME_MISMATCH"]
+    raise AssertionError(f"unknown synthetic mutation: {kind}")
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "valid",
+        "missing-manifest",
+        "duplicate-manifest",
+        "duplicate-member",
+        "case-alias",
+        "nfc-alias",
+        "noncanonical-manifest",
+        "mismatched-manifest",
+        "missing-member",
+        "extra-member",
+        "renamed-member",
+        "changed-member",
+        "posix-directory",
+        "posix-nonregular",
+        "dos-directory",
+        "encrypted",
+        "unsafe",
+        "compressed",
+        "artifact-mismatch",
+    ],
+)
+def test_byte_and_path_apis_have_exact_structural_mutation_parity(tmp_path, kind):
+    path, expected = _write_smoke_mutation(tmp_path / kind, kind)
+    captured = path.read_bytes()
+
+    assert smoke_release_zip.validate_release_zip_manifest(path) == expected
+    assert _validate_zip_bytes(captured, artifact_name=path.name) == expected
+
+
+def _corrupt_zip_bytes(valid: bytes, kind: str) -> bytes:
+    if kind == "empty":
+        return b""
+    if kind == "random":
+        return b"synthetic non-zip bytes"
+    payload = bytearray(valid)
+    if kind == "truncated-central-directory":
+        return bytes(payload[:-12])
+    if kind == "malformed-local-record":
+        offset = payload.index(b"PK\x03\x04")
+        payload[offset : offset + 4] = b"BAD!"
+        return bytes(payload)
+    if kind == "malformed-central-record":
+        offset = payload.index(b"PK\x01\x02")
+        payload[offset : offset + 4] = b"BAD!"
+        return bytes(payload)
+    if kind == "crc-mismatch":
+        offset = payload.index(b"alpha")
+        payload[offset] ^= 0x01
+        return bytes(payload)
+    raise AssertionError(f"unknown corrupt mutation: {kind}")
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "empty",
+        "random",
+        "truncated-central-directory",
+        "malformed-local-record",
+        "malformed-central-record",
+        "crc-mismatch",
+    ],
+)
+def test_byte_api_maps_each_malformed_zip_exactly_to_corrupt(tmp_path, kind):
+    path = _write_manifest_zip(tmp_path / "corrupt-source.zip")
+    payload = _corrupt_zip_bytes(path.read_bytes(), kind)
+
+    assert _validate_zip_bytes(payload) == ["RELEASE_ZIP_CORRUPT"]
+
+
+@pytest.mark.parametrize("stage", ["open", "info", "read"])
+@pytest.mark.parametrize("error_type", [OSError, ValueError, RuntimeError, EOFError])
+def test_byte_api_maps_in_memory_boundary_failures_exactly_to_io_error(
+    monkeypatch, tmp_path, stage, error_type
+):
+    path = _write_manifest_zip(tmp_path / "io-source.zip")
+    payload = path.read_bytes()
+    real_zipfile = zipfile.ZipFile
+
+    class FaultingArchive:
+        def __init__(self, source, mode="r", *args, **kwargs):
+            if stage == "open":
+                raise error_type("SENSITIVE_PROTOCOL_SENTINEL")
+            self._inner = real_zipfile(source, mode, *args, **kwargs)
+
+        def __enter__(self):
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._inner.__exit__(*args)
+
+        def infolist(self):
+            if stage == "info":
+                raise error_type("SENSITIVE_PROTOCOL_SENTINEL")
+            return self._inner.infolist()
+
+        def read(self, *_args, **_kwargs):
+            if stage == "read":
+                raise error_type("SENSITIVE_PROTOCOL_SENTINEL")
+            return self._inner.read(*_args, **_kwargs)
+
+    monkeypatch.setattr(smoke_release_zip.zipfile, "ZipFile", FaultingArchive)
+
+    assert _validate_zip_bytes(payload) == ["RELEASE_ZIP_IO_ERROR"]
+
+
+@pytest.mark.parametrize(
+    "payload_factory",
+    [
+        pytest.param(lambda value: bytearray(value), id="bytearray"),
+        pytest.param(lambda value: memoryview(value), id="memoryview"),
+        pytest.param(lambda value: _BytesSubclass(value), id="bytes-subclass"),
+    ],
+)
+def test_byte_api_rejects_non_builtin_bytes_without_conversion(tmp_path, payload_factory):
+    path = _write_manifest_zip(tmp_path / "byte-type-source.zip")
+
+    assert _validate_zip_bytes(payload_factory(path.read_bytes())) == [
+        "RELEASE_ZIP_IO_ERROR"
+    ]
+
+
+def test_byte_api_rejects_hostile_non_bytes_without_touching_protocols():
+    hostile = _HostileProtocolValue()
+
+    assert _validate_zip_bytes(hostile) == ["RELEASE_ZIP_IO_ERROR"]
+    assert hostile.touched is False
+
+
+_INVALID_ARTIFACT_NAMES = [
+    pytest.param("", id="empty"),
+    pytest.param(".", id="dot"),
+    pytest.param("..", id="dot-dot"),
+    pytest.param("folder/name.zip", id="slash"),
+    pytest.param("folder\\name.zip", id="backslash"),
+    pytest.param("C:name.zip", id="colon-drive-ads"),
+    pytest.param("bad<name.zip", id="less-than"),
+    pytest.param("bad>name.zip", id="greater-than"),
+    pytest.param('bad"name.zip', id="quote"),
+    pytest.param("bad|name.zip", id="pipe"),
+    pytest.param("bad?name.zip", id="question"),
+    pytest.param("bad*name.zip", id="asterisk"),
+    pytest.param("bad\x00name.zip", id="c0-nul"),
+    pytest.param("bad\x1fname.zip", id="c0-unit-separator"),
+    pytest.param("bad\x7fname.zip", id="del"),
+    pytest.param("cafe\N{COMBINING ACUTE ACCENT}.zip", id="decomposed-unicode"),
+    pytest.param("bad-name.", id="trailing-dot"),
+    pytest.param("bad-name ", id="trailing-space"),
+    pytest.param("\ud800.zip", id="non-utf8-surrogate"),
+    pytest.param("CON.zip", id="con-extension"),
+    pytest.param("prn.txt", id="prn-extension"),
+    pytest.param("AUX", id="aux"),
+    pytest.param("nul.any", id="nul-extension"),
+    pytest.param("CONIN$.zip", id="conin-extension"),
+    pytest.param("conout$.txt", id="conout-extension"),
+    *[
+        pytest.param(f"COM{index}.zip", id=f"com{index}-extension")
+        for index in range(1, 10)
+    ],
+    *[
+        pytest.param(f"LPT{index}.zip", id=f"lpt{index}-extension")
+        for index in range(1, 10)
+    ],
+    pytest.param("COM\N{SUPERSCRIPT ONE}.zip", id="com-superscript-one"),
+    pytest.param("com\N{SUPERSCRIPT TWO}.txt", id="com-superscript-two"),
+    pytest.param("COM\N{SUPERSCRIPT THREE}.zip", id="com-superscript-three"),
+    pytest.param("LPT\N{SUPERSCRIPT ONE}.zip", id="lpt-superscript-one"),
+    pytest.param("lpt\N{SUPERSCRIPT TWO}.txt", id="lpt-superscript-two"),
+    pytest.param("LPT\N{SUPERSCRIPT THREE}.zip", id="lpt-superscript-three"),
+]
+
+
+@pytest.mark.parametrize("artifact_name", _INVALID_ARTIFACT_NAMES)
+def test_invalid_artifact_name_has_precedence_without_touching_zip(artifact_name):
+    hostile_zip = _HostileProtocolValue()
+
+    assert _validate_zip_bytes(hostile_zip, artifact_name=artifact_name) == [
+        "RELEASE_ZIP_ARTIFACT_NAME_MISMATCH"
+    ]
+    assert hostile_zip.touched is False
+
+
+def test_artifact_name_rejects_subclass_and_hostile_object_without_protocols():
+    subclass = _StringSubclass(ZIP_NAME)
+    hostile = _HostileProtocolValue()
+
+    assert _validate_zip_bytes(b"not a zip", artifact_name=subclass) == [
+        "RELEASE_ZIP_ARTIFACT_NAME_MISMATCH"
+    ]
+    assert _validate_zip_bytes(b"not a zip", artifact_name=hostile) == [
+        "RELEASE_ZIP_ARTIFACT_NAME_MISMATCH"
+    ]
+    assert hostile.touched is False
+
+
+def test_path_api_captures_once_and_delegates_exact_bytes_and_basename(
+    monkeypatch, tmp_path
+):
+    first = _write_manifest_zip(tmp_path / "first-candidate.zip")
+    second = _write_manifest_zip(tmp_path / "second-candidate.zip", payload=b"omega")
+    first_bytes = first.read_bytes()
+    second_bytes = second.read_bytes()
+    original_read_bytes = Path.read_bytes
+    original_write_bytes = Path.write_bytes
+    reads = 0
+    delegated: list[tuple[bytes, str]] = []
+
+    def capture_then_replace(path: Path) -> bytes:
+        nonlocal reads
+        if path == first:
+            reads += 1
+            captured = original_read_bytes(path)
+            original_write_bytes(path, second_bytes)
+            return captured
+        return original_read_bytes(path)
+
+    def fake_byte_validator(payload: bytes, *, artifact_name: str) -> list[str]:
+        delegated.append((payload, artifact_name))
+        original_write_bytes(first, first_bytes)
+        return ["DELEGATED_SENTINEL"]
+
+    monkeypatch.setattr(Path, "read_bytes", capture_then_replace)
+    monkeypatch.setattr(
+        smoke_release_zip,
+        "validate_release_zip_manifest_bytes",
+        fake_byte_validator,
+        raising=False,
+    )
+
+    assert smoke_release_zip.validate_release_zip_manifest(first) == [
+        "DELEGATED_SENTINEL"
+    ]
+    assert reads == 1
+    assert len(delegated) == 1
+    assert type(delegated[0][0]) is bytes
+    assert delegated == [(first_bytes, first.name)]
+    assert original_read_bytes(first) == first_bytes
+
+
+def test_byte_api_uses_only_bytesio_and_no_filesystem_or_temp_seam(
+    monkeypatch, tmp_path
+):
+    path = _write_manifest_zip(tmp_path / "memory-only.zip")
+    payload = path.read_bytes()
+    real_zipfile = zipfile.ZipFile
+    opened: list[bytes] = []
+
+    def instrumented_zipfile(source, mode="r", *args, **kwargs):
+        assert type(source) is io.BytesIO
+        assert mode == "r"
+        value = source.getvalue()
+        assert type(value) is bytes
+        opened.append(value)
+        return real_zipfile(source, mode, *args, **kwargs)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("byte validator touched a filesystem or temp seam")
+
+    monkeypatch.setattr(smoke_release_zip.zipfile, "ZipFile", instrumented_zipfile)
+    monkeypatch.setattr(builtins, "open", forbidden)
+    monkeypatch.setattr(Path, "open", forbidden)
+    monkeypatch.setattr(Path, "read_bytes", forbidden)
+    monkeypatch.setattr(Path, "write_bytes", forbidden)
+    monkeypatch.setattr(smoke_release_zip.tempfile, "NamedTemporaryFile", forbidden)
+    monkeypatch.setattr(smoke_release_zip.tempfile, "TemporaryFile", forbidden)
+    monkeypatch.setattr(smoke_release_zip.tempfile, "TemporaryDirectory", forbidden)
+    monkeypatch.setattr(smoke_release_zip.tempfile, "mkstemp", forbidden)
+
+    assert _validate_zip_bytes(payload) == []
+    assert opened == [payload]
 
 
 def test_main_rejects_old_required_member_zip_before_extraction_or_import(

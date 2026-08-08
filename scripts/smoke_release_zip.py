@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import glob
 import importlib.util
+import io
 import json
 import stat
 import subprocess
@@ -53,6 +54,21 @@ def _load_candidate_manifest_contract():
 _CANDIDATE_MANIFEST = _load_candidate_manifest_contract()
 MANIFEST_MEMBER = _CANDIDATE_MANIFEST.MANIFEST_MEMBER
 
+_WINDOWS_RESERVED_ARTIFACT_STEMS = frozenset(
+    {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        "conin$",
+        "conout$",
+        *(f"com{number}" for number in range(1, 10)),
+        *(f"lpt{number}" for number in range(1, 10)),
+        *(f"com{number}" for number in "¹²³"),
+        *(f"lpt{number}" for number in "¹²³"),
+    }
+)
+
 
 def _unsafe_zip_member_name(name: str) -> bool:
     if (
@@ -84,14 +100,41 @@ def _contract_rejects_member_name(name: str) -> bool:
     return False
 
 
-def validate_release_zip_manifest(zip_path: Path) -> list[str]:
-    """Return sorted unique pathless codes; never raise."""
+def _valid_portable_artifact_name(value: object) -> bool:
+    if type(value) is not str or not value:
+        return False
+    try:
+        value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        return False
+    if (
+        value in {".", ".."}
+        or unicodedata.normalize("NFC", value) != value
+        or value.endswith((".", " "))
+        or any(character in '/\\:<>"|?*' for character in value)
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return False
+    stem = value.split(".", 1)[0].casefold()
+    return stem not in _WINDOWS_RESERVED_ARTIFACT_STEMS
+
+
+def validate_release_zip_manifest_bytes(
+    zip_bytes: bytes,
+    *,
+    artifact_name: str,
+) -> list[str]:
+    """Validate one immutable ZIP byte stream; return sorted pathless codes."""
+    if not _valid_portable_artifact_name(artifact_name):
+        return ["RELEASE_ZIP_ARTIFACT_NAME_MISMATCH"]
+    if type(zip_bytes) is not bytes:
+        return ["RELEASE_ZIP_IO_ERROR"]
     try:
         structural: set[str] = set()
         members: dict[str, bytes] = {}
         identities: set[str] = set()
         manifest_count = 0
-        with zipfile.ZipFile(zip_path, "r") as archive:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as archive:
             infos = archive.infolist()
             seen_names: set[str] = set()
             for info in infos:
@@ -151,7 +194,7 @@ def validate_release_zip_manifest(zip_path: Path) -> list[str]:
             return sorted(set(problems))
         assert document is not None
         result: set[str] = set()
-        if document.get("artifact_name") != zip_path.name:
+        if document.get("artifact_name") != artifact_name:
             result.add("RELEASE_ZIP_ARTIFACT_NAME_MISMATCH")
         result.update(
             _CANDIDATE_MANIFEST.validate_candidate_archive_members(document, members)
@@ -161,6 +204,24 @@ def validate_release_zip_manifest(zip_path: Path) -> list[str]:
         return ["RELEASE_ZIP_CORRUPT"]
     except (OSError, ValueError, RuntimeError, EOFError):
         return ["RELEASE_ZIP_IO_ERROR"]
+    except Exception:
+        return ["RELEASE_ZIP_IO_ERROR"]
+
+
+def validate_release_zip_manifest(zip_path: Path) -> list[str]:
+    """Capture one path snapshot and validate it without reopening the path."""
+    try:
+        artifact_name = zip_path.name
+        captured = zip_path.read_bytes()
+        if type(captured) is not bytes:
+            return ["RELEASE_ZIP_IO_ERROR"]
+    except Exception:
+        return ["RELEASE_ZIP_IO_ERROR"]
+    try:
+        return validate_release_zip_manifest_bytes(
+            captured,
+            artifact_name=artifact_name,
+        )
     except Exception:
         return ["RELEASE_ZIP_IO_ERROR"]
 

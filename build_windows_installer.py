@@ -5,16 +5,22 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import unicodedata
+import uuid
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import build_release
+from scripts.smoke_release_zip import validate_release_zip_manifest
 
 
 REPO_ROOT = Path(__file__).parent.resolve()
@@ -23,6 +29,83 @@ DIST_DIR = REPO_ROOT / "dist"
 STAGE_DIR = DIST_DIR / "installer_stage"
 INNO_SCRIPT = REPO_ROOT / "installer" / "PDFVectorImporter.iss"
 INNO_TOOLCHAIN_MANIFEST = REPO_ROOT / "installer" / "inno-toolchain-6.7.1.json"
+_STAGE_METADATA_DIRNAME = ".installer-source"
+_STAGE_TEMP_PREFIX = ".installer-stage-"
+_STAGE_QUARANTINE_PREFIX = ".installer-quarantine-"
+_ATTESTATION_TEMP_PREFIX = ".installer-attestation-"
+_FILE_ATTRIBUTE_REPARSE_POINT = getattr(
+    stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
+)
+_COMMIT = re.compile(r"\A[0-9a-f]{40}\Z")
+_DIGEST = re.compile(r"\A[0-9a-f]{64}\Z")
+
+
+def _load_candidate_manifest_contract():
+    """Load the pinned checkout contract without importing the addon package."""
+
+    contract_path = REPO_ROOT / "PDFVectorImporter" / "candidate_manifest.py"
+    spec = importlib.util.spec_from_file_location(
+        "_freecad_installer_candidate_manifest", contract_path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("candidate manifest contract unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_CANDIDATE_MANIFEST = _load_candidate_manifest_contract()
+MANIFEST_MEMBER = _CANDIDATE_MANIFEST.MANIFEST_MEMBER
+_MANIFEST_ERROR_CODES = frozenset(_CANDIDATE_MANIFEST._ERROR_CODES)
+_RELEASE_ZIP_ERROR_CODES = frozenset(
+    {
+        "RELEASE_ZIP_DUPLICATE_MEMBER",
+        "RELEASE_ZIP_MEMBER_ALIAS",
+        "RELEASE_ZIP_NONREGULAR_MEMBER",
+        "RELEASE_ZIP_ENCRYPTED_MEMBER",
+        "RELEASE_ZIP_UNSUPPORTED_COMPRESSION",
+        "RELEASE_ZIP_UNSAFE_MEMBER",
+        "RELEASE_ZIP_MANIFEST_MISSING",
+        "RELEASE_ZIP_MANIFEST_DUPLICATE",
+        "RELEASE_ZIP_ARTIFACT_NAME_MISMATCH",
+        "RELEASE_ZIP_CORRUPT",
+        "RELEASE_ZIP_IO_ERROR",
+        *_MANIFEST_ERROR_CODES,
+    }
+)
+
+
+@dataclass(frozen=True)
+class InstallerStage:
+    version: str
+    stage_root: Path
+    source_dir: Path
+    source_zip_snapshot: Path
+    source_zip_name: str
+    source_zip_size: int
+    source_zip_sha256: str
+    candidate_manifest_bytes: bytes
+    installed_manifest_sha256: str
+    stage_identity_sha256: str
+
+
+class _UnsafePath(Exception):
+    pass
+
+
+class _ChangedPath(Exception):
+    pass
+
+
+def _closed_release_zip_codes(values: object) -> list[str]:
+    try:
+        items = list(values)
+        codes = {value for value in items if value in _RELEASE_ZIP_ERROR_CODES}
+        if any(value not in _RELEASE_ZIP_ERROR_CODES for value in items):
+            codes.add("RELEASE_ZIP_IO_ERROR")
+        return sorted(codes)
+    except Exception:
+        return ["RELEASE_ZIP_IO_ERROR"]
 
 
 def _sha256_file(path: Path) -> str:
@@ -35,6 +118,322 @@ def _sha256_file(path: Path) -> str:
 
 def _canonical_json_bytes(payload: object) -> bytes:
     return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _absolute_lexical(path: str | Path) -> Path:
+    """Return an absolute path without resolving links or reparses."""
+
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _name_identity(name: str) -> str:
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def _is_link_or_reparse(path: Path, metadata=None) -> bool:
+    if metadata is None:
+        metadata = os.lstat(path)
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        getattr(metadata, "st_file_attributes", 0)
+        & _FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
+def _stat_identity(metadata) -> tuple[int, int, int]:
+    return (
+        int(getattr(metadata, "st_dev", 0)),
+        int(getattr(metadata, "st_ino", 0)),
+        stat.S_IFMT(metadata.st_mode),
+    )
+
+
+def _stable_identity(metadata) -> tuple[int, int, int, int, int]:
+    return (
+        *_stat_identity(metadata),
+        int(metadata.st_size),
+        int(getattr(metadata, "st_mtime_ns", 0)),
+    )
+
+
+def _assert_exact_child(parent: Path, name: str, *, allow_absent: bool) -> bool:
+    """Reject Windows-case/NFC aliases and report whether the exact child exists."""
+
+    identity = _name_identity(name)
+    exact = False
+    matches = 0
+    with os.scandir(parent) as entries:
+        for entry in entries:
+            if _name_identity(entry.name) != identity:
+                continue
+            matches += 1
+            if entry.name == name:
+                exact = True
+    if matches > 1 or (matches == 1 and not exact):
+        raise _UnsafePath
+    if not exact and not allow_absent:
+        raise _ChangedPath
+    return exact
+
+
+def _directory_chain(path: Path) -> tuple[tuple[Path, tuple[int, int, int]], ...]:
+    absolute = _absolute_lexical(path)
+    anchor = Path(absolute.anchor)
+    if not anchor.anchor:
+        raise _UnsafePath
+    chain: list[tuple[Path, tuple[int, int, int]]] = []
+    current = anchor
+    root_metadata = os.lstat(current)
+    if _is_link_or_reparse(current, root_metadata) or not stat.S_ISDIR(
+        root_metadata.st_mode
+    ):
+        raise _UnsafePath
+    chain.append((current, _stat_identity(root_metadata)))
+    for component in absolute.parts[1:]:
+        if not _assert_exact_child(current, component, allow_absent=False):
+            raise _ChangedPath
+        current = current / component
+        metadata = os.lstat(current)
+        if _is_link_or_reparse(current, metadata) or not stat.S_ISDIR(
+            metadata.st_mode
+        ):
+            raise _UnsafePath
+        chain.append((current, _stat_identity(metadata)))
+    return tuple(chain)
+
+
+def _prepare_safe_directory(
+    path: str | Path,
+) -> tuple[Path, tuple[tuple[Path, tuple[int, int, int]], ...]]:
+    """Create missing components one at a time without following aliases/links."""
+
+    absolute = _absolute_lexical(path)
+    anchor = Path(absolute.anchor)
+    if not anchor.anchor:
+        raise _UnsafePath
+    current = anchor
+    root_metadata = os.lstat(current)
+    if _is_link_or_reparse(current, root_metadata) or not stat.S_ISDIR(
+        root_metadata.st_mode
+    ):
+        raise _UnsafePath
+    for component in absolute.parts[1:]:
+        exists = _assert_exact_child(current, component, allow_absent=True)
+        candidate = current / component
+        if not exists:
+            os.mkdir(candidate)
+            if not _assert_exact_child(current, component, allow_absent=False):
+                raise _ChangedPath
+        metadata = os.lstat(candidate)
+        if _is_link_or_reparse(candidate, metadata) or not stat.S_ISDIR(
+            metadata.st_mode
+        ):
+            raise _UnsafePath
+        current = candidate
+    return absolute, _directory_chain(absolute)
+
+
+def _revalidate_chain(
+    expected: tuple[tuple[Path, tuple[int, int, int]], ...]
+) -> None:
+    if not expected:
+        raise _ChangedPath
+    actual = _directory_chain(expected[-1][0])
+    if actual != expected:
+        raise _ChangedPath
+
+
+def _capture_regular_file(path: Path) -> bytes:
+    """Read one regular, single-link file through a stable handle."""
+
+    before = os.lstat(path)
+    if (
+        _is_link_or_reparse(path, before)
+        or not stat.S_ISREG(before.st_mode)
+        or int(getattr(before, "st_nlink", 1)) != 1
+    ):
+        raise _UnsafePath
+    with path.open("rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if _stat_identity(opened) != _stat_identity(before):
+            raise _ChangedPath
+        chunks: list[bytes] = []
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            chunks.append(chunk)
+        after_handle = os.fstat(stream.fileno())
+    after_path = os.lstat(path)
+    if (
+        _stable_identity(before) != _stable_identity(after_handle)
+        or _stable_identity(before) != _stable_identity(after_path)
+        or _is_link_or_reparse(path, after_path)
+    ):
+        raise _ChangedPath
+    return b"".join(chunks)
+
+
+def _copy_source_zip_snapshot(source: Path, destination: Path) -> tuple[int, str]:
+    """Stream one stable caller file into an exclusively owned snapshot."""
+
+    before = os.lstat(source)
+    if (
+        _is_link_or_reparse(source, before)
+        or not stat.S_ISREG(before.st_mode)
+        or int(getattr(before, "st_nlink", 1)) != 1
+    ):
+        raise _UnsafePath
+    digest = hashlib.sha256()
+    size = 0
+    with source.open("rb") as reader:
+        opened = os.fstat(reader.fileno())
+        if _stat_identity(opened) != _stat_identity(before):
+            raise _ChangedPath
+        with destination.open("xb") as writer:
+            for chunk in iter(lambda: reader.read(1024 * 1024), b""):
+                writer.write(chunk)
+                digest.update(chunk)
+                size += len(chunk)
+            writer.flush()
+            os.fsync(writer.fileno())
+        after_handle = os.fstat(reader.fileno())
+    after_path = os.lstat(source)
+    if (
+        _stable_identity(before) != _stable_identity(after_handle)
+        or _stable_identity(before) != _stable_identity(after_path)
+        or _is_link_or_reparse(source, after_path)
+    ):
+        raise _ChangedPath
+    snapshot = _capture_regular_file(destination)
+    if len(snapshot) != size or hashlib.sha256(snapshot).hexdigest() != digest.hexdigest():
+        raise _ChangedPath
+    return size, digest.hexdigest()
+
+
+def _hardlink_scan(root: Path) -> set[str]:
+    problems: set[str] = set()
+
+    def visit(directory: Path) -> None:
+        try:
+            with os.scandir(directory) as entries:
+                snapshot = list(entries)
+        except Exception:
+            problems.add("MANIFEST_IO_ERROR")
+            return
+        for entry in snapshot:
+            path = Path(entry.path)
+            try:
+                metadata = os.lstat(path)
+                if _is_link_or_reparse(path, metadata):
+                    problems.add("MANIFEST_TREE_UNSAFE")
+                    continue
+                if stat.S_ISDIR(metadata.st_mode):
+                    visit(path)
+                elif stat.S_ISREG(metadata.st_mode):
+                    if int(getattr(metadata, "st_nlink", 1)) != 1:
+                        problems.add("MANIFEST_TREE_UNSAFE")
+                else:
+                    problems.add("MANIFEST_TREE_UNSAFE")
+            except Exception:
+                problems.add("MANIFEST_IO_ERROR")
+
+    try:
+        root_metadata = os.lstat(root)
+        if _is_link_or_reparse(root, root_metadata) or not stat.S_ISDIR(
+            root_metadata.st_mode
+        ):
+            return {"MANIFEST_TREE_UNSAFE"}
+        visit(root)
+    except Exception:
+        return {"MANIFEST_IO_ERROR"}
+    return problems
+
+
+def validate_installer_payload_tree(
+    document: object,
+    addon_root: Path,
+) -> list[str]:
+    """Return sorted unique Task 5A codes; never raise or expose a path."""
+
+    try:
+        root = Path(addon_root)
+        problems = _hardlink_scan(root)
+        problems.update(
+            _CANDIDATE_MANIFEST.validate_installed_candidate_tree(document, root)
+        )
+        problems.update(_hardlink_scan(root))
+        return sorted(problems)
+    except Exception:
+        return ["MANIFEST_IO_ERROR"]
+
+
+def _remove_owned_no_follow(path: Path) -> None:
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if _is_link_or_reparse(path, metadata) or not stat.S_ISDIR(metadata.st_mode):
+        os.unlink(path)
+        return
+    with os.scandir(path) as entries:
+        children = [Path(entry.path) for entry in entries]
+    for child in children:
+        _remove_owned_no_follow(child)
+    os.rmdir(path)
+
+
+def _cleanup_owned(path: Path, parent_chain) -> None:
+    try:
+        _revalidate_chain(parent_chain)
+        _remove_owned_no_follow(path)
+    except Exception:
+        try:
+            _revalidate_chain(parent_chain)
+            quarantine = path.parent / (
+                _STAGE_QUARANTINE_PREFIX + uuid.uuid4().hex
+            )
+            os.replace(path, quarantine)
+        except Exception:
+            pass
+
+
+def _create_owned_directory(parent: Path, name: str) -> Path:
+    if not _assert_exact_child(parent, name, allow_absent=True):
+        path = parent / name
+        os.mkdir(path)
+    path = parent / name
+    metadata = os.lstat(path)
+    if _is_link_or_reparse(path, metadata) or not stat.S_ISDIR(metadata.st_mode):
+        raise _UnsafePath
+    return path
+
+
+def _write_owned_member(root: Path, relative: str, payload: bytes) -> Path:
+    parts = relative.split("/")
+    current = root
+    for component in parts[:-1]:
+        current = _create_owned_directory(current, component)
+    leaf = parts[-1]
+    if _assert_exact_child(current, leaf, allow_absent=True):
+        raise _UnsafePath
+    destination = current / leaf
+    with destination.open("xb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+    metadata = os.lstat(destination)
+    if (
+        _is_link_or_reparse(destination, metadata)
+        or not stat.S_ISREG(metadata.st_mode)
+        or int(getattr(metadata, "st_nlink", 1)) != 1
+    ):
+        raise _UnsafePath
+    return destination
+
+
+def _stage_identity(manifest_sha256: str, source_zip_sha256: str) -> str:
+    payload = {
+        "installed_manifest_sha256": manifest_sha256,
+        "source_zip_sha256": source_zip_sha256,
+    }
+    return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
 
 
 def verify_inno_toolchain(
@@ -96,36 +495,201 @@ def verify_inno_toolchain(
     }
 
 
+def _exact_stage_closure(staged_release: InstallerStage) -> None:
+    root = staged_release.stage_root
+    expected_top = {"PDFVectorImporter", _STAGE_METADATA_DIRNAME}
+    with os.scandir(root) as entries:
+        actual = {entry.name for entry in entries}
+    if actual != expected_top:
+        raise _ChangedPath
+    metadata_root = root / _STAGE_METADATA_DIRNAME
+    metadata = os.lstat(metadata_root)
+    if _is_link_or_reparse(metadata_root, metadata) or not stat.S_ISDIR(
+        metadata.st_mode
+    ):
+        raise _UnsafePath
+    with os.scandir(metadata_root) as entries:
+        snapshot_names = {entry.name for entry in entries}
+    if snapshot_names != {staged_release.source_zip_name}:
+        raise _ChangedPath
+
+
+def _validate_stage_exact(
+    staged_release: InstallerStage,
+    *,
+    require_identity_name: bool = True,
+) -> dict:
+    if not isinstance(staged_release, InstallerStage):
+        raise _ChangedPath
+    if (
+        type(staged_release.candidate_manifest_bytes) is not bytes
+        or not isinstance(staged_release.version, str)
+        or _DIGEST.fullmatch(staged_release.source_zip_sha256) is None
+        or _DIGEST.fullmatch(staged_release.installed_manifest_sha256) is None
+        or _DIGEST.fullmatch(staged_release.stage_identity_sha256) is None
+        or type(staged_release.source_zip_size) is not int
+        or staged_release.source_zip_size < 0
+    ):
+        raise _ChangedPath
+
+    document, problems = _CANDIDATE_MANIFEST.parse_candidate_file_manifest(
+        staged_release.candidate_manifest_bytes
+    )
+    if problems or document is None:
+        raise _ChangedPath
+    manifest_digest = _CANDIDATE_MANIFEST.candidate_manifest_sha256(document)
+    identity = _stage_identity(manifest_digest, staged_release.source_zip_sha256)
+    if (
+        manifest_digest != staged_release.installed_manifest_sha256
+        or identity != staged_release.stage_identity_sha256
+        or document.get("package_version") != staged_release.version
+        or document.get("artifact_name") != staged_release.source_zip_name
+    ):
+        raise _ChangedPath
+
+    stage_root = _absolute_lexical(staged_release.stage_root)
+    expected_source = stage_root / "PDFVectorImporter"
+    expected_snapshot = stage_root / _STAGE_METADATA_DIRNAME / staged_release.source_zip_name
+    if (
+        staged_release.stage_root != stage_root
+        or (
+            require_identity_name
+            and stage_root.name != staged_release.stage_identity_sha256
+        )
+        or staged_release.source_dir != expected_source
+        or staged_release.source_zip_snapshot != expected_snapshot
+    ):
+        raise _ChangedPath
+    _directory_chain(stage_root)
+    _exact_stage_closure(staged_release)
+
+    snapshot = _capture_regular_file(expected_snapshot)
+    if (
+        len(snapshot) != staged_release.source_zip_size
+        or hashlib.sha256(snapshot).hexdigest() != staged_release.source_zip_sha256
+    ):
+        raise _ChangedPath
+    zip_problems = _closed_release_zip_codes(
+        validate_release_zip_manifest(expected_snapshot)
+    )
+    if zip_problems:
+        raise _ChangedPath
+    manifest_path = expected_source / MANIFEST_MEMBER.removeprefix(
+        "PDFVectorImporter/"
+    )
+    if _capture_regular_file(manifest_path) != staged_release.candidate_manifest_bytes:
+        raise _ChangedPath
+    tree_problems = validate_installer_payload_tree(document, expected_source)
+    if tree_problems:
+        raise _ChangedPath
+    if _read_package_version(expected_source / "package.xml") != staged_release.version:
+        raise _ChangedPath
+    _exact_stage_closure(staged_release)
+    return document
+
+
 def write_attestation(
     output_path: str | Path,
     *,
-    release_zip: str | Path,
+    staged_release: InstallerStage,
     installer_exe: str | Path,
     toolchain_identity: dict,
-    source_commit: str,
 ) -> Path:
-    """Write a deterministic artifact/toolchain binding for one Setup.exe."""
+    """Atomically bind Setup, source ZIP, toolchain, and installed manifest."""
 
-    zip_path = Path(release_zip).resolve()
-    setup_path = Path(installer_exe).resolve()
+    try:
+        document = _validate_stage_exact(staged_release)
+        if not isinstance(toolchain_identity, dict):
+            raise _ChangedPath
+    except Exception:
+        raise RuntimeError("INSTALLER_ATTESTATION_INPUT_INVALID") from None
+
+    try:
+        setup_path = _absolute_lexical(installer_exe)
+        setup_bytes = _capture_regular_file(setup_path)
+    except _UnsafePath:
+        raise RuntimeError("INSTALLER_SETUP_UNSAFE") from None
+    except _ChangedPath:
+        raise RuntimeError("INSTALLER_SETUP_CHANGED") from None
+    except Exception:
+        raise RuntimeError("INSTALLER_SETUP_CHANGED") from None
+
     payload = {
-        "schema": "bcs.freecad_installer_attestation/1.0",
-        "source_commit": str(source_commit or "unknown"),
+        "schema": "bcs.freecad_installer_attestation/1.1",
+        "source_commit": document["source_commit"],
+        "stage_identity_sha256": staged_release.stage_identity_sha256,
         "source_zip": {
-            "name": zip_path.name,
-            "size": zip_path.stat().st_size,
-            "sha256": _sha256_file(zip_path),
+            "name": staged_release.source_zip_name,
+            "size": staged_release.source_zip_size,
+            "sha256": staged_release.source_zip_sha256,
         },
         "installer": {
             "name": setup_path.name,
-            "size": setup_path.stat().st_size,
-            "sha256": _sha256_file(setup_path),
+            "size": len(setup_bytes),
+            "sha256": hashlib.sha256(setup_bytes).hexdigest(),
+        },
+        "payload_manifest": {
+            "schema": document["schema"],
+            "member": MANIFEST_MEMBER,
+            "sha256": staged_release.installed_manifest_sha256,
         },
         "toolchain": dict(toolchain_identity),
     }
-    destination = Path(output_path).resolve()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(_canonical_json_bytes(payload))
+    encoded = _canonical_json_bytes(payload)
+    try:
+        destination = _absolute_lexical(output_path)
+        parent, parent_chain = _prepare_safe_directory(destination.parent)
+        if destination.parent != parent:
+            raise _ChangedPath
+        if _assert_exact_child(parent, destination.name, allow_absent=True):
+            metadata = os.lstat(destination)
+            if (
+                _is_link_or_reparse(destination, metadata)
+                or not stat.S_ISREG(metadata.st_mode)
+                or int(getattr(metadata, "st_nlink", 1)) != 1
+            ):
+                raise _UnsafePath
+    except (_UnsafePath, _ChangedPath):
+        raise RuntimeError("INSTALLER_ATTESTATION_INPUT_INVALID") from None
+    except Exception:
+        raise RuntimeError("INSTALLER_ATTESTATION_IO_ERROR") from None
+
+    temporary = parent / (_ATTESTATION_TEMP_PREFIX + uuid.uuid4().hex)
+    try:
+        if _assert_exact_child(parent, temporary.name, allow_absent=True):
+            raise _UnsafePath
+        with temporary.open("xb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if _capture_regular_file(temporary) != encoded:
+            raise _ChangedPath
+        _validate_stage_exact(staged_release)
+        _revalidate_chain(parent_chain)
+    except Exception:
+        _cleanup_owned(temporary, parent_chain)
+        raise RuntimeError("INSTALLER_ATTESTATION_IO_ERROR") from None
+
+    try:
+        if _capture_regular_file(setup_path) != setup_bytes:
+            raise _ChangedPath
+    except _UnsafePath:
+        _cleanup_owned(temporary, parent_chain)
+        raise RuntimeError("INSTALLER_SETUP_UNSAFE") from None
+    except Exception:
+        _cleanup_owned(temporary, parent_chain)
+        raise RuntimeError("INSTALLER_SETUP_CHANGED") from None
+
+    try:
+        os.replace(temporary, destination)
+    except Exception:
+        _cleanup_owned(temporary, parent_chain)
+        raise RuntimeError("INSTALLER_ATTESTATION_PUBLISH_ERROR") from None
+    try:
+        if _capture_regular_file(destination) != encoded:
+            raise _ChangedPath
+    except Exception:
+        raise RuntimeError("INSTALLER_ATTESTATION_PUBLISH_ERROR") from None
     return destination
 
 
@@ -179,71 +743,249 @@ def stage_release(
     *,
     dist_dir: str | Path | None = None,
     stage_dir: str | Path | None = None,
-) -> tuple[str, Path, Path]:
+) -> InstallerStage:
+    """Validate and atomically publish one exact content-addressed stage."""
+
     version = read_version()
-    output_root = Path(dist_dir).resolve() if dist_dir is not None else DIST_DIR
-    stage_root = Path(stage_dir).resolve() if stage_dir is not None else STAGE_DIR
-    output_root.mkdir(parents=True, exist_ok=True)
+    expected_name = f"FreeCAD-PDF-Importer_v{version}.zip"
+    output_root = _absolute_lexical(dist_dir if dist_dir is not None else DIST_DIR)
 
     if source_zip is None:
-        zip_path = build_release.build(output_root)
+        try:
+            zip_path = _absolute_lexical(build_release.build(output_root))
+        except Exception:
+            raise RuntimeError("INSTALLER_SOURCE_IO_ERROR") from None
     else:
-        zip_path = Path(source_zip).resolve()
-        expected_name = f"FreeCAD-PDF-Importer_v{version}.zip"
-        if not zip_path.is_file():
-            raise FileNotFoundError(f"Canonical release ZIP not found: {zip_path}")
-        if zip_path.name != expected_name:
-            raise RuntimeError(
-                f"Canonical release ZIP must be named {expected_name}, got {zip_path.name}"
-            )
+        try:
+            zip_path = _absolute_lexical(source_zip)
+        except Exception:
+            raise RuntimeError("INSTALLER_SOURCE_UNSAFE") from None
+    if zip_path.name != expected_name:
+        raise RuntimeError("INSTALLER_SOURCE_UNSAFE")
 
-    if stage_root.exists():
-        shutil.rmtree(stage_root)
-    stage_root.mkdir(parents=True, exist_ok=True)
+    try:
+        stage_parent, parent_chain = _prepare_safe_directory(
+            stage_dir if stage_dir is not None else STAGE_DIR
+        )
+    except Exception:
+        raise RuntimeError("INSTALLER_STAGE_UNSAFE") from None
 
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(stage_root)
+    temporary = stage_parent / (_STAGE_TEMP_PREFIX + uuid.uuid4().hex)
+    try:
+        if _assert_exact_child(stage_parent, temporary.name, allow_absent=True):
+            raise _UnsafePath
+        os.mkdir(temporary)
+        temp_metadata = os.lstat(temporary)
+        if _is_link_or_reparse(temporary, temp_metadata) or not stat.S_ISDIR(
+            temp_metadata.st_mode
+        ):
+            raise _UnsafePath
+        metadata_root = _create_owned_directory(temporary, _STAGE_METADATA_DIRNAME)
+        snapshot_path = metadata_root / expected_name
+        source_size, source_digest = _copy_source_zip_snapshot(zip_path, snapshot_path)
+    except _UnsafePath:
+        _cleanup_owned(temporary, parent_chain)
+        raise RuntimeError("INSTALLER_SOURCE_UNSAFE") from None
+    except _ChangedPath:
+        _cleanup_owned(temporary, parent_chain)
+        raise RuntimeError("INSTALLER_SOURCE_CHANGED") from None
+    except Exception:
+        _cleanup_owned(temporary, parent_chain)
+        raise RuntimeError("INSTALLER_SOURCE_IO_ERROR") from None
 
-    source_dir = stage_root / "PDFVectorImporter"
-    if not source_dir.is_dir():
-        raise RuntimeError(f"Expected staged addon folder at {source_dir}")
-    staged_version = _read_package_version(source_dir / "package.xml")
-    if staged_version != version:
+    try:
+        problems = _closed_release_zip_codes(
+            validate_release_zip_manifest(snapshot_path)
+        )
+    except Exception:
+        _cleanup_owned(temporary, parent_chain)
+        raise RuntimeError("INSTALLER_SOURCE_IO_ERROR") from None
+    if problems:
+        _cleanup_owned(temporary, parent_chain)
         raise RuntimeError(
-            "Staged package version mismatch: "
-            f"repository={version} archive={staged_version}"
+            "INSTALLER_SOURCE_ZIP_INVALID: " + ", ".join(sorted(set(problems)))
         )
 
-    return version, source_dir, zip_path
+    try:
+        snapshot_bytes = _capture_regular_file(snapshot_path)
+        if (
+            len(snapshot_bytes) != source_size
+            or hashlib.sha256(snapshot_bytes).hexdigest() != source_digest
+        ):
+            raise _ChangedPath
+        with zipfile.ZipFile(snapshot_path, "r") as archive:
+            manifest_bytes = archive.read(MANIFEST_MEMBER)
+            document, parse_problems = (
+                _CANDIDATE_MANIFEST.parse_candidate_file_manifest(manifest_bytes)
+            )
+            if parse_problems or document is None:
+                codes = sorted(set(parse_problems or ["MANIFEST_INVALID_DOCUMENT"]))
+                raise RuntimeError(
+                    "INSTALLER_SOURCE_ZIP_INVALID: " + ", ".join(codes)
+                )
+            if (
+                document.get("package_version") != version
+                or document.get("artifact_name") != expected_name
+            ):
+                raise RuntimeError(
+                    "INSTALLER_SOURCE_ZIP_INVALID: MANIFEST_INVALID_IDENTITY"
+                )
+            installed_manifest_sha256 = (
+                _CANDIDATE_MANIFEST.candidate_manifest_sha256(document)
+            )
+            stage_identity_sha256 = _stage_identity(
+                installed_manifest_sha256, source_digest
+            )
+            source_dir = _create_owned_directory(temporary, "PDFVectorImporter")
+            manifest_relative = MANIFEST_MEMBER.removeprefix("PDFVectorImporter/")
+            _write_owned_member(source_dir, manifest_relative, manifest_bytes)
+            for record in document["files"]:
+                relative = record["path"]
+                payload = archive.read("PDFVectorImporter/" + relative)
+                _write_owned_member(source_dir, relative, payload)
+    except RuntimeError as exc:
+        _cleanup_owned(temporary, parent_chain)
+        if str(exc).startswith("INSTALLER_SOURCE_ZIP_INVALID"):
+            raise
+        raise RuntimeError("INSTALLER_STAGE_IO_ERROR") from None
+    except (zipfile.BadZipFile, _ChangedPath):
+        _cleanup_owned(temporary, parent_chain)
+        raise RuntimeError("INSTALLER_SOURCE_CHANGED") from None
+    except _UnsafePath:
+        _cleanup_owned(temporary, parent_chain)
+        raise RuntimeError("INSTALLER_STAGE_UNSAFE") from None
+    except Exception:
+        _cleanup_owned(temporary, parent_chain)
+        raise RuntimeError("INSTALLER_STAGE_IO_ERROR") from None
+
+    tree_problems = validate_installer_payload_tree(document, source_dir)
+    if tree_problems:
+        _cleanup_owned(temporary, parent_chain)
+        raise RuntimeError(
+            "INSTALLER_STAGE_TREE_INVALID: "
+            + ", ".join(sorted(set(tree_problems)))
+        )
+    try:
+        if _read_package_version(source_dir / "package.xml") != version:
+            raise _ChangedPath
+        if _closed_release_zip_codes(validate_release_zip_manifest(snapshot_path)):
+            raise _ChangedPath
+        snapshot_bytes = _capture_regular_file(snapshot_path)
+        if (
+            len(snapshot_bytes) != source_size
+            or hashlib.sha256(snapshot_bytes).hexdigest() != source_digest
+        ):
+            raise _ChangedPath
+        temporary_stage = InstallerStage(
+            version=version,
+            stage_root=temporary,
+            source_dir=source_dir,
+            source_zip_snapshot=snapshot_path,
+            source_zip_name=expected_name,
+            source_zip_size=source_size,
+            source_zip_sha256=source_digest,
+            candidate_manifest_bytes=manifest_bytes,
+            installed_manifest_sha256=installed_manifest_sha256,
+            stage_identity_sha256=stage_identity_sha256,
+        )
+        _validate_stage_exact(temporary_stage, require_identity_name=False)
+    except Exception:
+        _cleanup_owned(temporary, parent_chain)
+        raise RuntimeError("INSTALLER_STAGE_TREE_INVALID") from None
+
+    final_root = stage_parent / stage_identity_sha256
+    final_stage = InstallerStage(
+        version=version,
+        stage_root=final_root,
+        source_dir=final_root / "PDFVectorImporter",
+        source_zip_snapshot=final_root / _STAGE_METADATA_DIRNAME / expected_name,
+        source_zip_name=expected_name,
+        source_zip_size=source_size,
+        source_zip_sha256=source_digest,
+        candidate_manifest_bytes=manifest_bytes,
+        installed_manifest_sha256=installed_manifest_sha256,
+        stage_identity_sha256=stage_identity_sha256,
+    )
+
+    try:
+        _revalidate_chain(parent_chain)
+        target_exists = _assert_exact_child(
+            stage_parent, stage_identity_sha256, allow_absent=True
+        )
+    except Exception:
+        _cleanup_owned(temporary, parent_chain)
+        raise RuntimeError("INSTALLER_STAGE_UNSAFE") from None
+    if target_exists:
+        try:
+            _validate_stage_exact(final_stage)
+        except Exception:
+            _cleanup_owned(temporary, parent_chain)
+            raise RuntimeError("INSTALLER_STAGE_CONFLICT") from None
+        _cleanup_owned(temporary, parent_chain)
+    else:
+        try:
+            os.replace(temporary, final_root)
+        except Exception:
+            try:
+                if _assert_exact_child(
+                    stage_parent, stage_identity_sha256, allow_absent=True
+                ):
+                    _validate_stage_exact(final_stage)
+                    _cleanup_owned(temporary, parent_chain)
+                else:
+                    raise _ChangedPath
+            except Exception:
+                _cleanup_owned(temporary, parent_chain)
+                raise RuntimeError("INSTALLER_STAGE_PUBLISH_ERROR") from None
+
+    try:
+        _validate_stage_exact(final_stage)
+        _revalidate_chain(parent_chain)
+        _validate_stage_exact(final_stage)
+    except Exception:
+        raise RuntimeError("INSTALLER_STAGE_CONFLICT") from None
+    return final_stage
 
 
 def compile_installer(
     iscc: Path,
-    version: str,
-    source_dir: Path,
+    staged_release: InstallerStage,
     *,
     output_dir: str | Path | None = None,
 ) -> Path:
-    output_root = Path(output_dir).resolve() if output_dir is not None else DIST_DIR
-    output_root.mkdir(parents=True, exist_ok=True)
-    base_name = f"FreeCAD-PDF-Importer-Setup_v{version}"
+    """Revalidate the exact stage before invoking the pinned compiler."""
+
+    try:
+        _validate_stage_exact(staged_release)
+        output_root, _output_chain = _prepare_safe_directory(
+            output_dir if output_dir is not None else DIST_DIR
+        )
+    except Exception:
+        raise RuntimeError("INSTALLER_COMPILER_INPUT_INVALID") from None
+    base_name = f"FreeCAD-PDF-Importer-Setup_v{staged_release.version}"
     cmd = [
         str(iscc),
         str(INNO_SCRIPT),
-        f"/DMyAppVersion={version}",
-        f"/DSourceDir={source_dir}",
+        f"/DMyAppVersion={staged_release.version}",
+        f"/DSourceDir={staged_release.source_dir}",
         f"/O{output_root}",
         f"/F{base_name}",
     ]
-    print("Running:", " ".join(cmd))
-    subprocess.run(cmd, check=True, cwd=REPO_ROOT)
+    print("Running pinned Inno Setup compiler")
+    try:
+        subprocess.run(cmd, check=True, cwd=REPO_ROOT)
+    except (subprocess.CalledProcessError, OSError):
+        raise RuntimeError("INSTALLER_COMPILER_FAILED") from None
 
     installer_exe = output_root / f"{base_name}.exe"
-    if not installer_exe.exists():
-        raise RuntimeError(
-            "Inno Setup completed but installer was not found at "
-            f"{installer_exe}"
-        )
+    try:
+        metadata = os.lstat(installer_exe)
+        if _is_link_or_reparse(installer_exe, metadata) or not stat.S_ISREG(
+            metadata.st_mode
+        ):
+            raise _UnsafePath
+    except Exception:
+        raise RuntimeError("INSTALLER_COMPILER_FAILED") from None
     return installer_exe
 
 
@@ -275,8 +1017,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--source-commit",
-        default=os.environ.get("GITHUB_SHA", "unknown"),
-        help="Exact source commit bound into the attestation.",
+        default=os.environ.get("GITHUB_SHA"),
+        help="Optional exact equality assertion for the manifest source commit.",
     )
     parser.add_argument(
         "--source-zip",
@@ -294,30 +1036,39 @@ def main() -> int:
         print(json.dumps(toolchain_identity, sort_keys=True))
         return 0
 
-    version, source_dir, zip_path = stage_release(
+    staged_release = stage_release(
         args.source_zip,
         dist_dir=args.output_dir,
         stage_dir=args.stage_dir,
     )
+    if args.source_commit is not None:
+        document, problems = _CANDIDATE_MANIFEST.parse_candidate_file_manifest(
+            staged_release.candidate_manifest_bytes
+        )
+        if (
+            problems
+            or document is None
+            or _COMMIT.fullmatch(args.source_commit) is None
+            or args.source_commit != document.get("source_commit")
+        ):
+            raise RuntimeError("INSTALLER_COMPILER_INPUT_INVALID")
     installer_exe = compile_installer(
         iscc,
-        version,
-        source_dir,
+        staged_release,
         output_dir=args.output_dir,
     )
     if args.attestation:
         write_attestation(
             args.attestation,
-            release_zip=zip_path,
+            staged_release=staged_release,
             installer_exe=installer_exe,
             toolchain_identity=toolchain_identity,
-            source_commit=args.source_commit,
         )
 
     print("")
-    print(f"Release zip: {zip_path}")
+    print(f"Release zip: {staged_release.source_zip_snapshot}")
     print(f"Installer:   {installer_exe}")
-    print(f"Stage dir:   {source_dir}")
+    print(f"Stage dir:   {staged_release.source_dir}")
     return 0
 
 

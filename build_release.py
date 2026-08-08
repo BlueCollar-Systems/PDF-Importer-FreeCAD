@@ -22,6 +22,7 @@ Output:
 import argparse
 import base64
 import codecs
+import importlib.util
 import json
 import os
 import re
@@ -40,6 +41,24 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.resolve()
 ADDON_DIR = REPO_ROOT / "PDFVectorImporter"
+
+
+def _load_candidate_manifest_contract():
+    """Load the product contract without executing the addon initializer."""
+    contract_path = Path(__file__).parent / "PDFVectorImporter" / "candidate_manifest.py"
+    spec = importlib.util.spec_from_file_location(
+        "_freecad_release_candidate_manifest", contract_path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Release blocked: candidate manifest contract is unavailable.")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_CANDIDATE_MANIFEST = _load_candidate_manifest_contract()
+MANIFEST_MEMBER = _CANDIDATE_MANIFEST.MANIFEST_MEMBER
+_COMMIT_OID = re.compile(r"\A[0-9a-f]{40}\Z")
 
 # Files / dirs to always exclude (matched against each path component)
 EXCLUDE_DIRS = {
@@ -662,21 +681,10 @@ def _git_blob_oid(content: bytes) -> str:
     return proc.stdout.decode("ascii").strip()
 
 
-def _require_commit_bound_sources(
-    first_party_snapshot: tuple[tuple[Path, bytes], ...]
-) -> dict[Path, bytes]:
-    """Bind every selected first-party path and exact byte buffer to HEAD."""
+def _capture_source_commit() -> str:
+    """Resolve and validate one stable commit identity for this build attempt."""
     try:
-        addon_rel = ADDON_DIR.resolve().relative_to(REPO_ROOT.resolve())
-    except ValueError as exc:
-        raise RuntimeError(
-            f"Addon source is outside the release repository: {ADDON_DIR}"
-        ) from exc
-
-    release_pathspecs = [path.as_posix() for path in RELEASE_BUILD_INPUTS]
-    pathspecs = [addon_rel.as_posix(), *release_pathspecs]
-    try:
-        subprocess.run(
+        proc = subprocess.run(
             [
                 "git",
                 "-C",
@@ -689,7 +697,54 @@ def _require_commit_bound_sources(
             check=True,
             capture_output=True,
         )
-    except (OSError, subprocess.CalledProcessError) as exc:
+        source_commit = proc.stdout.decode("ascii").strip()
+    except (OSError, UnicodeError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(
+            "Release blocked: source repository must have a real HEAD commit."
+        ) from exc
+    if _COMMIT_OID.fullmatch(source_commit) is None:
+        raise RuntimeError(
+            "Release blocked: source repository returned an invalid commit identity."
+        )
+    return source_commit
+
+
+def _require_commit_bound_sources(
+    first_party_snapshot: tuple[tuple[Path, bytes], ...],
+    *,
+    source_commit: str,
+) -> dict[Path, bytes]:
+    """Bind every selected first-party path and byte buffer to one commit."""
+    if _COMMIT_OID.fullmatch(source_commit) is None:
+        raise RuntimeError("Release blocked: invalid source commit identity.")
+    try:
+        addon_rel = ADDON_DIR.resolve().relative_to(REPO_ROOT.resolve())
+    except ValueError as exc:
+        raise RuntimeError(
+            "Release blocked: addon source is outside the release repository."
+        ) from exc
+
+    release_pathspecs = [path.as_posix() for path in RELEASE_BUILD_INPUTS]
+    pathspecs = [addon_rel.as_posix(), *release_pathspecs]
+    try:
+        verified_proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(REPO_ROOT),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"{source_commit}^{{commit}}",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        if verified_proc.stdout.decode("ascii").strip() != source_commit:
+            raise RuntimeError(
+                "Release blocked: source commit verification changed identity."
+            )
+    except (OSError, UnicodeError, subprocess.CalledProcessError) as exc:
         raise RuntimeError(
             "Release blocked: source repository must have a real HEAD commit."
         ) from exc
@@ -704,7 +759,7 @@ def _require_commit_bound_sources(
                 "-r",
                 "-z",
                 "--full-tree",
-                "HEAD",
+                source_commit,
                 "--",
                 *pathspecs,
             ],
@@ -720,7 +775,7 @@ def _require_commit_bound_sources(
                 "--cached",
                 "--name-only",
                 "-z",
-                "HEAD",
+                source_commit,
                 "--",
                 *pathspecs,
             ],
@@ -892,6 +947,131 @@ def _read_version() -> str:
         if m:
             return m.group(1).strip()
     return "0.0.0"
+
+
+def _snapshot_package_version(
+    first_party_snapshot: tuple[tuple[Path, bytes], ...]
+) -> str:
+    """Read the package identity from the same captured bytes that will ship."""
+    for relative_path, content in first_party_snapshot:
+        if relative_path.as_posix() != "package.xml":
+            continue
+        try:
+            text = content.decode("utf-8")
+        except UnicodeError as exc:
+            raise RuntimeError("Release blocked: package version is invalid.") from exc
+        match = re.search(r"<version>(.*?)</version>", text)
+        if match:
+            return match.group(1).strip()
+    return "0.0.0"
+
+
+def _compose_release_members(
+    first_party_snapshot: tuple[tuple[Path, bytes], ...],
+    runtime_snapshot: tuple[tuple[Path, bytes], ...],
+    *,
+    source_commit: str,
+    package_version: str,
+    artifact_name: str,
+) -> tuple[dict[str, bytes], dict]:
+    """Create and validate one closed mapping from already captured bytes."""
+    members: dict[str, bytes] = {}
+    captured = (
+        (
+            (Path("PDFVectorImporter") / relative_path).as_posix(),
+            content,
+        )
+        for relative_path, content in first_party_snapshot
+    )
+    runtime = (
+        (
+            (
+                Path("PDFVectorImporter")
+                / "src"
+                / "lib"
+                / relative_path
+            ).as_posix(),
+            content,
+        )
+        for relative_path, content in runtime_snapshot
+    )
+    try:
+        for member_name, content in (*captured, *runtime):
+            if member_name in members:
+                raise ValueError("MANIFEST_MEMBER_COLLISION")
+            members[member_name] = content
+        document = _CANDIDATE_MANIFEST.build_candidate_file_manifest(
+            members,
+            source_commit=source_commit,
+            package_version=package_version,
+            artifact_name=artifact_name,
+        )
+        manifest_bytes = _CANDIDATE_MANIFEST.canonical_candidate_manifest_bytes(
+            document
+        )
+        if not manifest_bytes or MANIFEST_MEMBER in members:
+            raise ValueError("MANIFEST_MEMBER_COLLISION")
+        members[MANIFEST_MEMBER] = manifest_bytes
+        problems = _CANDIDATE_MANIFEST.validate_candidate_archive_members(
+            document, members
+        )
+        if problems:
+            raise ValueError(problems[0])
+    except ValueError as exc:
+        code = str(exc)
+        if not code.startswith("MANIFEST_"):
+            code = "MANIFEST_INVALID_DOCUMENT"
+        raise RuntimeError(
+            f"Release blocked: candidate archive composition failed ({code})."
+        ) from None
+    return members, document
+
+
+def _validate_written_release_zip(
+    temporary_path: Path,
+    expected_members: dict[str, bytes],
+    document: dict,
+) -> None:
+    """Reopen a temporary ZIP and prove exact regular-file byte closure."""
+    actual: dict[str, bytes] = {}
+    identities: set[str] = set()
+    with zipfile.ZipFile(temporary_path, "r") as archive:
+        infos = archive.infolist()
+        for info in infos:
+            name = info.filename
+            if name in actual:
+                raise RuntimeError("Release blocked: temporary ZIP has duplicate members.")
+            identity = unicodedata.normalize("NFC", name).casefold()
+            if identity in identities:
+                raise RuntimeError("Release blocked: temporary ZIP has aliased members.")
+            identities.add(identity)
+            mode = (info.external_attr >> 16) & 0xFFFF
+            file_type = stat.S_IFMT(mode)
+            if (
+                info.is_dir()
+                or name.endswith("/")
+                or (info.create_system == 3 and file_type not in (0, stat.S_IFREG))
+            ):
+                raise RuntimeError("Release blocked: temporary ZIP has non-file members.")
+            if info.flag_bits & 0x1:
+                raise RuntimeError("Release blocked: temporary ZIP has encrypted members.")
+            if info.compress_type != zipfile.ZIP_STORED:
+                raise RuntimeError(
+                    "Release blocked: temporary ZIP has unsupported compression."
+                )
+            actual[name] = archive.read(info)
+
+    if set(actual) != set(expected_members):
+        raise RuntimeError("Release blocked: temporary ZIP member set drifted.")
+    if any(actual[name] != content for name, content in expected_members.items()):
+        raise RuntimeError("Release blocked: temporary ZIP member bytes drifted.")
+    problems = _CANDIDATE_MANIFEST.validate_candidate_archive_members(document, actual)
+    if problems:
+        raise RuntimeError(
+            "Release blocked: temporary ZIP manifest closure failed ("
+            + problems[0]
+            + ")."
+        )
 
 
 def _candidate_freecad_pythons() -> list[Path]:
@@ -1239,10 +1419,6 @@ def build(
     python310: Path | None = None,
     python311: Path | None = None,
 ) -> Path:
-    version = _read_version()
-    zip_name = f"FreeCAD-PDF-Importer_v{version}.zip"
-    zip_path = out_dir / zip_name
-
     out_dir.mkdir(parents=True, exist_ok=True)
     external_private_terms = _load_external_private_denylist()
     _require_no_external_private_tracked_repository_data(external_private_terms)
@@ -1250,7 +1426,19 @@ def build(
     _require_no_private_artifacts()
     _require_no_private_content(external_private_terms)
     first_party_snapshot, first_party_skipped = _capture_first_party_files()
-    verified_build_inputs = _require_commit_bound_sources(first_party_snapshot)
+    source_commit = _capture_source_commit()
+    if _COMMIT_OID.fullmatch(source_commit) is None:
+        raise RuntimeError("Release blocked: invalid source commit identity.")
+    verified_build_inputs = _require_commit_bound_sources(
+        first_party_snapshot, source_commit=source_commit
+    )
+    if _capture_source_commit() != source_commit:
+        raise RuntimeError(
+            "Release blocked: source commit changed during source validation."
+        )
+    version = _snapshot_package_version(first_party_snapshot)
+    zip_name = f"FreeCAD-PDF-Importer_v{version}.zip"
+    zip_path = out_dir / zip_name
     with tempfile.TemporaryDirectory(prefix="fc-release-runtime-") as runtime_tmp:
         runtime_tmp_path = Path(runtime_tmp)
         runtime_dir = runtime_tmp_path / "lib"
@@ -1293,7 +1481,6 @@ def build(
             runtime_dir, external_private_terms
         )
 
-        file_count = 0
         skipped = first_party_skipped + runtime_skipped
 
         archive_names = tuple(
@@ -1307,32 +1494,52 @@ def build(
             for name in archive_names
         ):
             _raise_external_private_match("an archive member name")
+        for rel, content in first_party_snapshot:
+            private_label = _private_content_label(content, external_private_terms)
+            if private_label is not None:
+                if private_label == "external private denylist":
+                    _raise_external_private_match("shippable addon data")
+                raise RuntimeError(
+                    "Release blocked: private corpus content found in shippable "
+                    f"addon files: {rel.as_posix()} ({private_label})"
+                )
 
-        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
-            for rel, content in first_party_snapshot:
-                private_label = _private_content_label(content, external_private_terms)
-                if private_label is not None:
-                    if private_label == "external private denylist":
-                        _raise_external_private_match("shippable addon data")
-                    raise RuntimeError(
-                        "Release blocked: private corpus content found in "
-                        "shippable addon files: "
-                        f"{rel.as_posix()} ({private_label})"
+        members, document = _compose_release_members(
+            first_party_snapshot,
+            runtime_snapshot,
+            source_commit=source_commit,
+            package_version=version,
+            artifact_name=zip_name,
+        )
+        file_count = len(members)
+        owned_temporary: Path | None = None
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=out_dir, prefix=f".{zip_name}.", suffix=".tmp"
+            )
+            owned_temporary = Path(temporary_name)
+            os.close(descriptor)
+            with zipfile.ZipFile(
+                owned_temporary, "w", compression=zipfile.ZIP_STORED
+            ) as archive:
+                for member_name in sorted(members, key=lambda value: value.encode("utf-8")):
+                    _write_deterministic_bytes(
+                        archive,
+                        members[member_name],
+                        Path(member_name),
+                        external_private_terms,
                     )
-                # Archive path: PDFVectorImporter/<rel>
-                arc_name = Path("PDFVectorImporter") / rel
-                _write_deterministic_bytes(
-                    zf, content, arc_name, external_private_terms
-                )
-                file_count += 1
-
-            for runtime_rel, content in runtime_snapshot:
-                rel = Path("src") / "lib" / runtime_rel
-                arc_name = Path("PDFVectorImporter") / rel
-                _write_deterministic_bytes(
-                    zf, content, arc_name, external_private_terms
-                )
-                file_count += 1
+            _validate_written_release_zip(owned_temporary, members, document)
+            os.replace(owned_temporary, zip_path)
+        except Exception:
+            if owned_temporary is not None:
+                try:
+                    owned_temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise RuntimeError(
+                "Release blocked: deterministic release ZIP publication failed."
+            ) from None
 
     print(f"Built: {zip_path}")
     print(f"  {file_count} files included, {skipped} excluded")

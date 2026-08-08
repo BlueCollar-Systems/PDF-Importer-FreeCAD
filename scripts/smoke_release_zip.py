@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import glob
+import importlib.util
 import json
+import stat
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import zipfile
 from pathlib import Path
 
@@ -28,6 +31,137 @@ REQUIRED_WINDOWS_RUNTIME = {
     "PDFVectorImporter/src/lib/common/pymupdf/_extra.pyd",
     "PDFVectorImporter/src/lib/common/pymupdf/_mupdf.pyd",
 }
+
+
+def _load_candidate_manifest_contract():
+    """Load the pinned checkout contract without importing the addon package."""
+    contract_path = (
+        Path(__file__).resolve().parents[1]
+        / "PDFVectorImporter"
+        / "candidate_manifest.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_freecad_smoke_candidate_manifest", contract_path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("candidate manifest contract unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_CANDIDATE_MANIFEST = _load_candidate_manifest_contract()
+MANIFEST_MEMBER = _CANDIDATE_MANIFEST.MANIFEST_MEMBER
+
+
+def _unsafe_zip_member_name(name: str) -> bool:
+    if (
+        not name
+        or "\\" in name
+        or name.startswith("/")
+        or not name.startswith("PDFVectorImporter/")
+        or ":" in name
+        or unicodedata.normalize("NFC", name) != name
+        or any(ord(character) < 32 for character in name)
+    ):
+        return True
+    parts = name.rstrip("/").split("/")
+    return any(not part or part in {".", ".."} for part in parts)
+
+
+def _contract_rejects_member_name(name: str) -> bool:
+    if name == MANIFEST_MEMBER:
+        return False
+    try:
+        _CANDIDATE_MANIFEST.build_candidate_file_manifest(
+            {name: b""},
+            source_commit="0" * 40,
+            package_version="0.0.0",
+            artifact_name="FreeCAD-PDF-Importer_v0.0.0.zip",
+        )
+    except ValueError:
+        return True
+    return False
+
+
+def validate_release_zip_manifest(zip_path: Path) -> list[str]:
+    """Return sorted unique pathless codes; never raise."""
+    try:
+        structural: set[str] = set()
+        members: dict[str, bytes] = {}
+        identities: set[str] = set()
+        manifest_count = 0
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            infos = archive.infolist()
+            seen_names: set[str] = set()
+            for info in infos:
+                name = info.filename
+                if name == MANIFEST_MEMBER:
+                    manifest_count += 1
+                if name in seen_names:
+                    structural.add("RELEASE_ZIP_DUPLICATE_MEMBER")
+                seen_names.add(name)
+                identity = unicodedata.normalize("NFC", name).casefold()
+                is_alias = identity in identities and name not in members
+                if is_alias:
+                    structural.add("RELEASE_ZIP_MEMBER_ALIAS")
+                identities.add(identity)
+
+                mode = (info.external_attr >> 16) & 0xFFFF
+                file_type = stat.S_IFMT(mode)
+                is_nonregular = (
+                    info.is_dir()
+                    or name.endswith("/")
+                    or (info.create_system == 3 and file_type not in (0, stat.S_IFREG))
+                )
+                if is_nonregular:
+                    structural.add("RELEASE_ZIP_NONREGULAR_MEMBER")
+                if info.flag_bits & 0x1:
+                    structural.add("RELEASE_ZIP_ENCRYPTED_MEMBER")
+                if info.compress_type != zipfile.ZIP_STORED:
+                    structural.add("RELEASE_ZIP_UNSUPPORTED_COMPRESSION")
+                if _unsafe_zip_member_name(name) and not (
+                    is_alias and unicodedata.normalize("NFC", name) != name
+                ):
+                    structural.add("RELEASE_ZIP_UNSAFE_MEMBER")
+                if (
+                    not is_nonregular
+                    and not is_alias
+                    and _contract_rejects_member_name(name)
+                ):
+                    structural.add("RELEASE_ZIP_UNSAFE_MEMBER")
+                if name not in members and not structural:
+                    members[name] = archive.read(info)
+
+            if manifest_count == 0:
+                structural.add("RELEASE_ZIP_MANIFEST_MISSING")
+            elif manifest_count > 1:
+                structural.add("RELEASE_ZIP_MANIFEST_DUPLICATE")
+            if structural:
+                return sorted(structural)
+
+        manifest_payload = members.get(MANIFEST_MEMBER)
+        if manifest_payload is None:
+            return ["RELEASE_ZIP_MANIFEST_MISSING"]
+        document, problems = _CANDIDATE_MANIFEST.parse_candidate_file_manifest(
+            manifest_payload
+        )
+        if problems:
+            return sorted(set(problems))
+        assert document is not None
+        result: set[str] = set()
+        if document.get("artifact_name") != zip_path.name:
+            result.add("RELEASE_ZIP_ARTIFACT_NAME_MISMATCH")
+        result.update(
+            _CANDIDATE_MANIFEST.validate_candidate_archive_members(document, members)
+        )
+        return sorted(result)
+    except zipfile.BadZipFile:
+        return ["RELEASE_ZIP_CORRUPT"]
+    except (OSError, ValueError, RuntimeError, EOFError):
+        return ["RELEASE_ZIP_IO_ERROR"]
+    except Exception:
+        return ["RELEASE_ZIP_IO_ERROR"]
 
 
 def _resolve_zip(pattern: str) -> Path:
@@ -74,6 +208,15 @@ def main() -> int:
     args = parser.parse_args()
 
     zip_path = _resolve_zip(args.zip_path)
+    manifest_problems = validate_release_zip_manifest(zip_path)
+    if manifest_problems:
+        print(
+            "Release ZIP manifest failed: "
+            + zip_path.name
+            + ": "
+            + ", ".join(manifest_problems)
+        )
+        return 1
     with zipfile.ZipFile(zip_path, "r") as zf:
         names = set(zf.namelist())
         missing = sorted(REQUIRED_MEMBERS - names)

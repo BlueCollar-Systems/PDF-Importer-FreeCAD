@@ -112,6 +112,7 @@ def validate_release_zip_manifest(zip_path: Path) -> list[str]:
                 is_nonregular = (
                     info.is_dir()
                     or name.endswith("/")
+                    or (info.create_system == 0 and bool(info.external_attr & 0x10))
                     or (info.create_system == 3 and file_type not in (0, stat.S_IFREG))
                 )
                 if is_nonregular:

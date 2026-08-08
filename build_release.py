@@ -1050,6 +1050,7 @@ def _validate_written_release_zip(
             if (
                 info.is_dir()
                 or name.endswith("/")
+                or (info.create_system == 0 and bool(info.external_attr & 0x10))
                 or (info.create_system == 3 and file_type not in (0, stat.S_IFREG))
             ):
                 raise RuntimeError("Release blocked: temporary ZIP has non-file members.")

@@ -373,6 +373,43 @@ def _regular_info(
     return info
 
 
+def _write_dos_directory_manifest_zip(
+    path: Path,
+) -> tuple[Path, dict[str, bytes], dict]:
+    path = path / ZIP_NAME
+    members = {
+        "PDFVectorImporter/payload.bin": b"alpha",
+        "PDFVectorImporter/dos-directory": b"",
+    }
+    document = candidate_manifest.build_candidate_file_manifest(
+        members,
+        source_commit=SOURCE_COMMIT_A,
+        package_version=PACKAGE_VERSION,
+        artifact_name=ZIP_NAME,
+    )
+    archive_members = {
+        **members,
+        MANIFEST_MEMBER: candidate_manifest.canonical_candidate_manifest_bytes(
+            document
+        ),
+    }
+    dos_directory = zipfile.ZipInfo(
+        "PDFVectorImporter/dos-directory", date_time=(1980, 1, 1, 0, 0, 0)
+    )
+    dos_directory.compress_type = zipfile.ZIP_STORED
+    dos_directory.create_system = 0
+    dos_directory.external_attr = 0x10
+    path.parent.mkdir(parents=True)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr(
+            _regular_info("PDFVectorImporter/payload.bin"),
+            members["PDFVectorImporter/payload.bin"],
+        )
+        archive.writestr(dos_directory, members["PDFVectorImporter/dos-directory"])
+        archive.writestr(_regular_info(MANIFEST_MEMBER), archive_members[MANIFEST_MEMBER])
+    return path, archive_members, document
+
+
 def _write_manifest_zip(
     path: Path,
     *,
@@ -536,6 +573,27 @@ def test_smoke_rejects_directories_and_posix_nonregular_members(tmp_path, mode):
     assert smoke_release_zip.validate_release_zip_manifest(directory) == [
         "RELEASE_ZIP_NONREGULAR_MEMBER"
     ]
+
+
+def test_smoke_rejects_dos_directory_attribute_without_trailing_slash(tmp_path):
+    path, _members, _document = _write_dos_directory_manifest_zip(
+        tmp_path / "smoke-dos-directory"
+    )
+
+    assert smoke_release_zip.validate_release_zip_manifest(path) == [
+        "RELEASE_ZIP_NONREGULAR_MEMBER"
+    ]
+
+
+def test_builder_reopen_rejects_dos_directory_attribute_without_trailing_slash(
+    tmp_path,
+):
+    path, members, document = _write_dos_directory_manifest_zip(
+        tmp_path / "builder-dos-directory"
+    )
+
+    with pytest.raises(RuntimeError, match="non-file members"):
+        build_release._validate_written_release_zip(path, members, document)
 
 
 def _mark_first_entry_encrypted(path: Path) -> None:

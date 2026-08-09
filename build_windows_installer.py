@@ -61,6 +61,27 @@ _FILE_DIRECTORY_FILE = 0x00000001
 _FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
 _FILE_NON_DIRECTORY_FILE = 0x00000040
 _FILE_OPEN_REPARSE_POINT = 0x00200000
+_FILE_NOTIFY_CHANGE_FILE_NAME = 0x00000001
+_FILE_NOTIFY_CHANGE_DIR_NAME = 0x00000002
+_FILE_NOTIFY_CHANGE_ATTRIBUTES = 0x00000004
+_FILE_NOTIFY_CHANGE_SIZE = 0x00000008
+_FILE_NOTIFY_CHANGE_LAST_WRITE = 0x00000010
+_FILE_NOTIFY_CHANGE_CREATION = 0x00000040
+_FILE_NOTIFY_CHANGE_SECURITY = 0x00000100
+_STAGE_NOTIFY_FILTER = (
+    _FILE_NOTIFY_CHANGE_FILE_NAME
+    | _FILE_NOTIFY_CHANGE_DIR_NAME
+    | _FILE_NOTIFY_CHANGE_ATTRIBUTES
+    | _FILE_NOTIFY_CHANGE_SIZE
+    | _FILE_NOTIFY_CHANGE_LAST_WRITE
+    | _FILE_NOTIFY_CHANGE_CREATION
+    | _FILE_NOTIFY_CHANGE_SECURITY
+)
+_ERROR_IO_PENDING = 997
+_ERROR_OPERATION_ABORTED = 995
+_ERROR_NOT_FOUND = 1168
+_WAIT_OBJECT_0 = 0
+_WAIT_TIMEOUT = 258
 _COMMIT = re.compile(r"\A[0-9a-f]{40}\Z")
 _DIGEST = re.compile(r"\A[0-9a-f]{64}\Z")
 _VERSION = re.compile(r"\A(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z")
@@ -169,6 +190,17 @@ class _WindowsHeldEntry:
 
 
 @dataclass
+class _WindowsStageMonitor:
+    entry: _WindowsHeldEntry
+    event_handle: object
+    overlapped: object
+    buffer: object
+    bytes_returned: object
+    active: bool = True
+    event_closed: bool = False
+
+
+@dataclass
 class _WindowsStageHandles:
     stage_parent: Path
     parent_chain: list[_WindowsHeldEntry]
@@ -185,6 +217,7 @@ class _WindowsStageReadLease:
     directories: dict[str, _WindowsHeldEntry]
     files: dict[str, _WindowsHeldEntry]
     document: dict
+    monitor: _WindowsStageMonitor | None = None
     owns_root: bool = True
     active: bool = True
     capability_token: object | None = None
@@ -228,7 +261,11 @@ class CompiledInstaller:
     setup_basename: str
     output_identity_bytes: bytes
     output_identity_sha256: str
-    toolchain_identity: dict[str, str]
+    toolchain_name: str
+    toolchain_version: str
+    toolchain_source_sha256: str
+    toolchain_manifest_sha256: str
+    toolchain_tree_sha256: str
     toolchain_identity_bytes: bytes
     binding_sha256: str
     capability_token: object
@@ -673,7 +710,7 @@ def _nt_relative_create(
     return result.value
 
 
-def _open_windows_anchor_handle(anchor: str):
+def _open_windows_anchor_handle(anchor: str, *, add_file: bool = False):
     from ctypes import wintypes
 
     if not re.fullmatch(r"[A-Za-z]:\\", anchor):
@@ -696,7 +733,7 @@ def _open_windows_anchor_handle(anchor: str):
     handle = function(
         anchor,
         _FILE_LIST_DIRECTORY
-        | _FILE_ADD_SUBDIRECTORY
+        | (_FILE_ADD_FILE if add_file else _FILE_ADD_SUBDIRECTORY)
         | _FILE_READ_ATTRIBUTES
         | _FILE_TRAVERSE
         | _SYNCHRONIZE,
@@ -767,7 +804,12 @@ def _nt_open_directory_handle(parent_handle, name: str):
     )
 
 
-def _nt_open_directory_read_handle(parent_handle, name: str):
+def _nt_open_directory_read_handle(
+    parent_handle,
+    name: str,
+    *,
+    share_write: bool = True,
+):
     return _nt_relative_create(
         parent_handle,
         name,
@@ -777,13 +819,30 @@ def _nt_open_directory_read_handle(parent_handle, name: str):
             | _FILE_TRAVERSE
             | _SYNCHRONIZE
         ),
-        share_access=_FILE_SHARE_READ | _FILE_SHARE_WRITE,
+        share_access=(
+            _FILE_SHARE_READ | (_FILE_SHARE_WRITE if share_write else 0)
+        ),
         disposition=_FILE_OPEN,
         create_options=(
             _FILE_DIRECTORY_FILE
             | _FILE_SYNCHRONOUS_IO_NONALERT
             | _FILE_OPEN_REPARSE_POINT
         ),
+    )
+
+
+def _nt_open_directory_monitor_handle(parent_handle, name: str):
+    """Open one asynchronous, read-shared directory notification authority."""
+
+    return _nt_relative_create(
+        parent_handle,
+        name,
+        desired_access=(
+            _FILE_LIST_DIRECTORY | _FILE_READ_ATTRIBUTES | _FILE_TRAVERSE
+        ),
+        share_access=_FILE_SHARE_READ,
+        disposition=_FILE_OPEN,
+        create_options=_FILE_DIRECTORY_FILE | _FILE_OPEN_REPARSE_POINT,
     )
 
 
@@ -1581,7 +1640,7 @@ def _prepare_windows_stage_parent(
     anchor, components = _trusted_local_drive_parts(path)
     chain: list[_WindowsHeldEntry] = []
     try:
-        anchor_handle = _open_windows_anchor_handle(anchor)
+        anchor_handle = _open_windows_anchor_read_handle(anchor)
         anchor_entry = _entry_from_handle(
             anchor_handle,
             name=anchor,
@@ -1599,25 +1658,93 @@ def _prepare_windows_stage_parent(
             exists = _exact_windows_child_exists(
                 parent.handle, component, allow_absent=True
             )
-            if exists:
-                handle = _nt_open_directory_handle(parent.handle, component)
-                role = "ancestor"
-            else:
-                handle = _nt_create_directory_handle(
-                    parent.handle, component, parent_component=True
-                )
-                role = "created-parent"
             current_path = current_path / component
-            chain.append(
-                _entry_from_handle(
-                    handle,
+            if exists:
+                handle = _nt_open_directory_read_handle(
+                    parent.handle, component, share_write=True
+                )
+                chain.append(
+                    _entry_from_handle(
+                        handle,
+                        name=component,
+                        path=current_path,
+                        role="ancestor",
+                        parent=parent,
+                        expected_type=stat.S_IFDIR,
+                    )
+                )
+                continue
+
+            creator: _WindowsHeldEntry | None = None
+            created: _WindowsHeldEntry | None = None
+            retained: _WindowsHeldEntry | None = None
+            creator_handle = None
+            created_handle = None
+            retained_handle = None
+            try:
+                if len(chain) == 1:
+                    creator_handle = _open_windows_anchor_handle(anchor)
+                    creator_parent = None
+                else:
+                    creator_parent = chain[-2]
+                    creator_handle = _nt_open_directory_handle(
+                        creator_parent.handle, parent.name
+                    )
+                creator = _entry_from_handle(
+                    creator_handle,
+                    name=parent.name,
+                    path=parent.path,
+                    role="parent-creator-view",
+                    parent=creator_parent,
+                    expected_type=stat.S_IFDIR,
+                )
+                if creator.identity != parent.identity:
+                    raise _ChangedPath
+                _revalidate_windows_handle_chain(chain)
+                if _exact_windows_child_exists(
+                    creator.handle, component, allow_absent=True
+                ):
+                    raise _TempCollision
+                created_handle = _nt_create_directory_handle(
+                    creator.handle, component, parent_component=True
+                )
+                created = _entry_from_handle(
+                    created_handle,
                     name=component,
                     path=current_path,
-                    role=role,
+                    role="parent-created-view",
+                    parent=creator,
+                    expected_type=stat.S_IFDIR,
+                )
+                retained_handle = _nt_open_directory_read_handle(
+                    creator.handle, component, share_write=True
+                )
+                retained = _entry_from_handle(
+                    retained_handle,
+                    name=component,
+                    path=current_path,
+                    role="created-parent",
                     parent=parent,
                     expected_type=stat.S_IFDIR,
                 )
-            )
+                if retained.identity != created.identity:
+                    raise _ChangedPath
+                chain.append(retained)
+                _close_windows_entry(created)
+                _close_windows_entry(creator)
+            except Exception:
+                if retained is None and retained_handle is not None:
+                    _force_close_windows_handle(retained_handle)
+                if created is None and created_handle is not None:
+                    _force_close_windows_handle(created_handle)
+                if creator is None and creator_handle is not None:
+                    _force_close_windows_handle(creator_handle)
+                if retained is not None and retained not in chain:
+                    _close_windows_entries_nonraising([retained])
+                _close_windows_entries_nonraising(
+                    [entry for entry in (created, creator) if entry is not None]
+                )
+                raise
         if not components:
             raise _UnsafePath
         return _absolute_lexical(path), chain
@@ -1644,15 +1771,82 @@ def _revalidate_windows_handle_chain(chain) -> None:
         previous = entry
 
 
+def _open_windows_parent_creator_view(
+    chain: list[_WindowsHeldEntry],
+    *,
+    role: str,
+    add_file: bool = False,
+) -> _WindowsHeldEntry:
+    if not chain:
+        raise _ChangedPath
+    parent = chain[-1]
+    raw_handle = None
+    try:
+        if len(chain) == 1:
+            raw_handle = _open_windows_anchor_handle(
+                parent.name, add_file=add_file
+            )
+            creator_parent = None
+        else:
+            creator_parent = chain[-2]
+            if add_file:
+                raw_handle = _nt_relative_create(
+                    creator_parent.handle,
+                    parent.name,
+                    desired_access=(
+                        _FILE_LIST_DIRECTORY
+                        | _FILE_ADD_FILE
+                        | _FILE_READ_ATTRIBUTES
+                        | _FILE_TRAVERSE
+                        | _SYNCHRONIZE
+                    ),
+                    share_access=_FILE_SHARE_READ | _FILE_SHARE_WRITE,
+                    disposition=_FILE_OPEN,
+                    create_options=(
+                        _FILE_DIRECTORY_FILE
+                        | _FILE_SYNCHRONOUS_IO_NONALERT
+                        | _FILE_OPEN_REPARSE_POINT
+                    ),
+                )
+            else:
+                raw_handle = _nt_open_directory_handle(
+                    creator_parent.handle, parent.name
+                )
+        creator = _entry_from_handle(
+            raw_handle,
+            name=parent.name,
+            path=parent.path,
+            role=role,
+            parent=creator_parent,
+            expected_type=stat.S_IFDIR,
+        )
+        if creator.identity != parent.identity:
+            raise _ChangedPath
+        _revalidate_windows_handle_chain(chain)
+        return creator
+    except Exception:
+        if raw_handle is not None:
+            _force_close_windows_handle(raw_handle)
+        raise
+
+
 def _create_windows_stage_root(
     stage_parent: Path,
     parent_chain: list[_WindowsHeldEntry],
     name: str,
 ) -> _WindowsStageHandles:
     parent = parent_chain[-1]
-    handle = _nt_create_directory_handle(parent.handle, name, root=True)
+    if _exact_windows_child_exists(parent.handle, name, allow_absent=True):
+        raise _TempCollision
+    creator = _open_windows_parent_creator_view(
+        parent_chain, role="stage-parent-creator"
+    )
+    handle = None
     root: _WindowsHeldEntry | None = None
     try:
+        if _exact_windows_child_exists(creator.handle, name, allow_absent=True):
+            raise _TempCollision
+        handle = _nt_create_directory_handle(creator.handle, name, root=True)
         root = _entry_from_handle(
             handle,
             name=name,
@@ -1662,6 +1856,7 @@ def _create_windows_stage_root(
             expected_type=stat.S_IFDIR,
         )
         _revalidate_windows_handle_chain(parent_chain)
+        _close_windows_entry(creator)
         return _WindowsStageHandles(
             stage_parent=stage_parent,
             parent_chain=parent_chain,
@@ -1670,7 +1865,9 @@ def _create_windows_stage_root(
             files={},
         )
     except Exception:
-        _force_close_windows_handle(handle)
+        if handle is not None:
+            _force_close_windows_handle(handle)
+        _close_windows_entries_nonraising([creator])
         raise
 
 
@@ -1782,6 +1979,16 @@ def _validate_windows_stage_handles(
             raise _ChangedPath
         parent_key, _, name = relative.rpartition("/")
         expected_children[parent_key].add(name)
+    if type(document) is not dict:
+        raise _ChangedPath
+    package_entry = workspace.files.get("PDFVectorImporter/package.xml")
+    if (
+        package_entry is None
+        or package_entry.payload is None
+        or _parse_package_version_bytes(package_entry.payload)
+        != document.get("package_version")
+    ):
+        raise _ChangedPath
     for relative, entry in workspace.directories.items():
         names = _query_windows_directory_names(entry.handle)
         if len({_name_identity(name) for name in names}) != len(names):
@@ -2157,7 +2364,11 @@ def _open_windows_existing_directory_chain(
                 parent.handle, component, allow_absent=False
             ):
                 raise _ChangedPath
-            handle = _nt_open_directory_read_handle(parent.handle, component)
+            handle = _nt_open_directory_read_handle(
+                parent.handle,
+                component,
+                share_write=index != len(components) - 1,
+            )
             current_path /= component
             role = (
                 role_prefix + "-root"
@@ -2211,6 +2422,245 @@ def _stage_expected_payloads(
     return payloads
 
 
+def _create_windows_stage_monitor_event():
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_event = kernel32.CreateEventW
+    create_event.argtypes = [
+        wintypes.LPVOID,
+        wintypes.BOOL,
+        wintypes.BOOL,
+        wintypes.LPCWSTR,
+    ]
+    create_event.restype = wintypes.HANDLE
+    event_handle = create_event(None, True, False, None)
+    if not event_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return event_handle
+
+
+def _arm_windows_stage_monitor(
+    lease: _WindowsStageReadLease,
+) -> _WindowsStageMonitor:
+    """Arm one recursive NTFS change notification from retained root authority."""
+
+    from ctypes import wintypes
+
+    class _Overlapped(ctypes.Structure):
+        _fields_ = [
+            ("Internal", ctypes.c_size_t),
+            ("InternalHigh", ctypes.c_size_t),
+            ("Offset", wintypes.DWORD),
+            ("OffsetHigh", wintypes.DWORD),
+            ("hEvent", wintypes.HANDLE),
+        ]
+
+    if (
+        type(lease) is not _WindowsStageReadLease
+        or not lease.active
+        or not lease.parent_chain
+        or lease.monitor is not None
+    ):
+        raise _ChangedPath
+    raw_handle = None
+    event_handle = None
+    entry: _WindowsHeldEntry | None = None
+    monitor: _WindowsStageMonitor | None = None
+    try:
+        raw_handle = _nt_open_directory_monitor_handle(
+            lease.parent_chain[-1].handle, lease.root.name
+        )
+        entry = _entry_from_handle(
+            raw_handle,
+            name=lease.root.name,
+            path=lease.staged_release.stage_root,
+            role="stage-monitor",
+            parent=lease.parent_chain[-1],
+            expected_type=stat.S_IFDIR,
+        )
+        if (
+            entry.identity != lease.root.identity
+            or _query_windows_final_path(entry.handle)
+            != lease.staged_release.stage_root
+        ):
+            raise _ChangedPath
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        event_handle = _create_windows_stage_monitor_event()
+
+        overlapped = _Overlapped()
+        overlapped.hEvent = event_handle
+        buffer = ctypes.create_string_buffer(32 * 1024)
+        bytes_returned = wintypes.DWORD()
+        monitor = _WindowsStageMonitor(
+            entry=entry,
+            event_handle=event_handle,
+            overlapped=overlapped,
+            buffer=buffer,
+            bytes_returned=bytes_returned,
+        )
+        read_changes = kernel32.ReadDirectoryChangesW
+        read_changes.argtypes = [
+            wintypes.HANDLE,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(_Overlapped),
+            wintypes.LPVOID,
+        ]
+        read_changes.restype = wintypes.BOOL
+        ctypes.set_last_error(0)
+        queued = read_changes(
+            entry.handle,
+            buffer,
+            ctypes.sizeof(buffer),
+            True,
+            _STAGE_NOTIFY_FILTER,
+            ctypes.byref(bytes_returned),
+            ctypes.byref(overlapped),
+            None,
+        )
+        if not queued and ctypes.get_last_error() != _ERROR_IO_PENDING:
+            raise ctypes.WinError(ctypes.get_last_error())
+        _validate_windows_stage_monitor(monitor)
+        return monitor
+    except Exception:
+        if monitor is not None:
+            try:
+                _release_windows_stage_monitor(monitor)
+            except Exception:
+                pass
+        else:
+            if event_handle is not None:
+                _force_close_windows_handle(event_handle)
+            if entry is not None:
+                _close_windows_entries_nonraising([entry])
+            elif raw_handle is not None:
+                _force_close_windows_handle(raw_handle)
+        raise
+
+
+def _wait_windows_stage_monitor(monitor: _WindowsStageMonitor, timeout: int) -> int:
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    wait = kernel32.WaitForSingleObject
+    wait.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    wait.restype = wintypes.DWORD
+    return int(wait(monitor.event_handle, timeout))
+
+
+def _windows_stage_monitor_result(monitor: _WindowsStageMonitor) -> tuple[bool, int]:
+    from ctypes import wintypes
+
+    transferred = wintypes.DWORD()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_result = kernel32.GetOverlappedResult
+    get_result.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.BOOL,
+    ]
+    get_result.restype = wintypes.BOOL
+    ctypes.set_last_error(0)
+    succeeded = bool(
+        get_result(
+            monitor.entry.handle,
+            ctypes.byref(monitor.overlapped),
+            ctypes.byref(transferred),
+            False,
+        )
+    )
+    return succeeded, int(transferred.value if succeeded else ctypes.get_last_error())
+
+
+def _validate_windows_stage_monitor(monitor: _WindowsStageMonitor) -> None:
+    if type(monitor) is not _WindowsStageMonitor or not monitor.active:
+        raise _ChangedPath
+    wait_result = _wait_windows_stage_monitor(monitor, 0)
+    if wait_result == _WAIT_TIMEOUT:
+        return
+    if wait_result != _WAIT_OBJECT_0:
+        raise _NativeCapabilityError
+    succeeded, _value = _windows_stage_monitor_result(monitor)
+    if succeeded:
+        raise _ChangedPath
+    raise _NativeCapabilityError
+
+
+def _release_windows_stage_monitor(monitor: _WindowsStageMonitor) -> None:
+    """Cancel, prove completion, and close one monitor exactly once."""
+
+    from ctypes import wintypes
+
+    if type(monitor) is not _WindowsStageMonitor or not monitor.active:
+        return
+    first_error: Exception | None = None
+    wait_before = _wait_windows_stage_monitor(monitor, 0)
+    if wait_before == _WAIT_OBJECT_0:
+        first_error = _ChangedPath()
+    elif wait_before != _WAIT_TIMEOUT:
+        first_error = _NativeCapabilityError()
+
+    monitor.active = False
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    cancel = kernel32.CancelIoEx
+    cancel.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
+    cancel.restype = wintypes.BOOL
+    ctypes.set_last_error(0)
+    cancelled = bool(cancel(monitor.entry.handle, ctypes.byref(monitor.overlapped)))
+    cancel_error = 0 if cancelled else int(ctypes.get_last_error())
+    if not cancelled and cancel_error != _ERROR_NOT_FOUND and first_error is None:
+        first_error = _NativeCapabilityError()
+
+    if cancelled:
+        wait_after = _wait_windows_stage_monitor(monitor, 5000)
+        if wait_after != _WAIT_OBJECT_0:
+            if first_error is None:
+                first_error = _NativeCapabilityError()
+        else:
+            succeeded, result = _windows_stage_monitor_result(monitor)
+            if succeeded:
+                if first_error is None:
+                    first_error = _ChangedPath()
+            elif result != _ERROR_OPERATION_ABORTED and first_error is None:
+                first_error = _NativeCapabilityError()
+    elif cancel_error == _ERROR_NOT_FOUND and first_error is None:
+        first_error = _NativeCapabilityError()
+
+    try:
+        _close_windows_entry(monitor.entry)
+    except Exception as exc:
+        if first_error is None:
+            first_error = exc
+    if not monitor.event_closed:
+        try:
+            _close_windows_handle(monitor.event_handle)
+        except Exception as exc:
+            _force_close_windows_handle(monitor.event_handle)
+            if first_error is None:
+                first_error = exc
+        monitor.event_closed = True
+    if first_error is not None:
+        raise first_error
+
+
+def _retire_windows_stage_monitor(lease: _WindowsStageReadLease) -> None:
+    if (
+        type(lease) is not _WindowsStageReadLease
+        or not lease.active
+        or type(lease.monitor) is not _WindowsStageMonitor
+        or not lease.monitor.active
+    ):
+        raise _ChangedPath
+    _validate_windows_stage_monitor(lease.monitor)
+    _release_windows_stage_monitor(lease.monitor)
+
+
 def _open_windows_stage_descendants(
     staged_release: InstallerStage,
     document: dict,
@@ -2227,7 +2677,7 @@ def _open_windows_stage_descendants(
         if root.closed or _query_windows_opened_name(root.handle) != staged_release.stage_root.name:
             raise _ChangedPath
         snapshot_parent_handle = _nt_open_directory_read_handle(
-            root.handle, _STAGE_METADATA_DIRNAME
+            root.handle, _STAGE_METADATA_DIRNAME, share_write=False
         )
         snapshot_parent = _entry_from_handle(
             snapshot_parent_handle,
@@ -2271,7 +2721,9 @@ def _open_windows_stage_descendants(
         ):
             parent_key, _, name = relative.rpartition("/")
             parent = directories[parent_key]
-            handle = _nt_open_directory_read_handle(parent.handle, name)
+            handle = _nt_open_directory_read_handle(
+                parent.handle, name, share_write=False
+            )
             entry = _entry_from_handle(
                 handle,
                 name=name,
@@ -2314,13 +2766,20 @@ def _open_windows_stage_descendants(
         )
         _validate_windows_stage_read_lease(lease)
         return lease
-    except Exception:
-        _close_windows_entries_nonraising(reversed(opened_files))
-        _close_windows_entries_nonraising(reversed(opened_directories))
+    except Exception as original_error:
+        close_error: _StageCloseError | None = None
+        for entry in [*reversed(opened_files), *reversed(opened_directories)]:
+            try:
+                _close_windows_entry(entry)
+            except Exception:
+                if close_error is None:
+                    close_error = _StageCloseError(entry.role)
         if owns_root:
             _close_windows_entries_nonraising([root])
             _close_windows_entries_nonraising(reversed(parent_chain))
-        raise
+        if close_error is not None:
+            raise close_error from None
+        raise original_error
 
 
 def _acquire_windows_stage_read_lease(
@@ -2349,18 +2808,27 @@ def _acquire_windows_stage_read_lease(
         role_prefix="stage",
     )
     root = chain[-1]
-    return _open_windows_stage_descendants(
+    lease = _open_windows_stage_descendants(
         staged_release,
         document,
         chain[:-1],
         root,
         owns_root=True,
     )
+    try:
+        lease.monitor = _arm_windows_stage_monitor(lease)
+        _validate_windows_stage_read_lease(lease)
+        return lease
+    except Exception:
+        _release_windows_stage_read_lease_nonraising(lease)
+        raise
 
 
 def _validate_windows_stage_read_lease(lease: _WindowsStageReadLease) -> dict:
     if type(lease) is not _WindowsStageReadLease or not lease.active:
         raise _ChangedPath
+    if lease.monitor is not None:
+        _validate_windows_stage_monitor(lease.monitor)
     staged_release = lease.staged_release
     document = _validate_installer_stage_descriptor(staged_release)
     _revalidate_windows_handle_chain([*lease.parent_chain, lease.root])
@@ -2406,6 +2874,20 @@ def _validate_windows_stage_read_lease(lease: _WindowsStageReadLease) -> dict:
             raise _UnsafePath
         if set(names) != expected_children[relative]:
             raise _ChangedPath
+    package_entry = lease.files.get("PDFVectorImporter/package.xml")
+    if package_entry is None:
+        raise _ChangedPath
+    package_bytes = _read_windows_file_handle(package_entry.handle)
+    if (
+        package_bytes != package_entry.payload
+        or _parse_package_version_bytes(package_bytes)
+        != document.get("package_version")
+        or document.get("package_version") != staged_release.version
+        or document.get("artifact_name") != staged_release.source_zip_name
+    ):
+        raise _ChangedPath
+    if lease.monitor is not None:
+        _validate_windows_stage_monitor(lease.monitor)
     return document
 
 
@@ -2414,6 +2896,11 @@ def _release_windows_stage_read_lease(lease: _WindowsStageReadLease) -> None:
         return
     lease.active = False
     first_error: Exception | None = None
+    if lease.monitor is not None:
+        try:
+            _release_windows_stage_monitor(lease.monitor)
+        except Exception as exc:
+            first_error = exc
     for entry in reversed(tuple(lease.files.values())):
         try:
             _close_windows_entry(entry)
@@ -2476,6 +2963,18 @@ def _canonical_toolchain_identity(value: object) -> dict[str, str]:
     return result
 
 
+def _compiled_toolchain_identity(value: CompiledInstaller) -> dict[str, str]:
+    return _canonical_toolchain_identity(
+        {
+            "name": value.toolchain_name,
+            "version": value.toolchain_version,
+            "source_sha256": value.toolchain_source_sha256,
+            "manifest_sha256": value.toolchain_manifest_sha256,
+            "tree_sha256": value.toolchain_tree_sha256,
+        }
+    )
+
+
 def _canonical_compiled_installer_identity_bytes(
     *,
     setup_basename: str,
@@ -2534,27 +3033,35 @@ def _create_windows_output_root(
     name: str,
 ) -> _WindowsHeldEntry:
     parent = parent_chain[-1]
-    handle = _nt_relative_create(
-        parent.handle,
-        name,
-        desired_access=(
-            _FILE_LIST_DIRECTORY
-            | _FILE_ADD_FILE
-            | _FILE_READ_ATTRIBUTES
-            | _FILE_TRAVERSE
-            | _DELETE
-            | _SYNCHRONIZE
-        ),
-        share_access=_FILE_SHARE_READ | _FILE_SHARE_WRITE,
-        disposition=_FILE_CREATE,
-        create_options=(
-            _FILE_DIRECTORY_FILE
-            | _FILE_SYNCHRONOUS_IO_NONALERT
-            | _FILE_OPEN_REPARSE_POINT
-        ),
+    if _exact_windows_child_exists(parent.handle, name, allow_absent=True):
+        raise _TempCollision
+    creator = _open_windows_parent_creator_view(
+        parent_chain, role="output-parent-creator"
     )
+    handle = None
     try:
-        return _entry_from_handle(
+        if _exact_windows_child_exists(creator.handle, name, allow_absent=True):
+            raise _TempCollision
+        handle = _nt_relative_create(
+            creator.handle,
+            name,
+            desired_access=(
+                _FILE_LIST_DIRECTORY
+                | _FILE_ADD_FILE
+                | _FILE_READ_ATTRIBUTES
+                | _FILE_TRAVERSE
+                | _DELETE
+                | _SYNCHRONIZE
+            ),
+            share_access=_FILE_SHARE_READ | _FILE_SHARE_WRITE,
+            disposition=_FILE_CREATE,
+            create_options=(
+                _FILE_DIRECTORY_FILE
+                | _FILE_SYNCHRONOUS_IO_NONALERT
+                | _FILE_OPEN_REPARSE_POINT
+            ),
+        )
+        entry = _entry_from_handle(
             handle,
             name=name,
             path=output_parent / name,
@@ -2562,8 +3069,12 @@ def _create_windows_output_root(
             parent=parent,
             expected_type=stat.S_IFDIR,
         )
+        _close_windows_entry(creator)
+        return entry
     except Exception:
-        _force_close_windows_handle(handle)
+        if handle is not None:
+            _force_close_windows_handle(handle)
+        _close_windows_entries_nonraising([creator])
         raise
 
 
@@ -2842,7 +3353,7 @@ def _validate_compiled_installer_binding(value: CompiledInstaller) -> None:
         or value.output_lease.output_identity_sha256 != value.output_identity_sha256
     ):
         raise _ChangedPath
-    canonical_toolchain = _canonical_toolchain_identity(value.toolchain_identity)
+    canonical_toolchain = _compiled_toolchain_identity(value)
     toolchain_bytes = _canonical_json_bytes(canonical_toolchain)
     if toolchain_bytes != value.toolchain_identity_bytes:
         raise _ChangedPath
@@ -2922,6 +3433,11 @@ def finalize_compiled_installer(compiled_installer: CompiledInstaller) -> Path:
             except Exception:
                 token = "INSTALLER_COMPILER_INPUT_INVALID"
         if token is None:
+            try:
+                _retire_windows_stage_monitor(compiled_installer.stage_lease)
+            except Exception:
+                token = "INSTALLER_COMPILER_INPUT_INVALID"
+        if token is None:
             result = compiled_installer.output_lease.loose_path
     finally:
         _consume_compiled_installer(compiled_installer)
@@ -2965,26 +3481,39 @@ def _create_windows_attestation_temp(
     parent_chain: list[_WindowsHeldEntry],
     name: str,
 ) -> tuple[_WindowsHeldEntry, _WindowsHeldEntry]:
-    handle = _nt_relative_create(
-        parent_chain[-1].handle,
-        name,
-        desired_access=(
-            _FILE_READ_DATA
-            | _FILE_WRITE_DATA
-            | _FILE_READ_ATTRIBUTES
-            | _FILE_WRITE_ATTRIBUTES
-            | _DELETE
-            | _SYNCHRONIZE
-        ),
-        share_access=0,
-        disposition=_FILE_CREATE,
-        create_options=(
-            _FILE_NON_DIRECTORY_FILE
-            | _FILE_SYNCHRONOUS_IO_NONALERT
-            | _FILE_OPEN_REPARSE_POINT
-        ),
+    if _exact_windows_child_exists(
+        parent_chain[-1].handle, name, allow_absent=True
+    ):
+        raise _TempCollision
+    creator = _open_windows_parent_creator_view(
+        parent_chain,
+        role="attestation-parent-creator",
+        add_file=True,
     )
+    handle = None
+    work_handle = None
     try:
+        if _exact_windows_child_exists(creator.handle, name, allow_absent=True):
+            raise _TempCollision
+        handle = _nt_relative_create(
+            creator.handle,
+            name,
+            desired_access=(
+                _FILE_READ_DATA
+                | _FILE_WRITE_DATA
+                | _FILE_READ_ATTRIBUTES
+                | _FILE_WRITE_ATTRIBUTES
+                | _DELETE
+                | _SYNCHRONIZE
+            ),
+            share_access=0,
+            disposition=_FILE_CREATE,
+            create_options=(
+                _FILE_NON_DIRECTORY_FILE
+                | _FILE_SYNCHRONOUS_IO_NONALERT
+                | _FILE_OPEN_REPARSE_POINT
+            ),
+        )
         entry = _entry_from_handle(
             handle,
             name=name,
@@ -3016,9 +3545,14 @@ def _create_windows_attestation_temp(
             role="attestation-temp",
             parent_handle=entry.parent_handle,
         )
+        _close_windows_entry(creator)
         return entry, work_entry
     except Exception:
-        _force_close_windows_handle(handle)
+        if work_handle is not None:
+            _force_close_windows_handle(work_handle)
+        if handle is not None:
+            _force_close_windows_handle(handle)
+        _close_windows_entries_nonraising([creator])
         raise
 
 
@@ -3093,7 +3627,11 @@ def write_attestation(
 ) -> Path:
     """Publish canonical attestation bytes from one retained compiled capability."""
 
-    if legacy_arguments or not _is_active_compiled_installer(compiled_installer):
+    if legacy_arguments:
+        if _is_active_compiled_installer(compiled_installer):
+            _consume_compiled_installer(compiled_installer)
+        raise RuntimeError("INSTALLER_ATTESTATION_INPUT_INVALID") from None
+    if not _is_active_compiled_installer(compiled_installer):
         raise RuntimeError("INSTALLER_ATTESTATION_INPUT_INVALID") from None
     try:
         destination = _exact_lexical_path(output_path)
@@ -3128,6 +3666,7 @@ def write_attestation(
         raise RuntimeError(token) from None
 
     assert document is not None
+    verified_setup = compiled_installer.output_lease.loose_path
     staged_release = compiled_installer.staged_release
     encoded = _canonical_json_bytes(
         {
@@ -3149,7 +3688,7 @@ def write_attestation(
                 "member": MANIFEST_MEMBER,
                 "sha256": staged_release.installed_manifest_sha256,
             },
-            "toolchain": dict(compiled_installer.toolchain_identity),
+            "toolchain": _compiled_toolchain_identity(compiled_installer),
         }
     )
     try:
@@ -3180,7 +3719,6 @@ def write_attestation(
             or _read_windows_file_handle(temporary_work.handle) != encoded
         ):
             raise _ChangedPath
-        _close_windows_entry(temporary_work)
     except Exception:
         _close_windows_entries_nonraising(
             [temporary_work] if temporary_work is not None else []
@@ -3189,6 +3727,29 @@ def write_attestation(
         _close_windows_entries_nonraising(reversed(parent_chain))
         _consume_compiled_installer(compiled_installer)
         raise RuntimeError("INSTALLER_ATTESTATION_IO_ERROR") from None
+    try:
+        _close_windows_entry(temporary_work)
+    except Exception:
+        _close_windows_entries_nonraising(
+            [temporary] if temporary is not None else []
+        )
+        _close_windows_entries_nonraising(reversed(parent_chain))
+        _consume_compiled_installer(compiled_installer)
+        raise RuntimeError("INSTALLER_ATTESTATION_IO_ERROR") from None
+
+    try:
+        _validate_windows_stage_read_lease(compiled_installer.stage_lease)
+        _retire_windows_stage_monitor(compiled_installer.stage_lease)
+    except Exception:
+        cleaned = _cleanup_windows_attestation_temp(temporary)
+        _close_windows_entries_nonraising(reversed(parent_chain))
+        _consume_compiled_installer(compiled_installer)
+        token = (
+            "INSTALLER_ATTESTATION_INPUT_INVALID"
+            if cleaned
+            else "INSTALLER_ATTESTATION_IO_ERROR"
+        )
+        raise RuntimeError(token) from None
 
     try:
         _rename_windows_handle(
@@ -3226,7 +3787,7 @@ def write_attestation(
                 raise RuntimeError("INSTALLER_ATTESTATION_PUBLISH_ERROR") from None
             _close_windows_entries_nonraising([winner])
             _close_windows_entries_nonraising(reversed(parent_chain))
-            return destination
+            return verified_setup
         _close_windows_entries_nonraising([winner] if winner is not None else [])
         _close_windows_entries_nonraising(reversed(parent_chain))
         if exact and not cleaned:
@@ -3242,18 +3803,30 @@ def write_attestation(
     _close_windows_entries_nonraising([temporary])
     _close_windows_entries_nonraising(reversed(parent_chain))
     _consume_compiled_installer(compiled_installer)
-    return destination
+    return verified_setup
+
+
+def _parse_package_version_bytes(package_xml_bytes: bytes) -> str:
+    if type(package_xml_bytes) is not bytes:
+        raise _ChangedPath
+    try:
+        text = package_xml_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise _ChangedPath from None
+    matches = re.findall(r"<version>(.*?)</version>", text)
+    if len(matches) != 1:
+        raise _ChangedPath
+    version = matches[0].strip()
+    if not version:
+        raise _ChangedPath
+    return version
 
 
 def _read_package_version(package_xml: Path) -> str:
     if not package_xml.exists():
         raise FileNotFoundError(f"Missing package metadata: {package_xml}")
 
-    text = package_xml.read_text(encoding="utf-8")
-    match = re.search(r"<version>(.*?)</version>", text)
-    if not match:
-        raise RuntimeError("Could not determine version from package.xml")
-    return match.group(1).strip()
+    return _parse_package_version_bytes(package_xml.read_bytes())
 
 
 def read_version() -> str:
@@ -3298,25 +3871,37 @@ def stage_release(
 ) -> InstallerStage:
     """Validate and atomically publish one exact retained-handle stage."""
 
+    try:
+        validated_source = (
+            None if source_zip is None else _exact_lexical_path(source_zip)
+        )
+        output_root = _exact_lexical_path(
+            dist_dir if dist_dir is not None else DIST_DIR
+        )
+    except Exception:
+        raise RuntimeError("INSTALLER_SOURCE_UNSAFE") from None
+    try:
+        validated_stage_parent = _exact_lexical_path(
+            stage_dir if stage_dir is not None else STAGE_DIR
+        )
+    except Exception:
+        raise RuntimeError("INSTALLER_STAGE_UNSAFE") from None
+
     version = read_version()
     expected_name = f"FreeCAD-PDF-Importer_v{version}.zip"
-    output_root = _absolute_lexical(dist_dir if dist_dir is not None else DIST_DIR)
-    if source_zip is None:
+    if validated_source is None:
         try:
-            zip_path = _absolute_lexical(build_release.build(output_root))
+            zip_path = _exact_lexical_path(build_release.build(output_root))
         except Exception:
             raise RuntimeError("INSTALLER_SOURCE_IO_ERROR") from None
     else:
-        try:
-            zip_path = _absolute_lexical(source_zip)
-        except Exception:
-            raise RuntimeError("INSTALLER_SOURCE_UNSAFE") from None
+        zip_path = validated_source
     if zip_path.name != expected_name:
         raise RuntimeError("INSTALLER_SOURCE_UNSAFE")
 
     try:
         stage_parent, parent_chain = _prepare_windows_stage_parent(
-            stage_dir if stage_dir is not None else STAGE_DIR
+            validated_stage_parent
         )
     except (_UnsafePath, _ChangedPath):
         raise RuntimeError("INSTALLER_STAGE_UNSAFE") from None
@@ -3497,6 +4082,12 @@ def stage_release(
             cleanup_token="INSTALLER_STAGE_IO_ERROR",
             workspace=workspace,
         )
+    except OSError:
+        _raise_with_windows_stage_cleanup(
+            "INSTALLER_STAGE_IO_ERROR",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            workspace=workspace,
+        )
     except Exception:
         _raise_with_windows_stage_cleanup(
             "INSTALLER_STAGE_TREE_INVALID",
@@ -3511,35 +4102,11 @@ def stage_release(
             workspace=workspace,
         )
 
-    temporary = workspace.root.path
-    source_dir = temporary / "PDFVectorImporter"
     try:
         _close_windows_stage_descendants(workspace)
-    except _StageCloseError as exc:
-        token = (
-            "INSTALLER_SOURCE_IO_ERROR"
-            if exc.role == "source-file"
-            else "INSTALLER_STAGE_IO_ERROR"
-        )
-        _raise_with_windows_stage_cleanup(
-            token,
-            cleanup_token="INSTALLER_STAGE_IO_ERROR",
-            workspace=workspace,
-        )
-    try:
-        package_version = _read_package_version(source_dir / "package.xml")
-    except Exception:
-        _raise_with_windows_stage_cleanup(
-            "INSTALLER_STAGE_IO_ERROR",
-            cleanup_token="INSTALLER_STAGE_IO_ERROR",
-            workspace=workspace,
-        )
-    if package_version != version:
-        _raise_with_windows_stage_cleanup(
-            "INSTALLER_STAGE_TREE_INVALID",
-            cleanup_token="INSTALLER_STAGE_IO_ERROR",
-            workspace=workspace,
-        )
+    except _StageCloseError:
+        _close_windows_stage_authority(workspace)
+        raise RuntimeError("INSTALLER_STAGE_IO_ERROR") from None
     try:
         _revalidate_windows_handle_chain(parent_chain)
     except (_UnsafePath, _ChangedPath):
@@ -3648,6 +4215,9 @@ def stage_release(
             adopted_root=workspace.root,
             adopted_parent_chain=parent_chain,
         )
+    except _StageCloseError:
+        _close_windows_stage_authority(workspace)
+        raise RuntimeError("INSTALLER_STAGE_IO_ERROR") from None
     except _UnsafePath:
         _raise_with_windows_stage_cleanup(
             "INSTALLER_STAGE_UNSAFE",
@@ -3679,15 +4249,19 @@ def compile_installer(
     """Compile under retained input/output authority and return one sealed capability."""
 
     try:
+        compiler_path = _exact_lexical_path(iscc)
+        output_path = _exact_lexical_path(
+            output_dir if output_dir is not None else DIST_DIR
+        )
+        canonical_toolchain = _canonical_toolchain_identity(toolchain_identity)
+        toolchain_bytes = _canonical_json_bytes(canonical_toolchain)
+    except Exception:
+        raise RuntimeError("INSTALLER_COMPILER_INPUT_INVALID") from None
+    try:
         stage_lease = _acquire_windows_stage_read_lease(staged_release)
     except Exception:
         raise RuntimeError("INSTALLER_COMPILER_INPUT_INVALID") from None
     try:
-        canonical_toolchain = _canonical_toolchain_identity(toolchain_identity)
-        toolchain_bytes = _canonical_json_bytes(canonical_toolchain)
-        output_path = _exact_lexical_path(
-            output_dir if output_dir is not None else DIST_DIR
-        )
         output_root, output_chain = _prepare_windows_output_parent(output_path)
     except _ChangedPath:
         _release_windows_stage_read_lease_nonraising(stage_lease)
@@ -3716,7 +4290,7 @@ def compile_installer(
         raise RuntimeError("INSTALLER_COMPILER_FAILED") from None
 
     cmd = [
-        str(iscc),
+        str(compiler_path),
         str(INNO_SCRIPT),
         f"/DMyAppVersion={staged_release.version}",
         f"/DSourceDir={staged_release.source_dir}",
@@ -3888,7 +4462,11 @@ def compile_installer(
         setup_basename=setup_basename,
         output_identity_bytes=identity_bytes,
         output_identity_sha256=identity_sha256,
-        toolchain_identity=canonical_toolchain,
+        toolchain_name=canonical_toolchain["name"],
+        toolchain_version=canonical_toolchain["version"],
+        toolchain_source_sha256=canonical_toolchain["source_sha256"],
+        toolchain_manifest_sha256=canonical_toolchain["manifest_sha256"],
+        toolchain_tree_sha256=canonical_toolchain["tree_sha256"],
         toolchain_identity_bytes=toolchain_bytes,
         binding_sha256=binding_sha256,
         capability_token=capability_token,
@@ -3966,13 +4544,8 @@ def main() -> int:
         toolchain_identity=toolchain_identity,
         output_dir=args.output_dir,
     )
-    installer_exe = (
-        compiled_installer.output_lease.loose_path
-        if type(compiled_installer) is CompiledInstaller
-        else compiled_installer
-    )
     if args.attestation:
-        write_attestation(
+        installer_exe = write_attestation(
             args.attestation,
             compiled_installer=compiled_installer,
         )

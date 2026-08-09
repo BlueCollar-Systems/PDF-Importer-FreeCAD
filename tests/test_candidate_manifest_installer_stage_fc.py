@@ -1854,3 +1854,472 @@ def test_stage_tree_validator_failure_uses_exact_task5a_suffix_and_no_publish(
         re.fullmatch(r"[0-9a-f]{64}", child.name)
         for child in (tmp_path / "stages").iterdir()
     )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle ownership behavior")
+def test_stage_root_creation_handle_blocks_replacement_during_identity_capture(
+    monkeypatch, tmp_path
+):
+    source, _document, _members = _valid_zip(tmp_path)
+    stage_parent = tmp_path / "stages"
+    real_metadata = build_windows_installer._windows_handle_metadata
+    attempted = False
+    blocked = False
+
+    def attempt_replacement(handle):
+        nonlocal attempted, blocked
+        candidates = (
+            list(stage_parent.glob(build_windows_installer._STAGE_TEMP_PREFIX + "*"))
+            if stage_parent.exists()
+            else []
+        )
+        if candidates and not attempted:
+            attempted = True
+            temporary = candidates[0]
+            displaced = temporary.with_name(temporary.name + "-displaced")
+            try:
+                os.replace(temporary, displaced)
+            except OSError:
+                blocked = True
+            else:
+                os.replace(displaced, temporary)
+        return real_metadata(handle)
+
+    monkeypatch.setattr(
+        build_windows_installer, "_windows_handle_metadata", attempt_replacement
+    )
+
+    staged = _stage(monkeypatch, tmp_path, source, stage_parent=stage_parent)
+
+    assert attempted is True
+    assert blocked is True
+    assert staged.stage_root.is_dir()
+    assert not list(stage_parent.glob("*-displaced"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle ownership behavior")
+def test_stage_root_swap_after_mkdir_never_becomes_owned_or_quarantined(
+    monkeypatch, tmp_path
+):
+    source, _document, _members = _valid_zip(tmp_path)
+    stage_parent = tmp_path / "stages"
+    token = "3" * 32
+    temporary = stage_parent / (build_windows_installer._STAGE_TEMP_PREFIX + token)
+    displaced = temporary.with_name(temporary.name + "-created")
+    marker = temporary / "foreign-marker.bin"
+    real_mkdir = os.mkdir
+    injected = False
+
+    class FixedUUID:
+        hex = token
+
+    def replace_created_root(path, mode=0o777):
+        nonlocal injected
+        result = real_mkdir(path, mode)
+        if Path(path) == temporary and not injected:
+            injected = True
+            os.replace(temporary, displaced)
+            real_mkdir(temporary, mode)
+            marker.write_bytes(b"foreign replacement")
+        return result
+
+    monkeypatch.setattr(build_windows_installer.uuid, "uuid4", lambda: FixedUUID())
+    monkeypatch.setattr(build_windows_installer.os, "mkdir", replace_created_root)
+    monkeypatch.setattr(
+        build_windows_installer,
+        "validate_release_zip_manifest_bytes",
+        lambda _payload, *, artifact_name: ["RELEASE_ZIP_CORRUPT"],
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        _stage(monkeypatch, tmp_path, source, stage_parent=stage_parent)
+
+    assert _assert_pathless(caught.value, tmp_path) == (
+        "INSTALLER_SOURCE_ZIP_INVALID: RELEASE_ZIP_CORRUPT"
+    )
+    if injected:
+        assert marker.read_bytes() == b"foreign replacement"
+        assert displaced.is_dir()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle quarantine behavior")
+def test_real_cleanup_quarantine_seam_preserves_root_replacement(
+    monkeypatch, tmp_path
+):
+    parent = tmp_path / "parent"
+    root = parent / "owned"
+    root.mkdir(parents=True)
+    (root / "owned.bin").write_bytes(b"owned")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.bin"
+    sentinel.write_bytes(b"outside sentinel")
+    parent_chain = build_windows_installer._directory_chain(parent)
+    owned_identity = build_windows_installer._stat_identity(os.lstat(root))
+    real_quarantine = build_windows_installer._quarantine_windows_handle
+    replacement_marker = root / "foreign-marker.bin"
+    injected = False
+
+    def replace_before_real_quarantine(handle, parent_handle, destination):
+        nonlocal injected
+        if not injected:
+            injected = True
+            displaced = root.with_name(root.name + "-displaced")
+            os.replace(root, displaced)
+            root.mkdir()
+            replacement_marker.write_bytes(b"foreign replacement")
+        return real_quarantine(handle, parent_handle, destination)
+
+    monkeypatch.setattr(
+        build_windows_installer,
+        "_quarantine_windows_handle",
+        replace_before_real_quarantine,
+    )
+
+    assert build_windows_installer._cleanup_owned(
+        root, parent_chain, owned_identity
+    ) is True
+    assert injected is True
+    assert replacement_marker.read_bytes() == b"foreign replacement"
+    assert sentinel.read_bytes() == b"outside sentinel"
+
+
+def _valid_zip_with_deep_member(tmp_path: Path) -> Path:
+    source = tmp_path / "input" / ZIP_NAME
+    members = _release_members()
+    members["PDFVectorImporter/deep/parent/member.bin"] = b"deep member bytes"
+    document = candidate_manifest.build_candidate_file_manifest(
+        members,
+        source_commit=SOURCE_COMMIT,
+        package_version=PACKAGE_VERSION,
+        artifact_name=ZIP_NAME,
+    )
+    source.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr(
+            _regular_info(MANIFEST_MEMBER),
+            candidate_manifest.canonical_candidate_manifest_bytes(document),
+        )
+        for name, payload in members.items():
+            archive.writestr(_regular_info(name), payload)
+    assert smoke_release_zip.validate_release_zip_manifest(source) == []
+    return source
+
+
+def _replace_directory_with_test_link(path: Path, outside: Path) -> Path:
+    displaced = path.with_name(path.name + "-displaced")
+    os.replace(path, displaced)
+    try:
+        os.symlink(outside, path, target_is_directory=True)
+    except OSError:
+        os.replace(displaced, path)
+        pytest.skip("directory-link creation unavailable")
+    return displaced
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction behavior")
+def test_absent_stage_parent_component_swap_cannot_create_outside_tree(
+    monkeypatch, tmp_path
+):
+    source, _document, _members = _valid_zip(tmp_path)
+    container = tmp_path / "container"
+    container.mkdir()
+    swapped = container / "new-parent"
+    stage_parent = swapped / "nested" / "stages"
+    outside = tmp_path / "outside-parent"
+    outside.mkdir()
+    sentinel = outside / "sentinel.bin"
+    sentinel.write_bytes(b"outside sentinel")
+    real_detector = build_windows_installer._is_link_or_reparse
+    injected = False
+
+    def swap_after_last_path_check(path, metadata=None):
+        nonlocal injected
+        result = real_detector(path, metadata)
+        if Path(path) == swapped and not injected:
+            injected = True
+            _replace_directory_with_test_link(swapped, outside)
+        return result
+
+    monkeypatch.setattr(
+        build_windows_installer, "_is_link_or_reparse", swap_after_last_path_check
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        _stage(monkeypatch, tmp_path, source, stage_parent=stage_parent)
+
+    assert _assert_pathless(caught.value, tmp_path) == "INSTALLER_STAGE_UNSAFE"
+    assert injected is True
+    assert sentinel.read_bytes() == b"outside sentinel"
+    assert not (outside / "nested").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction behavior")
+@pytest.mark.parametrize(
+    ("boundary", "outside_leaf"),
+    [
+        ("metadata", ZIP_NAME),
+        ("source-root", "candidate-file-manifest.json"),
+        ("nested", "payload.bin"),
+        ("member-parent", "member.bin"),
+    ],
+)
+def test_checked_stage_directory_swap_never_writes_outside_owned_root(
+    monkeypatch, tmp_path, boundary, outside_leaf
+):
+    source = _valid_zip_with_deep_member(tmp_path)
+    stage_parent = tmp_path / "stages"
+    outside = tmp_path / ("outside-" + boundary)
+    outside.mkdir()
+    sentinel = outside / "sentinel.bin"
+    sentinel.write_bytes(b"outside sentinel")
+    real_detector = build_windows_installer._is_link_or_reparse
+    injected = False
+
+    def is_boundary(candidate: Path) -> bool:
+        if boundary == "metadata":
+            return candidate.name == build_windows_installer._STAGE_METADATA_DIRNAME
+        if boundary == "source-root":
+            return candidate.name == "PDFVectorImporter"
+        if boundary == "nested":
+            return candidate.name == "data" and candidate.parent.name == "PDFVectorImporter"
+        return candidate.name == "parent" and candidate.parent.name == "deep"
+
+    def swap_after_last_path_check(path, metadata=None):
+        nonlocal injected
+        result = real_detector(path, metadata)
+        candidate = Path(path)
+        if is_boundary(candidate) and not injected:
+            injected = True
+            _replace_directory_with_test_link(candidate, outside)
+        return result
+
+    monkeypatch.setattr(
+        build_windows_installer, "_is_link_or_reparse", swap_after_last_path_check
+    )
+
+    caught = None
+    try:
+        _stage(monkeypatch, tmp_path, source, stage_parent=stage_parent)
+    except RuntimeError as exc:
+        caught = exc
+
+    assert sentinel.read_bytes() == b"outside sentinel"
+    assert not (outside / outside_leaf).exists()
+    if caught is not None:
+        assert re.fullmatch(
+            r"INSTALLER_(?:SOURCE_CHANGED|STAGE_(?:IO_ERROR|UNSAFE|TREE_INVALID(?:: [A-Z0-9_, ]+)?))",
+            _assert_pathless(caught, tmp_path),
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows exclusive leaf behavior")
+def test_member_leaf_collision_is_preserved_without_pathname_fallback(
+    monkeypatch, tmp_path
+):
+    source, _document, _members = _valid_zip(tmp_path)
+    stage_parent = tmp_path / "stages"
+    real_create = getattr(
+        build_windows_installer, "_nt_create_file_handle", None
+    )
+    calls: list[str] = []
+    collision_identity = None
+    collision_path = None
+
+    def collide(parent_handle, name, *args, **kwargs):
+        nonlocal collision_identity, collision_path
+        calls.append(name)
+        if name == "payload.bin":
+            temporary = next(
+                stage_parent.glob(build_windows_installer._STAGE_TEMP_PREFIX + "*")
+            )
+            collision_path = temporary / "PDFVectorImporter" / "data" / name
+            collision_path.write_bytes(b"foreign leaf collision")
+            collision_identity = build_windows_installer._stat_identity(
+                os.lstat(collision_path)
+            )
+            raise FileExistsError("synthetic foreign leaf collision")
+        assert real_create is not None
+        return real_create(parent_handle, name, *args, **kwargs)
+
+    monkeypatch.setattr(
+        build_windows_installer,
+        "_nt_create_file_handle",
+        collide,
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        _stage(monkeypatch, tmp_path, source, stage_parent=stage_parent)
+
+    assert _assert_pathless(caught.value, tmp_path) == "INSTALLER_STAGE_IO_ERROR"
+    assert "payload.bin" in calls
+    assert collision_path is not None and collision_path.read_bytes() == (
+        b"foreign leaf collision"
+    )
+    assert build_windows_installer._stat_identity(os.lstat(collision_path)) == (
+        collision_identity
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native stage capabilities")
+@pytest.mark.parametrize(
+    ("seam", "expected"),
+    [
+        ("_nt_create_directory_handle", "INSTALLER_STAGE_IO_ERROR"),
+        ("_windows_handle_metadata", "INSTALLER_STAGE_IO_ERROR"),
+        ("_nt_create_file_handle", "INSTALLER_STAGE_IO_ERROR"),
+        ("_publish_windows_directory_handle", "INSTALLER_STAGE_PUBLISH_ERROR"),
+    ],
+)
+def test_missing_native_stage_capability_fails_closed_without_path_fallback(
+    monkeypatch, tmp_path, seam, expected
+):
+    source, _document, _members = _valid_zip(tmp_path)
+    stage_parent = tmp_path / "stages"
+    calls = 0
+
+    def unavailable(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise OSError("C:/private/native capability unavailable")
+
+    monkeypatch.setattr(
+        build_windows_installer, seam, unavailable, raising=False
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        _stage(monkeypatch, tmp_path, source, stage_parent=stage_parent)
+
+    assert calls >= 1
+    assert _assert_pathless(caught.value, tmp_path) == expected
+    assert source.is_file()
+    assert not any(
+        re.fullmatch(r"[0-9a-f]{64}", child.name)
+        for child in stage_parent.iterdir()
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle-bound publication")
+@pytest.mark.parametrize("winner_kind", ["exact", "conflict"])
+def test_handle_bound_publication_reuses_exact_winner_and_preserves_conflict(
+    monkeypatch, tmp_path, winner_kind
+):
+    source, _document, _members = _valid_zip(tmp_path)
+    baseline = _stage(monkeypatch, tmp_path / "baseline", source)
+    baseline_tree = {
+        path.relative_to(baseline.stage_root).as_posix(): path.read_bytes()
+        for path in baseline.stage_root.rglob("*")
+        if path.is_file()
+    }
+    target_parent = tmp_path / ("publish-" + winner_kind)
+    real_publish = getattr(
+        build_windows_installer, "_publish_windows_directory_handle", None
+    )
+    injected = False
+    conflict_marker = b"foreign conflicting winner"
+
+    def inject_winner(handle, parent_handle, destination, *args, **kwargs):
+        nonlocal injected
+        destination = Path(destination)
+        if not injected and destination.parent == target_parent:
+            injected = True
+            if winner_kind == "exact":
+                shutil.copytree(baseline.stage_root, destination)
+            else:
+                destination.mkdir()
+                (destination / "winner.bin").write_bytes(conflict_marker)
+            raise FileExistsError("synthetic concurrent final winner")
+        assert real_publish is not None
+        return real_publish(handle, parent_handle, destination, *args, **kwargs)
+
+    monkeypatch.setattr(
+        build_windows_installer,
+        "_publish_windows_directory_handle",
+        inject_winner,
+        raising=False,
+    )
+
+    if winner_kind == "exact":
+        staged = _stage(
+            monkeypatch,
+            tmp_path / "exact-work",
+            source,
+            stage_parent=target_parent,
+        )
+        assert {
+            path.relative_to(staged.stage_root).as_posix(): path.read_bytes()
+            for path in staged.stage_root.rglob("*")
+            if path.is_file()
+        } == baseline_tree
+    else:
+        with pytest.raises(RuntimeError) as caught:
+            _stage(
+                monkeypatch,
+                tmp_path / "conflict-work",
+                source,
+                stage_parent=target_parent,
+            )
+        assert _assert_pathless(caught.value, tmp_path) == (
+            "INSTALLER_STAGE_PUBLISH_ERROR"
+        )
+        assert next(target_parent.glob("*/winner.bin")).read_bytes() == conflict_marker
+    assert injected is True
+
+
+@pytest.mark.parametrize("failure", ["second-read-oserror", "second-read-mismatch"])
+def test_final_attestation_temp_readback_failure_is_atomic_io_error(
+    monkeypatch, tmp_path, failure
+):
+    staged = _stage(monkeypatch, tmp_path)
+    setup = tmp_path / "Setup.exe"
+    setup.write_bytes(b"setup")
+    output = tmp_path / "attestation.json"
+    seeded = b"seeded attestation bytes"
+    output.write_bytes(seeded)
+    real_capture = build_windows_installer._capture_regular_file
+    real_replace = os.replace
+    temp_captures = 0
+    final_replace_calls = 0
+
+    def fail_second_temp_capture(path):
+        nonlocal temp_captures
+        path = Path(path)
+        if path.name.startswith(build_windows_installer._ATTESTATION_TEMP_PREFIX):
+            temp_captures += 1
+            if temp_captures == 2:
+                if failure == "second-read-oserror":
+                    raise OSError("C:/private/final attestation readback")
+                return real_capture(path) + b"altered"
+        return real_capture(path)
+
+    def record_final_replace(source_path, destination_path):
+        nonlocal final_replace_calls
+        if Path(destination_path) == output:
+            final_replace_calls += 1
+        return real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(
+        build_windows_installer, "_capture_regular_file", fail_second_temp_capture
+    )
+    monkeypatch.setattr(build_windows_installer.os, "replace", record_final_replace)
+
+    with pytest.raises(RuntimeError) as caught:
+        build_windows_installer.write_attestation(
+            output,
+            staged_release=staged,
+            installer_exe=setup,
+            toolchain_identity=_valid_toolchain_identity(),
+        )
+
+    assert temp_captures == 2
+    assert _assert_pathless(caught.value, tmp_path) == (
+        "INSTALLER_ATTESTATION_IO_ERROR"
+    )
+    assert output.read_bytes() == seeded
+    assert final_replace_calls == 0
+    assert not any(
+        child.name.startswith(build_windows_installer._ATTESTATION_TEMP_PREFIX)
+        for child in tmp_path.iterdir()
+    )

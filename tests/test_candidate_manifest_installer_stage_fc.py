@@ -5334,7 +5334,613 @@ def test_attestation_exact_winner_is_held_through_temp_cleanup_and_consumption(
     assert events.count("winner-open") == 1
     assert events.count("winner-close") == 1
     assert events.count("monitor-close") == 1
-    assert events.index("monitor-close") < events.index("winner-open")
     assert events.index("winner-open") < events.index("temp-dispose")
-    assert events.index("temp-dispose") < events.index("capability-close")
+    assert events.index("temp-dispose") < events.index("monitor-close")
+    assert events.index("monitor-close") < events.index("capability-close")
     assert events.index("capability-close") < events.index("winner-close")
+
+
+# Task 5C independent-review A RED boundary.
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows attestation monitor boundary")
+@pytest.mark.parametrize("outcome", ["noncollision", "exact-winner", "different-winner"])
+def test_attestation_has_no_monitor_retirement_to_terminal_decision_window(
+    monkeypatch, tmp_path, outcome
+):
+    destination = tmp_path / outcome / "installer-attestation.json"
+    destination.parent.mkdir(parents=True)
+    if outcome == "exact-winner":
+        first, _calls = _compile_capability(monkeypatch, tmp_path / "seed")
+        build_windows_installer.write_attestation(
+            destination, compiled_installer=first
+        )
+    elif outcome == "different-winner":
+        destination.write_bytes(b"foreign winner")
+
+    capability, _calls = _compile_capability(monkeypatch, tmp_path / "candidate")
+    transient = capability.staged_release.source_dir / "retirement-window.py"
+    real_retire = build_windows_installer._retire_windows_stage_monitor
+    real_rename = build_windows_installer._rename_windows_handle
+    real_open_winner = build_windows_installer._open_windows_attestation_winner
+    real_read = build_windows_installer._read_windows_file_handle
+    real_cleanup = build_windows_installer._cleanup_windows_attestation_temp
+    real_consume = build_windows_installer._consume_compiled_installer
+    events: list[str] = []
+    terminal = False
+    winner_key: int | None = None
+    winner_reads = 0
+
+    def inject_if_preterminal(boundary):
+        if terminal:
+            return
+        transient.write_bytes(b"foreign transient input")
+        assert transient.read_bytes() == b"foreign transient input"
+        transient.unlink()
+        events.append("injected-before-terminal:" + boundary)
+
+    def retire(lease):
+        result = real_retire(lease)
+        events.append("monitor-retired")
+        inject_if_preterminal("retire")
+        return result
+
+    def rename(*args, **kwargs):
+        nonlocal terminal
+        events.append("rename-attempt")
+        try:
+            result = real_rename(*args, **kwargs)
+        except FileExistsError:
+            events.append("rename-collision")
+            raise
+        terminal = True
+        events.append("noncollision-commit")
+        return result
+
+    def open_winner(*args, **kwargs):
+        nonlocal winner_key
+        entry = real_open_winner(*args, **kwargs)
+        winner_key = _handle_key(entry.handle)
+        events.append("winner-open")
+        return entry
+
+    def read(handle):
+        nonlocal terminal, winner_reads
+        payload = real_read(handle)
+        if winner_key is not None and _handle_key(handle) == winner_key:
+            winner_reads += 1
+            events.append(f"winner-read:{winner_reads}")
+            if outcome == "exact-winner" and winner_reads == 2:
+                terminal = True
+                events.append("exact-winner-verified")
+            elif outcome == "different-winner" and winner_reads == 1:
+                terminal = True
+                events.append("different-winner-classified")
+        return payload
+
+    def cleanup(entry):
+        result = real_cleanup(entry)
+        events.append("temp-cleanup")
+        return result
+
+    def consume(value):
+        events.append("capability-consume")
+        inject_if_preterminal("consume")
+        return real_consume(value)
+
+    monkeypatch.setattr(build_windows_installer, "_retire_windows_stage_monitor", retire)
+    monkeypatch.setattr(build_windows_installer, "_rename_windows_handle", rename)
+    monkeypatch.setattr(
+        build_windows_installer, "_open_windows_attestation_winner", open_winner
+    )
+    monkeypatch.setattr(build_windows_installer, "_read_windows_file_handle", read)
+    monkeypatch.setattr(
+        build_windows_installer, "_cleanup_windows_attestation_temp", cleanup
+    )
+    monkeypatch.setattr(build_windows_installer, "_consume_compiled_installer", consume)
+
+    if outcome == "different-winner":
+        with pytest.raises(
+            RuntimeError, match=r"^INSTALLER_ATTESTATION_PUBLISH_ERROR$"
+        ):
+            build_windows_installer.write_attestation(
+                destination, compiled_installer=capability
+            )
+        assert destination.read_bytes() == b"foreign winner"
+    else:
+        expected_setup = capability.output_lease.loose_path
+        assert build_windows_installer.write_attestation(
+            destination, compiled_installer=capability
+        ) == expected_setup
+        assert destination.is_file()
+
+    assert not any(event.startswith("injected-before-terminal:") for event in events)
+    assert not transient.exists()
+    assert "capability-consume" in events
+    if outcome == "noncollision":
+        assert events.index("noncollision-commit") < events.index("capability-consume")
+    elif outcome == "exact-winner":
+        assert events.index("exact-winner-verified") < events.index(
+            "capability-consume"
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows attestation terminal I/O")
+@pytest.mark.parametrize(
+    "primary_failure",
+    [
+        "write",
+        "flush",
+        "readback-1",
+        "readback-2",
+        "identity-1",
+        "identity-2",
+        "link-1",
+        "link-2",
+    ],
+)
+def test_attestation_primary_io_failure_plus_aux_close_failure_preserves_temp(
+    monkeypatch, tmp_path, primary_failure
+):
+    capability, _calls = _compile_capability(monkeypatch, tmp_path / "build")
+    destination = tmp_path / "installer-attestation.json"
+    destination.write_bytes(b"seeded destination")
+    fixed_hex = "e" * 32
+    temporary_path = tmp_path / (
+        build_windows_installer._ATTESTATION_TEMP_PREFIX + fixed_hex
+    )
+    real_create = build_windows_installer._create_windows_attestation_temp
+    real_write = build_windows_installer._write_windows_file_handle
+    real_flush = build_windows_installer._flush_windows_file_handle
+    real_read = build_windows_installer._read_windows_file_handle
+    real_metadata = build_windows_installer._windows_handle_metadata
+    real_links = build_windows_installer._query_windows_link_count
+    real_close = build_windows_installer._close_windows_entry
+    real_dispose = build_windows_installer._dispose_windows_file_handle
+    real_rename = build_windows_installer._rename_windows_handle
+    real_quarantine = build_windows_installer._quarantine_windows_handle
+    work_entry: list[object] = []
+    primary_calls = {"readback": 0, "identity": 0, "link": 0}
+    primary_triggered: list[str] = []
+    close_failures: list[str] = []
+    post_terminal_actions: list[str] = []
+    terminal = False
+
+    class FixedUuid:
+        hex = fixed_hex
+
+    def create(*args, **kwargs):
+        temporary, work = real_create(*args, **kwargs)
+        work_entry[:] = [work]
+        return temporary, work
+
+    def is_work_handle(handle):
+        return bool(work_entry) and _handle_key(handle) == _handle_key(
+            work_entry[0].handle
+        )
+
+    def write(handle, payload):
+        if primary_failure == "write" and is_work_handle(handle):
+            primary_triggered.append("write")
+            raise OSError("synthetic write failure")
+        return real_write(handle, payload)
+
+    def flush(handle):
+        if primary_failure == "flush" and is_work_handle(handle):
+            primary_triggered.append("flush")
+            raise OSError("synthetic flush failure")
+        return real_flush(handle)
+
+    def read(handle):
+        if is_work_handle(handle):
+            primary_calls["readback"] += 1
+            expected = f"readback-{primary_calls['readback']}"
+            if primary_failure == expected:
+                primary_triggered.append(expected)
+                return b"synthetic mismatched readback"
+        return real_read(handle)
+
+    def metadata(handle):
+        if is_work_handle(handle):
+            primary_calls["identity"] += 1
+            expected = f"identity-{primary_calls['identity']}"
+            if primary_failure == expected:
+                primary_triggered.append(expected)
+                raise build_windows_installer._ChangedPath
+        return real_metadata(handle)
+
+    def links(handle):
+        if is_work_handle(handle):
+            primary_calls["link"] += 1
+            expected = f"link-{primary_calls['link']}"
+            if primary_failure == expected:
+                primary_triggered.append(expected)
+                return 2
+        return real_links(handle)
+
+    def close(entry):
+        nonlocal terminal
+        if work_entry and entry is work_entry[0]:
+            real_close(entry)
+            terminal = True
+            close_failures.append("attestation-temp")
+            raise OSError("synthetic auxiliary close failure")
+        return real_close(entry)
+
+    def dispose(*args, **kwargs):
+        if terminal:
+            post_terminal_actions.append("dispose")
+        return real_dispose(*args, **kwargs)
+
+    def rename(*args, **kwargs):
+        if terminal:
+            post_terminal_actions.append("rename")
+        return real_rename(*args, **kwargs)
+
+    def quarantine(*args, **kwargs):
+        if terminal:
+            post_terminal_actions.append("quarantine")
+        return real_quarantine(*args, **kwargs)
+
+    monkeypatch.setattr(build_windows_installer.uuid, "uuid4", lambda: FixedUuid())
+    monkeypatch.setattr(
+        build_windows_installer, "_create_windows_attestation_temp", create
+    )
+    monkeypatch.setattr(build_windows_installer, "_write_windows_file_handle", write)
+    monkeypatch.setattr(build_windows_installer, "_flush_windows_file_handle", flush)
+    monkeypatch.setattr(build_windows_installer, "_read_windows_file_handle", read)
+    monkeypatch.setattr(build_windows_installer, "_windows_handle_metadata", metadata)
+    monkeypatch.setattr(build_windows_installer, "_query_windows_link_count", links)
+    monkeypatch.setattr(build_windows_installer, "_close_windows_entry", close)
+    monkeypatch.setattr(build_windows_installer, "_dispose_windows_file_handle", dispose)
+    monkeypatch.setattr(build_windows_installer, "_rename_windows_handle", rename)
+    monkeypatch.setattr(
+        build_windows_installer, "_quarantine_windows_handle", quarantine
+    )
+
+    with pytest.raises(RuntimeError, match=r"^INSTALLER_ATTESTATION_IO_ERROR$"):
+        build_windows_installer.write_attestation(
+            destination, compiled_installer=capability
+        )
+
+    assert primary_triggered == [primary_failure]
+    assert close_failures == ["attestation-temp"]
+    assert post_terminal_actions == []
+    assert destination.read_bytes() == b"seeded destination"
+    assert temporary_path.is_file()
+    assert temporary_path.read_bytes().endswith(b"\n")
+    with pytest.raises(RuntimeError, match=r"^INSTALLER_COMPILER_INPUT_INVALID$"):
+        build_windows_installer.finalize_compiled_installer(capability)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows stage monitor failure matrix")
+def test_stage_monitor_queue_initialization_failure_is_closed_and_pathless(
+    monkeypatch, tmp_path
+):
+    staged = _stage(monkeypatch, tmp_path / "stage")
+    queue_monitor = getattr(
+        build_windows_installer, "_queue_windows_stage_monitor", None
+    )
+    assert callable(queue_monitor), "missing explicit monitor queue authority seam"
+    process_calls: list[object] = []
+
+    def fail_queue(_monitor):
+        raise build_windows_installer._NativeCapabilityError
+
+    monkeypatch.setattr(
+        build_windows_installer, "_queue_windows_stage_monitor", fail_queue
+    )
+    monkeypatch.setattr(
+        build_windows_installer.subprocess,
+        "run",
+        lambda *args, **kwargs: process_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        build_windows_installer.compile_installer(
+            tmp_path / "ISCC.exe",
+            staged,
+            toolchain_identity=_valid_toolchain_identity(),
+            output_dir=tmp_path / "output",
+        )
+    assert _assert_pathless(caught.value, tmp_path) == "INSTALLER_COMPILER_INPUT_INVALID"
+    assert process_calls == []
+    assert not list((tmp_path / "output").glob("FreeCAD-PDF-Importer-Setup_*.exe"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows stage monitor failure matrix")
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "wait",
+        "zero-byte-completion",
+        "get-result",
+        "cancel-hard",
+        "cancel-not-found",
+        "cancel-timeout",
+        "entry-close",
+        "event-close",
+    ],
+)
+def test_stage_monitor_failure_matrix_blocks_finalization(
+    monkeypatch, tmp_path, failure
+):
+    capability, _calls = _compile_capability(monkeypatch, tmp_path / "build")
+    monitor = capability.stage_lease.monitor
+    assert monitor is not None
+    injections: list[str] = []
+
+    if failure == "wait":
+        monkeypatch.setattr(
+            build_windows_installer,
+            "_wait_windows_stage_monitor",
+            lambda _monitor, _timeout: 0xFFFFFFFF,
+        )
+    elif failure == "zero-byte-completion":
+        monkeypatch.setattr(
+            build_windows_installer,
+            "_wait_windows_stage_monitor",
+            lambda _monitor, _timeout: build_windows_installer._WAIT_OBJECT_0,
+        )
+        monkeypatch.setattr(
+            build_windows_installer,
+            "_windows_stage_monitor_result",
+            lambda _monitor: (True, 0),
+        )
+    elif failure == "get-result":
+        monkeypatch.setattr(
+            build_windows_installer,
+            "_wait_windows_stage_monitor",
+            lambda _monitor, _timeout: build_windows_installer._WAIT_OBJECT_0,
+        )
+        monkeypatch.setattr(
+            build_windows_installer,
+            "_windows_stage_monitor_result",
+            lambda _monitor: (False, 5),
+        )
+    elif failure in {"cancel-hard", "cancel-not-found"}:
+        cancel_monitor = getattr(
+            build_windows_installer, "_cancel_windows_stage_monitor", None
+        )
+        assert callable(cancel_monitor), "missing explicit monitor cancellation seam"
+        error = (
+            build_windows_installer._ERROR_NOT_FOUND
+            if failure == "cancel-not-found"
+            else 5
+        )
+
+        def fail_cancel(_monitor):
+            injections.append(failure)
+            return False, error
+
+        monkeypatch.setattr(
+            build_windows_installer, "_cancel_windows_stage_monitor", fail_cancel
+        )
+    elif failure == "cancel-timeout":
+        real_wait = build_windows_installer._wait_windows_stage_monitor
+
+        def timeout_after_cancel(value, timeout):
+            if timeout:
+                injections.append(failure)
+                return build_windows_installer._WAIT_TIMEOUT
+            return real_wait(value, timeout)
+
+        monkeypatch.setattr(
+            build_windows_installer, "_wait_windows_stage_monitor", timeout_after_cancel
+        )
+    elif failure == "entry-close":
+        real_close_entry = build_windows_installer._close_windows_entry
+
+        def fail_entry_close(entry):
+            result = real_close_entry(entry)
+            if entry.role == "stage-monitor":
+                injections.append(failure)
+                raise OSError("synthetic monitor entry close failure")
+            return result
+
+        monkeypatch.setattr(
+            build_windows_installer, "_close_windows_entry", fail_entry_close
+        )
+    else:
+        real_close_handle = build_windows_installer._close_windows_handle
+        event_key = _handle_key(monitor.event_handle)
+
+        def fail_event_close(handle):
+            result = real_close_handle(handle)
+            if _handle_key(handle) == event_key:
+                injections.append(failure)
+                raise OSError("synthetic monitor event close failure")
+            return result
+
+        monkeypatch.setattr(
+            build_windows_installer, "_close_windows_handle", fail_event_close
+        )
+
+    with pytest.raises(RuntimeError, match=r"^INSTALLER_COMPILER_INPUT_INVALID$"):
+        build_windows_installer.finalize_compiled_installer(capability)
+    with pytest.raises(RuntimeError, match=r"^INSTALLER_COMPILER_INPUT_INVALID$"):
+        build_windows_installer.finalize_compiled_installer(capability)
+    if failure in {
+        "cancel-hard",
+        "cancel-not-found",
+        "cancel-timeout",
+        "entry-close",
+        "event-close",
+    }:
+        assert injections
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows raw-handle ownership transfer")
+@pytest.mark.parametrize(
+    "target",
+    [
+        "anchor",
+        "existing-component",
+        "stage-root",
+        "metadata-dir",
+        "source-dir",
+        "nested-dir",
+        "snapshot-zip",
+        "member-file",
+    ],
+)
+def test_raw_handle_pre_registration_failure_closes_exactly_once_leaf_to_root(
+    monkeypatch, tmp_path, target
+):
+    staged = None
+    source = None
+    prepare_target = None
+    stage_parent = None
+    if target in {
+        "metadata-dir",
+        "source-dir",
+        "nested-dir",
+        "snapshot-zip",
+        "member-file",
+    }:
+        staged = _stage(monkeypatch, tmp_path / "published")
+    elif target == "stage-root":
+        source, _document, _members = _valid_zip(tmp_path / "source")
+        stage_parent = tmp_path / "stage-parent"
+        stage_parent.mkdir(parents=True)
+        monkeypatch.setattr(
+            build_windows_installer, "read_version", lambda: PACKAGE_VERSION
+        )
+    else:
+        prepare_target = tmp_path / "existing" / "component"
+        prepare_target.mkdir(parents=True)
+
+    opened: dict[int, int] = {}
+    closed: dict[int, int] = {}
+    handles: dict[int, object] = {}
+    close_order: list[int] = []
+    failed_key: list[int] = []
+    failed_path: list[Path] = []
+    active_at_failure: list[set[int]] = []
+    raw_openers = (
+        "_open_windows_anchor_handle",
+        "_open_windows_anchor_read_handle",
+        "_nt_open_directory_handle",
+        "_nt_open_directory_read_handle",
+        "_nt_open_file_read_handle",
+        "_nt_create_directory_handle",
+        "_nt_create_file_handle",
+    )
+
+    def count(mapping, key):
+        mapping[key] = mapping.get(key, 0) + 1
+
+    for opener_name in raw_openers:
+        real_opener = getattr(build_windows_installer, opener_name)
+
+        def make_opener(real_function):
+            def open_and_record(*args, **kwargs):
+                handle = real_function(*args, **kwargs)
+                key = _handle_key(handle)
+                count(opened, key)
+                handles[key] = handle
+                return handle
+
+            return open_and_record
+
+        monkeypatch.setattr(
+            build_windows_installer, opener_name, make_opener(real_opener)
+        )
+
+    real_close_handle = build_windows_installer._close_windows_handle
+
+    def close_and_record(handle):
+        key = _handle_key(handle)
+        close_order.append(key)
+        count(closed, key)
+        return real_close_handle(handle)
+
+    monkeypatch.setattr(
+        build_windows_installer, "_close_windows_handle", close_and_record
+    )
+    real_entry = build_windows_installer._entry_from_handle
+
+    def is_target(role, name):
+        return {
+            "anchor": role == "anchor",
+            "existing-component": role == "ancestor"
+            and prepare_target is not None
+            and name == prepare_target.name,
+            "stage-root": role == "stage-root",
+            "metadata-dir": role == "stage-dir:.installer-source",
+            "source-dir": role == "stage-dir:PDFVectorImporter",
+            "nested-dir": role == "stage-dir:PDFVectorImporter/data",
+            "snapshot-zip": role == "stage-file:.installer-source/zip",
+            "member-file": role == "stage-file:PDFVectorImporter/module.py",
+        }[target]
+
+    def fail_entry(handle, *args, **kwargs):
+        role = kwargs["role"]
+        name = kwargs["name"]
+        if is_target(role, name):
+            key = _handle_key(handle)
+            failed_key.append(key)
+            failed_path.append(Path(kwargs["path"]))
+            active_at_failure.append(
+                {
+                    candidate
+                    for candidate, amount in opened.items()
+                    if amount > closed.get(candidate, 0)
+                }
+            )
+            raise build_windows_installer._ChangedPath
+        return real_entry(handle, *args, **kwargs)
+
+    monkeypatch.setattr(build_windows_installer, "_entry_from_handle", fail_entry)
+
+    caught = None
+    try:
+        if target in {"anchor", "existing-component"}:
+            build_windows_installer._prepare_windows_stage_parent(prepare_target)
+        elif target == "stage-root":
+            build_windows_installer.stage_release(
+                source,
+                dist_dir=tmp_path / "dist",
+                stage_dir=stage_parent,
+            )
+        else:
+            build_windows_installer._acquire_windows_stage_read_lease(staged)
+    except Exception as exc:
+        caught = exc
+
+    assert caught is not None
+    assert len(failed_key) == 1
+    target_key = failed_key[0]
+    counts_match = opened == closed
+    target_closed_once = closed.get(target_key, 0) == 1
+    reverse_order = target_key in close_order and all(
+        other == target_key
+        or other not in close_order
+        or close_order.index(target_key) < close_order.index(other)
+        for other in active_at_failure[0]
+    )
+
+    rename_proved = True
+    original_path = failed_path[0]
+    moved_path = original_path.with_name(original_path.name + ".ownership-probe")
+    if target != "anchor" and original_path.exists():
+        try:
+            os.replace(original_path, moved_path)
+            os.replace(moved_path, original_path)
+        except OSError:
+            rename_proved = False
+
+    # A failing implementation can leave a live native handle; release it so
+    # the worker-owned pytest directory remains clean even while this RED fails.
+    for key, amount in opened.items():
+        deficit = amount - closed.get(key, 0)
+        for _index in range(max(deficit, 0)):
+            try:
+                real_close_handle(handles[key])
+            except OSError:
+                pass
+
+    assert counts_match
+    assert target_closed_once
+    assert reverse_order
+    assert rename_proved

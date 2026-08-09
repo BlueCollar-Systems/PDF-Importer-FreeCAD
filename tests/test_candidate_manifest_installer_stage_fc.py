@@ -5321,8 +5321,10 @@ def test_attestation_exact_winner_is_held_through_temp_cleanup_and_consumption(
             events.append("monitor-proof-close")
         elif entry.role == "stage-monitor-successor":
             events.append("monitor-authority-close")
-        elif entry.role.startswith("output-") or entry.role.startswith("stage-"):
-            events.append("capability-close")
+        elif entry.role.startswith("output-"):
+            events.append("output-capability-close")
+        elif entry.role.startswith("stage-"):
+            events.append("stage-capability-close")
         return real_close(entry)
 
     monkeypatch.setattr(build_windows_installer, "_nt_relative_create", relative_create)
@@ -5339,9 +5341,14 @@ def test_attestation_exact_winner_is_held_through_temp_cleanup_and_consumption(
     assert events.count("monitor-authority-close") == 1
     assert events.index("monitor-proof-close") < events.index("winner-open")
     assert events.index("winner-open") < events.index("temp-dispose")
-    assert events.index("temp-dispose") < events.index("monitor-authority-close")
-    assert events.index("monitor-authority-close") < events.index("capability-close")
-    assert events.index("capability-close") < events.index("winner-close")
+    assert events.index("temp-dispose") < events.index("output-capability-close")
+    assert events.index("output-capability-close") < events.index(
+        "monitor-authority-close"
+    )
+    assert events.index("monitor-authority-close") < events.index(
+        "stage-capability-close"
+    )
+    assert events.index("stage-capability-close") < events.index("winner-close")
 
 
 # Task 5C independent-review A RED boundary.

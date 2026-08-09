@@ -1944,7 +1944,7 @@ def test_stage_root_swap_after_mkdir_never_becomes_owned_or_quarantined(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows handle quarantine behavior")
-def test_real_cleanup_quarantine_seam_preserves_root_replacement(
+def test_real_cleanup_quarantine_seam_blocks_name_change_then_moves_original(
     monkeypatch, tmp_path
 ):
     parent = tmp_path / "parent"
@@ -1958,30 +1958,37 @@ def test_real_cleanup_quarantine_seam_preserves_root_replacement(
     parent_chain = build_windows_installer._directory_chain(parent)
     owned_identity = build_windows_installer._stat_identity(os.lstat(root))
     real_quarantine = build_windows_installer._quarantine_windows_handle
-    replacement_marker = root / "foreign-marker.bin"
-    injected = False
+    attempted = False
+    blocked = False
 
-    def replace_before_real_quarantine(handle, parent_handle, destination):
-        nonlocal injected
-        if not injected:
-            injected = True
+    def attempt_name_change_then_quarantine(handle, parent_handle, destination):
+        nonlocal attempted, blocked
+        if not attempted:
+            attempted = True
             displaced = root.with_name(root.name + "-displaced")
-            os.replace(root, displaced)
-            root.mkdir()
-            replacement_marker.write_bytes(b"foreign replacement")
+            try:
+                os.replace(root, displaced)
+            except OSError:
+                blocked = True
+            else:
+                os.replace(displaced, root)
         return real_quarantine(handle, parent_handle, destination)
 
     monkeypatch.setattr(
         build_windows_installer,
         "_quarantine_windows_handle",
-        replace_before_real_quarantine,
+        attempt_name_change_then_quarantine,
     )
 
     assert build_windows_installer._cleanup_owned(
         root, parent_chain, owned_identity
     ) is True
-    assert injected is True
-    assert replacement_marker.read_bytes() == b"foreign replacement"
+    assert attempted is True
+    assert blocked is True
+    assert not root.exists()
+    assert next(parent.glob(".installer-quarantine-*/owned.bin")).read_bytes() == (
+        b"owned"
+    )
     assert sentinel.read_bytes() == b"outside sentinel"
 
 

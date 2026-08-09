@@ -1613,6 +1613,16 @@ def _entry_from_handle(
     )
 
 
+def _entry_from_new_handle(handle, **entry_arguments) -> _WindowsHeldEntry:
+    """Transfer one raw native handle only after entry validation succeeds."""
+
+    try:
+        return _entry_from_handle(handle, **entry_arguments)
+    except Exception:
+        _force_close_windows_handle(handle)
+        raise
+
+
 def _close_windows_entry(entry: _WindowsHeldEntry) -> None:
     if entry.closed:
         return
@@ -1641,7 +1651,7 @@ def _prepare_windows_stage_parent(
     chain: list[_WindowsHeldEntry] = []
     try:
         anchor_handle = _open_windows_anchor_read_handle(anchor)
-        anchor_entry = _entry_from_handle(
+        anchor_entry = _entry_from_new_handle(
             anchor_handle,
             name=anchor,
             path=Path(anchor),
@@ -1664,7 +1674,7 @@ def _prepare_windows_stage_parent(
                     parent.handle, component, share_write=True
                 )
                 chain.append(
-                    _entry_from_handle(
+                    _entry_from_new_handle(
                         handle,
                         name=component,
                         path=current_path,
@@ -2346,7 +2356,7 @@ def _open_windows_existing_directory_chain(
     chain: list[_WindowsHeldEntry] = []
     try:
         handle = _open_windows_anchor_read_handle(anchor)
-        entry = _entry_from_handle(
+        entry = _entry_from_new_handle(
             handle,
             name=anchor,
             path=Path(anchor),
@@ -2376,7 +2386,7 @@ def _open_windows_existing_directory_chain(
                 else role_prefix + "-ancestor"
             )
             chain.append(
-                _entry_from_handle(
+                _entry_from_new_handle(
                     handle,
                     name=component,
                     path=current_path,
@@ -2440,6 +2450,51 @@ def _create_windows_stage_monitor_event():
     return event_handle
 
 
+def _queue_windows_stage_monitor(monitor: _WindowsStageMonitor) -> None:
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    read_changes = kernel32.ReadDirectoryChangesW
+    read_changes.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+    ]
+    read_changes.restype = wintypes.BOOL
+    ctypes.set_last_error(0)
+    queued = read_changes(
+        monitor.entry.handle,
+        monitor.buffer,
+        ctypes.sizeof(monitor.buffer),
+        True,
+        _STAGE_NOTIFY_FILTER,
+        ctypes.byref(monitor.bytes_returned),
+        ctypes.byref(monitor.overlapped),
+        None,
+    )
+    if not queued and ctypes.get_last_error() != _ERROR_IO_PENDING:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _cancel_windows_stage_monitor(
+    monitor: _WindowsStageMonitor,
+) -> tuple[bool, int]:
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    cancel = kernel32.CancelIoEx
+    cancel.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
+    cancel.restype = wintypes.BOOL
+    ctypes.set_last_error(0)
+    cancelled = bool(cancel(monitor.entry.handle, ctypes.byref(monitor.overlapped)))
+    return cancelled, 0 if cancelled else int(ctypes.get_last_error())
+
+
 def _arm_windows_stage_monitor(
     lease: _WindowsStageReadLease,
 ) -> _WindowsStageMonitor:
@@ -2486,7 +2541,6 @@ def _arm_windows_stage_monitor(
         ):
             raise _ChangedPath
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         event_handle = _create_windows_stage_monitor_event()
 
         overlapped = _Overlapped()
@@ -2500,31 +2554,7 @@ def _arm_windows_stage_monitor(
             buffer=buffer,
             bytes_returned=bytes_returned,
         )
-        read_changes = kernel32.ReadDirectoryChangesW
-        read_changes.argtypes = [
-            wintypes.HANDLE,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-            wintypes.BOOL,
-            wintypes.DWORD,
-            ctypes.POINTER(wintypes.DWORD),
-            ctypes.POINTER(_Overlapped),
-            wintypes.LPVOID,
-        ]
-        read_changes.restype = wintypes.BOOL
-        ctypes.set_last_error(0)
-        queued = read_changes(
-            entry.handle,
-            buffer,
-            ctypes.sizeof(buffer),
-            True,
-            _STAGE_NOTIFY_FILTER,
-            ctypes.byref(bytes_returned),
-            ctypes.byref(overlapped),
-            None,
-        )
-        if not queued and ctypes.get_last_error() != _ERROR_IO_PENDING:
-            raise ctypes.WinError(ctypes.get_last_error())
+        _queue_windows_stage_monitor(monitor)
         _validate_windows_stage_monitor(monitor)
         return monitor
     except Exception:
@@ -2595,8 +2625,6 @@ def _validate_windows_stage_monitor(monitor: _WindowsStageMonitor) -> None:
 def _release_windows_stage_monitor(monitor: _WindowsStageMonitor) -> None:
     """Cancel, prove completion, and close one monitor exactly once."""
 
-    from ctypes import wintypes
-
     if type(monitor) is not _WindowsStageMonitor or not monitor.active:
         return
     first_error: Exception | None = None
@@ -2607,13 +2635,7 @@ def _release_windows_stage_monitor(monitor: _WindowsStageMonitor) -> None:
         first_error = _NativeCapabilityError()
 
     monitor.active = False
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    cancel = kernel32.CancelIoEx
-    cancel.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
-    cancel.restype = wintypes.BOOL
-    ctypes.set_last_error(0)
-    cancelled = bool(cancel(monitor.entry.handle, ctypes.byref(monitor.overlapped)))
-    cancel_error = 0 if cancelled else int(ctypes.get_last_error())
+    cancelled, cancel_error = _cancel_windows_stage_monitor(monitor)
     if not cancelled and cancel_error != _ERROR_NOT_FOUND and first_error is None:
         first_error = _NativeCapabilityError()
 
@@ -2661,6 +2683,53 @@ def _retire_windows_stage_monitor(lease: _WindowsStageReadLease) -> None:
     _release_windows_stage_monitor(lease.monitor)
 
 
+def _abandon_windows_stage_monitor_nonraising(monitor: object) -> None:
+    """Force-close monitor authority after a terminal lifecycle failure."""
+
+    if type(monitor) is not _WindowsStageMonitor:
+        return
+    monitor.active = False
+    if not monitor.entry.closed:
+        _force_close_windows_handle(monitor.entry.handle)
+        monitor.entry.closed = True
+    if not monitor.event_closed:
+        _force_close_windows_handle(monitor.event_handle)
+        monitor.event_closed = True
+
+
+def _handoff_windows_stage_monitor(lease: _WindowsStageReadLease) -> None:
+    """Pre-prove shutdown while preserving continuous recursive authority."""
+
+    if (
+        type(lease) is not _WindowsStageReadLease
+        or not lease.active
+        or type(lease.monitor) is not _WindowsStageMonitor
+        or not lease.monitor.active
+    ):
+        raise _ChangedPath
+    retiring = lease.monitor
+    _validate_windows_stage_monitor(retiring)
+
+    # The old request stays armed while its successor is opened and queued.
+    # Releasing the old request proves the fallible cancellation/close path
+    # before publication, while the successor remains authoritative through
+    # the final non-replacing commit and is consumed non-raising afterward.
+    lease.monitor = None
+    try:
+        successor = _arm_windows_stage_monitor(lease)
+    except Exception:
+        lease.monitor = retiring
+        raise
+    successor.entry.role = "stage-monitor-successor"
+    lease.monitor = successor
+    try:
+        _release_windows_stage_monitor(retiring)
+    except Exception:
+        _abandon_windows_stage_monitor_nonraising(successor)
+        _abandon_windows_stage_monitor_nonraising(retiring)
+        raise
+
+
 def _open_windows_stage_descendants(
     staged_release: InstallerStage,
     document: dict,
@@ -2679,7 +2748,7 @@ def _open_windows_stage_descendants(
         snapshot_parent_handle = _nt_open_directory_read_handle(
             root.handle, _STAGE_METADATA_DIRNAME, share_write=False
         )
-        snapshot_parent = _entry_from_handle(
+        snapshot_parent = _entry_from_new_handle(
             snapshot_parent_handle,
             name=_STAGE_METADATA_DIRNAME,
             path=staged_release.stage_root / _STAGE_METADATA_DIRNAME,
@@ -2692,7 +2761,7 @@ def _open_windows_stage_descendants(
         snapshot_handle = _nt_open_file_read_handle(
             snapshot_parent.handle, staged_release.source_zip_name
         )
-        snapshot_entry = _entry_from_handle(
+        snapshot_entry = _entry_from_new_handle(
             snapshot_handle,
             name=staged_release.source_zip_name,
             path=staged_release.source_zip_snapshot,
@@ -2724,7 +2793,7 @@ def _open_windows_stage_descendants(
             handle = _nt_open_directory_read_handle(
                 parent.handle, name, share_write=False
             )
-            entry = _entry_from_handle(
+            entry = _entry_from_new_handle(
                 handle,
                 name=name,
                 path=staged_release.stage_root / Path(relative),
@@ -2740,7 +2809,7 @@ def _open_windows_stage_descendants(
             parent_key, _, name = relative.rpartition("/")
             parent = directories[parent_key]
             handle = _nt_open_file_read_handle(parent.handle, name)
-            entry = _entry_from_handle(
+            entry = _entry_from_new_handle(
                 handle,
                 name=name,
                 path=staged_release.stage_root / Path(relative),
@@ -3720,10 +3789,20 @@ def write_attestation(
         ):
             raise _ChangedPath
     except Exception:
-        _close_windows_entries_nonraising(
-            [temporary_work] if temporary_work is not None else []
-        )
-        _cleanup_windows_attestation_temp(temporary)
+        auxiliary_close_failed = False
+        if temporary_work is not None:
+            try:
+                _close_windows_entry(temporary_work)
+            except Exception:
+                auxiliary_close_failed = True
+        if auxiliary_close_failed:
+            # Terminal auxiliary-close failure preserves the current temp name;
+            # it authorizes no later disposition, rename, or quarantine.
+            _close_windows_entries_nonraising(
+                [temporary] if temporary is not None else []
+            )
+        else:
+            _cleanup_windows_attestation_temp(temporary)
         _close_windows_entries_nonraising(reversed(parent_chain))
         _consume_compiled_installer(compiled_installer)
         raise RuntimeError("INSTALLER_ATTESTATION_IO_ERROR") from None
@@ -3739,7 +3818,8 @@ def write_attestation(
 
     try:
         _validate_windows_stage_read_lease(compiled_installer.stage_lease)
-        _retire_windows_stage_monitor(compiled_installer.stage_lease)
+        _handoff_windows_stage_monitor(compiled_installer.stage_lease)
+        _validate_windows_stage_read_lease(compiled_installer.stage_lease)
     except Exception:
         cleaned = _cleanup_windows_attestation_temp(temporary)
         _close_windows_entries_nonraising(reversed(parent_chain))
@@ -3771,7 +3851,6 @@ def write_attestation(
         except Exception:
             exact = False
         cleaned = _cleanup_windows_attestation_temp(temporary)
-        _consume_compiled_installer(compiled_installer)
         if exact and cleaned and winner is not None:
             try:
                 if (
@@ -3782,12 +3861,22 @@ def write_attestation(
                 ):
                     raise _ChangedPath
             except Exception:
+                _consume_compiled_installer(compiled_installer)
                 _close_windows_entries_nonraising([winner])
                 _close_windows_entries_nonraising(reversed(parent_chain))
                 raise RuntimeError("INSTALLER_ATTESTATION_PUBLISH_ERROR") from None
+            try:
+                _validate_windows_stage_read_lease(compiled_installer.stage_lease)
+            except Exception:
+                _consume_compiled_installer(compiled_installer)
+                _close_windows_entries_nonraising([winner])
+                _close_windows_entries_nonraising(reversed(parent_chain))
+                raise RuntimeError("INSTALLER_ATTESTATION_INPUT_INVALID") from None
+            _consume_compiled_installer(compiled_installer)
             _close_windows_entries_nonraising([winner])
             _close_windows_entries_nonraising(reversed(parent_chain))
             return verified_setup
+        _consume_compiled_installer(compiled_installer)
         _close_windows_entries_nonraising([winner] if winner is not None else [])
         _close_windows_entries_nonraising(reversed(parent_chain))
         if exact and not cleaned:

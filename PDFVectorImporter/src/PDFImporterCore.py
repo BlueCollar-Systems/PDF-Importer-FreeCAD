@@ -2649,6 +2649,7 @@ def _embedded_font_program_unusable(exception_text: Any) -> bool:
         return False
     needles = (
         "corrupt cmap",
+        "cmap failed validation",
         "cmap table format",
         "not a truetype",
         "not a valid ttf",

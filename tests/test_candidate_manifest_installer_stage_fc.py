@@ -2076,6 +2076,9 @@ def test_reparse_at_existing_composite_target_is_conflict_and_preserved(
     staged = _stage(monkeypatch, tmp_path, source)
     snapshot_before = staged.source_zip_snapshot.read_bytes()
     real_open = getattr(build_windows_installer, "_nt_open_directory_handle", None)
+    real_read_open = getattr(
+        build_windows_installer, "_nt_open_directory_read_handle", None
+    )
     real_attribute_tag = getattr(
         build_windows_installer, "_query_windows_attribute_tag", None
     )
@@ -2084,6 +2087,13 @@ def test_reparse_at_existing_composite_target_is_conflict_and_preserved(
     def capture_target(parent_handle, name, *args, **kwargs):
         assert real_open is not None
         handle = real_open(parent_handle, name, *args, **kwargs)
+        if str(name) == staged.stage_root.name:
+            target_handles.add(_handle_key(handle))
+        return handle
+
+    def capture_read_target(parent_handle, name, *args, **kwargs):
+        assert real_read_open is not None
+        handle = real_read_open(parent_handle, name, *args, **kwargs)
         if str(name) == staged.stage_root.name:
             target_handles.add(_handle_key(handle))
         return handle
@@ -2099,6 +2109,12 @@ def test_reparse_at_existing_composite_target_is_conflict_and_preserved(
         build_windows_installer,
         "_nt_open_directory_handle",
         capture_target,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        build_windows_installer,
+        "_nt_open_directory_read_handle",
+        capture_read_target,
         raising=False,
     )
     monkeypatch.setattr(
@@ -3008,7 +3024,10 @@ def _handle_key(handle) -> int:
 def _install_stage_lifecycle_recorder(monkeypatch):
     required = (
         "_open_windows_anchor_handle",
+        "_open_windows_anchor_read_handle",
         "_nt_open_directory_handle",
+        "_nt_open_directory_read_handle",
+        "_nt_open_file_read_handle",
         "_nt_create_directory_handle",
         "_nt_create_file_handle",
         "_validate_windows_stage_handles",
@@ -3035,7 +3054,10 @@ def _install_stage_lifecycle_recorder(monkeypatch):
         return handle
 
     real_anchor = build_windows_installer._open_windows_anchor_handle
+    real_read_anchor = build_windows_installer._open_windows_anchor_read_handle
     real_open_dir = build_windows_installer._nt_open_directory_handle
+    real_open_read_dir = build_windows_installer._nt_open_directory_read_handle
+    real_open_read_file = build_windows_installer._nt_open_file_read_handle
     real_create_dir = build_windows_installer._nt_create_directory_handle
     real_create_file = build_windows_installer._nt_create_file_handle
     real_validate = build_windows_installer._validate_windows_stage_handles
@@ -3046,11 +3068,32 @@ def _install_stage_lifecycle_recorder(monkeypatch):
     def open_anchor(*args, **kwargs):
         return register("open", "anchor", real_anchor(*args, **kwargs))
 
+    def open_read_anchor(*args, **kwargs):
+        return register(
+            "open", "lease-anchor", real_read_anchor(*args, **kwargs)
+        )
+
     def open_dir(parent_handle, name, *args, **kwargs):
         return register(
             "open",
             "existing-dir:" + str(name),
             real_open_dir(parent_handle, name, *args, **kwargs),
+            parent_handle,
+        )
+
+    def open_read_dir(parent_handle, name, *args, **kwargs):
+        return register(
+            "open",
+            "lease-dir:" + str(name),
+            real_open_read_dir(parent_handle, name, *args, **kwargs),
+            parent_handle,
+        )
+
+    def open_read_file(parent_handle, name, *args, **kwargs):
+        return register(
+            "open",
+            "lease-file:" + str(name),
+            real_open_read_file(parent_handle, name, *args, **kwargs),
             parent_handle,
         )
 
@@ -3120,7 +3163,16 @@ def _install_stage_lifecycle_recorder(monkeypatch):
         return real_publish(handle, parent_handle, destination, *args, **kwargs)
 
     monkeypatch.setattr(build_windows_installer, "_open_windows_anchor_handle", open_anchor)
+    monkeypatch.setattr(
+        build_windows_installer, "_open_windows_anchor_read_handle", open_read_anchor
+    )
     monkeypatch.setattr(build_windows_installer, "_nt_open_directory_handle", open_dir)
+    monkeypatch.setattr(
+        build_windows_installer, "_nt_open_directory_read_handle", open_read_dir
+    )
+    monkeypatch.setattr(
+        build_windows_installer, "_nt_open_file_read_handle", open_read_file
+    )
     monkeypatch.setattr(build_windows_installer, "_nt_create_directory_handle", create_dir)
     monkeypatch.setattr(build_windows_installer, "_nt_create_file_handle", create_file)
     monkeypatch.setattr(build_windows_installer, "_validate_windows_stage_handles", validate)
@@ -3229,7 +3281,17 @@ def test_stage_handle_lifecycle_is_leaf_to_root_exactly_once_and_leak_free(
     assert max(descendant_closes) < terminal_index
 
     if outcome == "success":
-        assert all(event[0] == "close" for event in events[terminal_index + 1 :])
+        post_publication = events[terminal_index + 1 :]
+        assert any(
+            event[0] == "open" and event[1].startswith("lease-")
+            for event in post_publication
+        )
+        assert all(event[0] in {"open", "close"} for event in post_publication)
+        assert all(
+            event[1].startswith("lease-")
+            for event in post_publication
+            if event[0] == "open"
+        )
 
 
 # Task 5C successor RED boundary. Each test below names a concrete authority or

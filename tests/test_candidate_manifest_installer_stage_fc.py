@@ -3246,6 +3246,7 @@ def _install_stage_lifecycle_recorder(monkeypatch):
         "_open_windows_anchor_read_handle",
         "_nt_open_directory_handle",
         "_nt_open_directory_read_handle",
+        "_nt_open_directory_monitor_handle",
         "_nt_open_file_read_handle",
         "_nt_create_directory_handle",
         "_nt_create_file_handle",
@@ -3253,6 +3254,7 @@ def _install_stage_lifecycle_recorder(monkeypatch):
         "_close_windows_handle",
         "_quarantine_windows_handle",
         "_publish_windows_directory_handle",
+        "_create_windows_stage_monitor_event",
     )
     missing = [
         name for name in required if not callable(getattr(build_windows_installer, name, None))
@@ -3276,6 +3278,7 @@ def _install_stage_lifecycle_recorder(monkeypatch):
     real_read_anchor = build_windows_installer._open_windows_anchor_read_handle
     real_open_dir = build_windows_installer._nt_open_directory_handle
     real_open_read_dir = build_windows_installer._nt_open_directory_read_handle
+    real_open_monitor = build_windows_installer._nt_open_directory_monitor_handle
     real_open_read_file = build_windows_installer._nt_open_file_read_handle
     real_create_dir = build_windows_installer._nt_create_directory_handle
     real_create_file = build_windows_installer._nt_create_file_handle
@@ -3283,6 +3286,7 @@ def _install_stage_lifecycle_recorder(monkeypatch):
     real_close = build_windows_installer._close_windows_handle
     real_quarantine = build_windows_installer._quarantine_windows_handle
     real_publish = build_windows_installer._publish_windows_directory_handle
+    real_create_monitor_event = build_windows_installer._create_windows_stage_monitor_event
 
     def open_anchor(*args, **kwargs):
         return register("open", "anchor", real_anchor(*args, **kwargs))
@@ -3306,6 +3310,21 @@ def _install_stage_lifecycle_recorder(monkeypatch):
             "lease-dir:" + str(name),
             real_open_read_dir(parent_handle, name, *args, **kwargs),
             parent_handle,
+        )
+
+    def open_monitor(parent_handle, name, *args, **kwargs):
+        return register(
+            "open",
+            "stage-monitor",
+            real_open_monitor(parent_handle, name, *args, **kwargs),
+            parent_handle,
+        )
+
+    def create_monitor_event(*args, **kwargs):
+        return register(
+            "open",
+            "stage-monitor-event",
+            real_create_monitor_event(*args, **kwargs),
         )
 
     def open_read_file(parent_handle, name, *args, **kwargs):
@@ -3388,6 +3407,14 @@ def _install_stage_lifecycle_recorder(monkeypatch):
     monkeypatch.setattr(build_windows_installer, "_nt_open_directory_handle", open_dir)
     monkeypatch.setattr(
         build_windows_installer, "_nt_open_directory_read_handle", open_read_dir
+    )
+    monkeypatch.setattr(
+        build_windows_installer, "_nt_open_directory_monitor_handle", open_monitor
+    )
+    monkeypatch.setattr(
+        build_windows_installer,
+        "_create_windows_stage_monitor_event",
+        create_monitor_event,
     )
     monkeypatch.setattr(
         build_windows_installer, "_nt_open_file_read_handle", open_read_file
@@ -5229,6 +5256,8 @@ def test_attestation_exact_winner_is_held_through_temp_cleanup_and_consumption(
     def close(entry):
         if entry.role == "attestation-winner":
             events.append("winner-close")
+        elif entry.role == "stage-monitor":
+            events.append("monitor-close")
         elif entry.role.startswith("output-") or entry.role.startswith("stage-"):
             events.append("capability-close")
         return real_close(entry)
@@ -5243,6 +5272,8 @@ def test_attestation_exact_winner_is_held_through_temp_cleanup_and_consumption(
     ) == expected_setup
     assert events.count("winner-open") == 1
     assert events.count("winner-close") == 1
+    assert events.count("monitor-close") == 1
+    assert events.index("monitor-close") < events.index("winner-open")
     assert events.index("winner-open") < events.index("temp-dispose")
     assert events.index("temp-dispose") < events.index("capability-close")
     assert events.index("capability-close") < events.index("winner-close")

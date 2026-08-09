@@ -3515,10 +3515,16 @@ def test_output_parent_or_ancestor_alias_is_setup_unsafe_for_both_provenances(
     )
     real_query = build_windows_installer._query_windows_opened_name
     target = output_dir.name if changed_component == "output" else output_dir.parent.name
+    target_handles = {
+        _handle_key(entry.handle)
+        for entry in capability.output_lease.parent_chain
+        if entry.name == target
+    }
+    assert target_handles
 
     def aliased_name(handle):
         actual = real_query(handle)
-        if actual == target:
+        if _handle_key(handle) in target_handles:
             return actual.upper() if actual.upper() != actual else actual.lower()
         return actual
 
@@ -4124,11 +4130,11 @@ def test_compiled_capability_context_releases_leaf_parent_chain_then_stage_once(
     monkeypatch, tmp_path, raise_inside
 ):
     capability, _calls = _compile_capability(monkeypatch, tmp_path / "build")
-    events: list[str] = []
+    events: list[tuple[str, int]] = []
     real_close = build_windows_installer._close_windows_entry
 
     def record_close(entry):
-        events.append(entry.role)
+        events.append((entry.role, _handle_key(entry.handle)))
         return real_close(entry)
 
     monkeypatch.setattr(build_windows_installer, "_close_windows_entry", record_close)
@@ -4144,17 +4150,22 @@ def test_compiled_capability_context_releases_leaf_parent_chain_then_stage_once(
         build_windows_installer.finalize_compiled_installer(capability)
     output_leaf = min(
         index
-        for index, role in enumerate(events)
+        for index, (role, _handle) in enumerate(events)
         if role in {"output-reader", "output-guard", "output-winner"}
     )
     output_parent = min(
         index
-        for index, role in enumerate(events)
+        for index, (role, _handle) in enumerate(events)
         if role in {"output-parent", "output-ancestor", "output-anchor"}
     )
-    stage = min(index for index, role in enumerate(events) if role.startswith("stage-"))
+    stage = min(
+        index
+        for index, (role, _handle) in enumerate(events)
+        if role.startswith("stage-")
+    )
     assert output_leaf < output_parent < stage
-    assert len(events) == len(set(events))
+    handles = [handle for _role, handle in events]
+    assert len(handles) == len(set(handles))
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows capability cross-binding")

@@ -5922,8 +5922,8 @@ def test_raw_handle_pre_registration_failure_closes_exactly_once_leaf_to_root(
 
     rename_proved = True
     original_path = failed_path[0]
-    moved_path = original_path.with_name(original_path.name + ".ownership-probe")
     if target != "anchor" and original_path.exists():
+        moved_path = original_path.with_name(original_path.name + ".ownership-probe")
         try:
             os.replace(original_path, moved_path)
             os.replace(moved_path, original_path)

@@ -39,6 +39,26 @@ _ATTESTATION_TEMP_PREFIX = ".installer-attestation-"
 _FILE_ATTRIBUTE_REPARSE_POINT = getattr(
     stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
 )
+_FILE_ATTRIBUTE_DIRECTORY = getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10)
+_WINDOWS_SUPPORTED_FILESYSTEMS = frozenset({"NTFS", "REFS"})
+_FILE_LIST_DIRECTORY = 0x00000001
+_FILE_ADD_FILE = 0x00000002
+_FILE_ADD_SUBDIRECTORY = 0x00000004
+_FILE_TRAVERSE = 0x00000020
+_FILE_READ_DATA = 0x00000001
+_FILE_WRITE_DATA = 0x00000002
+_FILE_READ_ATTRIBUTES = 0x00000080
+_FILE_WRITE_ATTRIBUTES = 0x00000100
+_DELETE = 0x00010000
+_SYNCHRONIZE = 0x00100000
+_FILE_SHARE_READ = 0x00000001
+_FILE_SHARE_WRITE = 0x00000002
+_FILE_OPEN = 0x00000001
+_FILE_CREATE = 0x00000002
+_FILE_DIRECTORY_FILE = 0x00000001
+_FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
+_FILE_NON_DIRECTORY_FILE = 0x00000040
+_FILE_OPEN_REPARSE_POINT = 0x00200000
 _COMMIT = re.compile(r"\A[0-9a-f]{40}\Z")
 _DIGEST = re.compile(r"\A[0-9a-f]{64}\Z")
 
@@ -102,6 +122,50 @@ class _ChangedPath(Exception):
 
 class _TempCollision(Exception):
     pass
+
+
+class _NativeCapabilityError(Exception):
+    pass
+
+
+class _StageCloseError(Exception):
+    def __init__(self, role: str):
+        super().__init__(role)
+        self.role = role
+
+
+@dataclass(frozen=True)
+class _WindowsHandleIdentity:
+    volume_serial: int
+    file_id: bytes
+    file_type: int
+    file_attributes: int
+    reparse_tag: int
+
+    def __post_init__(self) -> None:
+        if type(self.file_id) is not bytes or len(self.file_id) != 16:
+            raise ValueError("Windows file ID must contain exactly 128 bits")
+
+
+@dataclass
+class _WindowsHeldEntry:
+    handle: object
+    identity: _WindowsHandleIdentity
+    name: str
+    path: Path
+    role: str
+    parent_handle: object | None = None
+    payload: bytes | None = None
+    closed: bool = False
+
+
+@dataclass
+class _WindowsStageHandles:
+    stage_parent: Path
+    parent_chain: list[_WindowsHeldEntry]
+    root: _WindowsHeldEntry
+    directories: dict[str, _WindowsHeldEntry]
+    files: dict[str, _WindowsHeldEntry]
 
 
 def _closed_release_zip_codes(values: object) -> list[str]:
@@ -371,41 +435,404 @@ def validate_installer_payload_tree(
         return ["MANIFEST_IO_ERROR"]
 
 
-def _windows_handle_metadata(handle) -> tuple[int, int, int]:
-    """Return volume, file ID, and file type for an already-open Windows handle."""
+def _trusted_local_drive_parts(path: str | Path) -> tuple[str, tuple[str, ...]]:
+    """Return one trusted DOS drive anchor and lexical single components."""
 
+    raw = os.fspath(path)
+    if not isinstance(raw, str) or raw.startswith(("\\\\", "\\??\\")):
+        raise _UnsafePath
+    if not Path(raw).is_absolute():
+        raise _UnsafePath
+    absolute = _absolute_lexical(raw)
+    drive = absolute.drive
+    if not re.fullmatch(r"[A-Za-z]:", drive) or absolute.anchor != drive + "\\":
+        raise _UnsafePath
+    components = tuple(absolute.parts[1:])
+    for component in components:
+        _validate_windows_component_name(component)
+    return drive.upper() + "\\", components
+
+
+def _validate_windows_component_name(name: str) -> None:
+    if type(name) is not str or name in {"", ".", ".."}:
+        raise _UnsafePath
+    if name != unicodedata.normalize("NFC", name):
+        raise _UnsafePath
+    if any(character in name for character in '\\/:*?"<>|'):
+        raise _UnsafePath
+    if name[-1:] in {" ", "."}:
+        raise _UnsafePath
+    stem = name.split(".", 1)[0].casefold()
+    if stem in {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        *(f"com{index}" for index in range(1, 10)),
+        *(f"lpt{index}" for index in range(1, 10)),
+    }:
+        raise _UnsafePath
+
+
+def _ntstatus_to_winerror(status: int) -> int:
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    function = ntdll.RtlNtStatusToDosError
+    function.argtypes = [ctypes.c_long]
+    function.restype = ctypes.c_ulong
+    return int(function(ctypes.c_long(status)))
+
+
+def _raise_ntstatus(status: int, name: str) -> None:
+    code = _ntstatus_to_winerror(status)
+    if code in {2, 3}:
+        raise FileNotFoundError(code, "native relative entry absent", name)
+    if code in {80, 183}:
+        raise FileExistsError(code, "native relative entry exists", name)
+    raise OSError(code, "native relative operation failed", name)
+
+
+def _nt_relative_create(
+    parent_handle,
+    name: str,
+    *,
+    desired_access: int,
+    share_access: int,
+    disposition: int,
+    create_options: int,
+):
     from ctypes import wintypes
 
-    class _ByHandleFileInformation(ctypes.Structure):
+    _validate_windows_component_name(name)
+
+    class _UnicodeString(ctypes.Structure):
         _fields_ = [
-            ("dwFileAttributes", wintypes.DWORD),
-            ("ftCreationTime", wintypes.FILETIME),
-            ("ftLastAccessTime", wintypes.FILETIME),
-            ("ftLastWriteTime", wintypes.FILETIME),
-            ("dwVolumeSerialNumber", wintypes.DWORD),
-            ("nFileSizeHigh", wintypes.DWORD),
-            ("nFileSizeLow", wintypes.DWORD),
-            ("nNumberOfLinks", wintypes.DWORD),
-            ("nFileIndexHigh", wintypes.DWORD),
-            ("nFileIndexLow", wintypes.DWORD),
+            ("Length", wintypes.USHORT),
+            ("MaximumLength", wintypes.USHORT),
+            ("Buffer", wintypes.LPWSTR),
         ]
 
-    information = _ByHandleFileInformation()
+    class _ObjectAttributes(ctypes.Structure):
+        _fields_ = [
+            ("Length", wintypes.ULONG),
+            ("RootDirectory", wintypes.HANDLE),
+            ("ObjectName", ctypes.POINTER(_UnicodeString)),
+            ("Attributes", wintypes.ULONG),
+            ("SecurityDescriptor", wintypes.LPVOID),
+            ("SecurityQualityOfService", wintypes.LPVOID),
+        ]
+
+    class _IoStatusBlockUnion(ctypes.Union):
+        _fields_ = [("Status", ctypes.c_long), ("Pointer", wintypes.LPVOID)]
+
+    class _IoStatusBlock(ctypes.Structure):
+        _anonymous_ = ("value",)
+        _fields_ = [("value", _IoStatusBlockUnion), ("Information", ctypes.c_size_t)]
+
+    buffer = ctypes.create_unicode_buffer(name)
+    encoded_length = len(name.encode("utf-16-le"))
+    unicode_name = _UnicodeString(
+        encoded_length,
+        encoded_length + ctypes.sizeof(ctypes.c_wchar),
+        ctypes.cast(buffer, wintypes.LPWSTR),
+    )
+    attributes = _ObjectAttributes(
+        ctypes.sizeof(_ObjectAttributes),
+        parent_handle,
+        ctypes.pointer(unicode_name),
+        0x00000040,
+        None,
+        None,
+    )
+    io_status = _IoStatusBlock()
+    result = wintypes.HANDLE()
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    function = ntdll.NtCreateFile
+    function.argtypes = [
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.ULONG,
+        ctypes.POINTER(_ObjectAttributes),
+        ctypes.POINTER(_IoStatusBlock),
+        ctypes.POINTER(ctypes.c_longlong),
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.LPVOID,
+        wintypes.ULONG,
+    ]
+    function.restype = ctypes.c_long
+    status = int(
+        function(
+            ctypes.byref(result),
+            desired_access,
+            ctypes.byref(attributes),
+            ctypes.byref(io_status),
+            None,
+            0x00000080,
+            share_access,
+            disposition,
+            create_options,
+            None,
+            0,
+        )
+    )
+    if status < 0:
+        _raise_ntstatus(status, name)
+    if not result.value:
+        raise OSError("native relative operation returned no handle")
+    return result.value
+
+
+def _open_windows_anchor_handle(anchor: str):
+    from ctypes import wintypes
+
+    if not re.fullmatch(r"[A-Za-z]:\\", anchor):
+        raise _UnsafePath
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    function = kernel32.GetFileInformationByHandle
-    function.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ByHandleFileInformation)]
-    function.restype = wintypes.BOOL
-    if not function(handle, ctypes.byref(information)):
+    drive_type = kernel32.GetDriveTypeW(wintypes.LPCWSTR(anchor))
+    if int(drive_type) != 3:
+        raise _NativeCapabilityError
+    function = kernel32.CreateFileW
+    function.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    function.restype = wintypes.HANDLE
+    handle = function(
+        anchor,
+        _FILE_LIST_DIRECTORY
+        | _FILE_ADD_SUBDIRECTORY
+        | _FILE_READ_ATTRIBUTES
+        | _FILE_TRAVERSE
+        | _SYNCHRONIZE,
+        _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+        None,
+        3,
+        0x02000000 | _FILE_OPEN_REPARSE_POINT,
+        None,
+    )
+    invalid = wintypes.HANDLE(-1).value
+    if handle == invalid:
         raise ctypes.WinError(ctypes.get_last_error())
-    file_id = (int(information.nFileIndexHigh) << 32) | int(
-        information.nFileIndexLow
+    return handle
+
+
+def _nt_open_directory_handle(parent_handle, name: str):
+    return _nt_relative_create(
+        parent_handle,
+        name,
+        desired_access=(
+            _FILE_LIST_DIRECTORY
+            | _FILE_ADD_SUBDIRECTORY
+            | _FILE_READ_ATTRIBUTES
+            | _FILE_TRAVERSE
+            | _SYNCHRONIZE
+        ),
+        share_access=_FILE_SHARE_READ | _FILE_SHARE_WRITE,
+        disposition=_FILE_OPEN,
+        create_options=(
+            _FILE_DIRECTORY_FILE
+            | _FILE_SYNCHRONOUS_IO_NONALERT
+            | _FILE_OPEN_REPARSE_POINT
+        ),
     )
+
+
+def _nt_create_directory_handle(
+    parent_handle,
+    name: str,
+    *,
+    root: bool = False,
+    parent_component: bool = False,
+):
+    desired_access = (
+        _FILE_LIST_DIRECTORY
+        | _FILE_ADD_SUBDIRECTORY
+        | _FILE_READ_ATTRIBUTES
+        | _FILE_TRAVERSE
+        | _SYNCHRONIZE
+    )
+    if not parent_component:
+        desired_access |= _FILE_ADD_FILE
+    if root:
+        desired_access |= _DELETE
+    return _nt_relative_create(
+        parent_handle,
+        name,
+        desired_access=desired_access,
+        share_access=(
+            (_FILE_SHARE_READ | _FILE_SHARE_WRITE)
+            if parent_component
+            else 0
+        ),
+        disposition=_FILE_CREATE,
+        create_options=(
+            _FILE_DIRECTORY_FILE
+            | _FILE_SYNCHRONOUS_IO_NONALERT
+            | _FILE_OPEN_REPARSE_POINT
+        ),
+    )
+
+
+def _nt_create_file_handle(parent_handle, name: str):
+    return _nt_relative_create(
+        parent_handle,
+        name,
+        desired_access=(
+            _FILE_READ_DATA
+            | _FILE_WRITE_DATA
+            | _FILE_READ_ATTRIBUTES
+            | _FILE_WRITE_ATTRIBUTES
+            | _SYNCHRONIZE
+        ),
+        share_access=0,
+        disposition=_FILE_CREATE,
+        create_options=(
+            _FILE_NON_DIRECTORY_FILE
+            | _FILE_SYNCHRONOUS_IO_NONALERT
+            | _FILE_OPEN_REPARSE_POINT
+        ),
+    )
+
+
+def _query_windows_file_id(handle) -> tuple[int, bytes]:
+    from ctypes import wintypes
+
+    class _FileId128(ctypes.Structure):
+        _fields_ = [("Identifier", ctypes.c_ubyte * 16)]
+
+    class _FileIdInfo(ctypes.Structure):
+        _fields_ = [
+            ("VolumeSerialNumber", ctypes.c_ulonglong),
+            ("FileId", _FileId128),
+        ]
+
+    information = _FileIdInfo()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    function = kernel32.GetFileInformationByHandleEx
+    function.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    function.restype = wintypes.BOOL
+    if not function(handle, 18, ctypes.byref(information), ctypes.sizeof(information)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return int(information.VolumeSerialNumber), bytes(information.FileId.Identifier)
+
+
+def _query_windows_attribute_tag(handle) -> tuple[int, int]:
+    from ctypes import wintypes
+
+    class _FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [("FileAttributes", wintypes.DWORD), ("ReparseTag", wintypes.DWORD)]
+
+    information = _FileAttributeTagInfo()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    function = kernel32.GetFileInformationByHandleEx
+    function.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    function.restype = wintypes.BOOL
+    if not function(handle, 9, ctypes.byref(information), ctypes.sizeof(information)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return int(information.FileAttributes), int(information.ReparseTag)
+
+
+def _query_windows_link_count(handle) -> int:
+    from ctypes import wintypes
+
+    class _FileStandardInfo(ctypes.Structure):
+        _fields_ = [
+            ("AllocationSize", ctypes.c_longlong),
+            ("EndOfFile", ctypes.c_longlong),
+            ("NumberOfLinks", wintypes.DWORD),
+            ("DeletePending", wintypes.BOOLEAN),
+            ("Directory", wintypes.BOOLEAN),
+        ]
+
+    information = _FileStandardInfo()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    function = kernel32.GetFileInformationByHandleEx
+    function.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    function.restype = wintypes.BOOL
+    if not function(handle, 1, ctypes.byref(information), ctypes.sizeof(information)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return int(information.NumberOfLinks)
+
+
+def _query_windows_opened_name(handle) -> str:
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    function = kernel32.GetFinalPathNameByHandleW
+    function.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+    function.restype = wintypes.DWORD
+    capacity = 32768
+    buffer = ctypes.create_unicode_buffer(capacity)
+    length = int(function(handle, buffer, capacity, 0))
+    if length == 0 or length >= capacity:
+        raise ctypes.WinError(ctypes.get_last_error())
+    value = buffer.value.rstrip("\\")
+    return value.rsplit("\\", 1)[-1]
+
+
+def _query_windows_filesystem(handle) -> str:
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    function = getattr(kernel32, "GetVolumeInformationByHandleW", None)
+    if function is None:
+        raise _NativeCapabilityError
+    filesystem = ctypes.create_unicode_buffer(64)
+    function.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
+    function.restype = wintypes.BOOL
+    if not function(handle, None, 0, None, None, None, filesystem, len(filesystem)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return filesystem.value.upper()
+
+
+def _windows_handle_metadata(handle) -> _WindowsHandleIdentity:
+    """Return the complete authoritative identity of one retained handle."""
+
+    volume_serial, file_id = _query_windows_file_id(handle)
+    file_attributes, reparse_tag = _query_windows_attribute_tag(handle)
     file_type = (
-        stat.S_IFDIR
-        if int(information.dwFileAttributes) & stat.FILE_ATTRIBUTE_DIRECTORY
-        else stat.S_IFREG
+        stat.S_IFDIR if file_attributes & _FILE_ATTRIBUTE_DIRECTORY else stat.S_IFREG
     )
-    return int(information.dwVolumeSerialNumber), file_id, file_type
+    return _WindowsHandleIdentity(
+        volume_serial=volume_serial,
+        file_id=file_id,
+        file_type=file_type,
+        file_attributes=file_attributes,
+        reparse_tag=reparse_tag,
+    )
+
+
+def _assert_same_windows_volume(
+    parent: _WindowsHandleIdentity, child: _WindowsHandleIdentity
+) -> None:
+    if parent.volume_serial != child.volume_serial:
+        raise _UnsafePath
+
+
+def _assert_safe_windows_identity(
+    identity: _WindowsHandleIdentity, *, expected_type: int
+) -> None:
+    if (
+        identity.file_type != expected_type
+        or identity.file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT
+        or identity.reparse_tag != 0
+    ):
+        raise _UnsafePath
 
 
 def _open_windows_no_follow(
@@ -450,7 +877,165 @@ def _close_windows_handle(handle) -> None:
     function = kernel32.CloseHandle
     function.argtypes = [wintypes.HANDLE]
     function.restype = wintypes.BOOL
-    function(handle)
+    if not function(handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _force_close_windows_handle(handle) -> None:
+    try:
+        _close_windows_handle(handle)
+    except Exception:
+        try:
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            function = kernel32.CloseHandle
+            function.argtypes = [wintypes.HANDLE]
+            function.restype = wintypes.BOOL
+            function(handle)
+        except Exception:
+            pass
+
+
+def _write_windows_file_handle(handle, payload: bytes) -> None:
+    from ctypes import wintypes
+
+    if type(payload) is not bytes:
+        raise TypeError("payload must be exact bytes")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    set_pointer = kernel32.SetFilePointerEx
+    set_pointer.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_longlong,
+        ctypes.POINTER(ctypes.c_longlong),
+        wintypes.DWORD,
+    ]
+    set_pointer.restype = wintypes.BOOL
+    if not set_pointer(handle, 0, None, 0):
+        raise ctypes.WinError(ctypes.get_last_error())
+    write = kernel32.WriteFile
+    write.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPCVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    ]
+    write.restype = wintypes.BOOL
+    offset = 0
+    while offset < len(payload):
+        chunk = payload[offset : offset + 1024 * 1024]
+        buffer = ctypes.create_string_buffer(chunk)
+        written = wintypes.DWORD()
+        if not write(handle, buffer, len(chunk), ctypes.byref(written), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if int(written.value) <= 0:
+            raise OSError("native file write made no progress")
+        offset += int(written.value)
+
+
+def _flush_windows_file_handle(handle) -> None:
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    function = kernel32.FlushFileBuffers
+    function.argtypes = [wintypes.HANDLE]
+    function.restype = wintypes.BOOL
+    if not function(handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _read_windows_file_handle(handle) -> bytes:
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    set_pointer = kernel32.SetFilePointerEx
+    set_pointer.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_longlong,
+        ctypes.POINTER(ctypes.c_longlong),
+        wintypes.DWORD,
+    ]
+    set_pointer.restype = wintypes.BOOL
+    if not set_pointer(handle, 0, None, 0):
+        raise ctypes.WinError(ctypes.get_last_error())
+    read = kernel32.ReadFile
+    read.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    ]
+    read.restype = wintypes.BOOL
+    chunks: list[bytes] = []
+    while True:
+        buffer = ctypes.create_string_buffer(1024 * 1024)
+        count = wintypes.DWORD()
+        if not read(handle, buffer, len(buffer), ctypes.byref(count), None):
+            error = ctypes.get_last_error()
+            if error == 38:
+                break
+            raise ctypes.WinError(error)
+        if count.value == 0:
+            break
+        chunks.append(buffer.raw[: count.value])
+    return b"".join(chunks)
+
+
+def _query_windows_directory_names(handle) -> tuple[str, ...]:
+    """Enumerate exact child names through the already-retained directory handle."""
+
+    from ctypes import wintypes
+
+    class _FileIdBothDirectoryInfo(ctypes.Structure):
+        _fields_ = [
+            ("NextEntryOffset", wintypes.DWORD),
+            ("FileIndex", wintypes.DWORD),
+            ("CreationTime", ctypes.c_longlong),
+            ("LastAccessTime", ctypes.c_longlong),
+            ("LastWriteTime", ctypes.c_longlong),
+            ("ChangeTime", ctypes.c_longlong),
+            ("EndOfFile", ctypes.c_longlong),
+            ("AllocationSize", ctypes.c_longlong),
+            ("FileAttributes", wintypes.DWORD),
+            ("FileNameLength", wintypes.DWORD),
+            ("EaSize", wintypes.DWORD),
+            ("ShortNameLength", ctypes.c_byte),
+            ("ShortName", wintypes.WCHAR * 12),
+            ("FileId", ctypes.c_longlong),
+            ("FileName", wintypes.WCHAR * 1),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    function = kernel32.GetFileInformationByHandleEx
+    function.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    function.restype = wintypes.BOOL
+    names: list[str] = []
+    restart = True
+    while True:
+        buffer = ctypes.create_string_buffer(64 * 1024)
+        information_class = 11 if restart else 10
+        restart = False
+        if not function(handle, information_class, buffer, len(buffer)):
+            error = ctypes.get_last_error()
+            if error in {18, 38}:
+                break
+            raise ctypes.WinError(error)
+        offset = 0
+        while True:
+            entry = _FileIdBothDirectoryInfo.from_buffer(buffer, offset)
+            name_offset = offset + _FileIdBothDirectoryInfo.FileName.offset
+            name = ctypes.wstring_at(
+                ctypes.addressof(buffer) + name_offset,
+                int(entry.FileNameLength) // ctypes.sizeof(ctypes.c_wchar),
+            )
+            if name not in {".", ".."}:
+                names.append(name)
+            if entry.NextEntryOffset == 0:
+                break
+            offset += int(entry.NextEntryOffset)
+    return tuple(names)
 
 
 def _dispose_windows_file_handle(handle) -> bool:
@@ -479,24 +1064,26 @@ def _dispose_windows_file_handle(handle) -> bool:
     )
 
 
-def _quarantine_windows_handle(handle, parent_handle, destination: Path) -> bool:
+def _rename_windows_handle(handle, parent_handle, destination: Path) -> None:
     from ctypes import wintypes
 
-    name = os.fspath(destination)
+    name = Path(destination).name
+    _validate_windows_component_name(name)
+    target_name = os.fspath(_absolute_lexical(destination))
 
     class _FileRenameInfo(ctypes.Structure):
         _fields_ = [
             ("ReplaceIfExists", wintypes.BOOLEAN),
             ("RootDirectory", wintypes.HANDLE),
             ("FileNameLength", wintypes.DWORD),
-            ("FileName", wintypes.WCHAR * len(name)),
+            ("FileName", wintypes.WCHAR * (len(target_name) + 1)),
         ]
 
     information = _FileRenameInfo()
     information.ReplaceIfExists = False
     information.RootDirectory = None
-    information.FileNameLength = len(name.encode("utf-16-le"))
-    information.FileName = name
+    information.FileNameLength = len(target_name.encode("utf-16-le"))
+    information.FileName = target_name
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     function = kernel32.SetFileInformationByHandle
     function.argtypes = [
@@ -506,14 +1093,74 @@ def _quarantine_windows_handle(handle, parent_handle, destination: Path) -> bool
         wintypes.DWORD,
     ]
     function.restype = wintypes.BOOL
-    return bool(
-        function(
+    error = 0
+    for attempt in range(80):
+        if function(
             handle,
             3,
             ctypes.byref(information),
             ctypes.sizeof(information),
-        )
+        ):
+            return
+        error = ctypes.get_last_error()
+        if error != 32 or attempt == 79:
+            break
+        time.sleep(0.025)
+    if error in {80, 183}:
+        raise FileExistsError(error, "native target exists", name)
+    if error:
+        raise ctypes.WinError(error)
+
+
+def _quarantine_windows_handle(handle, parent_handle, destination: Path) -> bool:
+    try:
+        _rename_windows_handle(handle, parent_handle, destination)
+    except Exception:
+        return False
+    return True
+
+
+def _publish_windows_directory_handle(
+    handle, parent_handle, destination: Path
+) -> None:
+    _rename_windows_handle(handle, parent_handle, destination)
+
+
+def _legacy_windows_handle_metadata(handle) -> tuple[int, int, int]:
+    """Bridge the pre-existing attestation cleanup contract; never used by staging."""
+
+    from ctypes import wintypes
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        ]
+
+    information = _ByHandleFileInformation()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    function = kernel32.GetFileInformationByHandle
+    function.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ByHandleFileInformation)]
+    function.restype = wintypes.BOOL
+    if not function(handle, ctypes.byref(information)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    file_id = (int(information.nFileIndexHigh) << 32) | int(
+        information.nFileIndexLow
     )
+    file_type = (
+        stat.S_IFDIR
+        if int(information.dwFileAttributes) & _FILE_ATTRIBUTE_DIRECTORY
+        else stat.S_IFREG
+    )
+    return int(information.dwVolumeSerialNumber), file_id, file_type
 
 
 def _cleanup_owned(
@@ -548,12 +1195,14 @@ def _cleanup_owned(
                 share_delete=False,
             )
             child_handle = _open_windows_no_follow(
-                path, 0x00010000 | 0x00000080 | 0x00100000
+                path,
+                0x00010000 | 0x00000080 | 0x00100000,
+                share_delete=False,
             )
-            _parent_volume, parent_file_id, parent_type = _windows_handle_metadata(
+            _parent_volume, parent_file_id, parent_type = _legacy_windows_handle_metadata(
                 parent_handle
             )
-            _child_volume, child_file_id, child_type = _windows_handle_metadata(
+            _child_volume, child_file_id, child_type = _legacy_windows_handle_metadata(
                 child_handle
             )
             if (
@@ -620,6 +1269,398 @@ def _write_owned_member(root: Path, relative: str, payload: bytes) -> Path:
     ):
         raise _UnsafePath
     return destination
+
+
+def _require_windows_stage_capabilities() -> None:
+    required = (
+        "_open_windows_anchor_handle",
+        "_query_windows_filesystem",
+        "_nt_open_directory_handle",
+        "_nt_create_directory_handle",
+        "_ntstatus_to_winerror",
+        "_query_windows_file_id",
+        "_query_windows_attribute_tag",
+        "_query_windows_opened_name",
+        "_windows_handle_metadata",
+        "_nt_create_file_handle",
+        "_write_windows_file_handle",
+        "_flush_windows_file_handle",
+        "_read_windows_file_handle",
+        "_query_windows_directory_names",
+        "_query_windows_link_count",
+        "_revalidate_windows_handle_chain",
+        "_close_windows_handle",
+        "_quarantine_windows_handle",
+    )
+    if os.name != "nt" or any(not callable(globals().get(name)) for name in required):
+        raise _NativeCapabilityError
+
+
+def _exact_windows_child_exists(
+    parent_handle, name: str, *, allow_absent: bool
+) -> bool:
+    _validate_windows_component_name(name)
+    identity = _name_identity(name)
+    matches = [
+        actual
+        for actual in _query_windows_directory_names(parent_handle)
+        if _name_identity(actual) == identity
+    ]
+    if len(matches) > 1 or (matches and matches[0] != name):
+        raise _UnsafePath
+    if not matches and not allow_absent:
+        raise _ChangedPath
+    return bool(matches)
+
+
+def _entry_from_handle(
+    handle,
+    *,
+    name: str,
+    path: Path,
+    role: str,
+    parent: _WindowsHeldEntry | None,
+    expected_type: int,
+) -> _WindowsHeldEntry:
+    identity = _windows_handle_metadata(handle)
+    _assert_safe_windows_identity(identity, expected_type=expected_type)
+    if parent is not None:
+        _assert_same_windows_volume(parent.identity, identity)
+        if _query_windows_opened_name(handle) != name:
+            raise _UnsafePath
+    return _WindowsHeldEntry(
+        handle=handle,
+        identity=identity,
+        name=name,
+        path=path,
+        role=role,
+        parent_handle=None if parent is None else parent.handle,
+    )
+
+
+def _close_windows_entry(entry: _WindowsHeldEntry) -> None:
+    if entry.closed:
+        return
+    try:
+        _close_windows_handle(entry.handle)
+    except Exception:
+        _force_close_windows_handle(entry.handle)
+        entry.closed = True
+        raise
+    entry.closed = True
+
+
+def _close_windows_entries_nonraising(entries) -> None:
+    for entry in entries:
+        try:
+            _close_windows_entry(entry)
+        except Exception:
+            pass
+
+
+def _prepare_windows_stage_parent(
+    path: str | Path,
+) -> tuple[Path, list[_WindowsHeldEntry]]:
+    _require_windows_stage_capabilities()
+    anchor, components = _trusted_local_drive_parts(path)
+    chain: list[_WindowsHeldEntry] = []
+    try:
+        anchor_handle = _open_windows_anchor_handle(anchor)
+        anchor_entry = _entry_from_handle(
+            anchor_handle,
+            name=anchor,
+            path=Path(anchor),
+            role="anchor",
+            parent=None,
+            expected_type=stat.S_IFDIR,
+        )
+        chain.append(anchor_entry)
+        if _query_windows_filesystem(anchor_handle) not in _WINDOWS_SUPPORTED_FILESYSTEMS:
+            raise _NativeCapabilityError
+        current_path = Path(anchor)
+        for component in components:
+            parent = chain[-1]
+            exists = _exact_windows_child_exists(
+                parent.handle, component, allow_absent=True
+            )
+            if exists:
+                handle = _nt_open_directory_handle(parent.handle, component)
+                role = "ancestor"
+            else:
+                handle = _nt_create_directory_handle(
+                    parent.handle, component, parent_component=True
+                )
+                role = "created-parent"
+            current_path = current_path / component
+            chain.append(
+                _entry_from_handle(
+                    handle,
+                    name=component,
+                    path=current_path,
+                    role=role,
+                    parent=parent,
+                    expected_type=stat.S_IFDIR,
+                )
+            )
+        if not components:
+            raise _UnsafePath
+        return _absolute_lexical(path), chain
+    except Exception:
+        _close_windows_entries_nonraising(reversed(chain))
+        raise
+
+
+def _revalidate_windows_handle_chain(chain) -> None:
+    if not chain:
+        raise _ChangedPath
+    previous: _WindowsHeldEntry | None = None
+    for entry in chain:
+        if entry.closed:
+            raise _ChangedPath
+        identity = _windows_handle_metadata(entry.handle)
+        if identity != entry.identity:
+            raise _ChangedPath
+        _assert_safe_windows_identity(identity, expected_type=stat.S_IFDIR)
+        if previous is not None:
+            _assert_same_windows_volume(previous.identity, identity)
+            if _query_windows_opened_name(entry.handle) != entry.name:
+                raise _ChangedPath
+        previous = entry
+
+
+def _create_windows_stage_root(
+    stage_parent: Path,
+    parent_chain: list[_WindowsHeldEntry],
+    name: str,
+) -> _WindowsStageHandles:
+    parent = parent_chain[-1]
+    handle = _nt_create_directory_handle(parent.handle, name, root=True)
+    root: _WindowsHeldEntry | None = None
+    try:
+        root = _entry_from_handle(
+            handle,
+            name=name,
+            path=stage_parent / name,
+            role="stage-root",
+            parent=parent,
+            expected_type=stat.S_IFDIR,
+        )
+        _revalidate_windows_handle_chain(parent_chain)
+        return _WindowsStageHandles(
+            stage_parent=stage_parent,
+            parent_chain=parent_chain,
+            root=root,
+            directories={"": root},
+            files={},
+        )
+    except Exception:
+        _force_close_windows_handle(handle)
+        raise
+
+
+def _stage_create_directory(
+    workspace: _WindowsStageHandles, relative: str
+) -> _WindowsHeldEntry:
+    relative = relative.strip("/")
+    if not relative:
+        return workspace.root
+    current_key = ""
+    current = workspace.root
+    for component in relative.split("/"):
+        _validate_windows_component_name(component)
+        next_key = component if not current_key else current_key + "/" + component
+        existing = workspace.directories.get(next_key)
+        if existing is not None:
+            current_key = next_key
+            current = existing
+            continue
+        handle = _nt_create_directory_handle(current.handle, component)
+        entry: _WindowsHeldEntry | None = None
+        try:
+            entry = _entry_from_handle(
+                handle,
+                name=component,
+                path=current.path / component,
+                role="owned-dir",
+                parent=current,
+                expected_type=stat.S_IFDIR,
+            )
+        except Exception:
+            if entry is None:
+                _force_close_windows_handle(handle)
+            raise
+        workspace.directories[next_key] = entry
+        current_key = next_key
+        current = entry
+    return current
+
+
+def _stage_write_file(
+    workspace: _WindowsStageHandles,
+    relative: str,
+    payload: bytes,
+    *,
+    role: str,
+) -> _WindowsHeldEntry:
+    parts = relative.split("/")
+    if not parts or any(not part for part in parts):
+        raise _UnsafePath
+    parent_key = "/".join(parts[:-1])
+    parent = _stage_create_directory(workspace, parent_key)
+    name = parts[-1]
+    _validate_windows_component_name(name)
+    if relative in workspace.files:
+        raise _UnsafePath
+    handle = _nt_create_file_handle(parent.handle, name)
+    entry: _WindowsHeldEntry | None = None
+    try:
+        entry = _entry_from_handle(
+            handle,
+            name=name,
+            path=parent.path / name,
+            role=role,
+            parent=parent,
+            expected_type=stat.S_IFREG,
+        )
+        if _query_windows_link_count(handle) != 1:
+            raise _UnsafePath
+        workspace.files[relative] = entry
+        _write_windows_file_handle(handle, payload)
+        _flush_windows_file_handle(handle)
+        entry.payload = payload
+        return entry
+    except Exception:
+        if entry is None:
+            _force_close_windows_handle(handle)
+        raise
+
+
+def _validate_windows_stage_handles(
+    workspace: _WindowsStageHandles,
+    document: object,
+) -> list[str]:
+    try:
+        _revalidate_windows_handle_chain(workspace.parent_chain)
+    except (_UnsafePath, _ChangedPath):
+        raise _UnsafePath from None
+    if _windows_handle_metadata(workspace.root.handle) != workspace.root.identity:
+        raise _ChangedPath
+    expected_children: dict[str, set[str]] = {
+        relative: set() for relative in workspace.directories
+    }
+    for relative, entry in workspace.directories.items():
+        if entry.closed or _windows_handle_metadata(entry.handle) != entry.identity:
+            raise _ChangedPath
+        _assert_safe_windows_identity(entry.identity, expected_type=stat.S_IFDIR)
+        if relative:
+            parent_key, _, name = relative.rpartition("/")
+            expected_children[parent_key].add(name)
+    for relative, entry in workspace.files.items():
+        if entry.closed or entry.payload is None:
+            raise _ChangedPath
+        identity = _windows_handle_metadata(entry.handle)
+        if identity != entry.identity or _query_windows_link_count(entry.handle) != 1:
+            raise _ChangedPath
+        _assert_safe_windows_identity(identity, expected_type=stat.S_IFREG)
+        if _read_windows_file_handle(entry.handle) != entry.payload:
+            raise _ChangedPath
+        parent_key, _, name = relative.rpartition("/")
+        expected_children[parent_key].add(name)
+    for relative, entry in workspace.directories.items():
+        names = _query_windows_directory_names(entry.handle)
+        if len({_name_identity(name) for name in names}) != len(names):
+            raise _UnsafePath
+        if set(names) != expected_children[relative]:
+            raise _ChangedPath
+    return []
+
+
+def _close_windows_stage_descendants(workspace: _WindowsStageHandles) -> None:
+    first_error: _StageCloseError | None = None
+    for entry in reversed(tuple(workspace.files.values())):
+        try:
+            _close_windows_entry(entry)
+        except Exception:
+            if first_error is None:
+                first_error = _StageCloseError(entry.role)
+    directories = sorted(
+        (item for key, item in workspace.directories.items() if key),
+        key=lambda entry: len(entry.path.parts),
+        reverse=True,
+    )
+    for entry in directories:
+        try:
+            _close_windows_entry(entry)
+        except Exception:
+            if first_error is None:
+                first_error = _StageCloseError(entry.role)
+    if first_error is not None:
+        raise first_error
+
+
+def _close_windows_stage_authority(workspace: _WindowsStageHandles) -> None:
+    _close_windows_entries_nonraising([workspace.root])
+    _close_windows_entries_nonraising(reversed(workspace.parent_chain))
+
+
+def _preserve_windows_stage(workspace: _WindowsStageHandles) -> bool:
+    try:
+        _close_windows_stage_descendants(workspace)
+    except Exception:
+        _close_windows_stage_authority(workspace)
+        return False
+    _close_windows_stage_authority(workspace)
+    return True
+
+
+def _cleanup_windows_stage(workspace: _WindowsStageHandles) -> bool:
+    try:
+        _close_windows_stage_descendants(workspace)
+    except Exception:
+        _close_windows_stage_authority(workspace)
+        return False
+    success = False
+    try:
+        _revalidate_windows_handle_chain(workspace.parent_chain)
+        if _windows_handle_metadata(workspace.root.handle) != workspace.root.identity:
+            raise _ChangedPath
+        quarantine = workspace.stage_parent / (
+            _STAGE_QUARANTINE_PREFIX + uuid.uuid4().hex
+        )
+        success = bool(
+            _quarantine_windows_handle(
+                workspace.root.handle,
+                workspace.parent_chain[-1].handle,
+                quarantine,
+            )
+        )
+    except Exception:
+        success = False
+    finally:
+        _close_windows_stage_authority(workspace)
+    return success
+
+
+def _raise_with_windows_stage_cleanup(
+    token: str,
+    *,
+    cleanup_token: str,
+    workspace: _WindowsStageHandles,
+) -> None:
+    if not _cleanup_windows_stage(workspace):
+        token = cleanup_token
+    raise RuntimeError(token) from None
+
+
+def _raise_with_windows_stage_preserve(
+    token: str,
+    *,
+    cleanup_token: str,
+    workspace: _WindowsStageHandles,
+) -> None:
+    if not _preserve_windows_stage(workspace):
+        token = cleanup_token
+    raise RuntimeError(token) from None
 
 
 def _stage_identity(manifest_sha256: str, source_zip_sha256: str) -> str:
@@ -1083,12 +2124,11 @@ def stage_release(
     dist_dir: str | Path | None = None,
     stage_dir: str | Path | None = None,
 ) -> InstallerStage:
-    """Validate and atomically publish one exact content-addressed stage."""
+    """Validate and atomically publish one exact retained-handle stage."""
 
     version = read_version()
     expected_name = f"FreeCAD-PDF-Importer_v{version}.zip"
     output_root = _absolute_lexical(dist_dir if dist_dir is not None else DIST_DIR)
-
     if source_zip is None:
         try:
             zip_path = _absolute_lexical(build_release.build(output_root))
@@ -1103,109 +2143,105 @@ def stage_release(
         raise RuntimeError("INSTALLER_SOURCE_UNSAFE")
 
     try:
-        stage_parent, parent_chain = _prepare_safe_directory(
+        stage_parent, parent_chain = _prepare_windows_stage_parent(
             stage_dir if stage_dir is not None else STAGE_DIR
         )
-    except Exception:
+    except (_UnsafePath, _ChangedPath):
         raise RuntimeError("INSTALLER_STAGE_UNSAFE") from None
+    except Exception:
+        raise RuntimeError("INSTALLER_STAGE_IO_ERROR") from None
 
-    temporary = stage_parent / (_STAGE_TEMP_PREFIX + uuid.uuid4().hex)
-    owned_identity: tuple[int, int, int] | None = None
+    temporary_name = _STAGE_TEMP_PREFIX + uuid.uuid4().hex
     try:
-        if _assert_exact_child(stage_parent, temporary.name, allow_absent=True):
-            raise _TempCollision
-        try:
-            os.mkdir(temporary)
-        except FileExistsError:
-            raise _TempCollision from None
-        temp_metadata = os.lstat(temporary)
-        owned_identity = _stat_identity(temp_metadata)
-        if _is_link_or_reparse(temporary, temp_metadata) or not stat.S_ISDIR(
-            temp_metadata.st_mode
-        ):
-            raise _UnsafePath
-        _revalidate_chain(parent_chain)
-    except _TempCollision:
+        workspace = _create_windows_stage_root(
+            stage_parent, parent_chain, temporary_name
+        )
+    except (FileExistsError, _TempCollision):
+        _close_windows_entries_nonraising(reversed(parent_chain))
         raise RuntimeError("INSTALLER_STAGE_UNSAFE") from None
-    except _UnsafePath:
-        _raise_with_cleanup(
-            "INSTALLER_STAGE_UNSAFE",
-            cleanup_token="INSTALLER_STAGE_IO_ERROR",
-            path=temporary,
-            parent_chain=parent_chain,
-            owned_identity=owned_identity,
-        )
+    except (_UnsafePath, _ChangedPath):
+        _close_windows_entries_nonraising(reversed(parent_chain))
+        raise RuntimeError("INSTALLER_STAGE_UNSAFE") from None
     except Exception:
-        _raise_with_cleanup(
-            "INSTALLER_STAGE_IO_ERROR",
-            cleanup_token="INSTALLER_STAGE_IO_ERROR",
-            path=temporary,
-            parent_chain=parent_chain,
-            owned_identity=owned_identity,
-        )
+        _close_windows_entries_nonraising(reversed(parent_chain))
+        raise RuntimeError("INSTALLER_STAGE_IO_ERROR") from None
 
     try:
-        metadata_root = _create_owned_directory(temporary, _STAGE_METADATA_DIRNAME)
-        snapshot_path = metadata_root / expected_name
-        copied_size, copied_digest = _copy_source_zip_snapshot(zip_path, snapshot_path)
-        snapshot_bytes = _capture_regular_file(snapshot_path)
-        source_size = len(snapshot_bytes)
-        source_digest = hashlib.sha256(snapshot_bytes).hexdigest()
-        if source_size != copied_size or source_digest != copied_digest:
-            raise _ChangedPath
+        snapshot_bytes = _capture_regular_file(zip_path)
     except _UnsafePath:
-        _raise_with_cleanup(
+        _raise_with_windows_stage_cleanup(
             "INSTALLER_SOURCE_UNSAFE",
             cleanup_token="INSTALLER_STAGE_IO_ERROR",
-            path=temporary,
-            parent_chain=parent_chain,
-            owned_identity=owned_identity,
+            workspace=workspace,
         )
     except _ChangedPath:
-        _raise_with_cleanup(
+        _raise_with_windows_stage_cleanup(
             "INSTALLER_SOURCE_CHANGED",
             cleanup_token="INSTALLER_STAGE_IO_ERROR",
-            path=temporary,
-            parent_chain=parent_chain,
-            owned_identity=owned_identity,
+            workspace=workspace,
         )
     except Exception:
-        _raise_with_cleanup(
+        _raise_with_windows_stage_cleanup(
             "INSTALLER_SOURCE_IO_ERROR",
             cleanup_token="INSTALLER_STAGE_IO_ERROR",
-            path=temporary,
-            parent_chain=parent_chain,
-            owned_identity=owned_identity,
+            workspace=workspace,
+        )
+    source_size = len(snapshot_bytes)
+    source_digest = hashlib.sha256(snapshot_bytes).hexdigest()
+    snapshot_relative = _STAGE_METADATA_DIRNAME + "/" + expected_name
+    try:
+        _stage_write_file(
+            workspace,
+            snapshot_relative,
+            snapshot_bytes,
+            role="source-file",
+        )
+    except FileExistsError:
+        _raise_with_windows_stage_preserve(
+            "INSTALLER_SOURCE_IO_ERROR",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            workspace=workspace,
+        )
+    except _UnsafePath:
+        _raise_with_windows_stage_cleanup(
+            "INSTALLER_SOURCE_UNSAFE",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            workspace=workspace,
+        )
+    except _ChangedPath:
+        _raise_with_windows_stage_cleanup(
+            "INSTALLER_SOURCE_CHANGED",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            workspace=workspace,
+        )
+    except Exception:
+        _raise_with_windows_stage_cleanup(
+            "INSTALLER_SOURCE_IO_ERROR",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            workspace=workspace,
         )
 
     try:
         members, problems = _release_zip_member_map(
-            snapshot_bytes,
-            artifact_name=expected_name,
+            snapshot_bytes, artifact_name=expected_name
         )
     except Exception:
-        _raise_with_cleanup(
+        _raise_with_windows_stage_cleanup(
             "INSTALLER_SOURCE_IO_ERROR",
             cleanup_token="INSTALLER_STAGE_IO_ERROR",
-            path=temporary,
-            parent_chain=parent_chain,
-            owned_identity=owned_identity,
+            workspace=workspace,
         )
     if problems:
-        _raise_with_cleanup(
+        _raise_with_windows_stage_cleanup(
             "INSTALLER_SOURCE_ZIP_INVALID: " + ", ".join(sorted(set(problems))),
             cleanup_token="INSTALLER_STAGE_IO_ERROR",
-            path=temporary,
-            parent_chain=parent_chain,
-            owned_identity=owned_identity,
+            workspace=workspace,
         )
     if members is None:
-        _raise_with_cleanup(
+        _raise_with_windows_stage_cleanup(
             "INSTALLER_SOURCE_ZIP_INVALID: RELEASE_ZIP_IO_ERROR",
             cleanup_token="INSTALLER_STAGE_IO_ERROR",
-            path=temporary,
-            parent_chain=parent_chain,
-            owned_identity=owned_identity,
+            workspace=workspace,
         )
 
     try:
@@ -1232,13 +2268,11 @@ def stage_release(
         invalid_codes = ["MANIFEST_IO_ERROR"]
         document = None
     if invalid_codes or document is None:
-        _raise_with_cleanup(
+        _raise_with_windows_stage_cleanup(
             "INSTALLER_SOURCE_ZIP_INVALID: "
-            + ", ".join(sorted(set(invalid_codes))),
+            + ", ".join(sorted(set(invalid_codes)),),
             cleanup_token="INSTALLER_STAGE_IO_ERROR",
-            path=temporary,
-            parent_chain=parent_chain,
-            owned_identity=owned_identity,
+            workspace=workspace,
         )
 
     installed_manifest_sha256 = _CANDIDATE_MANIFEST.candidate_manifest_sha256(
@@ -1248,93 +2282,108 @@ def stage_release(
         installed_manifest_sha256, source_digest
     )
     try:
-        source_dir = _create_owned_directory(temporary, "PDFVectorImporter")
+        _stage_create_directory(workspace, "PDFVectorImporter")
         manifest_relative = MANIFEST_MEMBER.removeprefix("PDFVectorImporter/")
-        _write_owned_member(source_dir, manifest_relative, manifest_bytes)
+        _stage_write_file(
+            workspace,
+            "PDFVectorImporter/" + manifest_relative,
+            manifest_bytes,
+            role="member-file",
+        )
         for record in document["files"]:
             relative = record["path"]
-            _write_owned_member(
-                source_dir,
-                relative,
+            _stage_write_file(
+                workspace,
+                "PDFVectorImporter/" + relative,
                 members["PDFVectorImporter/" + relative],
+                role="member-file",
             )
-    except _UnsafePath:
-        _raise_with_cleanup(
-            "INSTALLER_STAGE_UNSAFE",
-            cleanup_token="INSTALLER_STAGE_IO_ERROR",
-            path=temporary,
-            parent_chain=parent_chain,
-            owned_identity=owned_identity,
-        )
-    except Exception:
-        _raise_with_cleanup(
+    except FileExistsError:
+        _raise_with_windows_stage_preserve(
             "INSTALLER_STAGE_IO_ERROR",
             cleanup_token="INSTALLER_STAGE_IO_ERROR",
-            path=temporary,
-            parent_chain=parent_chain,
-            owned_identity=owned_identity,
+            workspace=workspace,
+        )
+    except _UnsafePath:
+        _raise_with_windows_stage_cleanup(
+            "INSTALLER_STAGE_UNSAFE",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            workspace=workspace,
+        )
+    except Exception:
+        _raise_with_windows_stage_cleanup(
+            "INSTALLER_STAGE_IO_ERROR",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            workspace=workspace,
         )
 
-    tree_problems = validate_installer_payload_tree(document, source_dir)
+    try:
+        tree_problems = _validate_windows_stage_handles(workspace, document)
+    except _UnsafePath:
+        _raise_with_windows_stage_preserve(
+            "INSTALLER_STAGE_UNSAFE",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            workspace=workspace,
+        )
+    except Exception:
+        _raise_with_windows_stage_cleanup(
+            "INSTALLER_STAGE_TREE_INVALID",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            workspace=workspace,
+        )
     if tree_problems:
-        _raise_with_cleanup(
+        _raise_with_windows_stage_cleanup(
             "INSTALLER_STAGE_TREE_INVALID: "
             + ", ".join(sorted(set(tree_problems))),
             cleanup_token="INSTALLER_STAGE_IO_ERROR",
-            path=temporary,
-            parent_chain=parent_chain,
-            owned_identity=owned_identity,
+            workspace=workspace,
+        )
+
+    temporary = workspace.root.path
+    source_dir = temporary / "PDFVectorImporter"
+    try:
+        _close_windows_stage_descendants(workspace)
+    except _StageCloseError as exc:
+        token = (
+            "INSTALLER_SOURCE_IO_ERROR"
+            if exc.role == "source-file"
+            else "INSTALLER_STAGE_IO_ERROR"
+        )
+        _raise_with_windows_stage_cleanup(
+            token,
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            workspace=workspace,
         )
     try:
-        if _read_package_version(source_dir / "package.xml") != version:
-            raise _ChangedPath
+        package_version = _read_package_version(source_dir / "package.xml")
     except Exception:
-        _raise_with_cleanup(
+        _raise_with_windows_stage_cleanup(
             "INSTALLER_STAGE_IO_ERROR",
             cleanup_token="INSTALLER_STAGE_IO_ERROR",
-            path=temporary,
-            parent_chain=parent_chain,
-            owned_identity=owned_identity,
+            workspace=workspace,
         )
-
-    try:
-        final_snapshot_bytes = _capture_regular_file(snapshot_path)
-        if (
-            final_snapshot_bytes != snapshot_bytes
-            or len(final_snapshot_bytes) != source_size
-            or hashlib.sha256(final_snapshot_bytes).hexdigest() != source_digest
-        ):
-            raise _ChangedPath
-    except Exception:
-        _raise_with_cleanup(
-            "INSTALLER_SOURCE_CHANGED",
-            cleanup_token="INSTALLER_STAGE_IO_ERROR",
-            path=temporary,
-            parent_chain=parent_chain,
-            owned_identity=owned_identity,
-        )
-
-    try:
-        temporary_stage = InstallerStage(
-            version=version,
-            stage_root=temporary,
-            source_dir=source_dir,
-            source_zip_snapshot=snapshot_path,
-            source_zip_name=expected_name,
-            source_zip_size=source_size,
-            source_zip_sha256=source_digest,
-            candidate_manifest_bytes=manifest_bytes,
-            installed_manifest_sha256=installed_manifest_sha256,
-            stage_identity_sha256=stage_identity_sha256,
-        )
-        _validate_stage_exact(temporary_stage, require_identity_name=False)
-    except Exception:
-        _raise_with_cleanup(
+    if package_version != version:
+        _raise_with_windows_stage_cleanup(
             "INSTALLER_STAGE_TREE_INVALID",
             cleanup_token="INSTALLER_STAGE_IO_ERROR",
-            path=temporary,
-            parent_chain=parent_chain,
-            owned_identity=owned_identity,
+            workspace=workspace,
+        )
+    try:
+        _revalidate_windows_handle_chain(parent_chain)
+    except (_UnsafePath, _ChangedPath):
+        _raise_with_windows_stage_preserve(
+            "INSTALLER_STAGE_UNSAFE",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            workspace=workspace,
+        )
+    try:
+        if _windows_handle_metadata(workspace.root.handle) != workspace.root.identity:
+            raise _ChangedPath
+    except Exception:
+        _raise_with_windows_stage_cleanup(
+            "INSTALLER_STAGE_TREE_INVALID",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            workspace=workspace,
         )
 
     final_root = stage_parent / stage_identity_sha256
@@ -1352,63 +2401,87 @@ def stage_release(
     )
 
     try:
-        _revalidate_chain(parent_chain)
-        target_exists = _assert_exact_child(
-            stage_parent, stage_identity_sha256, allow_absent=True
+        target_exists = _exact_windows_child_exists(
+            parent_chain[-1].handle,
+            stage_identity_sha256,
+            allow_absent=True,
         )
     except Exception:
-        _raise_with_cleanup(
+        _raise_with_windows_stage_preserve(
             "INSTALLER_STAGE_UNSAFE",
             cleanup_token="INSTALLER_STAGE_IO_ERROR",
-            path=temporary,
-            parent_chain=parent_chain,
-            owned_identity=owned_identity,
+            workspace=workspace,
         )
     if target_exists:
+        target_entry: _WindowsHeldEntry | None = None
         try:
+            target_handle = _nt_open_directory_handle(
+                parent_chain[-1].handle, stage_identity_sha256
+            )
+            target_entry = _entry_from_handle(
+                target_handle,
+                name=stage_identity_sha256,
+                path=final_root,
+                role="winner",
+                parent=parent_chain[-1],
+                expected_type=stat.S_IFDIR,
+            )
             _validate_stage_exact(final_stage)
         except Exception:
-            _raise_with_cleanup(
+            if target_entry is not None:
+                _close_windows_entries_nonraising([target_entry])
+            _raise_with_windows_stage_cleanup(
                 "INSTALLER_STAGE_CONFLICT",
                 cleanup_token="INSTALLER_STAGE_IO_ERROR",
-                path=temporary,
-                parent_chain=parent_chain,
-                owned_identity=owned_identity,
+                workspace=workspace,
             )
-        if not _cleanup_owned(temporary, parent_chain, owned_identity):
+        _close_windows_entries_nonraising([target_entry])
+        if not _cleanup_windows_stage(workspace):
             raise RuntimeError("INSTALLER_STAGE_IO_ERROR") from None
-    else:
-        try:
-            os.replace(temporary, final_root)
-        except Exception:
-            try:
-                if _assert_exact_child(
-                    stage_parent, stage_identity_sha256, allow_absent=True
-                ):
-                    _validate_stage_exact(final_stage)
-                    if not _cleanup_owned(
-                        temporary, parent_chain, owned_identity
-                    ):
-                        raise _ChangedPath
-                else:
-                    raise _ChangedPath
-            except Exception:
-                _raise_with_cleanup(
-                    "INSTALLER_STAGE_PUBLISH_ERROR",
-                    cleanup_token="INSTALLER_STAGE_PUBLISH_ERROR",
-                    path=temporary,
-                    parent_chain=parent_chain,
-                    owned_identity=owned_identity,
-                )
-        else:
-            owned_identity = None
+        return final_stage
 
+    if not callable(globals().get("_publish_windows_directory_handle")):
+        _cleanup_windows_stage(workspace)
+        raise RuntimeError("INSTALLER_STAGE_PUBLISH_ERROR") from None
     try:
-        _validate_stage_exact(final_stage)
-        _revalidate_chain(parent_chain)
-        _validate_stage_exact(final_stage)
-    except Exception:
+        _publish_windows_directory_handle(
+            workspace.root.handle,
+            parent_chain[-1].handle,
+            final_root,
+        )
+    except FileExistsError:
+        winner: _WindowsHeldEntry | None = None
+        winner_is_exact = False
+        try:
+            winner_handle = _nt_open_directory_handle(
+                parent_chain[-1].handle, stage_identity_sha256
+            )
+            winner = _entry_from_handle(
+                winner_handle,
+                name=stage_identity_sha256,
+                path=final_root,
+                role="winner",
+                parent=parent_chain[-1],
+                expected_type=stat.S_IFDIR,
+            )
+            _validate_stage_exact(final_stage)
+            winner_is_exact = True
+        except Exception:
+            winner_is_exact = False
+        finally:
+            if winner is not None:
+                _close_windows_entries_nonraising([winner])
+        if winner_is_exact:
+            if not _cleanup_windows_stage(workspace):
+                raise RuntimeError("INSTALLER_STAGE_IO_ERROR") from None
+            return final_stage
+        _cleanup_windows_stage(workspace)
         raise RuntimeError("INSTALLER_STAGE_CONFLICT") from None
+    except Exception:
+        _cleanup_windows_stage(workspace)
+        raise RuntimeError("INSTALLER_STAGE_PUBLISH_ERROR") from None
+
+    _close_windows_stage_authority(workspace)
     return final_stage
 
 

@@ -862,6 +862,82 @@ def _model3d_report_payload(opts: ImportOptions) -> Dict[str, Any]:
     return payload
 
 
+def _merge_text_entity_info(
+    aggregate: Optional[Dict[str, Any]],
+    page_info: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Merge page text summaries without losing the exact source-item roster."""
+    if not isinstance(page_info, dict) or not page_info:
+        raise ValueError("page text entity information is missing")
+
+    def validated_roster(info: Dict[str, Any]) -> Optional[tuple[int, List[str]]]:
+        has_count = "source_item_count" in info
+        has_ids = "source_item_ids" in info
+        if has_count != has_ids:
+            raise ValueError("text entity source roster is incomplete")
+        if not has_count:
+            return None
+        source_item_count = info.get("source_item_count")
+        source_item_ids = info.get("source_item_ids")
+        if type(source_item_count) is not int or source_item_count < 0:
+            raise ValueError("text entity source item count is invalid")
+        if (
+            not isinstance(source_item_ids, list)
+            or any(
+                not isinstance(source_item_id, str)
+                or not source_item_id
+                or source_item_id != source_item_id.strip()
+                for source_item_id in source_item_ids
+            )
+            or len(source_item_ids) != len(set(source_item_ids))
+        ):
+            raise ValueError("text entity source item ids are invalid")
+        return source_item_count, list(source_item_ids)
+
+    page_roster = validated_roster(page_info)
+    page_count = page_info.get("count", 0)
+    if type(page_count) is not int or page_count < 0:
+        raise ValueError("page text entity count is invalid")
+    page_examples = page_info.get("examples", [])
+    if not isinstance(page_examples, list):
+        raise ValueError("page text entity examples must be a list")
+
+    if aggregate is None:
+        merged = dict(page_info)
+        merged["count"] = page_count
+        merged["examples"] = list(page_examples[:3])
+        if page_roster is not None:
+            merged["source_item_count"] = page_roster[0]
+            merged["source_item_ids"] = list(page_roster[1])
+        return merged
+
+    aggregate_roster = validated_roster(aggregate)
+    if (aggregate_roster is None) != (page_roster is None):
+        raise ValueError("multi-page text entity source roster is incomplete")
+
+    merged = dict(aggregate)
+    aggregate_count = aggregate.get("count", 0)
+    if type(aggregate_count) is not int or aggregate_count < 0:
+        raise ValueError("aggregate text entity count is invalid")
+    merged["count"] = aggregate_count + page_count
+    merged_examples = list(aggregate.get("examples", []))
+    if len(merged_examples) < 3:
+        merged_examples.extend(page_examples[: 3 - len(merged_examples)])
+    merged["examples"] = merged_examples
+    merged["font_rendered"] = bool(
+        aggregate.get("font_rendered") or page_info.get("font_rendered")
+    )
+
+    if aggregate_roster is not None and page_roster is not None:
+        aggregate_ids = aggregate_roster[1]
+        page_ids = page_roster[1]
+        if set(aggregate_ids).intersection(page_ids):
+            raise ValueError("multi-page text source item ids collide")
+        merged["source_item_count"] = aggregate_roster[0] + page_roster[0]
+        merged["source_item_ids"] = aggregate_ids + page_ids
+    return merged
+
+
 def write_import_report(
     *,
     pdf_path: str,
@@ -903,8 +979,33 @@ def write_import_report(
         if int(v or 0) > 0
     }
     entity_info = extra.get("actual_text_entity_types")
+    reported_source_item_ids: Optional[set[str]] = None
+    reported_source_item_count: Optional[int] = None
+    reported_source_roster_valid = True
     if isinstance(entity_info, dict):
-        extra["actual_text_entity_types"] = build_actual_text_entity_types(
+        if "source_item_ids" in entity_info:
+            raw_source_item_ids = entity_info.get("source_item_ids")
+            if (
+                isinstance(raw_source_item_ids, list)
+                and all(
+                    isinstance(source_item_id, str)
+                    and bool(source_item_id)
+                    and source_item_id == source_item_id.strip()
+                    for source_item_id in raw_source_item_ids
+                )
+                and len(raw_source_item_ids) == len(set(raw_source_item_ids))
+            ):
+                reported_source_item_ids = set(raw_source_item_ids)
+            else:
+                reported_source_roster_valid = False
+        if "source_item_count" in entity_info:
+            raw_source_item_count = entity_info.get("source_item_count")
+            if type(raw_source_item_count) is int and raw_source_item_count >= 0:
+                reported_source_item_count = raw_source_item_count
+            else:
+                reported_source_roster_valid = False
+
+        rebuilt_entity_info = build_actual_text_entity_types(
             host_app="freecad",
             text_mode=str(entity_info.get("entity_type") or opts.text_mode or "3d_text"),
             count=int(entity_info.get("count") or 0),
@@ -912,6 +1013,11 @@ def write_import_report(
             examples=list(entity_info.get("examples") or []),
             delivered_counts=delivered_counts or None,
         )
+        if reported_source_item_count is not None:
+            rebuilt_entity_info["source_item_count"] = reported_source_item_count
+        if reported_source_item_ids is not None:
+            rebuilt_entity_info["source_item_ids"] = sorted(reported_source_item_ids)
+        extra["actual_text_entity_types"] = rebuilt_entity_info
 
     text_attempts = [
         dict(attempt)
@@ -929,13 +1035,22 @@ def write_import_report(
 
     # Surface only proof-gated representation substitutions. The dominant
     # event lands in fallback.text and the complete ledger stays in extra.
-    text_fallback_events = [
-        dict(event)
-        for event in (getattr(opts, "text_mode_fallbacks", []) or [])
-        if int(event.get("count", 0) or 0) > 0
-        and bool((event.get("proof") or {}).get("item_specific_proven_impossible"))
-        and bool(event.get("source_item_ids"))
-    ]
+    text_fallback_events = []
+    for raw_event in (getattr(opts, "text_mode_fallbacks", []) or []):
+        event = dict(raw_event)
+        source_item_ids = list(event.get("source_item_ids") or [])
+        if int(event.get("count", 0) or 0) <= 0 or len(source_item_ids) != 1:
+            continue
+        source_item_id = str(source_item_ids[0] or "").strip()
+        try:
+            _validated_recorded_text_fallback_proof(
+                str(event.get("requested") or "").strip().lower(),
+                source_item_id,
+                event.get("proof"),
+            )
+        except (TypeError, ValueError):
+            continue
+        text_fallback_events.append(event)
     text_fallback: Optional[Dict[str, Any]] = None
     if text_fallback_events:
         text_fallback = dict(
@@ -943,20 +1058,20 @@ def write_import_report(
         )
         extra["text_mode_fallbacks"] = text_fallback_events
 
-    requested_mode = str(opts.text_mode or "").strip().lower()
-    requested_mode = {"label": "labels", "text3d": "3d_text", "outlines": "glyphs"}.get(
-        requested_mode, requested_mode
-    )
+    def canonical_text_mode(value: Any) -> str:
+        mode = str(value or "").strip().lower()
+        return {
+            "label": "labels",
+            "text3d": "3d_text",
+            "outlines": "glyphs",
+        }.get(mode, mode)
+
+    requested_mode = canonical_text_mode(opts.text_mode)
     entity_dict = extra.get("actual_text_entity_types")
     delivered_mode = ""
     delivered_count = 0
     if isinstance(entity_dict, dict):
-        delivered_mode = str(entity_dict.get("entity_type") or "").strip().lower()
-        delivered_mode = {
-            "label": "labels",
-            "text3d": "3d_text",
-            "outlines": "glyphs",
-        }.get(delivered_mode, delivered_mode)
+        delivered_mode = canonical_text_mode(entity_dict.get("entity_type"))
         delivered_count = int(entity_dict.get("count") or 0)
     delivered_mode_by_bucket = {
         "native_label": "labels",
@@ -981,33 +1096,155 @@ def write_import_report(
         # A legacy/custom report may provide only the aggregate type. Preserve
         # fail-closed behavior for an unexplained aggregate ``mixed`` value.
         delivered_modes.add(delivered_mode)
-    proven_fallback_modes = {
-        {
-            "label": "labels",
-            "text3d": "3d_text",
-            "outlines": "glyphs",
-        }.get(str(event.get("delivered") or "").strip().lower(),
-              str(event.get("delivered") or "").strip().lower())
-        for event in text_fallback_events
-        if str(event.get("requested") or "").strip().lower() == requested_mode
-    }
+    proven_fallback_sources: Dict[str, set[str]] = {}
+    unexpected_fallback_source_item_ids: set[str] = set()
+    for event in text_fallback_events:
+        event_source_item_ids = {
+            str(source_item_id).strip()
+            for source_item_id in (event.get("source_item_ids") or [])
+            if str(source_item_id).strip()
+        }
+        if canonical_text_mode(event.get("requested")) != requested_mode:
+            unexpected_fallback_source_item_ids.update(event_source_item_ids)
+            continue
+        proven_mode = canonical_text_mode(event.get("delivered"))
+        if not proven_mode:
+            continue
+        proven_fallback_sources.setdefault(proven_mode, set()).update(
+            event_source_item_ids
+        )
+    proven_fallback_modes = set(proven_fallback_sources)
     unproven_delivered_modes = delivered_modes - {
         requested_mode,
         *proven_fallback_modes,
     }
+
+    unproven_source_item_ids: set[str] = set()
+    mixed_delivery_ledger_complete = True
+    verified_attempts = [
+        attempt
+        for attempt in text_attempts
+        if str(attempt.get("outcome") or "").strip().lower() == "verified"
+    ]
+    verified_terminal_has_fallback = any(
+        canonical_text_mode(attempt.get("final_type"))
+        and canonical_text_mode(attempt.get("final_type")) != requested_mode
+        for attempt in verified_attempts
+    )
+    needs_item_reconciliation = (
+        delivered_mode == "mixed"
+        or bool(delivered_modes - {requested_mode})
+        or bool(text_fallback_events)
+        or verified_terminal_has_fallback
+    )
+    if needs_item_reconciliation:
+        terminal_attempts = [
+            attempt
+            for attempt in verified_attempts
+            if canonical_text_mode(attempt.get("final_type"))
+        ]
+        terminal_modes: set[str] = set()
+        terminal_modes_by_source: Dict[str, set[str]] = {}
+        terminal_source_entry_count = 0
+        for attempt in terminal_attempts:
+            source_item_id = str(attempt.get("source_item_id") or "").strip()
+            terminal_mode = canonical_text_mode(attempt.get("final_type"))
+            terminal_modes.add(terminal_mode)
+            if (
+                not source_item_id
+                or canonical_text_mode(attempt.get("requested_type"))
+                != requested_mode
+            ):
+                mixed_delivery_ledger_complete = False
+                continue
+            try:
+                _normalize_verified_text_item_result(
+                    {"source_item_id": source_item_id},
+                    requested_mode,
+                    terminal_mode,
+                    attempt,
+                )
+            except (TypeError, ValueError):
+                mixed_delivery_ledger_complete = False
+                continue
+            terminal_source_entry_count += 1
+            terminal_modes_by_source.setdefault(source_item_id, set()).add(terminal_mode)
+
+        if (
+            not terminal_attempts
+            or len(terminal_attempts) != len(verified_attempts)
+            or terminal_modes != delivered_modes
+            or terminal_source_entry_count != len(terminal_modes_by_source)
+            or any(len(modes) != 1 for modes in terminal_modes_by_source.values())
+        ):
+            mixed_delivery_ledger_complete = False
+        terminal_source_item_ids = set(terminal_modes_by_source)
+        if (
+            not reported_source_roster_valid
+            or reported_source_item_ids is None
+            or reported_source_item_count is None
+            or (
+                terminal_source_item_ids != reported_source_item_ids
+            )
+        ):
+            mixed_delivery_ledger_complete = False
+
+        terminal_fallback_sources: Dict[str, set[str]] = {}
+        for source_item_id, source_modes in terminal_modes_by_source.items():
+            for source_mode in source_modes:
+                if source_mode != requested_mode:
+                    terminal_fallback_sources.setdefault(source_mode, set()).add(
+                        source_item_id
+                    )
+
+        for fallback_mode in set(terminal_fallback_sources).union(
+            proven_fallback_sources
+        ):
+            terminal_sources = terminal_fallback_sources.get(fallback_mode, set())
+            proof_sources = proven_fallback_sources.get(fallback_mode, set())
+            if terminal_sources != proof_sources:
+                unproven_source_item_ids.update(terminal_sources.symmetric_difference(
+                    proof_sources
+                ))
+        if unexpected_fallback_source_item_ids:
+            unproven_source_item_ids.update(unexpected_fallback_source_item_ids)
+        if reported_source_item_ids is not None:
+            proof_source_item_ids = set().union(
+                *proven_fallback_sources.values()
+            ) if proven_fallback_sources else set()
+            phantom_proof_sources = proof_source_item_ids - reported_source_item_ids
+            if phantom_proof_sources:
+                unproven_source_item_ids.update(phantom_proof_sources)
+
+    contract_invalid = bool(unproven_delivered_modes)
+    if needs_item_reconciliation:
+        contract_invalid = (
+            contract_invalid
+            or bool(unproven_source_item_ids)
+            or not mixed_delivery_ledger_complete
+        )
     if (
         requested_mode
         and requested_mode != "none"
         and delivered_mode
         and delivered_count > 0
-        and bool(unproven_delivered_modes)
+        and contract_invalid
     ):
-        extra["representation_contract_violation"] = {
+        violation: Dict[str, Any] = {
             "requested_type": requested_mode,
             "delivered_type": delivered_mode,
             "delivered_count": delivered_count,
             "reason": "unproven_representation_substitution",
         }
+        if delivered_mode == "mixed":
+            violation.update(
+                {
+                    "unproven_delivered_types": sorted(unproven_delivered_modes),
+                    "unproven_source_item_ids": sorted(unproven_source_item_ids),
+                    "mixed_delivery_ledger_complete": mixed_delivery_ledger_complete,
+                }
+            )
+        extra["representation_contract_violation"] = violation
     if skips:
         extra["shapestring_skips"] = skips
         extra["shapestring_skip_total"] = sum(int(v) for v in skips.values())
@@ -2399,6 +2636,31 @@ _PROVEN_EXACT_FONT_ABSENCE_REASONS = frozenset({
 })
 
 
+def _embedded_font_program_unusable(exception_text: Any) -> bool:
+    """True when embedded staging failed because the font program itself is unusable.
+
+    Corrupt cmap / broken SFNT tables mean the embedded bytes cannot drive
+    ShapeString. That is an embedded-source miss, but requested 3D Text must
+    still try the exact Windows family/style alias (e.g. Arial Italic →
+    ariali.ttf) before aborting or descending the ladder.
+    """
+    text = str(exception_text or "").strip().lower()
+    if not text:
+        return False
+    needles = (
+        "corrupt cmap",
+        "cmap table format",
+        "not a truetype",
+        "not a valid ttf",
+        "bad sfnt",
+        "invalid sfnt",
+        "ttferror",
+        "ttlib.ttliberror",
+        "ttliberror",
+    )
+    return any(needle in text for needle in needles)
+
+
 def _resolve_shapestring_font_path_with_evidence(
     font_name: str,
     opts: Optional[ImportOptions] = None,
@@ -2816,10 +3078,15 @@ def _resolve_shapestring_font_path_with_evidence(
                     failure.get("reason") or "embedded_font_staging_failed"
                 )
                 failure_exception = str(failure.get("exception") or "")
-                if (
+                proven_absence = (
                     failure_reason in _PROVEN_EXACT_FONT_ABSENCE_REASONS
                     and not failure_exception
-                ):
+                )
+                unusable_program = (
+                    failure_reason == "embedded_font_staging_failed"
+                    and _embedded_font_program_unusable(failure_exception)
+                )
+                if proven_absence or unusable_program:
                     if (
                         failure.get("outcome") != "failed"
                         or type(failure.get("xref")) is not int
@@ -2850,19 +3117,36 @@ def _resolve_shapestring_font_path_with_evidence(
             exception="%s: %s" % (exc.__class__.__name__, exc),
         )]
 
+    embedded_absence_details: Dict[str, Any] = {}
     if (
         exact_nonembedded_observation is None
         and exact_unusable_observation is None
         and not _allow_unbound_compat
     ):
-        return None, [source_result(
-            "embedded_font",
-            "invalid",
-            font_identity,
-            reason="font_not_observed_in_completed_inventory",
-        )]
-
-    embedded_absence_details: Dict[str, Any] = {}
+        # A completed staging session that simply does not contain this font is
+        # the clean miss this function's contract describes -- not a runtime
+        # fault. Every way of *failing to establish* that has already returned
+        # "invalid" above: a missing/mismatched/duplicated session, an
+        # incomplete session, a session carrying a page-level failure, a
+        # malformed staged record or failure entry, and any lookup exception.
+        # Reaching here means staging ran to completion and the font is absent,
+        # which is exactly the proof the ladder needs.
+        #
+        # Reporting it as "invalid" made absence indistinguishable from an I/O
+        # fault, so 3D Text -- the only mode that requires an exact font to
+        # extrude outlines -- aborted the whole cell instead of descending,
+        # while text/labels/glyphs/geometry/raster all succeeded on the same
+        # document. Two distinct situations reach here: a font that was never
+        # staged at all, and a page whose staging failures named other fonts and
+        # so could not be attributed to the span requesting this one.
+        embedded_absence_details["absent_from_completed_inventory"] = True
+        # Keep the proof honest: if the page had staging failures that could not
+        # be attributed to this font, say so rather than implying a clean page.
+        unattributed = len(failures or [])
+        if unattributed:
+            embedded_absence_details["unattributed_page_staging_failures"] = (
+                unattributed
+            )
     if exact_nonembedded_observation is not None:
         embedded_absence_details["inventory_observation"] = (
             exact_nonembedded_observation
@@ -3716,6 +4000,84 @@ def _validate_item_impossibility_proof(
     return dict(proof)
 
 
+def _validated_recorded_text_fallback_proof(
+    requested: str,
+    source_item_id: str,
+    proof: Any,
+) -> Dict[str, Any]:
+    """Validate that fallback authority is exact, complete, and item-bound."""
+    if not isinstance(proof, dict):
+        raise ValueError("fallback proof must be a dictionary")
+    validated = dict(proof)
+    if validated.get("item_specific_proven_impossible") is not True:
+        raise ValueError("requested representation is not proven impossible")
+    if validated.get("importer_identity") != FREECAD_TEXT_IMPORTER_IDENTITY:
+        raise ValueError("fallback proof importer identity is invalid")
+    pdf_sha256 = validated.get("pdf_sha256")
+    if not isinstance(pdf_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", pdf_sha256) is None:
+        raise ValueError("fallback proof PDF SHA-256 is invalid")
+    page_number = validated.get("page_number")
+    if type(page_number) is not int or page_number <= 0:
+        raise ValueError("fallback proof page number is invalid")
+    if validated.get("source_item_id") != source_item_id:
+        raise ValueError("fallback proof source item id does not exactly match")
+    if validated.get("requested_type") != requested:
+        raise ValueError("fallback proof requested representation does not match")
+    if not str(validated.get("attempted_type") or "").strip():
+        raise ValueError("fallback proof attempted representation is missing")
+    evidence = validated.get("evidence")
+    if not isinstance(evidence, dict) or not evidence:
+        raise ValueError("fallback proof evidence is empty")
+    attempted_types = validated.get("attempted_types")
+    if (
+        not isinstance(attempted_types, list)
+        or requested not in attempted_types
+        or any(not isinstance(value, str) or not value for value in attempted_types)
+    ):
+        raise ValueError("fallback proof attempted representations are incomplete")
+    attempted_source_results = validated.get("attempted_source_results")
+    if not isinstance(attempted_source_results, list) or not attempted_source_results:
+        raise ValueError("fallback proof source results are empty")
+    if validated.get("attempted_sources_complete") is not True:
+        raise ValueError("fallback proof source inspection is incomplete")
+    _validated_entity_ids(
+        validated.get("created_entity_ids"),
+        field_name="fallback proof created_entity_ids",
+        allow_empty=True,
+    )
+    _validated_entity_ids(
+        validated.get("removed_entity_ids"),
+        field_name="fallback proof removed_entity_ids",
+        allow_empty=True,
+    )
+    if validated.get("cleanup_complete") is not True:
+        raise ValueError("fallback proof cleanup is incomplete")
+
+    proof_chain = validated.get("proof_chain")
+    if proof_chain is not None:
+        if not isinstance(proof_chain, list) or not proof_chain:
+            raise ValueError("fallback proof chain is empty")
+        for chain_proof in proof_chain:
+            if not isinstance(chain_proof, dict):
+                raise ValueError("fallback proof chain entry is invalid")
+            if (
+                chain_proof.get("item_specific_proven_impossible") is not True
+                or chain_proof.get("importer_identity")
+                != FREECAD_TEXT_IMPORTER_IDENTITY
+                or chain_proof.get("pdf_sha256") != pdf_sha256
+                or chain_proof.get("page_number") != page_number
+                or chain_proof.get("source_item_id") != source_item_id
+                or chain_proof.get("requested_type") != requested
+                or chain_proof.get("cleanup_complete") is not True
+            ):
+                raise ValueError("fallback proof chain is not bound to the source item")
+            chain_evidence = chain_proof.get("evidence")
+            if not isinstance(chain_evidence, dict) or not chain_evidence:
+                raise ValueError("fallback proof chain evidence is empty")
+
+    return validated
+
+
 def _record_text_mode_fallback(
     opts: ImportOptions,
     *,
@@ -3731,21 +4093,6 @@ def _record_text_mode_fallback(
     delivered = str(delivered or "").strip().lower()
     reason = str(reason or "").strip()
     source_item_id = str(source_item_id or "").strip()
-    proof = dict(proof or {})
-    evidence = str(proof.get("evidence") or "").strip()
-    attempted_types = [
-        str(value or "").strip().lower()
-        for value in list(proof.get("attempted_types") or [])
-        if str(value or "").strip()
-    ]
-    if (
-        not bool(proof.get("item_specific_proven_impossible"))
-        or not evidence
-        or requested not in attempted_types
-    ):
-        raise ValueError(
-            "requested representation must be item-specifically proven impossible"
-        )
     if (
         int(count or 0) <= 0
         or not requested
@@ -3755,6 +4102,11 @@ def _record_text_mode_fallback(
         or not source_item_id
     ):
         raise ValueError("fallback record requires exact modes, reason, count, and source id")
+    proof = _validated_recorded_text_fallback_proof(
+        requested,
+        source_item_id,
+        proof,
+    )
     events = getattr(opts, "text_mode_fallbacks", None)
     if events is None:
         raise ValueError("fallback ledger unavailable")
@@ -10181,6 +10533,50 @@ def _reset_import_run_state(opts: ImportOptions) -> None:
     opts.import_status = "running"
 
 
+_PAGE_RESULT_TELEMETRY_FIELDS = (
+    "phase_timings_ms",
+    "shapestring_skips",
+    "text_mode_fallbacks",
+    "text_delivered_counts",
+    "text_delivery_attempts",
+    "raster_page_count",
+    "raster_fallback_reasons",
+    "image_plane_count",
+    "auto_resolved_mode",
+    "auto_reason",
+    "resolved_scale",
+    "scale_hints",
+    "_font_stage_failures",
+    "_shapestring_font_paths",
+    "_shapestring_font_staging_sessions",
+    "_report_extra",
+    "_model3d_solids",
+    "_scale_cached_pages",
+    "wirestring_cache_stats",
+    "text3d_outline_cache_stats",
+)
+
+
+def _snapshot_page_result_telemetry(opts: ImportOptions) -> Dict[str, Any]:
+    """Capture result evidence that must follow page transaction semantics."""
+    return {
+        field_name: copy.deepcopy(getattr(opts, field_name))
+        for field_name in _PAGE_RESULT_TELEMETRY_FIELDS
+        if hasattr(opts, field_name)
+    }
+
+
+def _restore_page_result_telemetry(
+    opts: ImportOptions, snapshot: Dict[str, Any]
+) -> None:
+    """Remove evidence for host objects that cancellation or rollback removed."""
+    for field_name, value in snapshot.items():
+        setattr(opts, field_name, copy.deepcopy(value))
+    # This cache contains host-object references. Rebuild it after any rollback
+    # instead of retaining references to objects that no longer exist.
+    opts._native_text_object_index = None
+
+
 def _recompute_page_if_needed(fc_doc, opts: ImportOptions) -> bool:
     """Recompute now for direct page calls, or once after an orchestrated import."""
     if bool(getattr(opts, "_defer_page_recompute", False)):
@@ -10515,6 +10911,34 @@ def _session_state_payload(session_state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _representation_contract_scope(
+    requested_pages: List[int],
+    previously_certified_pages: List[int],
+    evaluated_pages: List[int],
+    current_invocation_completed_pages: List[int],
+    session_completed_pages: List[int],
+    rolled_back_pages: Optional[List[int]] = None,
+) -> Dict[str, Any]:
+    """Describe exactly which pages the invocation-scoped proof telemetry covers."""
+    prior = [int(page) for page in previously_certified_pages]
+    return {
+        "schema": "bcs.representation_contract_scope/1.0",
+        "scope": "current_invocation",
+        "coverage_status": (
+            "current_invocation_only" if prior else "full_session_to_date"
+        ),
+        "requested_pages": [int(page) for page in requested_pages],
+        "evaluated_pages": [int(page) for page in evaluated_pages],
+        "current_invocation_completed_pages": [
+            int(page) for page in current_invocation_completed_pages
+        ],
+        "rolled_back_pages": [int(page) for page in (rolled_back_pages or [])],
+        "previously_certified_pages_excluded": prior,
+        "session_completed_pages": [int(page) for page in session_completed_pages],
+        "complete_session_telemetry": not bool(prior),
+    }
+
+
 def find_resumable_import_session(
     pdf_path: str,
     opts: ImportOptions,
@@ -10674,6 +11098,12 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     cancelled = False
     session_state = None
     session_host = None
+    previously_certified_pages = []
+    evaluated_pages = []
+    current_invocation_completed_pages = []
+    rolled_back_pages = []
+    invocation_telemetry_snapshot = _snapshot_page_result_telemetry(opts)
+    active_page_telemetry_snapshot = invocation_telemetry_snapshot
     active_page_baseline_ids = set(baseline_object_ids)
     active_page_baseline_names = set(baseline_object_names)
 
@@ -10711,6 +11141,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             session_state = read_session_object(session_host)
 
         completed_pages = list(session_state["completed_pages"])
+        previously_certified_pages = list(completed_pages)
         page_groups = {
             int(page): str(group_name)
             for page, group_name in session_state["page_groups"].items()
@@ -10731,8 +11162,11 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             int(profile["page_number"]): dict(profile)
             for profile in ((getattr(opts, "work_plan", None) or {}).get("pages", []))
         }
+        invocation_telemetry_snapshot = _snapshot_page_result_telemetry(opts)
 
         for work_index, page_number in enumerate(pages_to_import, start=1):
+            active_page_telemetry_snapshot = _snapshot_page_result_telemetry(opts)
+            evaluated_pages.append(page_number)
             active_objects = _document_objects(fc_doc)
             active_page_baseline_ids = {id(host) for host in active_objects}
             active_page_baseline_names = {_host_object_id(host) for host in active_objects}
@@ -10777,15 +11211,10 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                 raise
 
             if page_text_info:
-                if all_text_entity_info is None:
-                    all_text_entity_info = page_text_info.copy()
-                else:
-                    all_text_entity_info["count"] += page_text_info.get("count", 0)
-                    examples = page_text_info.get("examples", [])
-                    if examples and len(all_text_entity_info["examples"]) < 3:
-                        all_text_entity_info["examples"].extend(
-                            examples[: 3 - len(all_text_entity_info["examples"])]
-                        )
+                all_text_entity_info = _merge_text_entity_info(
+                    all_text_entity_info,
+                    page_text_info,
+                )
 
             if page_group is None:
                 for host in reversed(_document_objects(fc_doc)):
@@ -10810,6 +11239,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                         pass
 
             completed_pages.append(page_number)
+            current_invocation_completed_pages.append(page_number)
             imported_count = len(completed_pages)
             if page_group is not None:
                 page_groups[page_number] = _host_object_id(page_group)
@@ -10833,6 +11263,8 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             time.perf_counter() - t_phase
         ) * 1000.0
     except ImportCancelled as cancel:
+        _restore_page_result_telemetry(opts, active_page_telemetry_snapshot)
+        rolled_back_pages = evaluated_pages[-1:]
         cleanup = _remove_post_baseline_document_objects(
             fc_doc,
             active_page_baseline_ids,
@@ -10869,8 +11301,21 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         rollback = _remove_post_baseline_document_objects(
             fc_doc, baseline_object_ids, baseline_object_names
         )
+        _restore_page_result_telemetry(opts, invocation_telemetry_snapshot)
+        _append_text_item_attempt(opts, dict(getattr(failure, "attempt", {}) or {}))
+        rolled_back_pages = list(evaluated_pages)
         report_extra = dict(getattr(opts, "_report_extra", {}) or {})
         report_extra["rollback"] = rollback
+        report_extra["representation_contract_scope"] = (
+            _representation_contract_scope(
+                valid_pages,
+                previously_certified_pages,
+                evaluated_pages,
+                [],
+                previously_certified_pages,
+                rolled_back_pages=rolled_back_pages,
+            )
+        )
         opts._report_extra = report_extra
         elapsed_ms = (time.perf_counter() - t_import_start) * 1000.0
         opts.phase_timings_ms["pages_import_ms"] = (
@@ -10881,7 +11326,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                 pdf_path=pdf_path,
                 opts=opts,
                 total_pages=total_pages,
-                pages_imported=imported_count,
+                pages_imported=len(previously_certified_pages),
                 elapsed_ms=elapsed_ms,
                 failure=failure,
             )
@@ -10900,6 +11345,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         rollback = _remove_post_baseline_document_objects(
             fc_doc, baseline_object_ids, baseline_object_names
         )
+        _restore_page_result_telemetry(opts, invocation_telemetry_snapshot)
         if not rollback["cleanup_complete"]:
             raise RuntimeError(
                 "Import failed and rollback was incomplete: %s" % rollback
@@ -10996,6 +11442,16 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         if session_state is not None:
             opts._report_extra["import_session"] = _session_state_payload(
                 session_state
+            )
+            opts._report_extra["representation_contract_scope"] = (
+                _representation_contract_scope(
+                    valid_pages,
+                    previously_certified_pages,
+                    evaluated_pages,
+                    current_invocation_completed_pages,
+                    list(session_state["completed_pages"]),
+                    rolled_back_pages=rolled_back_pages,
+                )
             )
         opts._report_extra.pop("terminal_failure", None)
 

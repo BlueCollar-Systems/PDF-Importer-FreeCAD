@@ -3,7 +3,7 @@
 **BUILT. NOT BOUGHT.**
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
-![Version: 4.0.84](https://img.shields.io/badge/Version-4.0.84-blue.svg)
+![Version: 4.0.87](https://img.shields.io/badge/Version-4.0.87-blue.svg)
 ![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
 
 Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.
@@ -11,6 +11,37 @@ Import vector geometry, text, and images from PDF files into FreeCAD as editable
 Arc reconstruction, dash mapping, color grouping, OCG layer support, and reference-based scaling -- all powered by pure-Python PDF parsing via PyMuPDF.
 
 > BlueCollar Systems -- BUILT. NOT BOUGHT.
+
+## Recent fixes (v4.0.87)
+
+- Corrupt embedded font cmap staging (e.g. Arial Italic) is treated as unusable
+  embedded program evidence so exact Windows system-font resolution can still
+  deliver in-mode 3D Text (CMJ page-31 canary).
+## Recent fixes (v4.0.86)
+
+- 3D Text now treats a font missing from a completed embedded-font inventory as
+  proven absence, allowing the finite fallback ladder to continue instead of
+  aborting the import as though staging had failed.
+- Corrupt, incomplete, or malformed font-staging evidence remains fail-closed,
+  and regression fixtures no longer expose private corpus identifiers.
+
+## Recent fixes (v4.0.85)
+
+- Mixed text delivery is now reconciled by exact source-item identity as well as
+  representation type. Every verified fallback item must have its own matching,
+  proof-gated fallback record; proof for one item can no longer authorize an
+  unproven peer that happens to use the same fallback representation.
+- Mixed-delivery reports fail closed when their terminal item ledger is missing,
+  duplicated, internally conflicting, or inconsistent with delivered buckets.
+- Proof identity, terminal host evidence, and the complete multi-page source
+  roster are cross-checked for mixed and homogeneous fallback delivery,
+  including source-free pages represented by an exact page-level raster item.
+- Resumed-import reports identify the exact pages evaluated in the current
+  invocation and explicitly exclude earlier certified pages whose proof
+  telemetry is not repeated, preventing session-wide overclaiming.
+- Cancellation and terminal-failure cleanup now roll back page-result telemetry
+  with the removed host objects and identify every evaluated page whose effects
+  were discarded.
 
 ## Recent fixes (v4.0.84)
 

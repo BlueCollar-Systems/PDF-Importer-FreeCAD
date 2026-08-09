@@ -1,7 +1,7 @@
 # PDF Vector Importer for FreeCAD
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Version: 4.0.84](https://img.shields.io/badge/Version-4.0.84-green.svg)
+![Version: 4.0.87](https://img.shields.io/badge/Version-4.0.87-green.svg)
 ![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
 
 **Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.**
@@ -11,6 +11,28 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 > **BlueCollar Systems** -- BUILT. NOT BOUGHT.
 
 ---
+
+## Recent fixes (v4.0.86)
+
+- 3D Text now recognizes a font missing from a completed embedded-font
+  inventory as proven absence and continues through the bounded fallback ladder.
+- Runtime staging faults remain terminal, while regression fixtures avoid
+  private corpus identifiers.
+
+## Recent fixes (v4.0.85)
+
+- Mixed text delivery now requires a one-to-one match between every exact
+  fallback source item and its proof-gated fallback record. Reports fail closed
+  if their terminal item ledger is missing, duplicated, internally conflicting,
+  or inconsistent with the delivered representation buckets.
+- Multi-page source rosters are preserved and checked against verified terminal
+  host evidence for mixed and homogeneous fallbacks, including page-level raster
+  items where the PDF contains no source text objects.
+- Resumed-import reports explicitly scope representation proof telemetry to the
+  pages evaluated by the current invocation and list prior certified pages that
+  are excluded from that telemetry.
+- Cancelled and failed pages no longer leave delivery counts, fallback proofs,
+  or report extras for host objects removed by cleanup or transaction rollback.
 
 ## Recent fixes (v4.0.84)
 

@@ -1,7 +1,7 @@
 # PDF Vector Importer for FreeCAD
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Version: 4.0.85](https://img.shields.io/badge/Version-4.0.85-green.svg)
+![Version: 4.0.87](https://img.shields.io/badge/Version-4.0.87-green.svg)
 ![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
 
 **Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.**
@@ -11,6 +11,13 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 > **BlueCollar Systems** -- BUILT. NOT BOUGHT.
 
 ---
+
+## Recent fixes (v4.0.86)
+
+- 3D Text now recognizes a font missing from a completed embedded-font
+  inventory as proven absence and continues through the bounded fallback ladder.
+- Runtime staging faults remain terminal, while regression fixtures avoid
+  private corpus identifiers.
 
 ## Recent fixes (v4.0.85)
 

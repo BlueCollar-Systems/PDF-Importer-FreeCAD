@@ -2636,6 +2636,31 @@ _PROVEN_EXACT_FONT_ABSENCE_REASONS = frozenset({
 })
 
 
+def _embedded_font_program_unusable(exception_text: Any) -> bool:
+    """True when embedded staging failed because the font program itself is unusable.
+
+    Corrupt cmap / broken SFNT tables mean the embedded bytes cannot drive
+    ShapeString. That is an embedded-source miss, but requested 3D Text must
+    still try the exact Windows family/style alias (e.g. Arial Italic →
+    ariali.ttf) before aborting or descending the ladder.
+    """
+    text = str(exception_text or "").strip().lower()
+    if not text:
+        return False
+    needles = (
+        "corrupt cmap",
+        "cmap table format",
+        "not a truetype",
+        "not a valid ttf",
+        "bad sfnt",
+        "invalid sfnt",
+        "ttferror",
+        "ttlib.ttliberror",
+        "ttliberror",
+    )
+    return any(needle in text for needle in needles)
+
+
 def _resolve_shapestring_font_path_with_evidence(
     font_name: str,
     opts: Optional[ImportOptions] = None,
@@ -3053,10 +3078,15 @@ def _resolve_shapestring_font_path_with_evidence(
                     failure.get("reason") or "embedded_font_staging_failed"
                 )
                 failure_exception = str(failure.get("exception") or "")
-                if (
+                proven_absence = (
                     failure_reason in _PROVEN_EXACT_FONT_ABSENCE_REASONS
                     and not failure_exception
-                ):
+                )
+                unusable_program = (
+                    failure_reason == "embedded_font_staging_failed"
+                    and _embedded_font_program_unusable(failure_exception)
+                )
+                if proven_absence or unusable_program:
                     if (
                         failure.get("outcome") != "failed"
                         or type(failure.get("xref")) is not int
@@ -3087,19 +3117,36 @@ def _resolve_shapestring_font_path_with_evidence(
             exception="%s: %s" % (exc.__class__.__name__, exc),
         )]
 
+    embedded_absence_details: Dict[str, Any] = {}
     if (
         exact_nonembedded_observation is None
         and exact_unusable_observation is None
         and not _allow_unbound_compat
     ):
-        return None, [source_result(
-            "embedded_font",
-            "invalid",
-            font_identity,
-            reason="font_not_observed_in_completed_inventory",
-        )]
-
-    embedded_absence_details: Dict[str, Any] = {}
+        # A completed staging session that simply does not contain this font is
+        # the clean miss this function's contract describes -- not a runtime
+        # fault. Every way of *failing to establish* that has already returned
+        # "invalid" above: a missing/mismatched/duplicated session, an
+        # incomplete session, a session carrying a page-level failure, a
+        # malformed staged record or failure entry, and any lookup exception.
+        # Reaching here means staging ran to completion and the font is absent,
+        # which is exactly the proof the ladder needs.
+        #
+        # Reporting it as "invalid" made absence indistinguishable from an I/O
+        # fault, so 3D Text -- the only mode that requires an exact font to
+        # extrude outlines -- aborted the whole cell instead of descending,
+        # while text/labels/glyphs/geometry/raster all succeeded on the same
+        # document. Two distinct situations reach here: a font that was never
+        # staged at all, and a page whose staging failures named other fonts and
+        # so could not be attributed to the span requesting this one.
+        embedded_absence_details["absent_from_completed_inventory"] = True
+        # Keep the proof honest: if the page had staging failures that could not
+        # be attributed to this font, say so rather than implying a clean page.
+        unattributed = len(failures or [])
+        if unattributed:
+            embedded_absence_details["unattributed_page_staging_failures"] = (
+                unattributed
+            )
     if exact_nonembedded_observation is not None:
         embedded_absence_details["inventory_observation"] = (
             exact_nonembedded_observation

@@ -3814,7 +3814,7 @@ def test_stage_monitor_shutdown_failure_cannot_finalize_a_capability(
         real_wait = build_windows_installer._wait_windows_stage_monitor
 
         def hide_cancel_completion(monitor, timeout):
-            if timeout:
+            if timeout and monitor.entry.role == "stage-monitor":
                 injections.append("unprovable-cancel")
                 return build_windows_installer._WAIT_TIMEOUT
             return real_wait(monitor, timeout)

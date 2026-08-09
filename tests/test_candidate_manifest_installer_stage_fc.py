@@ -1000,15 +1000,26 @@ def test_snapshot_substitution_after_byte_validation_cannot_publish_mixed_stage(
     attempted = False
     blocked = False
     original = source_a.read_bytes()
+    temporary = None
+    real_create_directory = getattr(
+        build_windows_installer, "_nt_create_directory_handle", None
+    )
+
+    def capture_temporary_root(parent_handle, name, *args, **kwargs):
+        nonlocal temporary
+        assert real_create_directory is not None
+        handle = real_create_directory(parent_handle, name, *args, **kwargs)
+        if str(name).startswith(build_windows_installer._STAGE_TEMP_PREFIX):
+            temporary = stage_parent / str(name)
+        return handle
 
     def substitute_after_validation(payload: bytes, *, artifact_name: str):
         nonlocal calls, attempted, blocked
         calls += 1
         result = real_validate(payload, artifact_name=artifact_name)
         if calls == 1:
-            snapshot = next(
-                stage_parent.glob(f"{build_windows_installer._STAGE_TEMP_PREFIX}*/.installer-source/{ZIP_NAME}")
-            )
+            assert temporary is not None
+            snapshot = temporary / ".installer-source" / ZIP_NAME
             attempted = True
             try:
                 snapshot.write_bytes(replacement)
@@ -1016,6 +1027,12 @@ def test_snapshot_substitution_after_byte_validation_cannot_publish_mixed_stage(
                 blocked = True
         return result
 
+    monkeypatch.setattr(
+        build_windows_installer,
+        "_nt_create_directory_handle",
+        capture_temporary_root,
+        raising=False,
+    )
     monkeypatch.setattr(
         build_windows_installer,
         "validate_release_zip_manifest_bytes",
@@ -2242,15 +2259,22 @@ def test_absent_stage_parent_component_swap_cannot_create_outside_tree(
     )
     attempted = False
     blocked = False
+    delete_attempted = False
+    delete_blocked = False
 
     def attempt_swap_before_child_create(parent_handle, name, *args, **kwargs):
-        nonlocal attempted, blocked
+        nonlocal attempted, blocked, delete_attempted, delete_blocked
         if str(name) == "nested" and not attempted:
             attempted = True
             try:
                 _replace_directory_with_test_link(swapped, outside)
             except OSError:
                 blocked = True
+            delete_attempted = True
+            try:
+                os.rmdir(swapped)
+            except OSError:
+                delete_blocked = True
         assert real_create is not None
         return real_create(parent_handle, name, *args, **kwargs)
 
@@ -2265,6 +2289,8 @@ def test_absent_stage_parent_component_swap_cannot_create_outside_tree(
 
     assert attempted is True
     assert blocked is True
+    assert delete_attempted is True
+    assert delete_blocked is True
     assert staged.stage_root.is_dir()
     assert sentinel.read_bytes() == b"outside sentinel"
     assert not (outside / "nested").exists()
@@ -2290,8 +2316,26 @@ def test_checked_stage_directory_swap_never_writes_outside_owned_root(
     sentinel = outside / "sentinel.bin"
     sentinel.write_bytes(b"outside sentinel")
     real_create = getattr(build_windows_installer, "_nt_create_file_handle", None)
+    real_create_directory = getattr(
+        build_windows_installer, "_nt_create_directory_handle", None
+    )
     attempted = False
     blocked = False
+    retained_paths: dict[int, Path] = {}
+
+    def retain_directory_path(parent_handle, name, *args, **kwargs):
+        assert real_create_directory is not None
+        handle = real_create_directory(parent_handle, name, *args, **kwargs)
+        parent_path = retained_paths.get(_handle_key(parent_handle))
+        if str(name).startswith(build_windows_installer._STAGE_TEMP_PREFIX):
+            candidate = stage_parent / str(name)
+        elif parent_path is not None:
+            candidate = parent_path / str(name)
+        else:
+            candidate = None
+        if candidate is not None:
+            retained_paths[_handle_key(handle)] = candidate
+        return handle
 
     def is_boundary(candidate: Path) -> bool:
         if boundary == "metadata":
@@ -2306,20 +2350,21 @@ def test_checked_stage_directory_swap_never_writes_outside_owned_root(
         nonlocal attempted, blocked
         if str(name) == outside_leaf and not attempted:
             attempted = True
-            temporary = next(
-                stage_parent.glob(build_windows_installer._STAGE_TEMP_PREFIX + "*")
-            )
-            candidates = [
-                path for path in temporary.rglob("*") if path.is_dir() and is_boundary(path)
-            ]
-            assert len(candidates) == 1
+            candidate = retained_paths[_handle_key(parent_handle)]
+            assert is_boundary(candidate)
             try:
-                _replace_directory_with_test_link(candidates[0], outside)
+                _replace_directory_with_test_link(candidate, outside)
             except OSError:
                 blocked = True
         assert real_create is not None
         return real_create(parent_handle, name, *args, **kwargs)
 
+    monkeypatch.setattr(
+        build_windows_installer,
+        "_nt_create_directory_handle",
+        retain_directory_path,
+        raising=False,
+    )
     monkeypatch.setattr(
         build_windows_installer,
         "_nt_create_file_handle",
@@ -2348,23 +2393,52 @@ def test_member_leaf_collision_is_preserved_without_pathname_fallback(
     calls: list[str] = []
     collision_identity = None
     collision_path = None
+    retained_paths: dict[int, Path] = {}
+    real_create_directory = getattr(
+        build_windows_installer, "_nt_create_directory_handle", None
+    )
+
+    def retain_directory_path(parent_handle, name, *args, **kwargs):
+        assert real_create_directory is not None
+        handle = real_create_directory(parent_handle, name, *args, **kwargs)
+        parent_path = retained_paths.get(_handle_key(parent_handle))
+        if str(name).startswith(build_windows_installer._STAGE_TEMP_PREFIX):
+            candidate = stage_parent / str(name)
+        elif parent_path is not None:
+            candidate = parent_path / str(name)
+        else:
+            candidate = None
+        if candidate is not None:
+            retained_paths[_handle_key(handle)] = candidate
+        return handle
 
     def collide(parent_handle, name, *args, **kwargs):
         nonlocal collision_identity, collision_path
         calls.append(name)
         if name == "payload.bin":
-            temporary = next(
-                stage_parent.glob(build_windows_installer._STAGE_TEMP_PREFIX + "*")
-            )
-            collision_path = temporary / "PDFVectorImporter" / "data" / name
-            collision_path.write_bytes(b"foreign leaf collision")
-            collision_identity = build_windows_installer._stat_identity(
-                os.lstat(collision_path)
-            )
+            collision_path = retained_paths[_handle_key(parent_handle)] / name
+            assert real_create is not None
+            collision_handle = real_create(parent_handle, name, *args, **kwargs)
+            try:
+                build_windows_installer._write_windows_file_handle(
+                    collision_handle, b"foreign leaf collision"
+                )
+                build_windows_installer._flush_windows_file_handle(collision_handle)
+                collision_identity = build_windows_installer._windows_handle_metadata(
+                    collision_handle
+                )
+            finally:
+                build_windows_installer._close_windows_handle(collision_handle)
             raise FileExistsError("synthetic foreign leaf collision")
         assert real_create is not None
         return real_create(parent_handle, name, *args, **kwargs)
 
+    monkeypatch.setattr(
+        build_windows_installer,
+        "_nt_create_directory_handle",
+        retain_directory_path,
+        raising=False,
+    )
     monkeypatch.setattr(
         build_windows_installer,
         "_nt_create_file_handle",
@@ -2380,9 +2454,18 @@ def test_member_leaf_collision_is_preserved_without_pathname_fallback(
     assert collision_path is not None and collision_path.read_bytes() == (
         b"foreign leaf collision"
     )
-    assert build_windows_installer._stat_identity(os.lstat(collision_path)) == (
-        collision_identity
+    check_handle = build_windows_installer._open_windows_no_follow(
+        collision_path,
+        build_windows_installer._FILE_READ_ATTRIBUTES
+        | build_windows_installer._SYNCHRONIZE,
+        share_delete=False,
     )
+    try:
+        assert build_windows_installer._windows_handle_metadata(check_handle) == (
+            collision_identity
+        )
+    finally:
+        build_windows_installer._close_windows_handle(check_handle)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows native stage capabilities")
@@ -2422,7 +2505,7 @@ def test_missing_native_stage_capability_fails_closed_without_path_fallback(
     assert getattr(build_windows_installer, seam) is None
     assert _assert_pathless(caught.value, tmp_path) == expected
     assert source.is_file()
-    assert not any(
+    assert not stage_parent.exists() or not any(
         re.fullmatch(r"[0-9a-f]{64}", child.name)
         for child in stage_parent.iterdir()
     )

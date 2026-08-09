@@ -3780,6 +3780,67 @@ def test_postcompiler_transient_stage_member_invalidates_attestation_capability(
         build_windows_installer.finalize_compiled_installer(capability)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows stage monitor lifecycle")
+@pytest.mark.parametrize("failure", ["close", "unprovable-cancel"])
+@pytest.mark.parametrize(
+    ("finalizer", "expected_token"),
+    [
+        ("plain", "INSTALLER_COMPILER_INPUT_INVALID"),
+        ("attestation", "INSTALLER_ATTESTATION_INPUT_INVALID"),
+    ],
+)
+def test_stage_monitor_shutdown_failure_cannot_finalize_a_capability(
+    monkeypatch, tmp_path, failure, finalizer, expected_token
+):
+    capability, _calls = _compile_capability(monkeypatch, tmp_path / "build")
+    destination = tmp_path / "attestation" / "installer-attestation.json"
+    injections: list[str] = []
+
+    if failure == "close":
+        real_close = build_windows_installer._close_windows_entry
+
+        def fail_monitor_close(entry):
+            result = real_close(entry)
+            if entry.role == "stage-monitor":
+                injections.append("close")
+                raise OSError("synthetic monitor close failure")
+            return result
+
+        monkeypatch.setattr(
+            build_windows_installer, "_close_windows_entry", fail_monitor_close
+        )
+    else:
+        real_wait = build_windows_installer._wait_windows_stage_monitor
+
+        def hide_cancel_completion(monitor, timeout):
+            if timeout:
+                injections.append("unprovable-cancel")
+                return build_windows_installer._WAIT_TIMEOUT
+            return real_wait(monitor, timeout)
+
+        monkeypatch.setattr(
+            build_windows_installer,
+            "_wait_windows_stage_monitor",
+            hide_cancel_completion,
+        )
+
+    with pytest.raises(RuntimeError, match=rf"^{expected_token}$"):
+        if finalizer == "attestation":
+            build_windows_installer.write_attestation(
+                destination,
+                compiled_installer=capability,
+            )
+        else:
+            build_windows_installer.finalize_compiled_installer(capability)
+
+    assert injections == [failure]
+    assert not destination.exists()
+    with pytest.raises(
+        RuntimeError, match=r"^INSTALLER_COMPILER_INPUT_INVALID$"
+    ):
+        build_windows_installer.finalize_compiled_installer(capability)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows least-privilege parent construction")
 @pytest.mark.parametrize(
     "preparer_name",

@@ -234,7 +234,7 @@ def test_valid_zip_is_snapshotted_validated_and_staged_once(monkeypatch, tmp_pat
     original_bytes = source_zip.read_bytes()
     calls: list[tuple[str, object]] = []
     real_validate = smoke_release_zip.validate_release_zip_manifest_bytes
-    real_read_package = build_windows_installer._read_package_version
+    real_parse_package = build_windows_installer._parse_package_version_bytes
 
     def validate(snapshot_bytes: bytes, *, artifact_name: str) -> list[str]:
         calls.append(("validate", artifact_name))
@@ -243,9 +243,10 @@ def test_valid_zip_is_snapshotted_validated_and_staged_once(monkeypatch, tmp_pat
         assert artifact_name == ZIP_NAME
         return real_validate(snapshot_bytes, artifact_name=artifact_name)
 
-    def read_package(path: Path) -> str:
-        calls.append(("package", path))
-        return real_read_package(path)
+    def parse_package(payload: bytes) -> str:
+        calls.append(("package", payload))
+        assert type(payload) is bytes
+        return real_parse_package(payload)
 
     monkeypatch.setattr(
         build_windows_installer,
@@ -253,7 +254,16 @@ def test_valid_zip_is_snapshotted_validated_and_staged_once(monkeypatch, tmp_pat
         validate,
         raising=False,
     )
-    monkeypatch.setattr(build_windows_installer, "_read_package_version", read_package)
+    monkeypatch.setattr(
+        build_windows_installer, "_parse_package_version_bytes", parse_package
+    )
+    monkeypatch.setattr(
+        build_windows_installer,
+        "_read_package_version",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("stage validation must not reopen package.xml by pathname")
+        ),
+    )
     staged = _stage(monkeypatch, tmp_path, source_zip)
 
     assert isinstance(staged, build_windows_installer.InstallerStage)
@@ -2440,7 +2450,7 @@ def test_stage_root_collision_never_becomes_owned_or_quarantined(
     with pytest.raises(RuntimeError, match=r"^INSTALLER_STAGE_UNSAFE$"):
         _stage(monkeypatch, tmp_path, source, stage_parent=stage_parent)
 
-    assert calls == 1
+    assert calls == 0
     assert marker.read_bytes() == b"foreign replacement"
     assert build_windows_installer._stat_identity(os.lstat(temporary)) == original_identity
 
@@ -3080,7 +3090,7 @@ def test_changed_retained_ancestor_fails_closed_before_publication(
     assert calls >= 1
     assert _assert_pathless(caught.value, tmp_path) == "INSTALLER_STAGE_UNSAFE"
     assert source.is_file()
-    assert not any(
+    assert not stage_parent.exists() or not any(
         re.fullmatch(r"[0-9a-f]{64}", child.name)
         for child in stage_parent.iterdir()
     )

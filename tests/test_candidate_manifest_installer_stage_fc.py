@@ -3696,17 +3696,61 @@ def test_compiler_cannot_observe_a_transient_stage_namespace_member(
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr(build_windows_installer.subprocess, "run", run)
+    with pytest.raises(
+        RuntimeError, match=r"^INSTALLER_COMPILER_INPUT_INVALID$"
+    ):
+        build_windows_installer.compile_installer(
+            tmp_path / "ISCC.exe",
+            staged,
+            toolchain_identity=_valid_toolchain_identity(),
+            output_dir=output_dir,
+        )
+
+    assert attempts == ["created", "read", "removed"]
+    assert not list(output_dir.glob("FreeCAD-PDF-Importer-Setup_*.exe"))
+    assert not transient.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows sealed stage namespace")
+def test_postcompiler_transient_stage_member_invalidates_attestation_capability(
+    monkeypatch, tmp_path
+):
+    staged = _stage(monkeypatch, tmp_path / "stage")
+    output_dir = tmp_path / "output"
+    destination = tmp_path / "attestation" / "installer-attestation.json"
+    transient = staged.source_dir / "synthetic-after-compile.py"
+    compiler_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        build_windows_installer.subprocess,
+        "run",
+        _synthetic_compiler_runner(b"synthetic setup", compiler_calls),
+    )
+
     capability = build_windows_installer.compile_installer(
         tmp_path / "ISCC.exe",
         staged,
         toolchain_identity=_valid_toolchain_identity(),
         output_dir=output_dir,
     )
-    setup = build_windows_installer.finalize_compiled_installer(capability)
+    assert len(compiler_calls) == 1
+    transient.write_bytes(b"foreign transient input")
+    assert transient.read_bytes() == b"foreign transient input"
+    transient.unlink()
 
-    assert attempts == ["blocked"]
-    assert setup.read_bytes() == clean_payload
+    with pytest.raises(
+        RuntimeError, match=r"^INSTALLER_ATTESTATION_INPUT_INVALID$"
+    ):
+        build_windows_installer.write_attestation(
+            destination,
+            compiled_installer=capability,
+        )
+
+    assert not destination.exists()
     assert not transient.exists()
+    with pytest.raises(
+        RuntimeError, match=r"^INSTALLER_COMPILER_INPUT_INVALID$"
+    ):
+        build_windows_installer.finalize_compiled_installer(capability)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows least-privilege parent construction")

@@ -11,6 +11,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 import unicodedata
 import zipfile
 from pathlib import Path
@@ -5341,11 +5342,11 @@ def test_attestation_exact_winner_is_held_through_temp_cleanup_and_consumption(
     assert events.count("monitor-authority-close") == 1
     assert events.index("monitor-proof-close") < events.index("winner-open")
     assert events.index("winner-open") < events.index("temp-dispose")
-    assert events.index("temp-dispose") < events.index("output-capability-close")
-    assert events.index("output-capability-close") < events.index(
-        "monitor-authority-close"
-    )
+    assert events.index("temp-dispose") < events.index("monitor-authority-close")
     assert events.index("monitor-authority-close") < events.index(
+        "output-capability-close"
+    )
+    assert events.index("output-capability-close") < events.index(
         "stage-capability-close"
     )
     assert events.index("stage-capability-close") < events.index("winner-close")
@@ -5356,55 +5357,72 @@ def test_attestation_exact_winner_is_held_through_temp_cleanup_and_consumption(
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows attestation monitor boundary")
 @pytest.mark.parametrize("outcome", ["noncollision", "exact-winner", "different-winner"])
-def test_attestation_has_no_monitor_retirement_to_terminal_decision_window(
+def test_attestation_terminal_monitor_event_never_accepts_publication(
     monkeypatch, tmp_path, outcome
 ):
     destination = tmp_path / outcome / "installer-attestation.json"
     destination.parent.mkdir(parents=True)
+    original: bytes | None = None
     if outcome == "exact-winner":
         first, _calls = _compile_capability(monkeypatch, tmp_path / "seed")
         build_windows_installer.write_attestation(
             destination, compiled_installer=first
         )
+        original = destination.read_bytes()
     elif outcome == "different-winner":
-        destination.write_bytes(b"foreign winner")
+        original = b"foreign winner"
+        destination.write_bytes(original)
 
     capability, _calls = _compile_capability(monkeypatch, tmp_path / "candidate")
-    transient = capability.staged_release.source_dir / "retirement-window.py"
-    real_retire = build_windows_installer._retire_windows_stage_monitor
+    transient = capability.staged_release.source_dir / "terminal-window.py"
+    real_handoff = build_windows_installer._handoff_windows_stage_monitor
+    real_validate = build_windows_installer._validate_windows_stage_read_lease
     real_rename = build_windows_installer._rename_windows_handle
     real_open_winner = build_windows_installer._open_windows_attestation_winner
     real_read = build_windows_installer._read_windows_file_handle
-    real_cleanup = build_windows_installer._cleanup_windows_attestation_temp
-    real_consume = build_windows_installer._consume_compiled_installer
     events: list[str] = []
-    terminal = False
+    handoff_complete = False
+    injected = False
     winner_key: int | None = None
     winner_reads = 0
 
-    def inject_if_preterminal(boundary):
-        if terminal:
+    def inject_and_prove_signal(boundary):
+        nonlocal injected
+        if injected:
             return
+        monitor = capability.stage_lease.monitor
+        assert monitor is not None and monitor.active
         transient.write_bytes(b"foreign transient input")
         assert transient.read_bytes() == b"foreign transient input"
         transient.unlink()
-        events.append("injected-before-terminal:" + boundary)
+        events.append("create-read-remove:" + boundary)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if (
+                build_windows_installer._wait_windows_stage_monitor(monitor, 10)
+                == build_windows_installer._WAIT_OBJECT_0
+            ):
+                events.append("successor-signaled:" + boundary)
+                injected = True
+                return
+        raise AssertionError("successor monitor did not observe terminal-window event")
 
-    def retire(lease):
-        result = real_retire(lease)
-        events.append("monitor-retired")
-        inject_if_preterminal("retire")
+    def handoff(lease):
+        nonlocal handoff_complete
+        result = real_handoff(lease)
+        handoff_complete = True
+        events.append("monitor-handoff")
         return result
 
     def rename(*args, **kwargs):
-        nonlocal terminal
         events.append("rename-attempt")
+        if outcome == "noncollision" and handoff_complete:
+            inject_and_prove_signal("before-noncollision-rename")
         try:
             result = real_rename(*args, **kwargs)
         except FileExistsError:
             events.append("rename-collision")
             raise
-        terminal = True
         events.append("noncollision-commit")
         return result
 
@@ -5416,64 +5434,204 @@ def test_attestation_has_no_monitor_retirement_to_terminal_decision_window(
         return entry
 
     def read(handle):
-        nonlocal terminal, winner_reads
+        nonlocal winner_reads
         payload = real_read(handle)
         if winner_key is not None and _handle_key(handle) == winner_key:
             winner_reads += 1
             events.append(f"winner-read:{winner_reads}")
-            if outcome == "exact-winner" and winner_reads == 2:
-                terminal = True
-                events.append("exact-winner-verified")
-            elif outcome == "different-winner" and winner_reads == 1:
-                terminal = True
-                events.append("different-winner-classified")
         return payload
 
-    def cleanup(entry):
-        result = real_cleanup(entry)
-        events.append("temp-cleanup")
+    def validate(lease):
+        result = real_validate(lease)
+        if outcome == "exact-winner" and winner_reads >= 2:
+            inject_and_prove_signal("after-exact-winner-final-validation")
         return result
 
-    def consume(value):
-        events.append("capability-consume")
-        inject_if_preterminal("consume")
-        return real_consume(value)
-
-    monkeypatch.setattr(build_windows_installer, "_retire_windows_stage_monitor", retire)
+    monkeypatch.setattr(build_windows_installer, "_handoff_windows_stage_monitor", handoff)
+    monkeypatch.setattr(build_windows_installer, "_validate_windows_stage_read_lease", validate)
     monkeypatch.setattr(build_windows_installer, "_rename_windows_handle", rename)
     monkeypatch.setattr(
         build_windows_installer, "_open_windows_attestation_winner", open_winner
     )
     monkeypatch.setattr(build_windows_installer, "_read_windows_file_handle", read)
-    monkeypatch.setattr(
-        build_windows_installer, "_cleanup_windows_attestation_temp", cleanup
-    )
-    monkeypatch.setattr(build_windows_installer, "_consume_compiled_installer", consume)
 
     if outcome == "different-winner":
-        with pytest.raises(
-            RuntimeError, match=r"^INSTALLER_ATTESTATION_PUBLISH_ERROR$"
-        ):
+        with pytest.raises(RuntimeError) as caught:
             build_windows_installer.write_attestation(
                 destination, compiled_installer=capability
             )
-        assert destination.read_bytes() == b"foreign winner"
-    else:
-        expected_setup = capability.output_lease.loose_path
-        assert build_windows_installer.write_attestation(
-            destination, compiled_installer=capability
-        ) == expected_setup
-        assert destination.is_file()
-
-    assert not any(event.startswith("injected-before-terminal:") for event in events)
-    assert not transient.exists()
-    assert "capability-consume" in events
-    if outcome == "noncollision":
-        assert events.index("noncollision-commit") < events.index("capability-consume")
-    elif outcome == "exact-winner":
-        assert events.index("exact-winner-verified") < events.index(
-            "capability-consume"
+        assert (
+            _assert_pathless(caught.value, tmp_path)
+            == "INSTALLER_ATTESTATION_PUBLISH_ERROR"
         )
+    else:
+        with pytest.raises(RuntimeError) as caught:
+            build_windows_installer.write_attestation(
+                destination, compiled_installer=capability
+            )
+        assert (
+            _assert_pathless(caught.value, tmp_path)
+            == "INSTALLER_ATTESTATION_INPUT_INVALID"
+        )
+
+    if original is None:
+        assert not destination.exists()
+    else:
+        assert destination.read_bytes() == original
+    assert not transient.exists()
+    assert injected is (outcome != "different-winner")
+    assert capability._state.active is False
+    with pytest.raises(
+        RuntimeError, match=r"^INSTALLER_COMPILER_INPUT_INVALID$"
+    ):
+        build_windows_installer.finalize_compiled_installer(capability)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows monitor handoff lifetime")
+@pytest.mark.parametrize(
+    "retiring_failure",
+    ["cancel-hard", "entry-close", "event-close"],
+)
+def test_handoff_failure_proves_completion_before_releasing_native_monitor_state(
+    monkeypatch, tmp_path, retiring_failure
+):
+    capability, _calls = _compile_capability(monkeypatch, tmp_path / "build")
+    destination = tmp_path / "installer-attestation.json"
+    retiring = capability.stage_lease.monitor
+    assert retiring is not None and retiring.active
+
+    real_queue = build_windows_installer._queue_windows_stage_monitor
+    real_cancel = build_windows_installer._cancel_windows_stage_monitor
+    real_wait = build_windows_installer._wait_windows_stage_monitor
+    real_result = build_windows_installer._windows_stage_monitor_result
+    real_close_handle = build_windows_installer._close_windows_handle
+    real_force_close = build_windows_installer._force_close_windows_handle
+    successors: list[object] = []
+    handle_owners: dict[int, object] = {}
+    terminal_completion: set[int] = set()
+    close_counts: dict[int, int] = {}
+    premature_releases: list[str] = []
+    injections: list[str] = []
+    events: list[str] = []
+
+    def register(monitor):
+        handle_owners[_handle_key(monitor.entry.handle)] = monitor
+        handle_owners[_handle_key(monitor.event_handle)] = monitor
+
+    register(retiring)
+
+    def monitor_label(monitor):
+        return "retiring" if monitor is retiring else "successor"
+
+    def queue(monitor):
+        result = real_queue(monitor)
+        if monitor is not retiring:
+            successors.append(monitor)
+            register(monitor)
+            events.append("successor-queued")
+        return result
+
+    def cancel(monitor):
+        label = monitor_label(monitor)
+        events.append(label + "-cancel")
+        if monitor is retiring and retiring_failure == "cancel-hard":
+            injections.append(retiring_failure)
+            return False, 5
+        return real_cancel(monitor)
+
+    def result(monitor):
+        outcome = real_result(monitor)
+        terminal_completion.add(id(monitor))
+        events.append(monitor_label(monitor) + "-terminal-result")
+        return outcome
+
+    def close_handle(handle):
+        key = _handle_key(handle)
+        monitor = handle_owners.get(key)
+        if monitor is not None and id(monitor) not in terminal_completion:
+            premature_releases.append(monitor_label(monitor) + "-close")
+        if monitor is retiring and retiring_failure in {"entry-close", "event-close"}:
+            target = (
+                retiring.entry.handle
+                if retiring_failure == "entry-close"
+                else retiring.event_handle
+            )
+            if key == _handle_key(target) and not injections:
+                injections.append(retiring_failure)
+                raise OSError("synthetic retiring monitor close failure")
+        result_value = real_close_handle(handle)
+        close_counts[key] = close_counts.get(key, 0) + 1
+        return result_value
+
+    def force_close(handle):
+        key = _handle_key(handle)
+        monitor = handle_owners.get(key)
+        if monitor is not None and id(monitor) not in terminal_completion:
+            premature_releases.append(monitor_label(monitor) + "-force-close")
+        result_value = real_force_close(handle)
+        close_counts[key] = close_counts.get(key, 0) + 1
+        return result_value
+
+    monkeypatch.setattr(build_windows_installer, "_queue_windows_stage_monitor", queue)
+    monkeypatch.setattr(build_windows_installer, "_cancel_windows_stage_monitor", cancel)
+    monkeypatch.setattr(build_windows_installer, "_windows_stage_monitor_result", result)
+    monkeypatch.setattr(build_windows_installer, "_close_windows_handle", close_handle)
+    monkeypatch.setattr(build_windows_installer, "_force_close_windows_handle", force_close)
+
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            build_windows_installer.write_attestation(
+                destination, compiled_installer=capability
+            )
+        assert (
+            _assert_pathless(caught.value, tmp_path)
+            == "INSTALLER_ATTESTATION_INPUT_INVALID"
+        )
+        assert injections == [retiring_failure]
+        assert len(successors) == 1
+        successor = successors[0]
+        assert id(successor) in terminal_completion
+        assert events.index("successor-cancel") < events.index(
+            "successor-terminal-result"
+        )
+        assert premature_releases == []
+        assert close_counts[_handle_key(successor.entry.handle)] == 1
+        assert close_counts[_handle_key(successor.event_handle)] == 1
+        terminal_owners = getattr(
+            build_windows_installer,
+            "_WINDOWS_STAGE_MONITOR_TERMINAL_OWNERS",
+            (),
+        )
+        if retiring_failure == "cancel-hard":
+            assert retiring in terminal_owners
+            assert not retiring.entry.closed
+            assert not retiring.event_closed
+        else:
+            assert retiring not in terminal_owners
+        assert not destination.exists()
+        assert capability._state.active is False
+    finally:
+        terminal_owners = getattr(
+            build_windows_installer,
+            "_WINDOWS_STAGE_MONITOR_TERMINAL_OWNERS",
+            None,
+        )
+        for monitor in [retiring, *successors]:
+            if not monitor.entry.closed:
+                try:
+                    real_cancel(monitor)
+                    if real_wait(monitor, 5000) == build_windows_installer._WAIT_OBJECT_0:
+                        real_result(monitor)
+                except Exception:
+                    pass
+                real_force_close(monitor.entry.handle)
+                monitor.entry.closed = True
+            if not monitor.event_closed:
+                real_force_close(monitor.event_handle)
+                monitor.event_closed = True
+            if isinstance(terminal_owners, list):
+                while monitor in terminal_owners:
+                    terminal_owners.remove(monitor)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows attestation terminal I/O")

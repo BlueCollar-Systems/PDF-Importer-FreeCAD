@@ -15,6 +15,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 import unicodedata
 import uuid
 import zipfile
@@ -536,7 +537,8 @@ def _cleanup_owned(
     except Exception:
         return False
 
-    for _attempt in range(4):
+    attempts = 12
+    for attempt in range(attempts):
         parent_handle = None
         child_handle = None
         try:
@@ -581,6 +583,8 @@ def _cleanup_owned(
                 _close_windows_handle(child_handle)
             if parent_handle is not None:
                 _close_windows_handle(parent_handle)
+        if attempt + 1 < attempts:
+            time.sleep(0.025)
     return False
 
 

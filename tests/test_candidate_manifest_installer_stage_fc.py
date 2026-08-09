@@ -3803,8 +3803,19 @@ def test_parent_construction_retains_only_minimal_handles_and_closes_creator_vie
             assert absent_indexes[0] < absent_indexes[1] < create_index
         retained_identities = {entry.identity for entry in chain}
         assert len(retained_identities) == len(chain)
+        creator_views = [
+            item
+            for item in calls
+            if item["disposition"] == build_windows_installer._FILE_OPEN
+            and item["desired_access"]
+            & build_windows_installer._FILE_ADD_SUBDIRECTORY
+        ]
+        assert len(creator_views) == len(created)
         for item in calls:
-            if item["disposition"] == build_windows_installer._FILE_OPEN:
+            if (
+                item["disposition"] == build_windows_installer._FILE_OPEN
+                and item not in creator_views
+            ):
                 assert item["desired_access"] & (
                     build_windows_installer._FILE_ADD_FILE
                     | build_windows_installer._FILE_ADD_SUBDIRECTORY

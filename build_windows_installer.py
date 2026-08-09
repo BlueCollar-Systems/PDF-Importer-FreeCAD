@@ -2046,6 +2046,16 @@ def write_attestation(
                 or int(getattr(destination_metadata, "st_nlink", 1)) != 1
             ):
                 raise _UnsafePath
+    except Exception:
+        _raise_with_cleanup(
+            "INSTALLER_ATTESTATION_INPUT_INVALID",
+            cleanup_token="INSTALLER_ATTESTATION_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
+
+    try:
         if (
             _stat_identity(os.lstat(temporary)) != owned_identity
             or _capture_regular_file(temporary) != encoded
@@ -2053,7 +2063,7 @@ def write_attestation(
             raise _ChangedPath
     except Exception:
         _raise_with_cleanup(
-            "INSTALLER_ATTESTATION_INPUT_INVALID",
+            "INSTALLER_ATTESTATION_IO_ERROR",
             cleanup_token="INSTALLER_ATTESTATION_IO_ERROR",
             path=temporary,
             parent_chain=parent_chain,

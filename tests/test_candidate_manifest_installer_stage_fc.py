@@ -2911,11 +2911,12 @@ def _install_stage_lifecycle_recorder(monkeypatch):
         )
 
     def create_dir(parent_handle, name, *args, **kwargs):
-        role = (
-            "stage-root"
-            if str(name).startswith(build_windows_installer._STAGE_TEMP_PREFIX)
-            else "owned-dir:" + str(name)
-        )
+        if str(name).startswith(build_windows_installer._STAGE_TEMP_PREFIX):
+            role = "stage-root"
+        elif kwargs.get("parent_component"):
+            role = "parent-created:" + str(name)
+        else:
+            role = "owned-dir:" + str(name)
         return register(
             "create", role, real_create_dir(parent_handle, name, *args, **kwargs), parent_handle
         )

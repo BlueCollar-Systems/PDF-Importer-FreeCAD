@@ -53,28 +53,72 @@ jobs:
           # protection through a narrowly scoped pull request below.
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      # A release is minted only when this push actually prepared one, i.e. the
+      # committed version has no tag yet. Ordinary product commits do not bump
+      # the version, so without this guard every one of them ran the full build
+      # -- ZIP, Inno toolchain, two reproducible installers, smoke test -- for
+      # two to eight minutes and then failed on "tag vX is at <old>, not release
+      # target <new>". That is knowable in the first second, and a pipeline that
+      # is red on ordinary commits trains everyone to ignore it.
+      #
+      # Skipping is the correct outcome, not a failure: an unbumped version means
+      # the author did not intend to release. Nothing here can mint a release by
+      # accident, and cutting one stays explicit.
+      - name: Decide whether this push mints a release
+        id: preflight
+        run: |
+          version="$(sed -n 's:.*<version>\([0-9][0-9.]*\)</version>.*:\1:p' \
+            PDFVectorImporter/package.xml | head -n1)"
+          if [ -z "$version" ]; then
+            echo "::error::Could not read <version> from PDFVectorImporter/package.xml"
+            exit 1
+          fi
+          tag="v${version}"
+          head="$(git rev-parse HEAD)"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+          if ! git rev-parse -q --verify "refs/tags/${tag}^{commit}" >/dev/null 2>&1; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Version ${version} has no tag yet - minting release ${tag}."
+            exit 0
+          fi
+
+          tagged="$(git rev-list -n1 "refs/tags/${tag}")"
+          echo "release=false" >> "$GITHUB_OUTPUT"
+          if [ "$tagged" = "$head" ]; then
+            echo "::notice::${tag} already points at this commit; nothing to mint."
+          else
+            echo "::notice::Skipping release: committed version is still ${version}, and ${tag} already points at ${tagged}. This commit changes the product without preparing a release, which is normal. To cut one, run scripts/prepare_release.py <new-version> and push that commit."
+          fi
+
       - name: Set up Python 3.10 runtime builder
+        if: steps.preflight.outputs.release == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: "3.10"
 
       - name: Capture Python 3.10 interpreter
+        if: steps.preflight.outputs.release == 'true'
         run: echo "PYTHON310=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
 
       - name: Set up Python 3.11 release driver
+        if: steps.preflight.outputs.release == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
       - name: Capture Python 3.11 interpreter
+        if: steps.preflight.outputs.release == 'true'
         run: echo "PYTHON311=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
 
       - name: Install release gate dependencies
+        if: steps.preflight.outputs.release == 'true'
         run: |
           python -m pip install --upgrade pip
           python -m pip install --editable . pytest
 
       - name: Run release gate tests
+        if: steps.preflight.outputs.release == 'true'
         run: |
           python pdfcadcore_sync_check.py --skip-cross-repo
           python -m compileall PDFVectorImporter
@@ -86,6 +130,7 @@ jobs:
           python -m pytest tests/ -q --basetemp "$RUNNER_TEMP/pytest-freecad"
 
       - name: Read committed version
+        if: steps.preflight.outputs.release == 'true'
         id: version
         run: |
           python - <<'PY'
@@ -119,13 +164,16 @@ jobs:
           PY
 
       - name: Set release target
+        if: steps.preflight.outputs.release == 'true'
         run: |
           echo "RELEASE_TARGET=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Build release zip
+        if: steps.preflight.outputs.release == 'true'
         run: python build_release.py --python310 "$PYTHON310" --python311 "$PYTHON311"
 
       - name: Install pinned Inno Setup toolchain
+        if: steps.preflight.outputs.release == 'true'
         shell: pwsh
         run: |
           ./scripts/install_inno_toolchain.ps1 `
@@ -133,6 +181,7 @@ jobs:
             -Destination "$env:RUNNER_TEMP\inno-6.7.1"
 
       - name: Build and compare Windows installers from the same canonical ZIP
+        if: steps.preflight.outputs.release == 'true'
         shell: pwsh
         run: |
           $version = '${{ steps.version.outputs.version }}'
@@ -172,9 +221,11 @@ jobs:
             -Destination (Join-Path 'dist' ($base + '.attestation.json'))
 
       - name: Smoke release zip dependency payload
+        if: steps.preflight.outputs.release == 'true'
         run: python scripts/smoke_release_zip.py "FreeCAD-PDF-Importer_v*.zip" --python310 "$PYTHON310" --python311 "$PYTHON311"
 
       - name: Create or verify exact tag and release
+        if: steps.preflight.outputs.release == 'true'
         id: mint
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

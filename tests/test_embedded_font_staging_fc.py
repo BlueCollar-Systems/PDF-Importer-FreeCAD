@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import sys
 from pathlib import Path
 
@@ -1739,21 +1740,12 @@ def test_font_absent_from_completed_inventory_is_a_clean_miss_not_a_fault():
     assert embedded["staging_complete"] is True
 
 
-def test_corrupt_embedded_font_remains_a_runtime_fault_not_proven_absence():
-    """A corrupt embedded font, with the record shape the stager actually emits.
+def test_corrupt_embedded_arial_italic_uses_exact_system_font():
+    """Corrupt embedded Arial Italic must not abort before system ariali.ttf.
 
-    Reproduced from a corrupt embedded-font fixture: the font IS present
-    and its name resolves (`ABCDEF+Arial,Italic` -> `arialitalic`), but staging
-    its embedded program raises `AssertionError: corrupt cmap table format 4`.
-
-    This is deliberately NOT promoted to proven absence. `_PROVEN_EXACT_FONT_
-    ABSENCE_REASONS` requires the failure to carry no exception, which is what
-    keeps a thrown fault from being laundered into ladder descent. A corrupt
-    source payload is arguably the same practical class as the already-whitelisted
-    `embedded_font_has_no_unicode_cmap`, but promoting an exception-bearing
-    failure weakens that guard, so it stays an owner-visible decision rather than
-    something widened in passing. This test pins the current behaviour so the
-    choice is explicit and any future change is deliberate.
+    CMJ page-31 canary on v4.0.86: embedded staging raises corrupt cmap format 4
+    for Arial,Italic while Windows ships the exact family/style alias. Requested
+    3D Text stays in-mode by using that system font; this is not ladder descent.
     """
     opts = core.ImportOptions(text_mode="3d_text")
     _set_completed_font_session(
@@ -1761,7 +1753,6 @@ def test_corrupt_embedded_font_remains_a_runtime_fault_not_proven_absence():
         records={},
         failures=[
             {
-                # exactly the keys stage_page_fonts emits
                 "font": "ABCDEF+Arial,Italic",
                 "outcome": "failed",
                 "reason": "embedded_font_staging_failed",
@@ -1781,15 +1772,53 @@ def test_corrupt_embedded_font_remains_a_runtime_fault_not_proven_absence():
         page_number=1,
     )
 
-    assert path is None
     embedded = results[0]
-    assert embedded["outcome"] == "invalid"
-    assert embedded["reason"] == "embedded_font_staging_failed"
-    assert "corrupt cmap" in embedded["exception"]
-    assert "absent_from_completed_inventory" not in embedded, (
-        "a font that IS in the inventory but failed to stage must not be "
-        "reported as absent from it"
+    assert embedded["source"] == "embedded_font"
+    assert embedded["outcome"] == "not_found"
+    assert embedded["unusable_observation"]["reason"] == "embedded_font_staging_failed"
+    assert "corrupt cmap" in embedded["unusable_observation"]["exception"]
+    assert "absent_from_completed_inventory" not in embedded
+
+    system = results[1]
+    assert system["source"] == "system_font"
+    expected = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "ariali.ttf")
+    if os.path.isfile(expected):
+        assert path == expected
+        assert system["outcome"] == "found"
+        assert system["path"] == expected
+    else:
+        assert path is None
+        assert system["outcome"] == "not_found"
+
+
+def test_generic_embedded_staging_exception_remains_invalid():
+    """Non-cmap staging exceptions stay terminal; do not invent system rescue."""
+    opts = core.ImportOptions(text_mode="3d_text")
+    _set_completed_font_session(
+        opts,
+        records={},
+        failures=[
+            {
+                "font": "Siwa-Regular",
+                "outcome": "failed",
+                "reason": "embedded_font_staging_failed",
+                "xref": 699,
+                "exception": "ValueError: current page font is broken",
+            }
+        ],
     )
+
+    path, results = core._resolve_shapestring_font_path_with_evidence(
+        "Siwa-Regular",
+        opts,
+        pdf_sha256=PDF_SHA_A,
+        page_number=1,
+    )
+
+    assert path is None
+    assert len(results) == 1
+    assert results[0]["outcome"] == "invalid"
+    assert results[0]["reason"] == "embedded_font_staging_failed"
 
 
 def test_incomplete_staging_session_is_still_a_runtime_fault():

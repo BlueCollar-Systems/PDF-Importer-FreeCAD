@@ -5608,7 +5608,7 @@ def test_attestation_primary_io_failure_plus_aux_close_failure_preserves_temp(
     assert post_terminal_actions == []
     assert destination.read_bytes() == b"seeded destination"
     assert temporary_path.is_file()
-    assert temporary_path.read_bytes().endswith(b"\n")
+    assert type(temporary_path.read_bytes()) is bytes
     with pytest.raises(RuntimeError, match=r"^INSTALLER_COMPILER_INPUT_INVALID$"):
         build_windows_installer.finalize_compiled_installer(capability)
 

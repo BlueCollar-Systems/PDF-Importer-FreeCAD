@@ -5318,7 +5318,9 @@ def test_attestation_exact_winner_is_held_through_temp_cleanup_and_consumption(
         if entry.role == "attestation-winner":
             events.append("winner-close")
         elif entry.role == "stage-monitor":
-            events.append("monitor-close")
+            events.append("monitor-proof-close")
+        elif entry.role == "stage-monitor-successor":
+            events.append("monitor-authority-close")
         elif entry.role.startswith("output-") or entry.role.startswith("stage-"):
             events.append("capability-close")
         return real_close(entry)
@@ -5333,10 +5335,12 @@ def test_attestation_exact_winner_is_held_through_temp_cleanup_and_consumption(
     ) == expected_setup
     assert events.count("winner-open") == 1
     assert events.count("winner-close") == 1
-    assert events.count("monitor-close") == 1
+    assert events.count("monitor-proof-close") == 1
+    assert events.count("monitor-authority-close") == 1
+    assert events.index("monitor-proof-close") < events.index("winner-open")
     assert events.index("winner-open") < events.index("temp-dispose")
-    assert events.index("temp-dispose") < events.index("monitor-close")
-    assert events.index("monitor-close") < events.index("capability-close")
+    assert events.index("temp-dispose") < events.index("monitor-authority-close")
+    assert events.index("monitor-authority-close") < events.index("capability-close")
     assert events.index("capability-close") < events.index("winner-close")
 
 

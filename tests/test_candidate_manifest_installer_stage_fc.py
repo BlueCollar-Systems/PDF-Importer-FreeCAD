@@ -5560,7 +5560,9 @@ def test_handoff_failure_proves_completion_before_releasing_native_monitor_state
                 injections.append(retiring_failure)
                 raise OSError("synthetic retiring monitor close failure")
         result_value = real_close_handle(handle)
-        close_counts[key] = close_counts.get(key, 0) + 1
+        if monitor is not None and key in handle_owners:
+            close_counts[key] = close_counts.get(key, 0) + 1
+            handle_owners.pop(key, None)
         return result_value
 
     def force_close(handle):
@@ -5569,7 +5571,9 @@ def test_handoff_failure_proves_completion_before_releasing_native_monitor_state
         if monitor is not None and id(monitor) not in terminal_completion:
             premature_releases.append(monitor_label(monitor) + "-force-close")
         result_value = real_force_close(handle)
-        close_counts[key] = close_counts.get(key, 0) + 1
+        if monitor is not None and key in handle_owners:
+            close_counts[key] = close_counts.get(key, 0) + 1
+            handle_owners.pop(key, None)
         return result_value
 
     monkeypatch.setattr(build_windows_installer, "_queue_windows_stage_monitor", queue)
@@ -5595,7 +5599,12 @@ def test_handoff_failure_proves_completion_before_releasing_native_monitor_state
             "successor-terminal-result"
         )
         assert premature_releases == []
-        assert close_counts[_handle_key(successor.entry.handle)] == 1
+        assert close_counts[_handle_key(successor.entry.handle)] == 1, (
+            _handle_key(successor.entry.handle),
+            _handle_key(successor.event_handle),
+            close_counts,
+            events,
+        )
         assert close_counts[_handle_key(successor.event_handle)] == 1
         terminal_owners = getattr(
             build_windows_installer,

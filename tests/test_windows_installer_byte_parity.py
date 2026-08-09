@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import stat
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -17,6 +18,32 @@ TOOLCHAIN_MANIFEST = (
     / "installer"
     / "inno-toolchain-6.7.1.json"
 )
+
+
+def _synthetic_compiler(payload: bytes):
+    def run(command, **_kwargs):
+        command = list(command)
+        output_root = Path(next(item[2:] for item in command if item.startswith("/O")))
+        basename = next(item[2:] for item in command if item.startswith("/F"))
+        setup = output_root / (basename + ".exe")
+        assert setup.is_file(), "compiler output must be atomically precreated"
+        handle = build_windows_installer._open_windows_no_follow(
+            setup,
+            build_windows_installer._FILE_READ_DATA
+            | build_windows_installer._FILE_WRITE_DATA
+            | build_windows_installer._FILE_READ_ATTRIBUTES
+            | build_windows_installer._FILE_WRITE_ATTRIBUTES
+            | build_windows_installer._SYNCHRONIZE,
+            share_delete=True,
+        )
+        try:
+            build_windows_installer._write_windows_file_handle(handle, payload)
+            build_windows_installer._flush_windows_file_handle(handle)
+        finally:
+            build_windows_installer._close_windows_handle(handle)
+        return subprocess.CompletedProcess(command, 0)
+
+    return run
 
 
 def _write_release_zip(path: Path, *, package_version: str = "4.0.72") -> None:
@@ -187,9 +214,7 @@ def test_toolchain_verification_is_exact_and_fails_closed(tmp_path):
 def test_attestation_is_canonical_and_binds_zip_setup_toolchain(monkeypatch, tmp_path):
     version = "4.0.72"
     release_zip = tmp_path / f"FreeCAD-PDF-Importer_v{version}.zip"
-    setup = tmp_path / "setup.exe"
     _write_release_zip(release_zip, package_version=version)
-    setup.write_bytes(b"setup")
     identity = {
         "name": "Inno Setup",
         "version": "6.7.1",
@@ -204,18 +229,31 @@ def test_attestation_is_canonical_and_binds_zip_setup_toolchain(monkeypatch, tmp
         release_zip,
         stage_dir=tmp_path / "stage",
     )
+    monkeypatch.setattr(
+        build_windows_installer.subprocess,
+        "run",
+        _synthetic_compiler(b"setup"),
+    )
+    first_capability = build_windows_installer.compile_installer(
+        tmp_path / "ISCC.exe",
+        staged_release,
+        toolchain_identity=identity,
+        output_dir=tmp_path / "first-output",
+    )
+    second_capability = build_windows_installer.compile_installer(
+        tmp_path / "ISCC.exe",
+        staged_release,
+        toolchain_identity=identity,
+        output_dir=tmp_path / "second-output",
+    )
 
     build_windows_installer.write_attestation(
         first,
-        staged_release=staged_release,
-        installer_exe=setup,
-        toolchain_identity=identity,
+        compiled_installer=first_capability,
     )
     build_windows_installer.write_attestation(
         second,
-        staged_release=staged_release,
-        installer_exe=setup,
-        toolchain_identity=identity,
+        compiled_installer=second_capability,
     )
 
     assert first.read_bytes() == second.read_bytes()
@@ -233,6 +271,18 @@ def test_attestation_is_canonical_and_binds_zip_setup_toolchain(monkeypatch, tmp
     }
     assert payload["stage_identity_sha256"] == staged_release.stage_identity_sha256
     assert payload["toolchain"] == identity
+
+    legacy = tmp_path / "legacy.json"
+    with pytest.raises(
+        RuntimeError, match=r"^INSTALLER_ATTESTATION_INPUT_INVALID$"
+    ):
+        build_windows_installer.write_attestation(
+            legacy,
+            staged_release=staged_release,
+            installer_exe=tmp_path / "setup.exe",
+            toolchain_identity=identity,
+        )
+    assert not legacy.exists()
 
 
 def test_workflow_bootstraps_exact_toolchain_and_compares_two_builds():

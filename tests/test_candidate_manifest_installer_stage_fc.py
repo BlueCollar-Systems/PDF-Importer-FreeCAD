@@ -139,6 +139,76 @@ def _valid_toolchain_identity() -> dict[str, str]:
     }
 
 
+def _synthetic_compiler_runner(
+    payload: bytes,
+    calls: list[list[str]],
+    *,
+    after_write=None,
+):
+    """Write the precreated Setup leaf through a compatible native handle."""
+
+    def run(command, **_kwargs):
+        command = list(command)
+        calls.append(command)
+        output_root = Path(next(item[2:] for item in command if item.startswith("/O")))
+        basename = next(item[2:] for item in command if item.startswith("/F"))
+        setup = output_root / (basename + ".exe")
+        assert setup.is_file(), "compiler output must be atomically precreated"
+        handle = build_windows_installer._open_windows_no_follow(
+            setup,
+            build_windows_installer._FILE_READ_DATA
+            | build_windows_installer._FILE_WRITE_DATA
+            | build_windows_installer._FILE_READ_ATTRIBUTES
+            | build_windows_installer._FILE_WRITE_ATTRIBUTES
+            | build_windows_installer._SYNCHRONIZE,
+            share_delete=True,
+        )
+        try:
+            build_windows_installer._write_windows_file_handle(handle, payload)
+            build_windows_installer._flush_windows_file_handle(handle)
+        finally:
+            build_windows_installer._close_windows_handle(handle)
+        if after_write is not None:
+            after_write(setup)
+        return subprocess.CompletedProcess(command, 0)
+
+    return run
+
+
+def _compile_capability(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    staged_release=None,
+    *,
+    output_dir: Path | None = None,
+    payload: bytes = b"synthetic setup",
+    toolchain_identity: dict[str, str] | None = None,
+    after_write=None,
+):
+    if staged_release is None:
+        staged_release = _stage(monkeypatch, tmp_path / "stage-work")
+    if output_dir is None:
+        output_dir = tmp_path / "compiler-output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        build_windows_installer.subprocess,
+        "run",
+        _synthetic_compiler_runner(payload, calls, after_write=after_write),
+    )
+    capability = build_windows_installer.compile_installer(
+        tmp_path / "ISCC.exe",
+        staged_release,
+        toolchain_identity=(
+            _valid_toolchain_identity()
+            if toolchain_identity is None
+            else toolchain_identity
+        ),
+        output_dir=output_dir,
+    )
+    return capability, calls
+
+
 def test_valid_zip_is_snapshotted_validated_and_staged_once(monkeypatch, tmp_path):
     source_zip, document, members = _valid_zip(tmp_path)
     original_bytes = source_zip.read_bytes()
@@ -591,20 +661,10 @@ def test_compiler_revalidates_stage_and_uses_exact_source_directory(
 ):
     staged = _stage(monkeypatch, tmp_path)
     output = tmp_path / "compiler-output"
-    calls: list[list[str]] = []
-
-    def fake_run(command, **kwargs):
-        calls.append(list(command))
-        output.mkdir(parents=True, exist_ok=True)
-        (output / f"FreeCAD-PDF-Importer-Setup_v{PACKAGE_VERSION}.exe").write_bytes(
-            b"synthetic setup"
-        )
-        return subprocess.CompletedProcess(command, 0)
-
-    monkeypatch.setattr(build_windows_installer.subprocess, "run", fake_run)
-    result = build_windows_installer.compile_installer(
-        tmp_path / "ISCC.exe", staged, output_dir=output
+    capability, calls = _compile_capability(
+        monkeypatch, tmp_path, staged, output_dir=output
     )
+    result = build_windows_installer.finalize_compiled_installer(capability)
 
     assert result.read_bytes() == b"synthetic setup"
     assert len(calls) == 1
@@ -613,7 +673,10 @@ def test_compiler_revalidates_stage_and_uses_exact_source_directory(
     (staged.source_dir / "module.py").write_bytes(b"tampered")
     with pytest.raises(RuntimeError, match=r"^INSTALLER_COMPILER_INPUT_INVALID$"):
         build_windows_installer.compile_installer(
-            tmp_path / "ISCC.exe", staged, output_dir=output
+            tmp_path / "ISCC.exe",
+            staged,
+            toolchain_identity=_valid_toolchain_identity(),
+            output_dir=output,
         )
     assert len(calls) == 1
 
@@ -633,7 +696,11 @@ def test_compiler_rejects_mutated_immutable_stage_values_and_maps_failures(
         lambda *_args, **_kwargs: calls.append(object()),
     )
     with pytest.raises(RuntimeError, match=r"^INSTALLER_COMPILER_INPUT_INVALID$"):
-        build_windows_installer.compile_installer(tmp_path / "ISCC.exe", mutated)
+        build_windows_installer.compile_installer(
+            tmp_path / "ISCC.exe",
+            mutated,
+            toolchain_identity=_valid_toolchain_identity(),
+        )
     assert calls == []
 
     def fail_compiler(command, **_kwargs):
@@ -641,7 +708,11 @@ def test_compiler_rejects_mutated_immutable_stage_values_and_maps_failures(
 
     monkeypatch.setattr(build_windows_installer.subprocess, "run", fail_compiler)
     with pytest.raises(RuntimeError) as caught:
-        build_windows_installer.compile_installer(tmp_path / "ISCC.exe", staged)
+        build_windows_installer.compile_installer(
+            tmp_path / "ISCC.exe",
+            staged,
+            toolchain_identity=_valid_toolchain_identity(),
+        )
     assert _assert_pathless(caught.value, tmp_path) == "INSTALLER_COMPILER_FAILED"
 
 
@@ -649,8 +720,6 @@ def test_attestation_1_1_binds_stable_setup_zip_toolchain_and_manifest(
     monkeypatch, tmp_path
 ):
     staged = _stage(monkeypatch, tmp_path)
-    setup = tmp_path / "Setup.exe"
-    setup.write_bytes(b"stable setup bytes")
     identity = {
         "name": "Inno Setup",
         "version": "6.7.1",
@@ -660,18 +729,30 @@ def test_attestation_1_1_binds_stable_setup_zip_toolchain_and_manifest(
     }
     first = tmp_path / "first.json"
     second = tmp_path / "second.json"
+    first_capability, _first_calls = _compile_capability(
+        monkeypatch,
+        tmp_path / "first-build",
+        staged,
+        output_dir=tmp_path / "first-output",
+        payload=b"stable setup bytes",
+        toolchain_identity=identity,
+    )
+    second_capability, _second_calls = _compile_capability(
+        monkeypatch,
+        tmp_path / "second-build",
+        staged,
+        output_dir=tmp_path / "second-output",
+        payload=b"stable setup bytes",
+        toolchain_identity=identity,
+    )
 
     build_windows_installer.write_attestation(
         first,
-        staged_release=staged,
-        installer_exe=setup,
-        toolchain_identity=identity,
+        compiled_installer=first_capability,
     )
     build_windows_installer.write_attestation(
         second,
-        staged_release=staged,
-        installer_exe=setup,
-        toolchain_identity=identity,
+        compiled_installer=second_capability,
     )
 
     assert first.read_bytes() == second.read_bytes()
@@ -687,7 +768,7 @@ def test_attestation_1_1_binds_stable_setup_zip_toolchain_and_manifest(
             "sha256": staged.source_zip_sha256,
         },
         "installer": {
-            "name": "Setup.exe",
+            "name": f"FreeCAD-PDF-Importer-Setup_v{PACKAGE_VERSION}.exe",
             "size": len(b"stable setup bytes"),
             "sha256": hashlib.sha256(b"stable setup bytes").hexdigest(),
         },
@@ -700,13 +781,15 @@ def test_attestation_1_1_binds_stable_setup_zip_toolchain_and_manifest(
     }
 
 
-def test_attestation_rejects_hardlinked_setup_and_preserves_existing_bytes(
+def test_compiler_rejects_hardlinked_loose_winner_and_preserves_existing_bytes(
     monkeypatch, tmp_path
 ):
     staged = _stage(monkeypatch, tmp_path)
-    setup = tmp_path / "Setup.exe"
+    output_dir = tmp_path / "compiler-output"
+    output_dir.mkdir()
+    setup = output_dir / f"FreeCAD-PDF-Importer-Setup_v{PACKAGE_VERSION}.exe"
     setup.write_bytes(b"setup")
-    other = tmp_path / "Setup-copy.exe"
+    other = output_dir / "Setup-copy.exe"
     try:
         os.link(setup, other)
     except OSError as exc:
@@ -714,15 +797,21 @@ def test_attestation_rejects_hardlinked_setup_and_preserves_existing_bytes(
     output = tmp_path / "attestation.json"
     output.write_bytes(b"preserve existing attestation")
 
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        build_windows_installer.subprocess,
+        "run",
+        _synthetic_compiler_runner(b"setup", calls),
+    )
     with pytest.raises(RuntimeError) as caught:
-        build_windows_installer.write_attestation(
-            output,
-            staged_release=staged,
-            installer_exe=setup,
-            toolchain_identity={},
+        build_windows_installer.compile_installer(
+            tmp_path / "ISCC.exe",
+            staged,
+            toolchain_identity=_valid_toolchain_identity(),
+            output_dir=output_dir,
         )
 
-    assert _assert_pathless(caught.value, tmp_path) == "INSTALLER_SETUP_UNSAFE"
+    assert _assert_pathless(caught.value, tmp_path) == "INSTALLER_COMPILER_FAILED"
     assert output.read_bytes() == b"preserve existing attestation"
 
 
@@ -730,61 +819,44 @@ def test_attestation_detects_setup_path_replacement_before_publication(
     monkeypatch, tmp_path
 ):
     staged = _stage(monkeypatch, tmp_path)
-    setup = tmp_path / "Setup.exe"
-    setup.write_bytes(b"original setup")
-    output = tmp_path / "attestation.json"
-    output.write_bytes(b"preserve existing attestation")
-    real_capture = build_windows_installer._capture_regular_file
-    setup_captures = 0
-
-    def replace_after_first_setup_capture(path: Path) -> bytes:
-        nonlocal setup_captures
-        payload = real_capture(path)
-        if Path(path) == setup:
-            setup_captures += 1
-            if setup_captures == 1:
-                setup.unlink()
-                setup.write_bytes(b"replacement setup")
-        return payload
-
-    monkeypatch.setattr(
-        build_windows_installer, "_capture_regular_file", replace_after_first_setup_capture
+    output_dir = tmp_path / "compiler-output"
+    capability, _calls = _compile_capability(
+        monkeypatch,
+        tmp_path / "build",
+        staged,
+        output_dir=output_dir,
+        payload=b"original setup",
     )
-    with pytest.raises(RuntimeError) as caught:
-        build_windows_installer.write_attestation(
-            output,
-            staged_release=staged,
-            installer_exe=setup,
-            toolchain_identity={"version": "synthetic"},
-        )
+    setup = output_dir / f"FreeCAD-PDF-Importer-Setup_v{PACKAGE_VERSION}.exe"
+    replacement = tmp_path / "replacement.exe"
+    replacement.write_bytes(b"replacement setup")
+    output = tmp_path / "attestation.json"
+    with pytest.raises(OSError):
+        os.replace(replacement, setup)
 
-    assert setup_captures >= 2
-    assert _assert_pathless(caught.value, tmp_path) == "INSTALLER_SETUP_CHANGED"
-    assert output.read_bytes() == b"preserve existing attestation"
+    result = build_windows_installer.write_attestation(
+        output,
+        compiled_installer=capability,
+    )
+
+    assert result == output.absolute()
+    assert setup.read_bytes() == b"original setup"
+    assert replacement.read_bytes() == b"replacement setup"
 
 
 def test_attestation_publication_failure_preserves_existing_bytes_and_cleans_temp(
     monkeypatch, tmp_path
 ):
     staged = _stage(monkeypatch, tmp_path)
-    setup = tmp_path / "Setup.exe"
-    setup.write_bytes(b"setup")
+    capability, _calls = _compile_capability(
+        monkeypatch, tmp_path / "build", staged, payload=b"setup"
+    )
     output = tmp_path / "attestation.json"
     output.write_bytes(b"preserve existing attestation")
-    original_replace = os.replace
-
-    def fail_attestation_publish(source, destination):
-        if Path(destination) == output:
-            raise OSError("C:/private/publish")
-        return original_replace(source, destination)
-
-    monkeypatch.setattr(build_windows_installer.os, "replace", fail_attestation_publish)
     with pytest.raises(RuntimeError) as caught:
         build_windows_installer.write_attestation(
             output,
-            staged_release=staged,
-            installer_exe=setup,
-            toolchain_identity=_valid_toolchain_identity(),
+            compiled_installer=capability,
         )
 
     assert _assert_pathless(caught.value, tmp_path) == (
@@ -802,24 +874,25 @@ def test_main_retains_source_commit_as_equality_only_and_reuses_one_stage(
     setup.write_bytes(b"setup")
     compile_calls: list[object] = []
     attest_calls: list[object] = []
+    compiled_capability = object()
     monkeypatch.setattr(sys, "argv", ["build_windows_installer.py", "--source-commit", SOURCE_COMMIT, "--attestation", str(tmp_path / "a.json")])
     monkeypatch.setattr(build_windows_installer, "find_iscc", lambda _path: tmp_path / "ISCC.exe")
     monkeypatch.setattr(build_windows_installer, "verify_inno_toolchain", lambda *_args: {"version": "synthetic"})
     monkeypatch.setattr(build_windows_installer, "stage_release", lambda *_args, **_kwargs: staged)
 
-    def compile_same(_iscc, staged_release, **_kwargs):
-        compile_calls.append(staged_release)
-        return setup
+    def compile_same(_iscc, staged_release, *, toolchain_identity, **_kwargs):
+        compile_calls.append((staged_release, toolchain_identity))
+        return compiled_capability
 
-    def attest_same(_output, *, staged_release, **_kwargs):
-        attest_calls.append(staged_release)
+    def attest_same(_output, *, compiled_installer):
+        attest_calls.append(compiled_installer)
         return tmp_path / "a.json"
 
     monkeypatch.setattr(build_windows_installer, "compile_installer", compile_same)
     monkeypatch.setattr(build_windows_installer, "write_attestation", attest_same)
     assert build_windows_installer.main() == 0
-    assert compile_calls == [staged]
-    assert attest_calls == [staged]
+    assert compile_calls == [(staged, {"version": "synthetic"})]
+    assert attest_calls == [compiled_capability]
 
     monkeypatch.setattr(sys, "argv", ["build_windows_installer.py", "--source-commit", "2" * 40])
     compile_calls.clear()
@@ -955,7 +1028,10 @@ def test_compiler_blocks_independently_valid_zip_a_manifest_tree_b_cross_binding
 
     with pytest.raises(RuntimeError, match=r"^INSTALLER_COMPILER_INPUT_INVALID$"):
         build_windows_installer.compile_installer(
-            tmp_path / "ISCC.exe", mixed, output_dir=tmp_path / "out"
+            tmp_path / "ISCC.exe",
+            mixed,
+            toolchain_identity=_valid_toolchain_identity(),
+            output_dir=tmp_path / "out",
         )
 
     assert calls == []
@@ -965,8 +1041,6 @@ def test_attestation_blocks_zip_a_manifest_tree_b_and_preserves_seeded_bytes(
     monkeypatch, tmp_path
 ):
     mixed = _mixed_stage_from_zip_a_and_tree_b(monkeypatch, tmp_path)
-    setup = tmp_path / "Setup.exe"
-    setup.write_bytes(b"setup")
     output = tmp_path / "attestation.json"
     seeded = b"seeded attestation"
     output.write_bytes(seeded)
@@ -975,7 +1049,7 @@ def test_attestation_blocks_zip_a_manifest_tree_b_and_preserves_seeded_bytes(
         build_windows_installer.write_attestation(
             output,
             staged_release=mixed,
-            installer_exe=setup,
+            installer_exe=tmp_path / "Setup.exe",
             toolchain_identity=_valid_toolchain_identity(),
         )
 
@@ -1143,33 +1217,23 @@ def test_attestation_temp_collision_before_ownership_is_preserved_and_io_error(
     monkeypatch, tmp_path
 ):
     staged = _stage(monkeypatch, tmp_path)
-    setup = tmp_path / "Setup.exe"
-    setup.write_bytes(b"setup")
+    capability, _calls = _compile_capability(
+        monkeypatch, tmp_path / "build", staged, payload=b"setup"
+    )
     output = tmp_path / "attestation.json"
     output.write_bytes(b"seeded")
     token = "2" * 32
     temporary = tmp_path / (build_windows_installer._ATTESTATION_TEMP_PREFIX + token)
-    original_open = Path.open
-
     class FixedUUID:
         hex = token
 
-    def collide_open(path: Path, mode="r", *args, **kwargs):
-        if Path(path) == temporary and mode == "xb":
-            with original_open(path, "wb") as stream:
-                stream.write(b"concurrent temp")
-            raise FileExistsError("synthetic collision")
-        return original_open(path, mode, *args, **kwargs)
-
     monkeypatch.setattr(build_windows_installer.uuid, "uuid4", lambda: FixedUUID())
-    monkeypatch.setattr(Path, "open", collide_open)
+    temporary.write_bytes(b"concurrent temp")
 
     with pytest.raises(RuntimeError, match=r"^INSTALLER_ATTESTATION_IO_ERROR$"):
         build_windows_installer.write_attestation(
             output,
-            staged_release=staged,
-            installer_exe=setup,
-            toolchain_identity=_valid_toolchain_identity(),
+            compiled_installer=capability,
         )
 
     assert temporary.read_bytes() == b"concurrent temp"
@@ -1288,42 +1352,45 @@ def test_cleanup_failure_overrides_with_exact_phase_token(
         with pytest.raises(RuntimeError) as caught:
             _stage(monkeypatch, tmp_path, source)
     else:
-        monkeypatch.setattr(
-            build_windows_installer, "_cleanup_owned", lambda *_args: False
-        )
         staged = _stage(monkeypatch, tmp_path)
-        setup = tmp_path / "Setup.exe"
-        setup.write_bytes(b"setup")
+        capability, _calls = _compile_capability(
+            monkeypatch, tmp_path / "build", staged, payload=b"setup"
+        )
         output = tmp_path / "attestation.json"
         output.write_bytes(b"seeded")
+        monkeypatch.setattr(
+            build_windows_installer,
+            "_dispose_windows_file_handle",
+            lambda *_args, **_kwargs: False,
+        )
         if phase == "attestation-prepublish":
-            real_capture = build_windows_installer._capture_regular_file
+            real_read = build_windows_installer._read_windows_file_handle
 
-            def fail_temp_read(path):
-                if Path(path).name.startswith(
+            def fail_temp_read(handle):
+                if build_windows_installer._query_windows_opened_name(handle).startswith(
                     build_windows_installer._ATTESTATION_TEMP_PREFIX
                 ):
                     raise OSError("synthetic readback failure")
-                return real_capture(path)
+                return real_read(handle)
 
             monkeypatch.setattr(
-                build_windows_installer, "_capture_regular_file", fail_temp_read
+                build_windows_installer, "_read_windows_file_handle", fail_temp_read
             )
         else:
-            original_replace = os.replace
+            real_rename = build_windows_installer._rename_windows_handle
 
-            def fail_publish(source_path, destination_path):
-                if Path(destination_path) == output:
+            def fail_publish(handle, parent_handle, destination_path):
+                if Path(destination_path) == output.absolute():
                     raise OSError("synthetic publish failure")
-                return original_replace(source_path, destination_path)
+                return real_rename(handle, parent_handle, destination_path)
 
-            monkeypatch.setattr(build_windows_installer.os, "replace", fail_publish)
+            monkeypatch.setattr(
+                build_windows_installer, "_rename_windows_handle", fail_publish
+            )
         with pytest.raises(RuntimeError) as caught:
             build_windows_installer.write_attestation(
                 output,
-                staged_release=staged,
-                installer_exe=setup,
-                toolchain_identity=_valid_toolchain_identity(),
+                compiled_installer=capability,
             )
     assert _assert_pathless(caught.value, tmp_path) == expected
 
@@ -1515,7 +1582,10 @@ def test_compiler_blocks_each_mutated_stage_identity_field_without_subprocess(
 
     with pytest.raises(RuntimeError, match=r"^INSTALLER_COMPILER_INPUT_INVALID$"):
         build_windows_installer.compile_installer(
-            tmp_path / "ISCC.exe", mutated, output_dir=tmp_path / "output"
+            tmp_path / "ISCC.exe",
+            mutated,
+            toolchain_identity=_valid_toolchain_identity(),
+            output_dir=tmp_path / "output",
         )
     assert calls == []
 
@@ -1533,28 +1603,30 @@ def test_compiler_blocks_zip_snapshot_byte_mutation_without_subprocess(
     )
 
     with pytest.raises(RuntimeError, match=r"^INSTALLER_COMPILER_INPUT_INVALID$"):
-        build_windows_installer.compile_installer(tmp_path / "ISCC.exe", staged)
+        build_windows_installer.compile_installer(
+            tmp_path / "ISCC.exe",
+            staged,
+            toolchain_identity=_valid_toolchain_identity(),
+        )
     assert calls == []
 
 
-def test_attestation_stage_or_zip_mutation_preserves_seeded_output(
+def test_compiled_stage_blocks_zip_mutation_through_attestation(
     monkeypatch, tmp_path
 ):
     staged = _stage(monkeypatch, tmp_path)
-    staged.source_zip_snapshot.write_bytes(b"mutated snapshot")
-    setup = tmp_path / "Setup.exe"
-    setup.write_bytes(b"setup")
+    capability, _calls = _compile_capability(
+        monkeypatch, tmp_path / "build", staged, payload=b"setup"
+    )
     output = tmp_path / "attestation.json"
-    output.write_bytes(b"seeded")
 
-    with pytest.raises(RuntimeError, match=r"^INSTALLER_ATTESTATION_INPUT_INVALID$"):
-        build_windows_installer.write_attestation(
-            output,
-            staged_release=staged,
-            installer_exe=setup,
-            toolchain_identity=_valid_toolchain_identity(),
-        )
-    assert output.read_bytes() == b"seeded"
+    with pytest.raises(OSError):
+        staged.source_zip_snapshot.write_bytes(b"mutated snapshot")
+
+    assert build_windows_installer.write_attestation(
+        output,
+        compiled_installer=capability,
+    ) == output.absolute()
 
 
 @pytest.mark.parametrize(
@@ -1808,30 +1880,36 @@ class _HostileToolchainValue:
         pytest.param({**_valid_toolchain_identity(), "tree_sha256": "g" * 64}, id="nonhex-digest"),
     ],
 )
-def test_attestation_rejects_noncanonical_toolchain_inputs_pathlessly_and_atomically(
+def test_compiler_rejects_noncanonical_toolchain_inputs_pathlessly_and_atomically(
     monkeypatch, tmp_path, identity
 ):
     staged = _stage(monkeypatch, tmp_path)
-    setup = tmp_path / "Setup.exe"
-    setup.write_bytes(b"setup")
-    output = tmp_path / "attestation.json"
-    output.write_bytes(b"seeded attestation")
+    output = tmp_path / "compiler-output"
+    output.mkdir()
+    marker = output / "foreign.bin"
+    marker.write_bytes(b"seeded output")
+    calls: list[object] = []
+    monkeypatch.setattr(
+        build_windows_installer.subprocess,
+        "run",
+        lambda *_args, **_kwargs: calls.append(object()),
+    )
 
     with pytest.raises(RuntimeError) as caught:
-        build_windows_installer.write_attestation(
-            output,
-            staged_release=staged,
-            installer_exe=setup,
+        build_windows_installer.compile_installer(
+            tmp_path / "ISCC.exe",
+            staged,
             toolchain_identity=identity,
+            output_dir=output,
         )
 
     assert _assert_pathless(caught.value, tmp_path) == (
-        "INSTALLER_ATTESTATION_INPUT_INVALID"
+        "INSTALLER_COMPILER_INPUT_INVALID"
     )
-    assert output.read_bytes() == b"seeded attestation"
+    assert calls == []
+    assert marker.read_bytes() == b"seeded output"
     assert not any(
-        path.name.startswith(build_windows_installer._ATTESTATION_TEMP_PREFIX)
-        for path in tmp_path.iterdir()
+        path.name.startswith(".installer-output-") for path in output.iterdir()
     )
 
 
@@ -1840,59 +1918,42 @@ def test_attestation_temp_failures_are_atomic_io_errors(
     monkeypatch, tmp_path, failure
 ):
     staged = _stage(monkeypatch, tmp_path)
-    setup = tmp_path / "Setup.exe"
-    setup.write_bytes(b"setup")
+    capability, _calls = _compile_capability(
+        monkeypatch, tmp_path / "build", staged, payload=b"setup"
+    )
     output = tmp_path / "attestation.json"
     output.write_bytes(b"seeded")
-    original_open = Path.open
-    real_capture = build_windows_installer._capture_regular_file
+    real_write = build_windows_installer._write_windows_file_handle
+    real_read = build_windows_installer._read_windows_file_handle
+    real_close_entry = build_windows_installer._close_windows_entry
 
-    class FaultingWriter:
-        def __init__(self, stream):
-            self.stream = stream
+    def fault_write(handle, payload):
+        if failure == "write":
+            raise OSError("synthetic write failure")
+        return real_write(handle, payload)
 
-        def __enter__(self):
-            self.stream.__enter__()
-            return self
-
-        def __exit__(self, *args):
-            result = self.stream.__exit__(*args)
-            if failure == "close":
-                raise OSError("synthetic close failure")
-            return result
-
-        def write(self, payload):
-            if failure == "write":
-                raise OSError("synthetic write failure")
-            return self.stream.write(payload)
-
-        def __getattr__(self, name):
-            return getattr(self.stream, name)
-
-    def fault_open(path: Path, mode="r", *args, **kwargs):
-        stream = original_open(path, mode, *args, **kwargs)
-        if mode == "xb" and Path(path).name.startswith(
-            build_windows_installer._ATTESTATION_TEMP_PREFIX
-        ):
-            return FaultingWriter(stream)
-        return stream
-
-    def fault_capture(path: Path):
-        if failure == "readback" and Path(path).name.startswith(
-            build_windows_installer._ATTESTATION_TEMP_PREFIX
-        ):
+    def fault_read(handle):
+        if failure == "readback" and build_windows_installer._query_windows_opened_name(
+            handle
+        ).startswith(build_windows_installer._ATTESTATION_TEMP_PREFIX):
             raise OSError("synthetic readback failure")
-        return real_capture(path)
+        return real_read(handle)
 
-    monkeypatch.setattr(Path, "open", fault_open)
-    monkeypatch.setattr(build_windows_installer, "_capture_regular_file", fault_capture)
+    def fault_close(entry):
+        if failure == "close" and entry.role == "attestation-temp":
+            build_windows_installer._force_close_windows_handle(entry.handle)
+            entry.closed = True
+            raise OSError("synthetic close failure")
+        return real_close_entry(entry)
+
+    monkeypatch.setattr(build_windows_installer, "_write_windows_file_handle", fault_write)
+    monkeypatch.setattr(build_windows_installer, "_read_windows_file_handle", fault_read)
+    monkeypatch.setattr(build_windows_installer, "_close_windows_entry", fault_close)
 
     with pytest.raises(RuntimeError, match=r"^INSTALLER_ATTESTATION_IO_ERROR$"):
         build_windows_installer.write_attestation(
             output,
-            staged_release=staged,
-            installer_exe=setup,
-            toolchain_identity=_valid_toolchain_identity(),
+            compiled_installer=capability,
         )
 
     assert output.read_bytes() == b"seeded"
@@ -1902,39 +1963,39 @@ def test_successful_attestation_replace_is_final_without_post_commit_capture(
     monkeypatch, tmp_path
 ):
     staged = _stage(monkeypatch, tmp_path)
-    setup = tmp_path / "Setup.exe"
-    setup.write_bytes(b"setup")
+    capability, _calls = _compile_capability(
+        monkeypatch, tmp_path / "build", staged, payload=b"setup"
+    )
     output = tmp_path / "attestation.json"
-    output.write_bytes(b"seeded")
-    real_replace = os.replace
-    real_capture = build_windows_installer._capture_regular_file
+    real_rename = build_windows_installer._rename_windows_handle
+    real_read = build_windows_installer._read_windows_file_handle
     committed = False
     post_commit_captures = 0
 
-    def mark_commit(source, destination):
+    def mark_commit(handle, parent_handle, destination):
         nonlocal committed
-        result = real_replace(source, destination)
-        if Path(destination) == output:
+        result = real_rename(handle, parent_handle, destination)
+        if Path(destination) == output.absolute():
             committed = True
         return result
 
-    def forbid_post_commit_capture(path):
+    def forbid_post_commit_capture(handle):
         nonlocal post_commit_captures
-        if committed and Path(path) == output:
+        if committed:
             post_commit_captures += 1
             raise OSError("post-commit capture forbidden")
-        return real_capture(path)
+        return real_read(handle)
 
-    monkeypatch.setattr(build_windows_installer.os, "replace", mark_commit)
+    monkeypatch.setattr(build_windows_installer, "_rename_windows_handle", mark_commit)
     monkeypatch.setattr(
-        build_windows_installer, "_capture_regular_file", forbid_post_commit_capture
+        build_windows_installer,
+        "_read_windows_file_handle",
+        forbid_post_commit_capture,
     )
 
     result = build_windows_installer.write_attestation(
         output,
-        staged_release=staged,
-        installer_exe=setup,
-        toolchain_identity=_valid_toolchain_identity(),
+        compiled_installer=capability,
     )
 
     assert result == output.absolute()
@@ -2581,44 +2642,44 @@ def test_final_attestation_temp_readback_failure_is_atomic_io_error(
     monkeypatch, tmp_path, failure
 ):
     staged = _stage(monkeypatch, tmp_path)
-    setup = tmp_path / "Setup.exe"
-    setup.write_bytes(b"setup")
+    capability, _calls = _compile_capability(
+        monkeypatch, tmp_path / "build", staged, payload=b"setup"
+    )
     output = tmp_path / "attestation.json"
     seeded = b"seeded attestation bytes"
     output.write_bytes(seeded)
-    real_capture = build_windows_installer._capture_regular_file
-    real_replace = os.replace
+    real_read = build_windows_installer._read_windows_file_handle
+    real_rename = build_windows_installer._rename_windows_handle
     temp_captures = 0
     final_replace_calls = 0
 
-    def fail_second_temp_capture(path):
+    def fail_second_temp_capture(handle):
         nonlocal temp_captures
-        path = Path(path)
-        if path.name.startswith(build_windows_installer._ATTESTATION_TEMP_PREFIX):
+        if build_windows_installer._query_windows_opened_name(handle).startswith(
+            build_windows_installer._ATTESTATION_TEMP_PREFIX
+        ):
             temp_captures += 1
             if temp_captures == 2:
                 if failure == "second-read-oserror":
                     raise OSError("C:/private/final attestation readback")
-                return real_capture(path) + b"altered"
-        return real_capture(path)
+                return real_read(handle) + b"altered"
+        return real_read(handle)
 
-    def record_final_replace(source_path, destination_path):
+    def record_final_replace(handle, parent_handle, destination_path):
         nonlocal final_replace_calls
-        if Path(destination_path) == output:
+        if Path(destination_path) == output.absolute():
             final_replace_calls += 1
-        return real_replace(source_path, destination_path)
+        return real_rename(handle, parent_handle, destination_path)
 
     monkeypatch.setattr(
-        build_windows_installer, "_capture_regular_file", fail_second_temp_capture
+        build_windows_installer, "_read_windows_file_handle", fail_second_temp_capture
     )
-    monkeypatch.setattr(build_windows_installer.os, "replace", record_final_replace)
+    monkeypatch.setattr(build_windows_installer, "_rename_windows_handle", record_final_replace)
 
     with pytest.raises(RuntimeError) as caught:
         build_windows_installer.write_attestation(
             output,
-            staged_release=staged,
-            installer_exe=setup,
-            toolchain_identity=_valid_toolchain_identity(),
+            compiled_installer=capability,
         )
 
     assert temp_captures == 2
@@ -3169,3 +3230,1088 @@ def test_stage_handle_lifecycle_is_leaf_to_root_exactly_once_and_leak_free(
 
     if outcome == "success":
         assert all(event[0] == "close" for event in events[terminal_index + 1 :])
+
+
+# Task 5C successor RED boundary. Each test below names a concrete authority or
+# lifecycle break from the independently approved successor addendum.
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows adopted-stage authority")
+def test_published_stage_is_adopted_and_rejects_postrename_byte_mutation(
+    monkeypatch, tmp_path
+):
+    source, _document, _members = _valid_zip(tmp_path)
+    stage_parent = tmp_path / "adopted-stages"
+    real_publish = build_windows_installer._publish_windows_directory_handle
+    injected = False
+
+    def mutate_after_handle_publish(handle, parent_handle, destination, *args, **kwargs):
+        nonlocal injected
+        result = real_publish(handle, parent_handle, destination, *args, **kwargs)
+        module = Path(destination) / "PDFVectorImporter" / "module.py"
+        module.write_bytes(b"VALUE = 'post-rename mutation'\n")
+        injected = True
+        return result
+
+    monkeypatch.setattr(
+        build_windows_installer,
+        "_publish_windows_directory_handle",
+        mutate_after_handle_publish,
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        _stage(monkeypatch, tmp_path / "work", source, stage_parent=stage_parent)
+
+    assert injected is True
+    assert _assert_pathless(caught.value, tmp_path) == "INSTALLER_STAGE_TREE_INVALID"
+    assert source.is_file()
+    assert not any(
+        re.fullmatch(r"[0-9a-f]{64}", child.name)
+        for child in stage_parent.iterdir()
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows no-create stage lease")
+def test_ordinary_stage_lease_is_no_create_and_blocks_live_mutation(
+    monkeypatch, tmp_path
+):
+    acquire = getattr(build_windows_installer, "_acquire_windows_stage_read_lease", None)
+    validate = getattr(build_windows_installer, "_validate_windows_stage_read_lease", None)
+    release = getattr(build_windows_installer, "_release_windows_stage_read_lease", None)
+    assert callable(acquire), "ordinary no-create stage lease acquisition is required"
+    assert callable(validate), "ordinary stage lease validation is required"
+    assert callable(release), "ordinary stage lease release is required"
+    staged = _stage(monkeypatch, tmp_path / "stage")
+    lease = acquire(staged)
+    module = staged.source_dir / "module.py"
+    try:
+        with pytest.raises(OSError):
+            module.write_bytes(b"tampered while leased")
+        assert validate(lease)["package_version"] == PACKAGE_VERSION
+    finally:
+        release(lease)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows no-create stage lease")
+def test_ordinary_stage_lease_never_creates_a_missing_component(
+    monkeypatch, tmp_path
+):
+    acquire = getattr(build_windows_installer, "_acquire_windows_stage_read_lease", None)
+    assert callable(acquire), "ordinary no-create stage lease acquisition is required"
+    staged = _stage(monkeypatch, tmp_path / "stage")
+    missing_root = staged.stage_root / "missing-root"
+    missing = dataclasses.replace(
+        staged,
+        stage_root=missing_root,
+        source_dir=missing_root / "PDFVectorImporter",
+        source_zip_snapshot=(
+            missing_root / build_windows_installer._STAGE_METADATA_DIRNAME / ZIP_NAME
+        ),
+    )
+    creates = 0
+    real_create = build_windows_installer._nt_create_directory_handle
+
+    def record_create(*args, **kwargs):
+        nonlocal creates
+        creates += 1
+        return real_create(*args, **kwargs)
+
+    monkeypatch.setattr(
+        build_windows_installer, "_nt_create_directory_handle", record_create
+    )
+
+    with pytest.raises((build_windows_installer._UnsafePath, build_windows_installer._ChangedPath)):
+        acquire(missing)
+    assert creates == 0
+    assert not missing_root.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows least-privilege stage lease")
+def test_ordinary_stage_lease_opens_existing_directories_without_create_or_delete_rights(
+    monkeypatch, tmp_path
+):
+    acquire = getattr(build_windows_installer, "_acquire_windows_stage_read_lease", None)
+    release = getattr(build_windows_installer, "_release_windows_stage_read_lease", None)
+    assert callable(acquire) and callable(release)
+    staged = _stage(monkeypatch, tmp_path / "stage")
+    records: list[dict[str, int]] = []
+    real_relative = build_windows_installer._nt_relative_create
+
+    def record_relative(parent_handle, name, **kwargs):
+        records.append({"name": name, **kwargs})
+        return real_relative(parent_handle, name, **kwargs)
+
+    monkeypatch.setattr(build_windows_installer, "_nt_relative_create", record_relative)
+    lease = acquire(staged)
+    release(lease)
+
+    directory_records = [
+        item
+        for item in records
+        if item["create_options"] & build_windows_installer._FILE_DIRECTORY_FILE
+    ]
+    assert directory_records
+    for item in directory_records:
+        assert item["disposition"] == build_windows_installer._FILE_OPEN
+        assert item["share_access"] == (
+            build_windows_installer._FILE_SHARE_READ
+            | build_windows_installer._FILE_SHARE_WRITE
+        )
+        assert item["desired_access"] & (
+            build_windows_installer._FILE_ADD_FILE
+            | build_windows_installer._FILE_ADD_SUBDIRECTORY
+            | build_windows_installer._DELETE
+        ) == 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows supported filesystem gate")
+def test_ordinary_stage_lease_rejects_refs_without_mutation(monkeypatch, tmp_path):
+    acquire = getattr(build_windows_installer, "_acquire_windows_stage_read_lease", None)
+    assert callable(acquire), "ordinary no-create stage lease acquisition is required"
+    staged = _stage(monkeypatch, tmp_path / "stage")
+    monkeypatch.setattr(
+        build_windows_installer, "_query_windows_filesystem", lambda _handle: "REFS"
+    )
+    creates = 0
+
+    def forbid_create(*_args, **_kwargs):
+        nonlocal creates
+        creates += 1
+        raise AssertionError("ordinary lease must not create")
+
+    monkeypatch.setattr(
+        build_windows_installer, "_nt_create_directory_handle", forbid_create
+    )
+    with pytest.raises(build_windows_installer._NativeCapabilityError):
+        acquire(staged)
+    assert creates == 0
+    assert staged.stage_root.is_dir()
+
+
+def test_installer_stage_and_compiled_capabilities_are_exact_pathless_types(
+    monkeypatch, tmp_path
+):
+    staged = _stage(monkeypatch, tmp_path / "stage")
+    stage_repr = repr(staged)
+    assert "InstallerStage" in stage_repr
+    assert str(tmp_path) not in stage_repr
+    assert staged.stage_identity_sha256 not in stage_repr
+    compiled_type = getattr(build_windows_installer, "CompiledInstaller", None)
+    output_type = getattr(build_windows_installer, "_WindowsOutputLease", None)
+    stage_lease_type = getattr(build_windows_installer, "_WindowsStageReadLease", None)
+    assert all(isinstance(item, type) for item in (compiled_type, output_type, stage_lease_type))
+
+
+def test_canonical_compiled_output_identity_matches_fixed_vector():
+    builder = getattr(
+        build_windows_installer,
+        "_canonical_compiled_installer_identity_bytes",
+        None,
+    )
+    assert callable(builder), "canonical compiled-output identity builder is required"
+    encoded = builder(
+        setup_basename="FreeCAD-PDF-Importer-Setup_v1.2.3.exe",
+        setup_sha256="e" * 64,
+        setup_size=33,
+        stage_identity_sha256="d" * 64,
+        toolchain_identity={
+            "name": "Inno Setup",
+            "version": "6.7.1",
+            "source_sha256": "a" * 64,
+            "manifest_sha256": "b" * 64,
+            "tree_sha256": "c" * 64,
+        },
+    )
+    assert type(encoded) is bytes
+    assert len(encoded) == 653
+    assert hashlib.sha256(
+        b"BCS-FREECAD-COMPILED-INSTALLER-IDENTITY\0v1\0" + encoded
+    ).hexdigest() == "cb81e114f25e33a78a5f44d8b8cfbb8ea0e76fc1f09318cd7fec0b68cfe5e5eb"
+    assert encoded.endswith(b"\n")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows guarded compiler output")
+def test_compile_returns_capability_and_finalizer_returns_bound_loose_path(
+    monkeypatch, tmp_path
+):
+    staged = _stage(monkeypatch, tmp_path / "stage")
+    output_dir = tmp_path / "namespace" / "output"
+    capability, calls = _compile_capability(
+        monkeypatch,
+        tmp_path / "build",
+        staged,
+        output_dir=output_dir,
+        payload=b"bound setup bytes",
+    )
+    compiled_type = getattr(build_windows_installer, "CompiledInstaller", None)
+    assert compiled_type is not None and type(capability) is compiled_type
+    assert str(tmp_path) not in repr(capability)
+    expected = (
+        output_dir / f"FreeCAD-PDF-Importer-Setup_v{PACKAGE_VERSION}.exe"
+    ).absolute()
+    assert len(calls) == 1
+    with pytest.raises(OSError):
+        os.replace(output_dir, output_dir.with_name("renamed-output"))
+
+    assert build_windows_installer.finalize_compiled_installer(capability) == expected
+    assert expected.read_bytes() == b"bound setup bytes"
+    with pytest.raises(RuntimeError, match=r"^INSTALLER_COMPILER_INPUT_INVALID$"):
+        build_windows_installer.finalize_compiled_installer(capability)
+
+    renamed = output_dir.with_name("renamed-output")
+    os.replace(output_dir, renamed)
+    os.replace(renamed, output_dir)
+
+
+def _compiled_for_provenance(monkeypatch, tmp_path, provenance: str):
+    staged = _stage(monkeypatch, tmp_path / "stage")
+    output_dir = tmp_path / "namespace" / "output"
+    if provenance == "winner":
+        first, _calls = _compile_capability(
+            monkeypatch,
+            tmp_path / "first-build",
+            staged,
+            output_dir=output_dir,
+            payload=b"same setup bytes",
+        )
+        build_windows_installer.finalize_compiled_installer(first)
+    capability, calls = _compile_capability(
+        monkeypatch,
+        tmp_path / "second-build",
+        staged,
+        output_dir=output_dir,
+        payload=b"same setup bytes",
+    )
+    setup = output_dir / f"FreeCAD-PDF-Importer-Setup_v{PACKAGE_VERSION}.exe"
+    return capability, calls, output_dir, setup
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows retained output namespace")
+@pytest.mark.parametrize("provenance", ["owned", "winner"])
+def test_both_output_provenances_retain_parent_and_ancestor_path_binding(
+    monkeypatch, tmp_path, provenance
+):
+    capability, calls, output_dir, setup = _compiled_for_provenance(
+        monkeypatch, tmp_path / provenance, provenance
+    )
+    assert len(calls) == 1
+    ancestor = output_dir.parent
+    with pytest.raises(OSError):
+        os.replace(output_dir, output_dir.with_name("direct-parent-renamed"))
+    with pytest.raises(OSError):
+        os.replace(ancestor, ancestor.with_name("ancestor-renamed"))
+    assert setup.resolve(strict=True) == setup.absolute()
+    assert build_windows_installer.finalize_compiled_installer(capability) == setup.absolute()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows retained output namespace")
+@pytest.mark.parametrize("provenance", ["owned", "winner"])
+@pytest.mark.parametrize("changed_component", ["output", "namespace"])
+def test_output_parent_or_ancestor_alias_is_setup_unsafe_for_both_provenances(
+    monkeypatch, tmp_path, provenance, changed_component
+):
+    capability, _calls, output_dir, _setup = _compiled_for_provenance(
+        monkeypatch, tmp_path / provenance / changed_component, provenance
+    )
+    real_query = build_windows_installer._query_windows_opened_name
+    target = output_dir.name if changed_component == "output" else output_dir.parent.name
+
+    def aliased_name(handle):
+        actual = real_query(handle)
+        if actual == target:
+            return actual.upper() if actual.upper() != actual else actual.lower()
+        return actual
+
+    monkeypatch.setattr(build_windows_installer, "_query_windows_opened_name", aliased_name)
+    with pytest.raises(RuntimeError, match=r"^INSTALLER_SETUP_UNSAFE$"):
+        build_windows_installer.finalize_compiled_installer(capability)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows loose-winner collision")
+def test_loose_output_collision_reuses_exact_winner_and_preserves_conflict(
+    monkeypatch, tmp_path
+):
+    capability, calls, output_dir, setup = _compiled_for_provenance(
+        monkeypatch, tmp_path / "exact", "winner"
+    )
+    winner_bytes = setup.read_bytes()
+    assert len(calls) == 1
+    assert build_windows_installer.finalize_compiled_installer(capability) == setup.absolute()
+    assert setup.read_bytes() == winner_bytes
+    assert not list(output_dir.glob(".installer-output-*"))
+
+    conflict_stage = _stage(monkeypatch, tmp_path / "conflict-stage")
+    conflict_dir = tmp_path / "conflict-output"
+    conflict_dir.mkdir()
+    conflict = conflict_dir / f"FreeCAD-PDF-Importer-Setup_v{PACKAGE_VERSION}.exe"
+    conflict.write_bytes(b"foreign winner")
+    calls = []
+    monkeypatch.setattr(
+        build_windows_installer.subprocess,
+        "run",
+        _synthetic_compiler_runner(b"candidate bytes", calls),
+    )
+    with pytest.raises(RuntimeError, match=r"^INSTALLER_COMPILER_FAILED$"):
+        build_windows_installer.compile_installer(
+            tmp_path / "ISCC.exe",
+            conflict_stage,
+            toolchain_identity=_valid_toolchain_identity(),
+            output_dir=conflict_dir,
+        )
+    assert calls and conflict.read_bytes() == b"foreign winner"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows compiled finalization")
+@pytest.mark.parametrize(
+    ("failures", "expected"),
+    [
+        (("stage", "namespace", "bytes"), "INSTALLER_COMPILER_INPUT_INVALID"),
+        (("namespace", "bytes"), "INSTALLER_SETUP_UNSAFE"),
+        (("bytes",), "INSTALLER_SETUP_CHANGED"),
+    ],
+)
+def test_finalize_compiled_installer_uses_exact_failure_precedence_and_consumes(
+    monkeypatch, tmp_path, failures, expected
+):
+    required = (
+        "_validate_windows_stage_read_lease",
+        "_validate_windows_output_namespace",
+        "_validate_windows_output_bytes",
+    )
+    assert all(callable(getattr(build_windows_installer, name, None)) for name in required)
+    capability, _calls = _compile_capability(monkeypatch, tmp_path / "build")
+
+    if "stage" in failures:
+        monkeypatch.setattr(
+            build_windows_installer,
+            "_validate_windows_stage_read_lease",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                build_windows_installer._ChangedPath()
+            ),
+        )
+    if "namespace" in failures:
+        monkeypatch.setattr(
+            build_windows_installer,
+            "_validate_windows_output_namespace",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                build_windows_installer._UnsafePath()
+            ),
+        )
+    if "bytes" in failures:
+        monkeypatch.setattr(
+            build_windows_installer,
+            "_validate_windows_output_bytes",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                build_windows_installer._ChangedPath()
+            ),
+        )
+
+    with pytest.raises(RuntimeError, match=rf"^{expected}$"):
+        build_windows_installer.finalize_compiled_installer(capability)
+    with pytest.raises(RuntimeError, match=r"^INSTALLER_COMPILER_INPUT_INVALID$"):
+        build_windows_installer.finalize_compiled_installer(capability)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows attestation precedence")
+@pytest.mark.parametrize(
+    ("failures", "expected"),
+    [
+        (("stage", "namespace", "bytes", "binding"), "INSTALLER_ATTESTATION_INPUT_INVALID"),
+        (("namespace", "bytes", "binding"), "INSTALLER_SETUP_UNSAFE"),
+        (("bytes", "binding"), "INSTALLER_SETUP_CHANGED"),
+        (("binding",), "INSTALLER_ATTESTATION_INPUT_INVALID"),
+    ],
+)
+@pytest.mark.parametrize("provenance", ["owned", "winner"])
+def test_attestation_simultaneous_failure_precedence_is_exact(
+    monkeypatch, tmp_path, failures, expected, provenance
+):
+    required = (
+        "_validate_windows_stage_read_lease",
+        "_validate_windows_output_namespace",
+        "_validate_windows_output_bytes",
+        "_validate_compiled_installer_binding",
+    )
+    assert all(callable(getattr(build_windows_installer, name, None)) for name in required)
+    capability, _calls, _output_dir, _setup = _compiled_for_provenance(
+        monkeypatch, tmp_path / provenance, provenance
+    )
+    if "stage" in failures:
+        monkeypatch.setattr(
+            build_windows_installer,
+            "_validate_windows_stage_read_lease",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                build_windows_installer._ChangedPath()
+            ),
+        )
+    if "namespace" in failures:
+        monkeypatch.setattr(
+            build_windows_installer,
+            "_validate_windows_output_namespace",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                build_windows_installer._UnsafePath()
+            ),
+        )
+    if "bytes" in failures:
+        monkeypatch.setattr(
+            build_windows_installer,
+            "_validate_windows_output_bytes",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                build_windows_installer._ChangedPath()
+            ),
+        )
+    if "binding" in failures:
+        monkeypatch.setattr(
+            build_windows_installer,
+            "_validate_compiled_installer_binding",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                build_windows_installer._ChangedPath()
+            ),
+        )
+
+    with pytest.raises(RuntimeError, match=rf"^{expected}$"):
+        build_windows_installer.write_attestation(
+            tmp_path / "attestation.json", compiled_installer=capability
+        )
+    assert not (tmp_path / "attestation.json").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows output close lifecycle")
+@pytest.mark.parametrize("provenance", ["owned", "winner"])
+@pytest.mark.parametrize("finalizer", ["plain", "attestation"])
+def test_output_parent_close_failure_is_exactly_once_nonoverriding(
+    monkeypatch, tmp_path, provenance, finalizer
+):
+    capability, _calls, output_dir, setup = _compiled_for_provenance(
+        monkeypatch, tmp_path / provenance / finalizer, provenance
+    )
+    real_close = build_windows_installer._close_windows_entry
+    failed_roles: list[str] = []
+
+    def fail_one_parent_close(entry):
+        if not failed_roles and entry.role in {
+            "output-parent",
+            "output-ancestor",
+            "output-anchor",
+        }:
+            failed_roles.append(entry.role)
+            build_windows_installer._force_close_windows_handle(entry.handle)
+            entry.closed = True
+            raise OSError("synthetic parent close failure")
+        return real_close(entry)
+
+    monkeypatch.setattr(build_windows_installer, "_close_windows_entry", fail_one_parent_close)
+    if finalizer == "plain":
+        assert build_windows_installer.finalize_compiled_installer(capability) == setup.absolute()
+    else:
+        attestation = tmp_path / provenance / finalizer / "attestation.json"
+        assert build_windows_installer.write_attestation(
+            attestation, compiled_installer=capability
+        ) == attestation.absolute()
+    assert len(failed_roles) == 1
+    renamed = output_dir.with_name("output-after-close")
+    os.replace(output_dir, renamed)
+    os.replace(renamed, output_dir)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle-bound attestation")
+def test_attestation_temp_cannot_be_path_substituted_before_same_handle_commit(
+    monkeypatch, tmp_path
+):
+    capability, _calls = _compile_capability(monkeypatch, tmp_path / "build")
+    output = tmp_path / "attestation.json"
+    replacement = tmp_path / "replacement.json"
+    replacement.write_bytes(b"attacker bytes")
+    real_rename = build_windows_installer._rename_windows_handle
+    blocked = False
+
+    def attempt_substitution(handle, parent_handle, destination):
+        nonlocal blocked
+        if Path(destination) == output.absolute():
+            temporary = output.parent / build_windows_installer._query_windows_opened_name(
+                handle
+            )
+            try:
+                os.replace(replacement, temporary)
+            except OSError:
+                blocked = True
+            else:
+                raise AssertionError("attestation temp pathname was substitutable")
+        return real_rename(handle, parent_handle, destination)
+
+    monkeypatch.setattr(build_windows_installer, "_rename_windows_handle", attempt_substitution)
+    assert build_windows_installer.write_attestation(
+        output, compiled_installer=capability
+    ) == output.absolute()
+    assert blocked is True
+    assert replacement.read_bytes() == b"attacker bytes"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows attestation winner handling")
+def test_attestation_exact_winner_reuses_and_different_winner_is_preserved(
+    monkeypatch, tmp_path
+):
+    output = tmp_path / "attestation.json"
+    first, _calls = _compile_capability(monkeypatch, tmp_path / "first-build")
+    assert build_windows_installer.write_attestation(
+        output, compiled_installer=first
+    ) == output.absolute()
+    exact_bytes = output.read_bytes()
+
+    second, _calls = _compile_capability(monkeypatch, tmp_path / "second-build")
+    assert build_windows_installer.write_attestation(
+        output, compiled_installer=second
+    ) == output.absolute()
+    assert output.read_bytes() == exact_bytes
+
+    output.write_bytes(b"foreign attestation winner")
+    third, _calls = _compile_capability(monkeypatch, tmp_path / "third-build")
+    with pytest.raises(RuntimeError, match=r"^INSTALLER_ATTESTATION_PUBLISH_ERROR$"):
+        build_windows_installer.write_attestation(
+            output, compiled_installer=third
+        )
+    assert output.read_bytes() == b"foreign attestation winner"
+
+
+def test_hostile_capabilities_and_path_protocols_are_rejected_without_execution(
+    tmp_path,
+):
+    class Hostile:
+        def __getattribute__(self, _name):
+            raise AssertionError("hostile capability attribute executed")
+
+        def __fspath__(self):
+            raise AssertionError("hostile fspath executed")
+
+    hostile = Hostile()
+    with pytest.raises(RuntimeError, match=r"^INSTALLER_COMPILER_INPUT_INVALID$"):
+        build_windows_installer.finalize_compiled_installer(hostile)
+    with pytest.raises(RuntimeError, match=r"^INSTALLER_ATTESTATION_INPUT_INVALID$"):
+        build_windows_installer.write_attestation(
+            tmp_path / "attestation.json", compiled_installer=hostile
+        )
+    with pytest.raises(RuntimeError, match=r"^INSTALLER_ATTESTATION_INPUT_INVALID$"):
+        build_windows_installer.write_attestation(
+            hostile, compiled_installer=hostile
+        )
+
+
+def test_main_consumes_compiled_capability_without_attestation(monkeypatch, tmp_path):
+    staged = _stage(monkeypatch, tmp_path / "stage")
+    capability = object()
+    setup = tmp_path / "Setup.exe"
+    finalize_calls: list[object] = []
+    monkeypatch.setattr(sys, "argv", ["build_windows_installer.py"])
+    monkeypatch.setattr(build_windows_installer, "find_iscc", lambda _path: tmp_path / "ISCC.exe")
+    monkeypatch.setattr(
+        build_windows_installer,
+        "verify_inno_toolchain",
+        lambda *_args: _valid_toolchain_identity(),
+    )
+    monkeypatch.setattr(build_windows_installer, "stage_release", lambda *_args, **_kwargs: staged)
+    monkeypatch.setattr(
+        build_windows_installer,
+        "compile_installer",
+        lambda *_args, **_kwargs: capability,
+    )
+
+    def finalize(value):
+        finalize_calls.append(value)
+        return setup
+
+    monkeypatch.setattr(
+        build_windows_installer,
+        "finalize_compiled_installer",
+        finalize,
+        raising=False,
+    )
+    assert build_windows_installer.main() == 0
+    assert finalize_calls == [capability]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows compiler handle choreography")
+def test_guarded_compiler_uses_exact_native_access_share_matrix(
+    monkeypatch, tmp_path
+):
+    staged = _stage(monkeypatch, tmp_path / "stage")
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    setup_name = f"FreeCAD-PDF-Importer-Setup_v{PACKAGE_VERSION}.exe"
+    native_calls: list[tuple[str, int, int, int, int]] = []
+    process_calls: list[list[str]] = []
+    real_relative_create = build_windows_installer._nt_relative_create
+
+    def record_relative_create(parent_handle, name, **kwargs):
+        native_calls.append(
+            (
+                str(name),
+                kwargs["desired_access"],
+                kwargs["share_access"],
+                kwargs["disposition"],
+                kwargs["create_options"],
+            )
+        )
+        return real_relative_create(parent_handle, name, **kwargs)
+
+    synthetic = _synthetic_compiler_runner(b"guarded setup", process_calls)
+
+    def run(command, **kwargs):
+        assert kwargs["check"] is True
+        assert kwargs["cwd"] == REPO_ROOT
+        assert kwargs["close_fds"] is True
+        return synthetic(command, **kwargs)
+
+    monkeypatch.setattr(
+        build_windows_installer, "_nt_relative_create", record_relative_create
+    )
+    monkeypatch.setattr(build_windows_installer.subprocess, "run", run)
+
+    capability = build_windows_installer.compile_installer(
+        tmp_path / "ISCC.exe",
+        staged,
+        toolchain_identity=_valid_toolchain_identity(),
+        output_dir=output_dir,
+    )
+
+    root_call = next(
+        call
+        for call in native_calls
+        if call[0].startswith(build_windows_installer._OUTPUT_TEMP_PREFIX)
+    )
+    guard_call = next(
+        call
+        for call in native_calls
+        if call[0] == setup_name and call[3] == build_windows_installer._FILE_CREATE
+    )
+    reader_call = next(
+        call
+        for call in native_calls
+        if call[0] == setup_name and call[3] == build_windows_installer._FILE_OPEN
+    )
+    assert root_call[1:4] == (0x001100A3, 0x3, build_windows_installer._FILE_CREATE)
+    assert guard_call[1:4] == (0x00110080, 0x3, build_windows_installer._FILE_CREATE)
+    assert reader_call[1:4] == (0x00100081, 0x5, build_windows_installer._FILE_OPEN)
+    assert len(process_calls) == 1
+    build_windows_installer.finalize_compiled_installer(capability)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows compiler lease boundary")
+def test_compiler_holds_stage_lease_and_binds_completed_writer_bytes(
+    monkeypatch, tmp_path
+):
+    staged = _stage(monkeypatch, tmp_path / "stage")
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    mutation_blocked = False
+    process_calls: list[list[str]] = []
+    synthetic = _synthetic_compiler_runner(b"captured writer bytes", process_calls)
+
+    def run(command, **kwargs):
+        nonlocal mutation_blocked
+        try:
+            (staged.source_dir / "module.py").write_bytes(b"late mutation")
+        except OSError:
+            mutation_blocked = True
+        else:
+            raise AssertionError("retained stage lease admitted a late writer")
+        return synthetic(command, **kwargs)
+
+    monkeypatch.setattr(build_windows_installer.subprocess, "run", run)
+    capability = build_windows_installer.compile_installer(
+        tmp_path / "ISCC.exe",
+        staged,
+        toolchain_identity=_valid_toolchain_identity(),
+        output_dir=output_dir,
+    )
+
+    assert mutation_blocked is True
+    assert capability.setup_bytes == b"captured writer bytes"
+    identity = json.loads(capability.output_identity_bytes)
+    assert identity["setup_size"] == len(b"captured writer bytes")
+    assert identity["setup_sha256"] == hashlib.sha256(
+        b"captured writer bytes"
+    ).hexdigest()
+    assert not ({"pid", "process", "writer", "executable"} & set(identity))
+    build_windows_installer.finalize_compiled_installer(capability)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows guarded compiler output")
+def test_compiler_temp_root_collision_is_foreign_and_invokes_no_process(
+    monkeypatch, tmp_path
+):
+    staged = _stage(monkeypatch, tmp_path / "stage")
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    token = "4" * 32
+    collision = output_dir / (build_windows_installer._OUTPUT_TEMP_PREFIX + token)
+    collision.mkdir()
+    marker = collision / "foreign.bin"
+    marker.write_bytes(b"foreign root")
+    calls: list[object] = []
+
+    class FixedUUID:
+        hex = token
+
+    monkeypatch.setattr(build_windows_installer.uuid, "uuid4", lambda: FixedUUID())
+    monkeypatch.setattr(
+        build_windows_installer.subprocess,
+        "run",
+        lambda *_args, **_kwargs: calls.append(object()),
+    )
+
+    with pytest.raises(RuntimeError, match=r"^INSTALLER_COMPILER_FAILED$"):
+        build_windows_installer.compile_installer(
+            tmp_path / "ISCC.exe",
+            staged,
+            toolchain_identity=_valid_toolchain_identity(),
+            output_dir=output_dir,
+        )
+    assert calls == []
+    assert marker.read_bytes() == b"foreign root"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows guarded compiler output")
+@pytest.mark.parametrize("failure", ["compiler", "extra-output", "hardlink"])
+def test_compiler_output_failures_preserve_only_owned_handle_bound_residue(
+    monkeypatch, tmp_path, failure
+):
+    staged = _stage(monkeypatch, tmp_path / "stage")
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    process_calls: list[list[str]] = []
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"outside sentinel")
+
+    if failure == "compiler":
+        def run(command, **_kwargs):
+            process_calls.append(list(command))
+            raise subprocess.CalledProcessError(1, command)
+    else:
+        def after_write(setup):
+            if failure == "extra-output":
+                (setup.parent / "foreign-extra.bin").write_bytes(b"foreign extra")
+            else:
+                try:
+                    os.link(setup, setup.parent / "foreign-hardlink.exe")
+                except OSError:
+                    pytest.skip("hardlink creation unavailable")
+
+        run = _synthetic_compiler_runner(
+            b"candidate setup", process_calls, after_write=after_write
+        )
+    monkeypatch.setattr(build_windows_installer.subprocess, "run", run)
+
+    with pytest.raises(RuntimeError, match=r"^INSTALLER_COMPILER_FAILED$"):
+        build_windows_installer.compile_installer(
+            tmp_path / "ISCC.exe",
+            staged,
+            toolchain_identity=_valid_toolchain_identity(),
+            output_dir=output_dir,
+        )
+    assert len(process_calls) == 1
+    assert outside.read_bytes() == b"outside sentinel"
+    assert not list(output_dir.glob(f"FreeCAD-PDF-Importer-Setup_v{PACKAGE_VERSION}.exe"))
+    residue = list(output_dir.glob(build_windows_installer._OUTPUT_TEMP_PREFIX + "*"))
+    if failure == "compiler":
+        assert residue == []
+    else:
+        assert len(residue) == 1
+        assert any(path.name.startswith("foreign-") for path in residue[0].iterdir())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows compiler close lifecycle")
+@pytest.mark.parametrize("role", ["output-guard", "output-root"])
+def test_compiler_terminal_output_close_failure_preserves_root_and_stops_rename(
+    monkeypatch, tmp_path, role
+):
+    staged = _stage(monkeypatch, tmp_path / "stage")
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    real_close = build_windows_installer._close_windows_entry
+    failed: list[str] = []
+    rename_calls: list[Path] = []
+
+    def fail_compiler(command, **_kwargs):
+        raise subprocess.CalledProcessError(1, command)
+
+    def fail_selected_close(entry):
+        if not failed and entry.role == role:
+            failed.append(role)
+            build_windows_installer._force_close_windows_handle(entry.handle)
+            entry.closed = True
+            raise OSError("synthetic terminal close failure")
+        return real_close(entry)
+
+    def record_rename(handle, parent_handle, destination):
+        rename_calls.append(Path(destination))
+        return build_windows_installer._rename_windows_handle(
+            handle, parent_handle, destination
+        )
+
+    monkeypatch.setattr(build_windows_installer.subprocess, "run", fail_compiler)
+    monkeypatch.setattr(build_windows_installer, "_close_windows_entry", fail_selected_close)
+    original_rename = build_windows_installer._rename_windows_handle
+    monkeypatch.setattr(
+        build_windows_installer,
+        "_rename_windows_handle",
+        lambda handle, parent_handle, destination: (
+            rename_calls.append(Path(destination)),
+            original_rename(handle, parent_handle, destination),
+        )[1],
+    )
+
+    with pytest.raises(RuntimeError, match=r"^INSTALLER_COMPILER_FAILED$"):
+        build_windows_installer.compile_installer(
+            tmp_path / "ISCC.exe",
+            staged,
+            toolchain_identity=_valid_toolchain_identity(),
+            output_dir=output_dir,
+        )
+    assert failed == [role]
+    assert rename_calls == []
+    assert len(list(output_dir.glob(build_windows_installer._OUTPUT_TEMP_PREFIX + "*"))) == 1
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows compiler publication residue")
+def test_successful_loose_publication_never_recursively_traverses_temp_residue(
+    monkeypatch, tmp_path
+):
+    output_dir = tmp_path / "output"
+    real_dispose = build_windows_installer._dispose_windows_file_handle
+    recursive_calls: list[object] = []
+
+    def leave_root(handle):
+        try:
+            if build_windows_installer._query_windows_attribute_tag(handle)[0] & (
+                build_windows_installer._FILE_ATTRIBUTE_DIRECTORY
+            ):
+                return False
+        except Exception:
+            pass
+        return real_dispose(handle)
+
+    monkeypatch.setattr(build_windows_installer, "_dispose_windows_file_handle", leave_root)
+    monkeypatch.setattr(
+        build_windows_installer.shutil,
+        "rmtree",
+        lambda *_args, **_kwargs: recursive_calls.append(object()),
+    )
+    capability, _calls = _compile_capability(
+        monkeypatch, tmp_path / "build", output_dir=output_dir
+    )
+    setup = build_windows_installer.finalize_compiled_installer(capability)
+
+    assert setup.is_file()
+    assert recursive_calls == []
+    assert len(list(output_dir.glob(build_windows_installer._OUTPUT_TEMP_PREFIX + "*"))) == 1
+
+
+def test_workflow_and_finalizer_share_the_exact_loose_setup_path_contract():
+    workflow = (REPO_ROOT / ".github" / "workflows" / "auto-release.yml").read_text(
+        encoding="utf-8"
+    )
+    assert '$base = "FreeCAD-PDF-Importer-Setup_v$version"' in workflow
+    assert "$first = Join-Path 'dist/repro-a' ($base + '.exe')" in workflow
+    assert "$second = Join-Path 'dist/repro-b' ($base + '.exe')" in workflow
+    assert "--output-dir dist/repro-a" in workflow
+    assert "--output-dir dist/repro-b" in workflow
+    assert "Copy-Item -LiteralPath $first" in workflow
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows sealed capability lifecycle")
+@pytest.mark.parametrize("raise_inside", [False, True])
+def test_compiled_capability_context_releases_leaf_parent_chain_then_stage_once(
+    monkeypatch, tmp_path, raise_inside
+):
+    capability, _calls = _compile_capability(monkeypatch, tmp_path / "build")
+    events: list[str] = []
+    real_close = build_windows_installer._close_windows_entry
+
+    def record_close(entry):
+        events.append(entry.role)
+        return real_close(entry)
+
+    monkeypatch.setattr(build_windows_installer, "_close_windows_entry", record_close)
+    if raise_inside:
+        with pytest.raises(ValueError, match="caller failure"):
+            with capability:
+                raise ValueError("caller failure")
+    else:
+        with capability:
+            pass
+
+    with pytest.raises(RuntimeError, match=r"^INSTALLER_COMPILER_INPUT_INVALID$"):
+        build_windows_installer.finalize_compiled_installer(capability)
+    output_leaf = min(
+        index
+        for index, role in enumerate(events)
+        if role in {"output-reader", "output-guard", "output-winner"}
+    )
+    output_parent = min(
+        index
+        for index, role in enumerate(events)
+        if role in {"output-parent", "output-ancestor", "output-anchor"}
+    )
+    stage = min(index for index, role in enumerate(events) if role.startswith("stage-"))
+    assert output_leaf < output_parent < stage
+    assert len(events) == len(set(events))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows capability cross-binding")
+def test_mixed_compiled_capability_is_consumed_and_rejected_before_attestation(
+    monkeypatch, tmp_path
+):
+    first, _calls = _compile_capability(monkeypatch, tmp_path / "first")
+    second, _calls = _compile_capability(monkeypatch, tmp_path / "second")
+    mixed = dataclasses.replace(first, output_lease=second.output_lease)
+    output = tmp_path / "mixed.json"
+
+    with pytest.raises(RuntimeError, match=r"^INSTALLER_ATTESTATION_INPUT_INVALID$"):
+        build_windows_installer.write_attestation(
+            output, compiled_installer=mixed
+        )
+    assert not output.exists()
+    build_windows_installer.finalize_compiled_installer(first)
+    build_windows_installer.finalize_compiled_installer(second)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows attestation temp identity")
+@pytest.mark.parametrize("identity_failure", ["link-count", "file-id-high-half"])
+def test_attestation_temp_requires_full_identity_and_single_link(
+    monkeypatch, tmp_path, identity_failure
+):
+    capability, _calls = _compile_capability(monkeypatch, tmp_path / "build")
+    output = tmp_path / "attestation.json"
+    real_links = build_windows_installer._query_windows_link_count
+    real_metadata = build_windows_installer._windows_handle_metadata
+
+    def is_attestation_temp(handle):
+        return build_windows_installer._query_windows_opened_name(handle).startswith(
+            build_windows_installer._ATTESTATION_TEMP_PREFIX
+        )
+
+    def changed_links(handle):
+        if identity_failure == "link-count" and is_attestation_temp(handle):
+            return 2
+        return real_links(handle)
+
+    def changed_metadata(handle):
+        metadata = real_metadata(handle)
+        if identity_failure == "file-id-high-half" and is_attestation_temp(handle):
+            return dataclasses.replace(
+                metadata,
+                file_id=metadata.file_id[:8]
+                + bytes([metadata.file_id[8] ^ 1])
+                + metadata.file_id[9:],
+            )
+        return metadata
+
+    monkeypatch.setattr(build_windows_installer, "_query_windows_link_count", changed_links)
+    monkeypatch.setattr(build_windows_installer, "_windows_handle_metadata", changed_metadata)
+    with pytest.raises(RuntimeError, match=r"^INSTALLER_ATTESTATION_IO_ERROR$"):
+        build_windows_installer.write_attestation(
+            output, compiled_installer=capability
+        )
+    assert not output.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows attestation collision cleanup")
+@pytest.mark.parametrize(
+    ("winner", "cleanup_succeeds", "expected"),
+    [
+        ("exact", False, "INSTALLER_ATTESTATION_IO_ERROR"),
+        ("different", True, "INSTALLER_ATTESTATION_PUBLISH_ERROR"),
+        ("different", False, "INSTALLER_ATTESTATION_PUBLISH_ERROR"),
+        ("noncollision", True, "INSTALLER_ATTESTATION_PUBLISH_ERROR"),
+        ("noncollision", False, "INSTALLER_ATTESTATION_PUBLISH_ERROR"),
+    ],
+)
+def test_attestation_collision_and_publish_tokens_do_not_overwrite(
+    monkeypatch, tmp_path, winner, cleanup_succeeds, expected
+):
+    output = tmp_path / "attestation.json"
+    first, _calls = _compile_capability(monkeypatch, tmp_path / "first")
+    if winner == "exact":
+        build_windows_installer.write_attestation(output, compiled_installer=first)
+    else:
+        build_windows_installer.finalize_compiled_installer(first)
+        if winner == "different":
+            output.write_bytes(b"foreign winner")
+    original = output.read_bytes() if output.exists() else None
+    capability, _calls = _compile_capability(monkeypatch, tmp_path / "candidate")
+    real_dispose = build_windows_installer._dispose_windows_file_handle
+    real_rename = build_windows_installer._rename_windows_handle
+
+    def dispose(handle):
+        if build_windows_installer._query_windows_opened_name(handle).startswith(
+            build_windows_installer._ATTESTATION_TEMP_PREFIX
+        ):
+            return cleanup_succeeds and real_dispose(handle)
+        return real_dispose(handle)
+
+    def rename(handle, parent_handle, destination):
+        if winner == "noncollision" and Path(destination) == output.absolute():
+            raise OSError("synthetic noncollision failure")
+        return real_rename(handle, parent_handle, destination)
+
+    monkeypatch.setattr(build_windows_installer, "_dispose_windows_file_handle", dispose)
+    monkeypatch.setattr(build_windows_installer, "_rename_windows_handle", rename)
+
+    with pytest.raises(RuntimeError, match=rf"^{expected}$"):
+        build_windows_installer.write_attestation(
+            output, compiled_installer=capability
+        )
+    if original is None:
+        assert not output.exists()
+    else:
+        assert output.read_bytes() == original
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows attestation winner lifecycle")
+def test_attestation_exact_winner_is_held_through_temp_cleanup_and_consumption(
+    monkeypatch, tmp_path
+):
+    output = tmp_path / "attestation.json"
+    first, _calls = _compile_capability(monkeypatch, tmp_path / "first")
+    build_windows_installer.write_attestation(output, compiled_installer=first)
+    capability, _calls = _compile_capability(monkeypatch, tmp_path / "second")
+    events: list[str] = []
+    real_relative_create = build_windows_installer._nt_relative_create
+    real_dispose = build_windows_installer._dispose_windows_file_handle
+    real_close = build_windows_installer._close_windows_entry
+
+    def relative_create(parent_handle, name, **kwargs):
+        handle = real_relative_create(parent_handle, name, **kwargs)
+        if (
+            str(name) == output.name
+            and kwargs["disposition"] == build_windows_installer._FILE_OPEN
+        ):
+            events.append("winner-open")
+        return handle
+
+    def dispose(handle):
+        if build_windows_installer._query_windows_opened_name(handle).startswith(
+            build_windows_installer._ATTESTATION_TEMP_PREFIX
+        ):
+            events.append("temp-dispose")
+        return real_dispose(handle)
+
+    def close(entry):
+        if entry.role == "attestation-winner":
+            events.append("winner-close")
+        elif entry.role.startswith("output-") or entry.role.startswith("stage-"):
+            events.append("capability-close")
+        return real_close(entry)
+
+    monkeypatch.setattr(build_windows_installer, "_nt_relative_create", relative_create)
+    monkeypatch.setattr(build_windows_installer, "_dispose_windows_file_handle", dispose)
+    monkeypatch.setattr(build_windows_installer, "_close_windows_entry", close)
+
+    assert build_windows_installer.write_attestation(
+        output, compiled_installer=capability
+    ) == output.absolute()
+    assert events.count("winner-open") == 1
+    assert events.count("winner-close") == 1
+    assert events.index("winner-open") < events.index("temp-dispose")
+    assert events.index("temp-dispose") < events.index("capability-close")
+    assert events.index("capability-close") < events.index("winner-close")

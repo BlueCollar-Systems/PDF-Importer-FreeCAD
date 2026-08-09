@@ -537,7 +537,7 @@ def _cleanup_owned(
     except Exception:
         return False
 
-    attempts = 12
+    attempts = 80
     for attempt in range(attempts):
         parent_handle = None
         child_handle = None

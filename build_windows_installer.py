@@ -78,6 +78,7 @@ _STAGE_NOTIFY_FILTER = (
     | _FILE_NOTIFY_CHANGE_SECURITY
 )
 _ERROR_IO_PENDING = 997
+_ERROR_IO_INCOMPLETE = 996
 _ERROR_OPERATION_ABORTED = 995
 _ERROR_NOT_FOUND = 1168
 _WAIT_OBJECT_0 = 0
@@ -196,8 +197,12 @@ class _WindowsStageMonitor:
     overlapped: object
     buffer: object
     bytes_returned: object
+    queued: bool = False
     active: bool = True
     event_closed: bool = False
+
+
+_WINDOWS_STAGE_MONITOR_TERMINAL_OWNERS: list[_WindowsStageMonitor] = []
 
 
 @dataclass
@@ -2479,6 +2484,7 @@ def _queue_windows_stage_monitor(monitor: _WindowsStageMonitor) -> None:
     )
     if not queued and ctypes.get_last_error() != _ERROR_IO_PENDING:
         raise ctypes.WinError(ctypes.get_last_error())
+    monitor.queued = True
 
 
 def _cancel_windows_stage_monitor(
@@ -2609,7 +2615,11 @@ def _windows_stage_monitor_result(monitor: _WindowsStageMonitor) -> tuple[bool, 
 
 
 def _validate_windows_stage_monitor(monitor: _WindowsStageMonitor) -> None:
-    if type(monitor) is not _WindowsStageMonitor or not monitor.active:
+    if (
+        type(monitor) is not _WindowsStageMonitor
+        or not monitor.active
+        or not monitor.queued
+    ):
         raise _ChangedPath
     wait_result = _wait_windows_stage_monitor(monitor, 0)
     if wait_result == _WAIT_TIMEOUT:
@@ -2622,38 +2632,102 @@ def _validate_windows_stage_monitor(monitor: _WindowsStageMonitor) -> None:
     raise _NativeCapabilityError
 
 
+def _retain_windows_stage_monitor_terminal_owner(
+    monitor: _WindowsStageMonitor,
+) -> None:
+    if all(owner is not monitor for owner in _WINDOWS_STAGE_MONITOR_TERMINAL_OWNERS):
+        _WINDOWS_STAGE_MONITOR_TERMINAL_OWNERS.append(monitor)
+
+
+def _discard_windows_stage_monitor_terminal_owner(
+    monitor: _WindowsStageMonitor,
+) -> None:
+    _WINDOWS_STAGE_MONITOR_TERMINAL_OWNERS[:] = [
+        owner
+        for owner in _WINDOWS_STAGE_MONITOR_TERMINAL_OWNERS
+        if owner is not monitor
+    ]
+
+
+def _observe_windows_stage_monitor_terminal(
+    monitor: _WindowsStageMonitor,
+    *,
+    cancellation_expected: bool,
+) -> tuple[bool, Exception | None]:
+    try:
+        succeeded, result = _windows_stage_monitor_result(monitor)
+    except Exception:
+        return False, _NativeCapabilityError()
+    if succeeded:
+        return True, _ChangedPath()
+    if result == _ERROR_IO_INCOMPLETE:
+        return False, _NativeCapabilityError()
+    if result == _ERROR_OPERATION_ABORTED and cancellation_expected:
+        return True, None
+    return True, _NativeCapabilityError()
+
+
 def _release_windows_stage_monitor(monitor: _WindowsStageMonitor) -> None:
-    """Cancel, prove completion, and close one monitor exactly once."""
+    """Prove overlapped completion before closing one monitor exactly once."""
 
     if type(monitor) is not _WindowsStageMonitor or not monitor.active:
         return
-    first_error: Exception | None = None
-    wait_before = _wait_windows_stage_monitor(monitor, 0)
-    if wait_before == _WAIT_OBJECT_0:
-        first_error = _ChangedPath()
-    elif wait_before != _WAIT_TIMEOUT:
-        first_error = _NativeCapabilityError()
-
     monitor.active = False
-    cancelled, cancel_error = _cancel_windows_stage_monitor(monitor)
-    if not cancelled and cancel_error != _ERROR_NOT_FOUND and first_error is None:
-        first_error = _NativeCapabilityError()
+    first_error: Exception | None = None
+    completion_proven = not monitor.queued
 
-    if cancelled:
-        wait_after = _wait_windows_stage_monitor(monitor, 5000)
-        if wait_after != _WAIT_OBJECT_0:
-            if first_error is None:
+    if monitor.queued:
+        try:
+            wait_before = _wait_windows_stage_monitor(monitor, 0)
+        except Exception:
+            wait_before = None
+            first_error = _NativeCapabilityError()
+        if wait_before == _WAIT_OBJECT_0:
+            completion_proven, result_error = _observe_windows_stage_monitor_terminal(
+                monitor,
+                cancellation_expected=False,
+            )
+            if result_error is not None and first_error is None:
+                first_error = result_error
+        elif wait_before != _WAIT_TIMEOUT and first_error is None:
+            first_error = _NativeCapabilityError()
+
+        if not completion_proven:
+            try:
+                cancelled, cancel_error = _cancel_windows_stage_monitor(monitor)
+            except Exception:
+                cancelled, cancel_error = False, 0
+            if not cancelled and first_error is None:
                 first_error = _NativeCapabilityError()
-        else:
-            succeeded, result = _windows_stage_monitor_result(monitor)
-            if succeeded:
+            try:
+                wait_after = _wait_windows_stage_monitor(monitor, 5000)
+            except Exception:
+                wait_after = None
                 if first_error is None:
-                    first_error = _ChangedPath()
-            elif result != _ERROR_OPERATION_ABORTED and first_error is None:
+                    first_error = _NativeCapabilityError()
+            if wait_after == _WAIT_OBJECT_0:
+                completion_proven, result_error = (
+                    _observe_windows_stage_monitor_terminal(
+                        monitor,
+                        cancellation_expected=cancelled,
+                    )
+                )
+                if result_error is not None and first_error is None:
+                    first_error = result_error
+            elif first_error is None:
                 first_error = _NativeCapabilityError()
-    elif cancel_error == _ERROR_NOT_FOUND and first_error is None:
-        first_error = _NativeCapabilityError()
+            if not cancelled and cancel_error == _ERROR_NOT_FOUND and first_error is None:
+                first_error = _NativeCapabilityError()
 
+    if not completion_proven:
+        # Closing either handle before the OVERLAPPED request reaches a
+        # terminal result would permit native code to outlive its Python
+        # buffer. Keep the complete monitor authority alive for process life.
+        _retain_windows_stage_monitor_terminal_owner(monitor)
+        raise first_error or _NativeCapabilityError()
+
+    monitor.queued = False
+    _discard_windows_stage_monitor_terminal_owner(monitor)
     try:
         _close_windows_entry(monitor.entry)
     except Exception as exc:
@@ -2671,6 +2745,15 @@ def _release_windows_stage_monitor(monitor: _WindowsStageMonitor) -> None:
         raise first_error
 
 
+def _release_windows_stage_monitor_nonraising(
+    monitor: _WindowsStageMonitor,
+) -> None:
+    try:
+        _release_windows_stage_monitor(monitor)
+    except Exception:
+        pass
+
+
 def _retire_windows_stage_monitor(lease: _WindowsStageReadLease) -> None:
     if (
         type(lease) is not _WindowsStageReadLease
@@ -2681,20 +2764,6 @@ def _retire_windows_stage_monitor(lease: _WindowsStageReadLease) -> None:
         raise _ChangedPath
     _validate_windows_stage_monitor(lease.monitor)
     _release_windows_stage_monitor(lease.monitor)
-
-
-def _abandon_windows_stage_monitor_nonraising(monitor: object) -> None:
-    """Force-close monitor authority after a terminal lifecycle failure."""
-
-    if type(monitor) is not _WindowsStageMonitor:
-        return
-    monitor.active = False
-    if not monitor.entry.closed:
-        _force_close_windows_handle(monitor.entry.handle)
-        monitor.entry.closed = True
-    if not monitor.event_closed:
-        _force_close_windows_handle(monitor.event_handle)
-        monitor.event_closed = True
 
 
 def _handoff_windows_stage_monitor(lease: _WindowsStageReadLease) -> None:
@@ -2725,8 +2794,7 @@ def _handoff_windows_stage_monitor(lease: _WindowsStageReadLease) -> None:
     try:
         _release_windows_stage_monitor(retiring)
     except Exception:
-        _abandon_windows_stage_monitor_nonraising(successor)
-        _abandon_windows_stage_monitor_nonraising(retiring)
+        _release_windows_stage_monitor_nonraising(successor)
         raise
 
 
@@ -3867,6 +3935,7 @@ def write_attestation(
                 raise RuntimeError("INSTALLER_ATTESTATION_PUBLISH_ERROR") from None
             try:
                 _validate_windows_stage_read_lease(compiled_installer.stage_lease)
+                _retire_windows_stage_monitor(compiled_installer.stage_lease)
             except Exception:
                 _consume_compiled_installer(compiled_installer)
                 _close_windows_entries_nonraising([winner])
@@ -3888,7 +3957,23 @@ def write_attestation(
         _consume_compiled_installer(compiled_installer)
         raise RuntimeError("INSTALLER_ATTESTATION_PUBLISH_ERROR") from None
 
-    # The same-handle non-replacing rename above is the last fallible success commit.
+    # Publication precedes the physically required terminal notification
+    # decision. If that decision observes a stage event or cannot prove native
+    # completion, delete only this newly owned attestation through its retained
+    # handle; a pre-existing winner is never dispositioned here.
+    try:
+        _retire_windows_stage_monitor(compiled_installer.stage_lease)
+    except Exception:
+        cleaned = _cleanup_windows_attestation_temp(temporary)
+        _close_windows_entries_nonraising(reversed(parent_chain))
+        _consume_compiled_installer(compiled_installer)
+        token = (
+            "INSTALLER_ATTESTATION_INPUT_INVALID"
+            if cleaned
+            else "INSTALLER_ATTESTATION_IO_ERROR"
+        )
+        raise RuntimeError(token) from None
+
     _close_windows_entries_nonraising([temporary])
     _close_windows_entries_nonraising(reversed(parent_chain))
     _consume_compiled_installer(compiled_installer)

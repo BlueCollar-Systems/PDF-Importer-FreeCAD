@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -20,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import build_release
-from scripts.smoke_release_zip import validate_release_zip_manifest
+from scripts.smoke_release_zip import validate_release_zip_manifest_bytes
 
 
 REPO_ROOT = Path(__file__).parent.resolve()
@@ -94,6 +96,10 @@ class _UnsafePath(Exception):
 
 
 class _ChangedPath(Exception):
+    pass
+
+
+class _TempCollision(Exception):
     pass
 
 
@@ -364,34 +370,218 @@ def validate_installer_payload_tree(
         return ["MANIFEST_IO_ERROR"]
 
 
-def _remove_owned_no_follow(path: Path) -> None:
-    try:
-        metadata = os.lstat(path)
-    except FileNotFoundError:
-        return
-    if _is_link_or_reparse(path, metadata) or not stat.S_ISDIR(metadata.st_mode):
-        os.unlink(path)
-        return
-    with os.scandir(path) as entries:
-        children = [Path(entry.path) for entry in entries]
-    for child in children:
-        _remove_owned_no_follow(child)
-    os.rmdir(path)
+def _windows_handle_metadata(handle) -> tuple[int, int, int]:
+    """Return volume, file ID, and file type for an already-open Windows handle."""
+
+    from ctypes import wintypes
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        ]
+
+    information = _ByHandleFileInformation()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    function = kernel32.GetFileInformationByHandle
+    function.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ByHandleFileInformation)]
+    function.restype = wintypes.BOOL
+    if not function(handle, ctypes.byref(information)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    file_id = (int(information.nFileIndexHigh) << 32) | int(
+        information.nFileIndexLow
+    )
+    file_type = (
+        stat.S_IFDIR
+        if int(information.dwFileAttributes) & stat.FILE_ATTRIBUTE_DIRECTORY
+        else stat.S_IFREG
+    )
+    return int(information.dwVolumeSerialNumber), file_id, file_type
 
 
-def _cleanup_owned(path: Path, parent_chain) -> None:
+def _open_windows_no_follow(
+    path: Path, access: int, *, share_delete: bool = True
+):
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    function = kernel32.CreateFileW
+    function.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    function.restype = wintypes.HANDLE
+    share_mode = 0x00000001 | 0x00000002
+    if share_delete:
+        share_mode |= 0x00000004
+    handle = function(
+        os.fspath(path),
+        access,
+        share_mode,
+        None,
+        3,
+        0x02000000 | 0x00200000,
+        None,
+    )
+    invalid = wintypes.HANDLE(-1).value
+    if handle == invalid:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return handle
+
+
+def _close_windows_handle(handle) -> None:
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    function = kernel32.CloseHandle
+    function.argtypes = [wintypes.HANDLE]
+    function.restype = wintypes.BOOL
+    function(handle)
+
+
+def _dispose_windows_file_handle(handle) -> bool:
+    from ctypes import wintypes
+
+    class _FileDispositionInfo(ctypes.Structure):
+        _fields_ = [("DeleteFile", wintypes.BOOLEAN)]
+
+    information = _FileDispositionInfo(True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    function = kernel32.SetFileInformationByHandle
+    function.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    function.restype = wintypes.BOOL
+    return bool(
+        function(
+            handle,
+            4,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        )
+    )
+
+
+def _quarantine_windows_handle(handle, parent_handle, destination: Path) -> bool:
+    from ctypes import wintypes
+
+    name = os.fspath(destination)
+
+    class _FileRenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("ReplaceIfExists", wintypes.BOOLEAN),
+            ("RootDirectory", wintypes.HANDLE),
+            ("FileNameLength", wintypes.DWORD),
+            ("FileName", wintypes.WCHAR * len(name)),
+        ]
+
+    information = _FileRenameInfo()
+    information.ReplaceIfExists = False
+    information.RootDirectory = None
+    information.FileNameLength = len(name.encode("utf-16-le"))
+    information.FileName = name
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    function = kernel32.SetFileInformationByHandle
+    function.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    function.restype = wintypes.BOOL
+    return bool(
+        function(
+            handle,
+            3,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        )
+    )
+
+
+def _cleanup_owned(
+    path: Path,
+    parent_chain: tuple[tuple[Path, tuple[int, int, int]], ...],
+    owned_identity: tuple[int, int, int],
+) -> bool:
+    """Remove/quarantine only the exact entry proven through one open handle."""
+
+    if os.name != "nt" or not parent_chain:
+        return False
+    path = _absolute_lexical(path)
+    parent = path.parent
+    if parent_chain[-1][0] != parent:
+        return False
     try:
-        _revalidate_chain(parent_chain)
-        _remove_owned_no_follow(path)
+        if _directory_chain(parent) != parent_chain:
+            return False
+        if not _assert_exact_child(parent, path.name, allow_absent=False):
+            return False
     except Exception:
+        return False
+
+    for _attempt in range(4):
+        parent_handle = None
+        child_handle = None
         try:
-            _revalidate_chain(parent_chain)
-            quarantine = path.parent / (
-                _STAGE_QUARANTINE_PREFIX + uuid.uuid4().hex
+            parent_handle = _open_windows_no_follow(
+                parent,
+                0x00000001 | 0x00000020 | 0x00000080 | 0x00100000,
+                share_delete=False,
             )
-            os.replace(path, quarantine)
+            child_handle = _open_windows_no_follow(
+                path, 0x00010000 | 0x00000080 | 0x00100000
+            )
+            _parent_volume, parent_file_id, parent_type = _windows_handle_metadata(
+                parent_handle
+            )
+            _child_volume, child_file_id, child_type = _windows_handle_metadata(
+                child_handle
+            )
+            if (
+                parent_file_id != parent_chain[-1][1][1]
+                or parent_type != parent_chain[-1][1][2]
+                or child_file_id != owned_identity[1]
+                or child_type != owned_identity[2]
+            ):
+                return False
+            if child_type == stat.S_IFREG:
+                if _dispose_windows_file_handle(child_handle):
+                    return True
+            elif child_type == stat.S_IFDIR:
+                quarantine = parent / (
+                    _STAGE_QUARANTINE_PREFIX + uuid.uuid4().hex
+                )
+                if _quarantine_windows_handle(
+                    child_handle, parent_handle, quarantine
+                ):
+                    return True
+            else:
+                return False
         except Exception:
             pass
+        finally:
+            if child_handle is not None:
+                _close_windows_handle(child_handle)
+            if parent_handle is not None:
+                _close_windows_handle(parent_handle)
+    return False
 
 
 def _create_owned_directory(parent: Path, name: str) -> Path:
@@ -514,6 +704,31 @@ def _exact_stage_closure(staged_release: InstallerStage) -> None:
         raise _ChangedPath
 
 
+def _release_zip_member_map(
+    snapshot_bytes: bytes, *, artifact_name: str
+) -> tuple[dict[str, bytes] | None, list[str]]:
+    """Validate and read one immutable ZIP value without reopening a pathname."""
+
+    if type(snapshot_bytes) is not bytes:
+        return None, ["RELEASE_ZIP_IO_ERROR"]
+    problems = _closed_release_zip_codes(
+        validate_release_zip_manifest_bytes(
+            snapshot_bytes,
+            artifact_name=artifact_name,
+        )
+    )
+    if problems:
+        return None, problems
+    try:
+        with zipfile.ZipFile(io.BytesIO(snapshot_bytes), "r") as archive:
+            members = {info.filename: archive.read(info) for info in archive.infolist()}
+    except zipfile.BadZipFile:
+        return None, ["RELEASE_ZIP_CORRUPT"]
+    except Exception:
+        return None, ["RELEASE_ZIP_IO_ERROR"]
+    return members, []
+
+
 def _validate_stage_exact(
     staged_release: InstallerStage,
     *,
@@ -523,27 +738,13 @@ def _validate_stage_exact(
         raise _ChangedPath
     if (
         type(staged_release.candidate_manifest_bytes) is not bytes
-        or not isinstance(staged_release.version, str)
+        or type(staged_release.version) is not str
+        or type(staged_release.source_zip_name) is not str
         or _DIGEST.fullmatch(staged_release.source_zip_sha256) is None
         or _DIGEST.fullmatch(staged_release.installed_manifest_sha256) is None
         or _DIGEST.fullmatch(staged_release.stage_identity_sha256) is None
         or type(staged_release.source_zip_size) is not int
         or staged_release.source_zip_size < 0
-    ):
-        raise _ChangedPath
-
-    document, problems = _CANDIDATE_MANIFEST.parse_candidate_file_manifest(
-        staged_release.candidate_manifest_bytes
-    )
-    if problems or document is None:
-        raise _ChangedPath
-    manifest_digest = _CANDIDATE_MANIFEST.candidate_manifest_sha256(document)
-    identity = _stage_identity(manifest_digest, staged_release.source_zip_sha256)
-    if (
-        manifest_digest != staged_release.installed_manifest_sha256
-        or identity != staged_release.stage_identity_sha256
-        or document.get("package_version") != staged_release.version
-        or document.get("artifact_name") != staged_release.source_zip_name
     ):
         raise _ChangedPath
 
@@ -569,10 +770,38 @@ def _validate_stage_exact(
         or hashlib.sha256(snapshot).hexdigest() != staged_release.source_zip_sha256
     ):
         raise _ChangedPath
-    zip_problems = _closed_release_zip_codes(
-        validate_release_zip_manifest(expected_snapshot)
+    members, zip_problems = _release_zip_member_map(
+        snapshot,
+        artifact_name=staged_release.source_zip_name,
     )
     if zip_problems:
+        raise _ChangedPath
+    if members is None:
+        raise _ChangedPath
+    manifest_bytes = members.get(MANIFEST_MEMBER)
+    if (
+        type(manifest_bytes) is not bytes
+        or manifest_bytes != staged_release.candidate_manifest_bytes
+    ):
+        raise _ChangedPath
+    document, problems = _CANDIDATE_MANIFEST.parse_candidate_file_manifest(
+        staged_release.candidate_manifest_bytes
+    )
+    if problems or document is None:
+        raise _ChangedPath
+    member_problems = _CANDIDATE_MANIFEST.validate_candidate_archive_members(
+        document, members
+    )
+    if member_problems:
+        raise _ChangedPath
+    manifest_digest = _CANDIDATE_MANIFEST.candidate_manifest_sha256(document)
+    identity = _stage_identity(manifest_digest, staged_release.source_zip_sha256)
+    if (
+        manifest_digest != staged_release.installed_manifest_sha256
+        or identity != staged_release.stage_identity_sha256
+        or document.get("package_version") != staged_release.version
+        or document.get("artifact_name") != staged_release.source_zip_name
+    ):
         raise _ChangedPath
     manifest_path = expected_source / MANIFEST_MEMBER.removeprefix(
         "PDFVectorImporter/"
@@ -588,6 +817,44 @@ def _validate_stage_exact(
     return document
 
 
+def _canonical_toolchain_identity(value: object) -> dict[str, str]:
+    keys = (
+        "name",
+        "version",
+        "source_sha256",
+        "manifest_sha256",
+        "tree_sha256",
+    )
+    if type(value) is not dict or set(value) != set(keys):
+        raise _ChangedPath
+    result: dict[str, str] = {}
+    for key in keys:
+        item = value[key]
+        if type(item) is not str:
+            raise _ChangedPath
+        result[key] = item
+    for key in ("source_sha256", "manifest_sha256", "tree_sha256"):
+        if _DIGEST.fullmatch(result[key]) is None:
+            raise _ChangedPath
+    _canonical_json_bytes(result)
+    return result
+
+
+def _raise_with_cleanup(
+    token: str,
+    *,
+    cleanup_token: str,
+    path: Path,
+    parent_chain: tuple[tuple[Path, tuple[int, int, int]], ...],
+    owned_identity: tuple[int, int, int] | None,
+) -> None:
+    if owned_identity is not None and not _cleanup_owned(
+        path, parent_chain, owned_identity
+    ):
+        token = cleanup_token
+    raise RuntimeError(token) from None
+
+
 def write_attestation(
     output_path: str | Path,
     *,
@@ -599,43 +866,46 @@ def write_attestation(
 
     try:
         document = _validate_stage_exact(staged_release)
-        if not isinstance(toolchain_identity, dict):
-            raise _ChangedPath
     except Exception:
         raise RuntimeError("INSTALLER_ATTESTATION_INPUT_INVALID") from None
 
     try:
         setup_path = _absolute_lexical(installer_exe)
         setup_bytes = _capture_regular_file(setup_path)
+        if _capture_regular_file(setup_path) != setup_bytes:
+            raise _ChangedPath
     except _UnsafePath:
         raise RuntimeError("INSTALLER_SETUP_UNSAFE") from None
-    except _ChangedPath:
-        raise RuntimeError("INSTALLER_SETUP_CHANGED") from None
     except Exception:
         raise RuntimeError("INSTALLER_SETUP_CHANGED") from None
 
-    payload = {
-        "schema": "bcs.freecad_installer_attestation/1.1",
-        "source_commit": document["source_commit"],
-        "stage_identity_sha256": staged_release.stage_identity_sha256,
-        "source_zip": {
-            "name": staged_release.source_zip_name,
-            "size": staged_release.source_zip_size,
-            "sha256": staged_release.source_zip_sha256,
-        },
-        "installer": {
-            "name": setup_path.name,
-            "size": len(setup_bytes),
-            "sha256": hashlib.sha256(setup_bytes).hexdigest(),
-        },
-        "payload_manifest": {
-            "schema": document["schema"],
-            "member": MANIFEST_MEMBER,
-            "sha256": staged_release.installed_manifest_sha256,
-        },
-        "toolchain": dict(toolchain_identity),
-    }
-    encoded = _canonical_json_bytes(payload)
+    try:
+        canonical_toolchain = _canonical_toolchain_identity(toolchain_identity)
+        payload = {
+            "schema": "bcs.freecad_installer_attestation/1.1",
+            "source_commit": document["source_commit"],
+            "stage_identity_sha256": staged_release.stage_identity_sha256,
+            "source_zip": {
+                "name": staged_release.source_zip_name,
+                "size": staged_release.source_zip_size,
+                "sha256": staged_release.source_zip_sha256,
+            },
+            "installer": {
+                "name": setup_path.name,
+                "size": len(setup_bytes),
+                "sha256": hashlib.sha256(setup_bytes).hexdigest(),
+            },
+            "payload_manifest": {
+                "schema": document["schema"],
+                "member": MANIFEST_MEMBER,
+                "sha256": staged_release.installed_manifest_sha256,
+            },
+            "toolchain": canonical_toolchain,
+        }
+        encoded = _canonical_json_bytes(payload)
+    except Exception:
+        raise RuntimeError("INSTALLER_ATTESTATION_INPUT_INVALID") from None
+
     try:
         destination = _absolute_lexical(output_path)
         parent, parent_chain = _prepare_safe_directory(destination.parent)
@@ -655,41 +925,106 @@ def write_attestation(
         raise RuntimeError("INSTALLER_ATTESTATION_IO_ERROR") from None
 
     temporary = parent / (_ATTESTATION_TEMP_PREFIX + uuid.uuid4().hex)
+    owned_identity: tuple[int, int, int] | None = None
     try:
         if _assert_exact_child(parent, temporary.name, allow_absent=True):
+            raise _TempCollision
+        try:
+            stream = temporary.open("xb")
+        except FileExistsError:
+            raise _TempCollision from None
+        opened = os.fstat(stream.fileno())
+        owned_identity = _stat_identity(opened)
+        if (
+            stat.S_IFMT(opened.st_mode) != stat.S_IFREG
+            or int(getattr(opened, "st_nlink", 1)) != 1
+        ):
             raise _UnsafePath
-        with temporary.open("xb") as stream:
+        with stream:
             stream.write(encoded)
             stream.flush()
             os.fsync(stream.fileno())
-        if _capture_regular_file(temporary) != encoded:
+        if (
+            _stat_identity(os.lstat(temporary)) != owned_identity
+            or _capture_regular_file(temporary) != encoded
+        ):
             raise _ChangedPath
-        _validate_stage_exact(staged_release)
-        _revalidate_chain(parent_chain)
-    except Exception:
-        _cleanup_owned(temporary, parent_chain)
+    except _TempCollision:
         raise RuntimeError("INSTALLER_ATTESTATION_IO_ERROR") from None
+    except Exception:
+        _raise_with_cleanup(
+            "INSTALLER_ATTESTATION_IO_ERROR",
+            cleanup_token="INSTALLER_ATTESTATION_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
+
+    try:
+        _validate_stage_exact(staged_release)
+    except Exception:
+        _raise_with_cleanup(
+            "INSTALLER_ATTESTATION_INPUT_INVALID",
+            cleanup_token="INSTALLER_ATTESTATION_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
 
     try:
         if _capture_regular_file(setup_path) != setup_bytes:
             raise _ChangedPath
     except _UnsafePath:
-        _cleanup_owned(temporary, parent_chain)
-        raise RuntimeError("INSTALLER_SETUP_UNSAFE") from None
+        _raise_with_cleanup(
+            "INSTALLER_SETUP_UNSAFE",
+            cleanup_token="INSTALLER_ATTESTATION_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
     except Exception:
-        _cleanup_owned(temporary, parent_chain)
-        raise RuntimeError("INSTALLER_SETUP_CHANGED") from None
+        _raise_with_cleanup(
+            "INSTALLER_SETUP_CHANGED",
+            cleanup_token="INSTALLER_ATTESTATION_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
+
+    try:
+        _revalidate_chain(parent_chain)
+        if _assert_exact_child(parent, destination.name, allow_absent=True):
+            destination_metadata = os.lstat(destination)
+            if (
+                _is_link_or_reparse(destination, destination_metadata)
+                or not stat.S_ISREG(destination_metadata.st_mode)
+                or int(getattr(destination_metadata, "st_nlink", 1)) != 1
+            ):
+                raise _UnsafePath
+        if (
+            _stat_identity(os.lstat(temporary)) != owned_identity
+            or _capture_regular_file(temporary) != encoded
+        ):
+            raise _ChangedPath
+    except Exception:
+        _raise_with_cleanup(
+            "INSTALLER_ATTESTATION_INPUT_INVALID",
+            cleanup_token="INSTALLER_ATTESTATION_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
 
     try:
         os.replace(temporary, destination)
     except Exception:
-        _cleanup_owned(temporary, parent_chain)
-        raise RuntimeError("INSTALLER_ATTESTATION_PUBLISH_ERROR") from None
-    try:
-        if _capture_regular_file(destination) != encoded:
-            raise _ChangedPath
-    except Exception:
-        raise RuntimeError("INSTALLER_ATTESTATION_PUBLISH_ERROR") from None
+        _raise_with_cleanup(
+            "INSTALLER_ATTESTATION_PUBLISH_ERROR",
+            cleanup_token="INSTALLER_ATTESTATION_PUBLISH_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
     return destination
 
 
@@ -771,111 +1106,211 @@ def stage_release(
         raise RuntimeError("INSTALLER_STAGE_UNSAFE") from None
 
     temporary = stage_parent / (_STAGE_TEMP_PREFIX + uuid.uuid4().hex)
+    owned_identity: tuple[int, int, int] | None = None
     try:
         if _assert_exact_child(stage_parent, temporary.name, allow_absent=True):
-            raise _UnsafePath
-        os.mkdir(temporary)
+            raise _TempCollision
+        try:
+            os.mkdir(temporary)
+        except FileExistsError:
+            raise _TempCollision from None
         temp_metadata = os.lstat(temporary)
+        owned_identity = _stat_identity(temp_metadata)
         if _is_link_or_reparse(temporary, temp_metadata) or not stat.S_ISDIR(
             temp_metadata.st_mode
         ):
             raise _UnsafePath
+        _revalidate_chain(parent_chain)
+    except _TempCollision:
+        raise RuntimeError("INSTALLER_STAGE_UNSAFE") from None
+    except _UnsafePath:
+        _raise_with_cleanup(
+            "INSTALLER_STAGE_UNSAFE",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
+    except Exception:
+        _raise_with_cleanup(
+            "INSTALLER_STAGE_IO_ERROR",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
+
+    try:
         metadata_root = _create_owned_directory(temporary, _STAGE_METADATA_DIRNAME)
         snapshot_path = metadata_root / expected_name
-        source_size, source_digest = _copy_source_zip_snapshot(zip_path, snapshot_path)
-    except _UnsafePath:
-        _cleanup_owned(temporary, parent_chain)
-        raise RuntimeError("INSTALLER_SOURCE_UNSAFE") from None
-    except _ChangedPath:
-        _cleanup_owned(temporary, parent_chain)
-        raise RuntimeError("INSTALLER_SOURCE_CHANGED") from None
-    except Exception:
-        _cleanup_owned(temporary, parent_chain)
-        raise RuntimeError("INSTALLER_SOURCE_IO_ERROR") from None
-
-    try:
-        problems = _closed_release_zip_codes(
-            validate_release_zip_manifest(snapshot_path)
-        )
-    except Exception:
-        _cleanup_owned(temporary, parent_chain)
-        raise RuntimeError("INSTALLER_SOURCE_IO_ERROR") from None
-    if problems:
-        _cleanup_owned(temporary, parent_chain)
-        raise RuntimeError(
-            "INSTALLER_SOURCE_ZIP_INVALID: " + ", ".join(sorted(set(problems)))
-        )
-
-    try:
+        copied_size, copied_digest = _copy_source_zip_snapshot(zip_path, snapshot_path)
         snapshot_bytes = _capture_regular_file(snapshot_path)
-        if (
-            len(snapshot_bytes) != source_size
-            or hashlib.sha256(snapshot_bytes).hexdigest() != source_digest
-        ):
+        source_size = len(snapshot_bytes)
+        source_digest = hashlib.sha256(snapshot_bytes).hexdigest()
+        if source_size != copied_size or source_digest != copied_digest:
             raise _ChangedPath
-        with zipfile.ZipFile(snapshot_path, "r") as archive:
-            manifest_bytes = archive.read(MANIFEST_MEMBER)
-            document, parse_problems = (
-                _CANDIDATE_MANIFEST.parse_candidate_file_manifest(manifest_bytes)
+    except _UnsafePath:
+        _raise_with_cleanup(
+            "INSTALLER_SOURCE_UNSAFE",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
+    except _ChangedPath:
+        _raise_with_cleanup(
+            "INSTALLER_SOURCE_CHANGED",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
+    except Exception:
+        _raise_with_cleanup(
+            "INSTALLER_SOURCE_IO_ERROR",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
+
+    try:
+        members, problems = _release_zip_member_map(
+            snapshot_bytes,
+            artifact_name=expected_name,
+        )
+    except Exception:
+        _raise_with_cleanup(
+            "INSTALLER_SOURCE_IO_ERROR",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
+    if problems:
+        _raise_with_cleanup(
+            "INSTALLER_SOURCE_ZIP_INVALID: " + ", ".join(sorted(set(problems))),
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
+    if members is None:
+        _raise_with_cleanup(
+            "INSTALLER_SOURCE_ZIP_INVALID: RELEASE_ZIP_IO_ERROR",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
+
+    try:
+        manifest_bytes = members[MANIFEST_MEMBER]
+        document, parse_problems = _CANDIDATE_MANIFEST.parse_candidate_file_manifest(
+            manifest_bytes
+        )
+        if parse_problems or document is None:
+            invalid_codes = sorted(
+                set(parse_problems or ["MANIFEST_INVALID_DOCUMENT"])
             )
-            if parse_problems or document is None:
-                codes = sorted(set(parse_problems or ["MANIFEST_INVALID_DOCUMENT"]))
-                raise RuntimeError(
-                    "INSTALLER_SOURCE_ZIP_INVALID: " + ", ".join(codes)
-                )
+        else:
+            invalid_codes = _CANDIDATE_MANIFEST.validate_candidate_archive_members(
+                document, members
+            )
             if (
                 document.get("package_version") != version
                 or document.get("artifact_name") != expected_name
             ):
-                raise RuntimeError(
-                    "INSTALLER_SOURCE_ZIP_INVALID: MANIFEST_INVALID_IDENTITY"
+                invalid_codes = sorted(
+                    {*invalid_codes, "MANIFEST_INVALID_IDENTITY"}
                 )
-            installed_manifest_sha256 = (
-                _CANDIDATE_MANIFEST.candidate_manifest_sha256(document)
-            )
-            stage_identity_sha256 = _stage_identity(
-                installed_manifest_sha256, source_digest
-            )
-            source_dir = _create_owned_directory(temporary, "PDFVectorImporter")
-            manifest_relative = MANIFEST_MEMBER.removeprefix("PDFVectorImporter/")
-            _write_owned_member(source_dir, manifest_relative, manifest_bytes)
-            for record in document["files"]:
-                relative = record["path"]
-                payload = archive.read("PDFVectorImporter/" + relative)
-                _write_owned_member(source_dir, relative, payload)
-    except RuntimeError as exc:
-        _cleanup_owned(temporary, parent_chain)
-        if str(exc).startswith("INSTALLER_SOURCE_ZIP_INVALID"):
-            raise
-        raise RuntimeError("INSTALLER_STAGE_IO_ERROR") from None
-    except (zipfile.BadZipFile, _ChangedPath):
-        _cleanup_owned(temporary, parent_chain)
-        raise RuntimeError("INSTALLER_SOURCE_CHANGED") from None
-    except _UnsafePath:
-        _cleanup_owned(temporary, parent_chain)
-        raise RuntimeError("INSTALLER_STAGE_UNSAFE") from None
     except Exception:
-        _cleanup_owned(temporary, parent_chain)
-        raise RuntimeError("INSTALLER_STAGE_IO_ERROR") from None
+        invalid_codes = ["MANIFEST_IO_ERROR"]
+        document = None
+    if invalid_codes or document is None:
+        _raise_with_cleanup(
+            "INSTALLER_SOURCE_ZIP_INVALID: "
+            + ", ".join(sorted(set(invalid_codes))),
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
+
+    installed_manifest_sha256 = _CANDIDATE_MANIFEST.candidate_manifest_sha256(
+        document
+    )
+    stage_identity_sha256 = _stage_identity(
+        installed_manifest_sha256, source_digest
+    )
+    try:
+        source_dir = _create_owned_directory(temporary, "PDFVectorImporter")
+        manifest_relative = MANIFEST_MEMBER.removeprefix("PDFVectorImporter/")
+        _write_owned_member(source_dir, manifest_relative, manifest_bytes)
+        for record in document["files"]:
+            relative = record["path"]
+            _write_owned_member(
+                source_dir,
+                relative,
+                members["PDFVectorImporter/" + relative],
+            )
+    except _UnsafePath:
+        _raise_with_cleanup(
+            "INSTALLER_STAGE_UNSAFE",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
+    except Exception:
+        _raise_with_cleanup(
+            "INSTALLER_STAGE_IO_ERROR",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
 
     tree_problems = validate_installer_payload_tree(document, source_dir)
     if tree_problems:
-        _cleanup_owned(temporary, parent_chain)
-        raise RuntimeError(
+        _raise_with_cleanup(
             "INSTALLER_STAGE_TREE_INVALID: "
-            + ", ".join(sorted(set(tree_problems)))
+            + ", ".join(sorted(set(tree_problems))),
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
         )
     try:
         if _read_package_version(source_dir / "package.xml") != version:
             raise _ChangedPath
-        if _closed_release_zip_codes(validate_release_zip_manifest(snapshot_path)):
-            raise _ChangedPath
-        snapshot_bytes = _capture_regular_file(snapshot_path)
+    except Exception:
+        _raise_with_cleanup(
+            "INSTALLER_STAGE_IO_ERROR",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
+
+    try:
+        final_snapshot_bytes = _capture_regular_file(snapshot_path)
         if (
-            len(snapshot_bytes) != source_size
-            or hashlib.sha256(snapshot_bytes).hexdigest() != source_digest
+            final_snapshot_bytes != snapshot_bytes
+            or len(final_snapshot_bytes) != source_size
+            or hashlib.sha256(final_snapshot_bytes).hexdigest() != source_digest
         ):
             raise _ChangedPath
+    except Exception:
+        _raise_with_cleanup(
+            "INSTALLER_SOURCE_CHANGED",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
+
+    try:
         temporary_stage = InstallerStage(
             version=version,
             stage_root=temporary,
@@ -890,8 +1325,13 @@ def stage_release(
         )
         _validate_stage_exact(temporary_stage, require_identity_name=False)
     except Exception:
-        _cleanup_owned(temporary, parent_chain)
-        raise RuntimeError("INSTALLER_STAGE_TREE_INVALID") from None
+        _raise_with_cleanup(
+            "INSTALLER_STAGE_TREE_INVALID",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
 
     final_root = stage_parent / stage_identity_sha256
     final_stage = InstallerStage(
@@ -913,15 +1353,26 @@ def stage_release(
             stage_parent, stage_identity_sha256, allow_absent=True
         )
     except Exception:
-        _cleanup_owned(temporary, parent_chain)
-        raise RuntimeError("INSTALLER_STAGE_UNSAFE") from None
+        _raise_with_cleanup(
+            "INSTALLER_STAGE_UNSAFE",
+            cleanup_token="INSTALLER_STAGE_IO_ERROR",
+            path=temporary,
+            parent_chain=parent_chain,
+            owned_identity=owned_identity,
+        )
     if target_exists:
         try:
             _validate_stage_exact(final_stage)
         except Exception:
-            _cleanup_owned(temporary, parent_chain)
-            raise RuntimeError("INSTALLER_STAGE_CONFLICT") from None
-        _cleanup_owned(temporary, parent_chain)
+            _raise_with_cleanup(
+                "INSTALLER_STAGE_CONFLICT",
+                cleanup_token="INSTALLER_STAGE_IO_ERROR",
+                path=temporary,
+                parent_chain=parent_chain,
+                owned_identity=owned_identity,
+            )
+        if not _cleanup_owned(temporary, parent_chain, owned_identity):
+            raise RuntimeError("INSTALLER_STAGE_IO_ERROR") from None
     else:
         try:
             os.replace(temporary, final_root)
@@ -931,12 +1382,22 @@ def stage_release(
                     stage_parent, stage_identity_sha256, allow_absent=True
                 ):
                     _validate_stage_exact(final_stage)
-                    _cleanup_owned(temporary, parent_chain)
+                    if not _cleanup_owned(
+                        temporary, parent_chain, owned_identity
+                    ):
+                        raise _ChangedPath
                 else:
                     raise _ChangedPath
             except Exception:
-                _cleanup_owned(temporary, parent_chain)
-                raise RuntimeError("INSTALLER_STAGE_PUBLISH_ERROR") from None
+                _raise_with_cleanup(
+                    "INSTALLER_STAGE_PUBLISH_ERROR",
+                    cleanup_token="INSTALLER_STAGE_PUBLISH_ERROR",
+                    path=temporary,
+                    parent_chain=parent_chain,
+                    owned_identity=owned_identity,
+                )
+        else:
+            owned_identity = None
 
     try:
         _validate_stage_exact(final_stage)

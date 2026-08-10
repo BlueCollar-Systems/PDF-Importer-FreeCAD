@@ -2144,10 +2144,8 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
         ):
             raise RuntimeError("created SVG text entity IDs could not be verified")
         current_objects = list(getattr(doc, "Objects", []) or [])
-        if any(
-            not any(candidate is host_obj for candidate in current_objects)
-            for host_obj in owned
-        ):
+        live_object_ids = {id(candidate) for candidate in current_objects}
+        if any(id(host_obj) not in live_object_ids for host_obj in owned):
             raise RuntimeError("created SVG text host object is not live")
         if parent_group is not None:
             if hasattr(parent_group, "Group"):
@@ -2156,10 +2154,8 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 group_objects = list(parent_group.objects or [])
             else:
                 raise RuntimeError("SVG text parent group membership is unverifiable")
-            if any(
-                not any(candidate is host_obj for candidate in group_objects)
-                for host_obj in owned
-            ):
+            group_object_ids = {id(candidate) for candidate in group_objects}
+            if any(id(host_obj) not in group_object_ids for host_obj in owned):
                 raise RuntimeError("created SVG text entity is not in its parent group")
         if len(owned) != len(child_source_ids):
             raise RuntimeError("created SVG text child identity count is invalid")

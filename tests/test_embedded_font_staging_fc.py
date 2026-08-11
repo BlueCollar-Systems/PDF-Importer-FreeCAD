@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -1655,6 +1656,47 @@ def test_staged_font_sha_mismatch_is_invalid(tmp_path):
     assert path is None
     assert results[0]["outcome"] == "invalid"
     assert results[0]["reason"] == "staged_font_sha256_mismatch"
+
+
+def test_staged_font_sha_memo_reuses_hash_for_unchanged_path(tmp_path, monkeypatch):
+    staged_path = tmp_path / "font.otf"
+    payload = b"exact-font-bytes"
+    staged_path.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    record = {
+        "path": str(staged_path),
+        "sha256": digest,
+        "source": "pdf_embedded",
+        "xref": 7,
+    }
+    opts = core.ImportOptions()
+    _set_completed_font_session(opts, records={"siwaregular": record})
+    reads = {"count": 0}
+    original = Path.read_bytes
+
+    def counting_read(self):
+        if self.resolve() == staged_path.resolve():
+            reads["count"] += 1
+        return original(self)
+
+    monkeypatch.setattr(Path, "read_bytes", counting_read)
+
+    first, _ = core._resolve_shapestring_font_path_with_evidence(
+        "Siwa-Regular",
+        opts,
+        pdf_sha256=PDF_SHA_A,
+        page_number=1,
+    )
+    second, _ = core._resolve_shapestring_font_path_with_evidence(
+        "Siwa-Regular",
+        opts,
+        pdf_sha256=PDF_SHA_A,
+        page_number=1,
+    )
+
+    assert first == str(staged_path)
+    assert second == str(staged_path)
+    assert reads["count"] == 1
 
 
 def test_staged_record_lookup_exception_is_invalid_and_compatibility_wrapper_is_safe():

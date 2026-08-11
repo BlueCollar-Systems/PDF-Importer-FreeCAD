@@ -2457,6 +2457,41 @@ def _shapestring_font_cache_dir() -> Path:
         )
 
 
+def _verified_staged_font_sha256(
+    opts: Optional["ImportOptions"],
+    staged_path: Path,
+) -> str:
+    """Hash a staged font once per import while its path identity is unchanged.
+
+    Dense pages resolve the same staged TTF/OTF for every span. Re-reading and
+    re-hashing identical bytes is pure I/O. Identity is (resolved path, size,
+    mtime_ns); any identity change forces a fresh content hash. Mismatch against
+    the staged record remains a hard failure at the caller.
+    """
+    resolved = staged_path.resolve()
+    stat = resolved.stat()
+    identity = (str(resolved), int(stat.st_size), int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9))))
+    memo = None
+    if opts is not None:
+        memo = getattr(opts, "_staged_font_sha_memo", None)
+        if not isinstance(memo, dict):
+            memo = {}
+            opts._staged_font_sha_memo = memo
+        cached = memo.get(identity[0])
+        if (
+            isinstance(cached, tuple)
+            and len(cached) == 2
+            and cached[0] == identity
+            and isinstance(cached[1], str)
+            and re.fullmatch(r"[0-9a-f]{64}", cached[1])
+        ):
+            return cached[1]
+    digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    if memo is not None:
+        memo[identity[0]] = (identity, digest)
+    return digest
+
+
 def _stage_page_shapestring_fonts(
     pdf_doc,
     page,
@@ -2962,7 +2997,7 @@ def _resolve_shapestring_font_path_with_evidence(
                     path=path_value,
                     sha256=sha_value,
                 )]
-            actual_sha = hashlib.sha256(staged_path.read_bytes()).hexdigest()
+            actual_sha = _verified_staged_font_sha256(opts, staged_path)
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             return None, [source_result(
                 "embedded_font",

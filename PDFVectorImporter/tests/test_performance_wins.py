@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from pdfcadcore.ir_cache import cache_key, cache_path, clear_cache, load_ir, save_ir
+from pdfcadcore.ir_cache import cache_key, clear_cache, load_ir, save_ir
 from pdfcadcore.primitive_extractor import _append_linearized_cubic
 from pdfcadcore.primitives import NormalizedText, PageData, Primitive
 from pdfcadcore.streaming import iter_pages
@@ -135,7 +135,7 @@ class TestStreamingCache:
             par = list(iter_pages(str(path), parallel=True, max_workers=2, use_cache=False))
 
             assert len(seq) == len(par) == 3
-            for (ns, ds), (np, dp) in zip(seq, par):
+            for (ns, ds), (np, dp) in zip(seq, par, strict=True):
                 assert ns == np
                 assert len(ds.primitives) == len(dp.primitives)
                 assert len(ds.text_items) == len(dp.text_items)

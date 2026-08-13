@@ -124,6 +124,15 @@ jobs:
       - name: Run pdfcadcore unit tests
         run: python -m pytest tests/ -v
 
+      # PDFVectorImporter/tests was previously NOT executed by CI at all. That gap is
+      # how TestRotationCorrectedPageHeight sat red against correct product code for
+      # four weeks without a single red build, and how the circle_fit summation guard
+      # merged in #29 protected nothing until #30 moved it out. A guard CI does not
+      # execute is decoration. Kept as a separate step so a failure here is
+      # attributable at a glance rather than buried in the root suite's output.
+      - name: Run PDFVectorImporter unit tests
+        run: python -m pytest PDFVectorImporter/tests -v
+
       - name: Validate private validation schemas
         env:
           BCS_PRIVATE_VALIDATION_ROOT: ${{ secrets.BCS_PRIVATE_VALIDATION_ROOT }}

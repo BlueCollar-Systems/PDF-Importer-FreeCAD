@@ -131,10 +131,14 @@ jobs:
       # execute is decoration. Kept as a separate step so a failure here is
       # attributable at a glance rather than buried in the root suite's output.
       - name: Show which pdfcadcore these tests import
-        # Diagnostic that stays: the promotion oracle failed here while passing on a dev
-        # machine, and the cause candidates all reduce to "which copy of pdfcadcore did
-        # the interpreter actually load". One line settles that permanently.
-        run: python -c "import pdfcadcore, inspect; print('pdfcadcore ->', inspect.getfile(pdfcadcore))"
+        # Diagnostic that stays: the promotion oracle once failed here while passing on
+        # a dev machine, and diagnosing it reduced to "which copy of pdfcadcore did the
+        # interpreter load". Under pytest, PDFVectorImporter/tests/__init__.py makes
+        # pytest insert PDFVectorImporter/ on sys.path, so pdfcadcore resolves to the
+        # repo's own copy; a bare interpreter has no such insertion (this step proved
+        # that by failing with ModuleNotFoundError as first written). Mirror pytest's
+        # path so the printed file is the one the tests actually import.
+        run: python -c "import sys, inspect; sys.path.insert(0, 'PDFVectorImporter'); import pdfcadcore; print('pdfcadcore ->', inspect.getfile(pdfcadcore))"
 
       - name: Run PDFVectorImporter unit tests
         run: python -m pytest PDFVectorImporter/tests -v

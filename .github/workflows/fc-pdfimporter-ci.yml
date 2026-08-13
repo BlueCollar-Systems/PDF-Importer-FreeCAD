@@ -124,6 +124,25 @@ jobs:
       - name: Run pdfcadcore unit tests
         run: python -m pytest tests/ -v
 
+      # PDFVectorImporter/tests was previously NOT executed by CI at all. That gap is
+      # how TestRotationCorrectedPageHeight sat red against correct product code for
+      # four weeks without a single red build, and how the circle_fit summation guard
+      # merged in #29 protected nothing until #30 moved it out. A guard CI does not
+      # execute is decoration. Kept as a separate step so a failure here is
+      # attributable at a glance rather than buried in the root suite's output.
+      - name: Show which pdfcadcore these tests import
+        # Diagnostic that stays: the promotion oracle once failed here while passing on
+        # a dev machine, and diagnosing it reduced to "which copy of pdfcadcore did the
+        # interpreter load". Under pytest, PDFVectorImporter/tests/__init__.py makes
+        # pytest insert PDFVectorImporter/ on sys.path, so pdfcadcore resolves to the
+        # repo's own copy; a bare interpreter has no such insertion (this step proved
+        # that by failing with ModuleNotFoundError as first written). Mirror pytest's
+        # path so the printed file is the one the tests actually import.
+        run: python -c "import sys, inspect; sys.path.insert(0, 'PDFVectorImporter'); import pdfcadcore; print('pdfcadcore ->', inspect.getfile(pdfcadcore))"
+
+      - name: Run PDFVectorImporter unit tests
+        run: python -m pytest PDFVectorImporter/tests -v
+
       - name: Validate private validation schemas
         env:
           BCS_PRIVATE_VALIDATION_ROOT: ${{ secrets.BCS_PRIVATE_VALIDATION_ROOT }}

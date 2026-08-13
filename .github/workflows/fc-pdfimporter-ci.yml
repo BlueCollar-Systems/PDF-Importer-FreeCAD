@@ -130,6 +130,12 @@ jobs:
       # merged in #29 protected nothing until #30 moved it out. A guard CI does not
       # execute is decoration. Kept as a separate step so a failure here is
       # attributable at a glance rather than buried in the root suite's output.
+      - name: Show which pdfcadcore these tests import
+        # Diagnostic that stays: the promotion oracle failed here while passing on a dev
+        # machine, and the cause candidates all reduce to "which copy of pdfcadcore did
+        # the interpreter actually load". One line settles that permanently.
+        run: python -c "import pdfcadcore, inspect; print('pdfcadcore ->', inspect.getfile(pdfcadcore))"
+
       - name: Run PDFVectorImporter unit tests
         run: python -m pytest PDFVectorImporter/tests -v
 

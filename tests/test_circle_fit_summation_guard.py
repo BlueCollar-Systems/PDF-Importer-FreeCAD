@@ -26,11 +26,11 @@ from pdfcadcore import geometry_cleanup
 ACCUMULATORS = ("sx", "sy", "sx2", "sy2", "sxy", "sz", "sxz", "syz")
 
 _REASON = (
-    "On CPython >= 3.12 builtin sum() is Neumaier-compensated, so an explicit += loop is "
-    "measurably LESS accurate (0/400 bit-identical fits when this was measured; sum() beat "
-    "a manual loop 1809-0 against math.fsum). The perturbation feeds the arc/circle "
-    "promotion thresholds in promote_circular_primitives(), so this is a fidelity change, "
-    "not a constant-factor win. Landed once as 564f983, reverted as 5f0be3b."
+    "math.fsum is exactly rounded, so the fit is identical on every CPython version and "
+    "platform. builtin sum() is compensated only on >=3.12 and a += loop never is; on the "
+    "ill-conditioned oracle case (seed 81011 case 143) that difference shifts radius by "
+    "5.3e-2 and flips the promotion decision -- FreeCAD 3.11 and Blender 3.13 disagreed "
+    "about the same drawing. Landed as sum() twice; fsum ends the class."
 )
 
 
@@ -38,11 +38,23 @@ def _source() -> str:
     return inspect.getsource(geometry_cleanup.circle_fit)
 
 
-def test_every_accumulator_uses_builtin_sum():
+def test_every_accumulator_uses_fsum():
     body = _source()
     for name in ACCUMULATORS:
-        assert re.search(rf"^\s*{re.escape(name)}\s*=\s*sum\(", body, re.M), (
-            f"circle_fit accumulator {name!r} is no longer a builtin sum(). {_REASON}"
+        assert re.search(rf"^\s*{re.escape(name)}\s*=\s*math\.fsum\(", body, re.M), (
+            f"circle_fit accumulator {name!r} is no longer math.fsum(). {_REASON}"
+        )
+
+
+def test_builtin_sum_is_not_reintroduced():
+    # builtin sum() is compensated only on >=3.12, so it reintroduces the version
+    # dependence fsum exists to kill. Proven host-visible: oracle case 143 promotes on
+    # 3.12 and not on 3.11 under sum().
+    body = _source()
+    for name in ACCUMULATORS:
+        assert not re.search(rf"^\s*{re.escape(name)}\s*=\s*sum\(", body, re.M), (
+            f"circle_fit accumulator {name!r} regressed from math.fsum() to builtin "
+            f"sum(), which is version-dependent. {_REASON}"
         )
 
 
@@ -61,8 +73,8 @@ def test_rms_pass_uses_sum_too():
     # The rewrite replaced the RMS generator with its own accumulation loop; guarding only
     # the eight moment accumulators would let half of it back in.
     body = _source()
-    assert re.search(r"rms\s*=\s*math\.sqrt\(\s*sum\(", body), (
-        f"the RMS pass must stay a builtin sum() generator. {_REASON}"
+    assert re.search(r"rms\s*=\s*math\.sqrt\(\s*math\.fsum\(", body), (
+        f"the RMS pass must stay a math.fsum() generator. {_REASON}"
     )
     assert not re.search(r"^\s*rms\s*\+=", body, re.M), (
         f"circle_fit accumulates rms with += instead of sum(). {_REASON}"

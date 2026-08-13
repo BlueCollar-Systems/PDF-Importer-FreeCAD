@@ -1,0 +1,1134 @@
+{
+  "schema": "bcs.pdfcadcore.equivalence_harness/1.0",
+  "host_profile_id": "pdfcadcore_freecad_win_py3.12_default",
+  "corpus_schema": "bcs.pdfcadcore.corpus_manifest/1.0",
+  "created_at": "2026-08-13T16:32:16-0500",
+  "workloads": [
+    {
+      "workload_id": "1011_1of2",
+      "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\PDFTest Files\\1011 (1 OF 2) - Rev 0.pdf",
+      "category": "short",
+      "notes": "Single-page engineering detail",
+      "sha256_pdf": "e84a16bd2243277a523320aa276ce1207c2b80722e964b73e801200846eb4d94",
+      "status": "ok",
+      "wall_ms": 8173.1032,
+      "extract_ms": 1288.6107,
+      "host_build_ms": 0.0519,
+      "pages": [
+        {
+          "page_number": 1,
+          "digest": "74483481dedafc2d4fb7cbdd0d7d57a1b98607da323afe221f9f993d75ba52c5",
+          "summary": {
+            "primitive_count": 5649,
+            "text_count": 979,
+            "width": 914.000024414,
+            "height": 608.999993557
+          }
+        }
+      ],
+      "total_pages": 1,
+      "total_primitives": 5649,
+      "total_text": 979
+    },
+    {
+      "workload_id": "1015_ocr",
+      "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\PDFTest Files\\1015 - Rev 0.pdf",
+      "category": "short",
+      "notes": "Single-page engineering detail",
+      "sha256_pdf": "79cb988cea577e98220797b86b6ef6b48abab1a42b2a4f384b3660ea00521241",
+      "status": "ok",
+      "wall_ms": 2546.6582,
+      "extract_ms": 617.1086,
+      "host_build_ms": 0.0095,
+      "pages": [
+        {
+          "page_number": 1,
+          "digest": "043c290705738971632642979148a3b79f58c309e02630d9e7d38cf7ba37e7b8",
+          "summary": {
+            "primitive_count": 2155,
+            "text_count": 361,
+            "width": 914.000024414,
+            "height": 608.999993557
+          }
+        }
+      ],
+      "total_pages": 1,
+      "total_primitives": 2155,
+      "total_text": 361
+    },
+    {
+      "workload_id": "aws_weld_symbols",
+      "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\PDFTest Files\\AWSWeldSymbolchart.pdf",
+      "category": "short",
+      "notes": "Symbol chart, dense vector content",
+      "sha256_pdf": "5c4dea77110147aaebabc507cd82ff249443da48c1bc1b95d655828c1ef16a6a",
+      "status": "ok",
+      "wall_ms": 215.9726,
+      "extract_ms": 213.7621,
+      "host_build_ms": 0.0043,
+      "pages": [
+        {
+          "page_number": 1,
+          "digest": "56bbceb243c8a9c1e3b4e41839308bb5855dadb03d1c64c9c79a77f8c44b20f2",
+          "summary": {
+            "primitive_count": 0,
+            "text_count": 0,
+            "width": 215.9,
+            "height": 279.4
+          }
+        }
+      ],
+      "total_pages": 1,
+      "total_primitives": 0,
+      "total_text": 0
+    },
+    {
+      "workload_id": "alphatrans",
+      "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\PDFTest Files\\alphatrans.pdf",
+      "category": "short",
+      "notes": "Small text/geometry sample",
+      "sha256_pdf": "234c0ab8e9458f4d17133b08d2b66170eeb92be2a80e1508aa5117a2bf568f63",
+      "status": "ok",
+      "wall_ms": 947.8409,
+      "extract_ms": 898.131,
+      "host_build_ms": 0.0153,
+      "pages": [
+        {
+          "page_number": 1,
+          "digest": "ac51fd599df6a3287d04d4bd2abcd4f3b143e12e823a907f1ad7ac1909c42ea7",
+          "summary": {
+            "primitive_count": 3,
+            "text_count": 6,
+            "width": 210.001565891,
+            "height": 297.000088501
+          }
+        }
+      ],
+      "total_pages": 1,
+      "total_primitives": 3,
+      "total_text": 6
+    },
+    {
+      "workload_id": "blendmode",
+      "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\PDFTest Files\\blendmode.pdf",
+      "category": "short",
+      "notes": "Graphics primitives",
+      "sha256_pdf": "39ce34c2d32738c7c94970fd76559ecb9efd671f5ab99e515a853674e7a824ce",
+      "status": "ok",
+      "wall_ms": 997.3443,
+      "extract_ms": 891.491,
+      "host_build_ms": 0.0123,
+      "pages": [
+        {
+          "page_number": 1,
+          "digest": "36a16c2736c5726f0274c27a68b2c657bdaaf43388ddf5f350230ef21082e244",
+          "summary": {
+            "primitive_count": 0,
+            "text_count": 18,
+            "width": 210.001565891,
+            "height": 297.000088501
+          }
+        }
+      ],
+      "total_pages": 1,
+      "total_primitives": 0,
+      "total_text": 18
+    },
+    {
+      "workload_id": "aisc_wf",
+      "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\PDFTest Files\\AISC_Wide_Flange_Beams.pdf",
+      "category": "medium",
+      "notes": "Steel shape tables",
+      "sha256_pdf": "0c3d76ee77b7a48b769e21c13bb1ec0e703365ce2648c71f8dabef8433d82672",
+      "status": "ok",
+      "wall_ms": 81516.7023,
+      "extract_ms": 73688.1447,
+      "host_build_ms": 0.064,
+      "pages": [
+        {
+          "page_number": 1,
+          "digest": "b45956dabd99ae26f8834cf42a55ec601e3a61d10b13e44c3e65af4130a466c5",
+          "summary": {
+            "primitive_count": 127,
+            "text_count": 6866,
+            "width": 177.8,
+            "height": 1508.759931098
+          }
+        },
+        {
+          "page_number": 2,
+          "digest": "782831158cf4afbbabfcf58a0617bb536149d9f61d375e831fbcc1c7b0a8fe3d",
+          "summary": {
+            "primitive_count": 11,
+            "text_count": 193,
+            "width": 177.8,
+            "height": 200.659995694
+          }
+        },
+        {
+          "page_number": 3,
+          "digest": "c801d6671b5dc1a97022b2f441b0cbe33a8c74f4c676ad430f80319475f276c0",
+          "summary": {
+            "primitive_count": 22,
+            "text_count": 152,
+            "width": 177.8,
+            "height": 123.190004306
+          }
+        },
+        {
+          "page_number": 4,
+          "digest": "e33ec2764a3bec8d8588358abed556a00c4d5a4c98e3b6aac78b0c3b6b0b6e9e",
+          "summary": {
+            "primitive_count": 21,
+            "text_count": 958,
+            "width": 177.8,
+            "height": 293.369991387
+          }
+        }
+      ],
+      "total_pages": 4,
+      "total_primitives": 181,
+      "total_text": 8169
+    },
+    {
+      "workload_id": "garden_map",
+      "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\PDFTest Files\\Alvord TX \u2014 Garden Map \u00b7 Final.pdf",
+      "category": "medium",
+      "notes": "Plan drawing with text",
+      "sha256_pdf": "c50c134208c5fdda736c78ad235e247d14b6effa40ec940b1626ad3059cd2af5",
+      "status": "ok",
+      "wall_ms": 4711.3018,
+      "extract_ms": 2177.1872,
+      "host_build_ms": 0.0163,
+      "pages": [
+        {
+          "page_number": 1,
+          "digest": "28032462044e06e862724b70ce9fc7f0f7088cda4dbd0927ed3d9f6561aab47d",
+          "summary": {
+            "primitive_count": 2526,
+            "text_count": 2377,
+            "width": 558.8,
+            "height": 863.6
+          }
+        }
+      ],
+      "total_pages": 1,
+      "total_primitives": 2526,
+      "total_text": 2377
+    },
+    {
+      "workload_id": "geotech_report",
+      "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\PDFTest Files\\CMJ Report 3306-25-01 Geotech.pdf",
+      "category": "medium",
+      "notes": "Geotechnical report with mixed content",
+      "sha256_pdf": "da8b27aec6353ff637382289086d79e28f25960d6d90ff4ec9783bc5e50b7946",
+      "status": "ok",
+      "wall_ms": 42164.5757,
+      "extract_ms": 17095.5533,
+      "host_build_ms": 0.3251,
+      "pages": [
+        {
+          "page_number": 1,
+          "digest": "be61a137f0d8b5fad4ba64827c2c768b494cc8b8e53deb6906b626051e2098fd",
+          "summary": {
+            "primitive_count": 0,
+            "text_count": 31,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 2,
+          "digest": "94d5c051a29e7c163bbca1bb508f8bf77a4b89e4b3e1e98a4834cf3f9de447e9",
+          "summary": {
+            "primitive_count": 0,
+            "text_count": 0,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 3,
+          "digest": "6e0775edb7521fa12148017f8ad65dc7f0dd244636c5401f5cd2d19115dd1ad7",
+          "summary": {
+            "primitive_count": 2,
+            "text_count": 59,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 4,
+          "digest": "0fbb11d1e52c9fa3c096587c7b94d0e4f04bd15ca40e6d36d753d542441db226",
+          "summary": {
+            "primitive_count": 0,
+            "text_count": 44,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 5,
+          "digest": "8cc1b23d7db60f4856e5832039ca2f5a42fea8f2887337a8eaaf7cf25f67e87b",
+          "summary": {
+            "primitive_count": 0,
+            "text_count": 43,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 6,
+          "digest": "721b365d1a7fd5154598afedfa4a7cd6f6c2a610d728cdfba661b9cd1de57553",
+          "summary": {
+            "primitive_count": 0,
+            "text_count": 44,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 7,
+          "digest": "7ad7839df3b561dc89dca155a4024bbd87a615320ca7f86e617342deb11bea44",
+          "summary": {
+            "primitive_count": 0,
+            "text_count": 44,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 8,
+          "digest": "d9a32b1e10f8a5ec4a241f2d4e084e22bc0f56ea2d95329e38b4d0dc0abe8f44",
+          "summary": {
+            "primitive_count": 3,
+            "text_count": 46,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 9,
+          "digest": "1c65de8c163c19225f95796312c7e2066d6200b72b928a3c1f94c7cc8838093b",
+          "summary": {
+            "primitive_count": 4,
+            "text_count": 51,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 10,
+          "digest": "9ea962b08bba31fd8c39078fc9c3938942af80ddecaba46c54bcf4d96b595dcd",
+          "summary": {
+            "primitive_count": 2,
+            "text_count": 43,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 11,
+          "digest": "68ad8252b940d9fda972522eb52e60aab0c1938d238a01e1e9203ed888eda420",
+          "summary": {
+            "primitive_count": 0,
+            "text_count": 41,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 12,
+          "digest": "3521eb91f441e73fc306d147069604621f2ce7d3c07c0a5cfba5e1ca1a3c07b2",
+          "summary": {
+            "primitive_count": 0,
+            "text_count": 74,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 13,
+          "digest": "2dc813edfd61c6f16023547fb05263ff6021110a938ca0b7f5b94843c5d88556",
+          "summary": {
+            "primitive_count": 0,
+            "text_count": 43,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 14,
+          "digest": "305e7efc9e8d6d107bc2e5851b61b9d9f09edf7611dba8b3b3a2211a675dd4e9",
+          "summary": {
+            "primitive_count": 0,
+            "text_count": 44,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 15,
+          "digest": "c77eb551ab1352b02808d77e4edf3a2c4050a0171eb499dcd7f215dc330cc133",
+          "summary": {
+            "primitive_count": 0,
+            "text_count": 41,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 16,
+          "digest": "37313fa605902ef4b53abe14047de42fa9dc841d8d8d9289f492c45c1f511cd1",
+          "summary": {
+            "primitive_count": 2,
+            "text_count": 49,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 17,
+          "digest": "d3ae8c676992a0638d732a49e94d8393184a5374bdb2f8a49e1b74436831b34e",
+          "summary": {
+            "primitive_count": 1,
+            "text_count": 63,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 18,
+          "digest": "f19e0defe7458a64aa6be955f3bbe529a38f862b7e5969aabfb0564e36781020",
+          "summary": {
+            "primitive_count": 0,
+            "text_count": 51,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 19,
+          "digest": "2f159cde3b0b02ca7fd5a0497f298772bfce1844058c926e7b4865032e0c5d29",
+          "summary": {
+            "primitive_count": 1,
+            "text_count": 42,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 20,
+          "digest": "98a048d4696479ef70a7702c63465b35694a8fc7f21236fc2bf0f4b36cb10751",
+          "summary": {
+            "primitive_count": 4,
+            "text_count": 46,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 21,
+          "digest": "356eb771e07564fdc138988f2143cb883727aead7997483a57098f25ddfdf2f2",
+          "summary": {
+            "primitive_count": 1,
+            "text_count": 43,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 22,
+          "digest": "6b0215c08da543eedffd332ea51e2014715346b797375b8d0af68ce1df115059",
+          "summary": {
+            "primitive_count": 4,
+            "text_count": 44,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 23,
+          "digest": "62f86325c8a68c5ad675d1a58bb3ba3264017b58b3266b5ec531b60bd2f51569",
+          "summary": {
+            "primitive_count": 0,
+            "text_count": 43,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 24,
+          "digest": "08fa5b1572419bfa52b55de400dc6ec3881c63a4df381f4bf3d9949515c71892",
+          "summary": {
+            "primitive_count": 0,
+            "text_count": 44,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 25,
+          "digest": "cae08507410717c600aaa9a9a6e87ed2460775eddfc1995b8c5ea0facb3bada0",
+          "summary": {
+            "primitive_count": 0,
+            "text_count": 44,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 26,
+          "digest": "dec9262a3f8f7d9a32f6243d504a5337b02967be1d9a22f982a24d4d7039309f",
+          "summary": {
+            "primitive_count": 0,
+            "text_count": 41,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 27,
+          "digest": "b9306fe2c640c9466d349d23dd3d1220d53c4cf8e454848fb96e2766342bd7b6",
+          "summary": {
+            "primitive_count": 0,
+            "text_count": 42,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 28,
+          "digest": "5965080ff1e3dbc69fb72e2268a38b565944a2b0ffcbbc5d99d74e68d83053f8",
+          "summary": {
+            "primitive_count": 0,
+            "text_count": 42,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 29,
+          "digest": "e18890c99ea7eec57a982e7bbffd37bedac56c6bc769918e9ef23628c8f85808",
+          "summary": {
+            "primitive_count": 0,
+            "text_count": 11,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 30,
+          "digest": "6bd6b32adbb3780d6d0ec8e38af42ff9e7defda42782dea89de9beb6460e8ee2",
+          "summary": {
+            "primitive_count": 1268,
+            "text_count": 27,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 31,
+          "digest": "f1bfa9171a3f5c13e3bbd7ddf935148782bc42a3c547174ac5889c49c1e4e5bc",
+          "summary": {
+            "primitive_count": 46,
+            "text_count": 183,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 32,
+          "digest": "a6ff5c275f20cdc22c56ee9f8e4816ba916e580fd0faf01cb1a0349184f617c7",
+          "summary": {
+            "primitive_count": 82,
+            "text_count": 102,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 33,
+          "digest": "d01f33d753becfd0538fe96fd34508600aaea073000952d89780e87866fbc62e",
+          "summary": {
+            "primitive_count": 2353,
+            "text_count": 78,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 34,
+          "digest": "508c5273e3bc0fbe327d8fd52ddd90d325426513ec410e2c3ab95bc41bc6af9d",
+          "summary": {
+            "primitive_count": 2374,
+            "text_count": 81,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 35,
+          "digest": "c2c25484c3a15efa934fd95b60c23684b69002dfec4bfdf49be676037663737a",
+          "summary": {
+            "primitive_count": 4336,
+            "text_count": 81,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 36,
+          "digest": "ce47dd1ed19850f3dce4c3d2d35fdaaf746f4dfbbbf7f1f1c83e2216411a0f10",
+          "summary": {
+            "primitive_count": 4295,
+            "text_count": 83,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 37,
+          "digest": "549f34c3005fb39a32463013bcc52aea04bda6b1f5d54a044904bbdd15decc75",
+          "summary": {
+            "primitive_count": 398,
+            "text_count": 76,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 38,
+          "digest": "aadf1da04f66fb983b29141b38f4b418995a1637b0f718a47c5d2fe009034e14",
+          "summary": {
+            "primitive_count": 158,
+            "text_count": 60,
+            "width": 215.9,
+            "height": 279.4
+          }
+        },
+        {
+          "page_number": 39,
+          "digest": "9cc8607f422aea03da5da17a11702bf9732ec01b925611b013059b6522e19f34",
+          "summary": {
+            "primitive_count": 287,
+            "text_count": 112,
+            "width": 215.9,
+            "height": 279.4
+          }
+        }
+      ],
+      "total_pages": 39,
+      "total_primitives": 15621,
+      "total_text": 2136
+    },
+    {
+      "workload_id": "plans_22060",
+      "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\PDFTest Files\\22060_A1_01_Plans.pdf",
+      "category": "long",
+      "notes": "Large multi-page plan set",
+      "sha256_pdf": "bd0203ede39cfe101c7d1ea6555e1c9fc408247627a47de549ebf2590f1b887b",
+      "status": "ok",
+      "wall_ms": 842.6944,
+      "extract_ms": 761.2184,
+      "host_build_ms": 0.0056,
+      "pages": [
+        {
+          "page_number": 1,
+          "digest": "0654285126250520bdb77308d60cff14861c3fda8cea448d1e951bd649ad0769",
+          "summary": {
+            "primitive_count": 59,
+            "text_count": 0,
+            "width": 296.999980842,
+            "height": 419.999600559
+          }
+        }
+      ],
+      "total_pages": 1,
+      "total_primitives": 59,
+      "total_text": 0
+    },
+    {
+      "workload_id": "alvord_2013",
+      "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\PDFTest Files\\alvord-2013.pdf",
+      "category": "long",
+      "notes": "Large survey document",
+      "sha256_pdf": "4afbccbef48b08a1f8c4aca70a33bfaac41bfe04adcb172f371d6516a1eb1711",
+      "status": "ok",
+      "wall_ms": 15930.1019,
+      "extract_ms": 11020.1955,
+      "host_build_ms": 0.0179,
+      "pages": [
+        {
+          "page_number": 1,
+          "digest": "bb942a7f2b70c749b0b221d606f64caec81e34ccca98f62f7d1a37c78aac07b9",
+          "summary": {
+            "primitive_count": 11161,
+            "text_count": 1035,
+            "width": 609.6,
+            "height": 736.6
+          }
+        }
+      ],
+      "total_pages": 1,
+      "total_primitives": 11161,
+      "total_text": 1035
+    },
+    {
+      "workload_id": "attachment_c",
+      "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\PDFTest Files\\Attachment-C-Drawings.pdf",
+      "category": "long",
+      "notes": "Large drawing attachment",
+      "sha256_pdf": "9aed76b73fbe205e1579e3a00be6e95b7564e72594b1fdb83311819d447f8fc4",
+      "status": "ok",
+      "wall_ms": 472853.2637,
+      "extract_ms": 294013.8507,
+      "host_build_ms": 0.3994,
+      "pages": [
+        {
+          "page_number": 1,
+          "digest": "221c5f2a4415b4dd43b983904c7f15f5f07666f817d28391d21359e9e5174886",
+          "summary": {
+            "primitive_count": 1517,
+            "text_count": 790,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 2,
+          "digest": "86c96ca80d9e26b12f2d188b3c54ae96371fdcd6c8a852ce3edbba5cc6cf5ff1",
+          "summary": {
+            "primitive_count": 16277,
+            "text_count": 729,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 3,
+          "digest": "1146a8c8ce0c456530c7d16f11f4977cb86d8946baf25077c235b4751a3eae1a",
+          "summary": {
+            "primitive_count": 22754,
+            "text_count": 129,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 4,
+          "digest": "852818b08928c328dfd948ce82d7d4034aa1e6d8bae5e16d2de2f453724fae7d",
+          "summary": {
+            "primitive_count": 23582,
+            "text_count": 165,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 5,
+          "digest": "f77e3100ba321ae45e051f5e7524876abd475142d77c8c1571ec31d6107d1afc",
+          "summary": {
+            "primitive_count": 23435,
+            "text_count": 157,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 6,
+          "digest": "816090add8ff60915e512474e65d9ae530b2464c117a74e1afbad9566857b1c7",
+          "summary": {
+            "primitive_count": 23,
+            "text_count": 33,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 7,
+          "digest": "34b6b7ed49e3a428af7e8c2e25418e03c05e5c7f106adfbfb8604c9b82c2e16d",
+          "summary": {
+            "primitive_count": 1228,
+            "text_count": 886,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 8,
+          "digest": "b61754fa58ae16c8a278d581b463da4c060ebc347bbb44b62507f97afa0bf5d3",
+          "summary": {
+            "primitive_count": 2466,
+            "text_count": 363,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 9,
+          "digest": "694f43922bc8700911c0431d22d293bea1f0bf43661f69a5446c70b92260b048",
+          "summary": {
+            "primitive_count": 15739,
+            "text_count": 330,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 10,
+          "digest": "8c8155f3a269b9ce2dcd1385f9f0f791d22e591f6b0a8257c770afd53de956c8",
+          "summary": {
+            "primitive_count": 4854,
+            "text_count": 168,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 11,
+          "digest": "9e1836884c40bdb8ca1108f9e29f1bdaac727a580d5e8eec3e15b9f4d990ea23",
+          "summary": {
+            "primitive_count": 21669,
+            "text_count": 118,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 12,
+          "digest": "17954da40721eaec2340527ec69ce2fc4d67d019ab7720fa9c9a87214c807266",
+          "summary": {
+            "primitive_count": 26369,
+            "text_count": 269,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 13,
+          "digest": "af0463243722d72f72b9f6e044c1247eb67fe6ec40348fafe518b580fff8da76",
+          "summary": {
+            "primitive_count": 26015,
+            "text_count": 252,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 14,
+          "digest": "8bd22935ff7cddfcf8af20451e5102eb81a11c26093a472c25d24b2b4b833126",
+          "summary": {
+            "primitive_count": 44665,
+            "text_count": 544,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 15,
+          "digest": "39160b650ee1e268054ce00c494795c0016b7f6ef3bc89612d48c687086c5836",
+          "summary": {
+            "primitive_count": 18007,
+            "text_count": 797,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 16,
+          "digest": "0689bc86a332bdeefd83ee0b053ccb4459e03257cd0087db7af484fa452952b9",
+          "summary": {
+            "primitive_count": 16623,
+            "text_count": 283,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 17,
+          "digest": "7f446fcd31ca45d998c196fbc42fb09bf683a62327e6510c6f2560353951b96d",
+          "summary": {
+            "primitive_count": 7585,
+            "text_count": 326,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 18,
+          "digest": "563aa6e0badc255f15ea0a731c9518762f11f0c0847b5d8d4d57569b851ded95",
+          "summary": {
+            "primitive_count": 26969,
+            "text_count": 216,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 19,
+          "digest": "f4368515f5191a9cd4ffc672a004761d6d27f21b815470f9a10d79520c1700af",
+          "summary": {
+            "primitive_count": 12974,
+            "text_count": 627,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 20,
+          "digest": "44ef87f1b733b95ddb9862910f47eb31a76445681ee3a0c8037173b0252d9d8b",
+          "summary": {
+            "primitive_count": 14302,
+            "text_count": 506,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 21,
+          "digest": "992eee282f160a8baccc1842eba69e2742b6fdc775203f08e87d2f4c208619b8",
+          "summary": {
+            "primitive_count": 22052,
+            "text_count": 139,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 22,
+          "digest": "0651dc9410211fee97beec2c719b9c8d8d96f6b584f4ade11e113b296afa5ffb",
+          "summary": {
+            "primitive_count": 26367,
+            "text_count": 209,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 23,
+          "digest": "033fef70025efeb0eb888d6babc8a7e1de86aa1c0856fec814ccbf4e4ac78521",
+          "summary": {
+            "primitive_count": 30371,
+            "text_count": 198,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 24,
+          "digest": "c8ef4d8999a454007a41a14c28bcdcdc531bff030c6e8596bf3a62fdb0007127",
+          "summary": {
+            "primitive_count": 16946,
+            "text_count": 160,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 25,
+          "digest": "efa58457c9e92e8627a574f172601a1eb5581d53d97f7d640f88833d3cc06d81",
+          "summary": {
+            "primitive_count": 11888,
+            "text_count": 459,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 26,
+          "digest": "5c4b4d656a4c70a804ada8028c9f723fac17c3952fc1882a43ecbad641cc134b",
+          "summary": {
+            "primitive_count": 18155,
+            "text_count": 210,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 27,
+          "digest": "74b47af582f993d9c3253fe36a6067e961dafa7565890a4e622c30284cb76e32",
+          "summary": {
+            "primitive_count": 46124,
+            "text_count": 355,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 28,
+          "digest": "eb4bc003f24d19c5298c5cdfba581966a16ee9fed745725d6aceee704dd5422b",
+          "summary": {
+            "primitive_count": 19950,
+            "text_count": 467,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 29,
+          "digest": "0c422fbac7d101166cb64fb0ef3d8cd5aee4f05f1a4685d798e0181197b83128",
+          "summary": {
+            "primitive_count": 16522,
+            "text_count": 398,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 30,
+          "digest": "785a58315dd2e576d7b5bfefc11e58341d4fcf22d3033b89051449ca0b7fd888",
+          "summary": {
+            "primitive_count": 102700,
+            "text_count": 476,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 31,
+          "digest": "eb1cf1eea71c337868ca2cc97a40ab9a0e569d8f1cdf42fe9b547d43f2d72fec",
+          "summary": {
+            "primitive_count": 22852,
+            "text_count": 733,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 32,
+          "digest": "e2952f91b3d17d15675e656afe01989474776f5f0ea67341848b80399762b7d7",
+          "summary": {
+            "primitive_count": 86315,
+            "text_count": 418,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 33,
+          "digest": "4a35326a9d4909a46ae45caeae3adae22bca9bef1bf623148c7a34d64e85f2f7",
+          "summary": {
+            "primitive_count": 20834,
+            "text_count": 509,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 34,
+          "digest": "798353de8911da2298456a58a81890c56a75fe3e7d1141f9fd882e2d8796bef3",
+          "summary": {
+            "primitive_count": 14613,
+            "text_count": 465,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 35,
+          "digest": "fafdc79adc7a6037a1e4842d52b6141c123c750d02aca4c89622e6e4e218844e",
+          "summary": {
+            "primitive_count": 10162,
+            "text_count": 539,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 36,
+          "digest": "3ceaeeeec21833a686d04d6e0fa1cc8af127e9393c2b9683f0f469cf742f113e",
+          "summary": {
+            "primitive_count": 108332,
+            "text_count": 431,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 37,
+          "digest": "ff51ad479b3e8e74a5f3eb440954b791ed08c4aad1b064762d5a06763a5868e6",
+          "summary": {
+            "primitive_count": 77879,
+            "text_count": 197,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 38,
+          "digest": "7e513ffe8d87711d72f1281c1a88cf6b31d7670251fdaec6b2a07b0b0c8f26ce",
+          "summary": {
+            "primitive_count": 76791,
+            "text_count": 137,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 39,
+          "digest": "4ede632adae31304f9b6e2a4c596cdacda2e0c4b613f237f50cdeac58d467704",
+          "summary": {
+            "primitive_count": 76639,
+            "text_count": 201,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 40,
+          "digest": "ff99742fddd62ded3a8a0c04a2cbc4d670b514519d38d5d94b2a63bd2fcd61c3",
+          "summary": {
+            "primitive_count": 50563,
+            "text_count": 500,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 41,
+          "digest": "71aaaf4ebde3a24dab046f311a3e652607e7efbcb0ed2a8d40a0bbf652c53fe4",
+          "summary": {
+            "primitive_count": 49238,
+            "text_count": 250,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 42,
+          "digest": "c352f413a46b7f5c558fd15e45401fa9952b639ac514304895134ea9fda2c05d",
+          "summary": {
+            "primitive_count": 49041,
+            "text_count": 367,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 43,
+          "digest": "51b568883dc1b86540d2f026ff64e14a4238827d85b1bb81ab623ede8cf15a37",
+          "summary": {
+            "primitive_count": 5523,
+            "text_count": 395,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        },
+        {
+          "page_number": 44,
+          "digest": "29477d17dc17dda56d7ea2dc448df371d14c00e48f9c44516a92048ba56cd344",
+          "summary": {
+            "primitive_count": 3693,
+            "text_count": 283,
+            "width": 1066.8,
+            "height": 762.0
+          }
+        }
+      ],
+      "total_pages": 44,
+      "total_primitives": 1290603,
+      "total_text": 16184
+    }
+  ]
+}

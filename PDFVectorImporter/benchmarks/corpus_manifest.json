@@ -1,74 +1,14 @@
 {
   "schema": "bcs.pdfcadcore.corpus_manifest/1.0",
-  "description": "Initial Phase 2 benchmark corpus for pdfcadcore extraction equivalence and timing. Workloads are categorized as short, medium, or long by file size and expected extraction cost.",
+  "description": "Phase 2 benchmark corpus for pdfcadcore extraction equivalence and timing. Local PDF paths stay out of git; resolve them at run time.",
   "host_profile_id": "pdfcadcore_freecad_win_py3.12_default",
   "workloads": [
     {
       "workload_id": "1011_1of2",
-      "path": "C:/Users/Rowdy Payton/Desktop/PDFTest Files/1011 (1 OF 2) - Rev 0.pdf",
+      "path": "workloads/1011_1of2.pdf",
       "category": "short",
-      "notes": "Single-page engineering detail. Baseline: import in <=30s with 100% canonical-IR fidelity; pdfcadcore extraction self-equivalent and ~8.2s wall/1.8s extract/5.8s host-build on current profile.",
+      "notes": "Single-page engineering detail. Baseline: import in <=30s with 100% canonical-IR fidelity.",
       "baseline_report": "baseline_1011_1of2.json"
-    },
-    {
-      "workload_id": "1015_ocr",
-      "path": "C:/Users/Rowdy Payton/Desktop/PDFTest Files/1015 - Rev 0.pdf",
-      "category": "short",
-      "notes": "Single-page engineering detail"
-    },
-    {
-      "workload_id": "aws_weld_symbols",
-      "path": "C:/Users/Rowdy Payton/Desktop/PDFTest Files/AWSWeldSymbolchart.pdf",
-      "category": "short",
-      "notes": "Symbol chart, dense vector content"
-    },
-    {
-      "workload_id": "alphatrans",
-      "path": "C:/Users/Rowdy Payton/Desktop/PDFTest Files/alphatrans.pdf",
-      "category": "short",
-      "notes": "Small text/geometry sample"
-    },
-    {
-      "workload_id": "blendmode",
-      "path": "C:/Users/Rowdy Payton/Desktop/PDFTest Files/blendmode.pdf",
-      "category": "short",
-      "notes": "Graphics primitives"
-    },
-    {
-      "workload_id": "aisc_wf",
-      "path": "C:/Users/Rowdy Payton/Desktop/PDFTest Files/AISC_Wide_Flange_Beams.pdf",
-      "category": "medium",
-      "notes": "Steel shape tables"
-    },
-    {
-      "workload_id": "garden_map",
-      "path": "C:/Users/Rowdy Payton/Desktop/PDFTest Files/Alvord TX — Garden Map · Final.pdf",
-      "category": "medium",
-      "notes": "Plan drawing with text"
-    },
-    {
-      "workload_id": "geotech_report",
-      "path": "C:/Users/Rowdy Payton/Desktop/PDFTest Files/CMJ Report 3306-25-01 Geotech.pdf",
-      "category": "medium",
-      "notes": "Geotechnical report with mixed content"
-    },
-    {
-      "workload_id": "plans_22060",
-      "path": "C:/Users/Rowdy Payton/Desktop/PDFTest Files/22060_A1_01_Plans.pdf",
-      "category": "long",
-      "notes": "Large multi-page plan set"
-    },
-    {
-      "workload_id": "alvord_2013",
-      "path": "C:/Users/Rowdy Payton/Desktop/PDFTest Files/alvord-2013.pdf",
-      "category": "long",
-      "notes": "Large survey document"
-    },
-    {
-      "workload_id": "attachment_c",
-      "path": "C:/Users/Rowdy Payton/Desktop/PDFTest Files/Attachment-C-Drawings.pdf",
-      "category": "long",
-      "notes": "Large drawing attachment"
     }
   ]
 }

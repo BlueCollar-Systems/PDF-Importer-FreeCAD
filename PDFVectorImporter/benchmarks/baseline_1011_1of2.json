@@ -6,7 +6,7 @@
   "workloads": [
     {
       "workload_id": "1011_1of2",
-      "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\PDFTest Files\\1011 (1 OF 2) - Rev 0.pdf",
+      "pdf_path": "workloads/1011_1of2.pdf",
       "category": "short",
       "notes": "Single-page engineering detail - 30s accuracy baseline",
       "sha256_pdf": "e84a16bd2243277a523320aa276ce1207c2b80722e964b73e801200846eb4d94",

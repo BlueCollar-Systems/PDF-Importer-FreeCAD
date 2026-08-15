@@ -18,12 +18,11 @@ import argparse
 import dataclasses
 import hashlib
 import json
-import os
 import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 # PDFVectorImporter root is PDFVectorImporter/; repo root is one above.
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -31,7 +30,7 @@ PDFCADCORE_ROOT = REPO_ROOT / "PDFVectorImporter" / "pdfcadcore"
 if str(PDFCADCORE_ROOT.parent) not in sys.path:
     sys.path.insert(0, str(PDFCADCORE_ROOT.parent))
 
-from pdfcadcore.primitives import PageData, Primitive, NormalizedText
+from pdfcadcore.primitives import PageData
 from pdfcadcore.stage_timing import StageTimer
 from pdfcadcore.streaming import iter_pages
 

@@ -7,7 +7,8 @@
       "workload_id": "1011_1of2",
       "path": "C:/Users/Rowdy Payton/Desktop/PDFTest Files/1011 (1 OF 2) - Rev 0.pdf",
       "category": "short",
-      "notes": "Single-page engineering detail"
+      "notes": "Single-page engineering detail. Baseline: import in <=30s with 100% canonical-IR fidelity; pdfcadcore extraction self-equivalent and ~8.2s wall/1.8s extract/5.8s host-build on current profile.",
+      "baseline_report": "baseline_1011_1of2.json"
     },
     {
       "workload_id": "1015_ocr",

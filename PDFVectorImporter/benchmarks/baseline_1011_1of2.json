@@ -1,0 +1,34 @@
+{
+  "schema": "bcs.pdfcadcore.equivalence_harness/1.0",
+  "host_profile_id": "pdfcadcore_freecad_win_py3.12_default",
+  "corpus_schema": "bcs.pdfcadcore.corpus_manifest/1.0",
+  "created_at": "2026-08-15T12:26:29-0500",
+  "workloads": [
+    {
+      "workload_id": "1011_1of2",
+      "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\PDFTest Files\\1011 (1 OF 2) - Rev 0.pdf",
+      "category": "short",
+      "notes": "Single-page engineering detail - 30s accuracy baseline",
+      "sha256_pdf": "e84a16bd2243277a523320aa276ce1207c2b80722e964b73e801200846eb4d94",
+      "status": "ok",
+      "wall_ms": 8162.1344,
+      "extract_ms": 1779.1488,
+      "host_build_ms": 5778.3887,
+      "pages": [
+        {
+          "page_number": 1,
+          "digest": "74483481dedafc2d4fb7cbdd0d7d57a1b98607da323afe221f9f993d75ba52c5",
+          "summary": {
+            "primitive_count": 5649,
+            "text_count": 979,
+            "width": 914.000024414,
+            "height": 608.999993557
+          }
+        }
+      ],
+      "total_pages": 1,
+      "total_primitives": 5649,
+      "total_text": 979
+    }
+  ]
+}

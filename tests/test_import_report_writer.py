@@ -110,6 +110,8 @@ class TestImportReportWriter(unittest.TestCase):
             expected_version = package_xml.split("<version>", 1)[1].split("</version>", 1)[0]
             self.assertEqual(data["importer"]["version"], expected_version)
             self.assertEqual(data["result"]["primitives"], 7)
+            self.assertEqual(data["extra"]["host_object_count"], 7)
+            self.assertEqual(data["extra"]["fallback_transitions"], [])
             self.assertEqual(data["result"]["text_entities"], 2)
             self.assertEqual(data["result"]["layers"], 1)
             self.assertEqual(data["performance"]["phases"]["open_pdf_ms"], 1.25)

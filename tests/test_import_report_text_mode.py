@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "PDFVectorImporter"))
 
 from pdfcadcore.import_report import (
     build_actual_text_entity_types,
+    build_fallback_transitions,
     build_font_embedding_hints,
     build_import_contract_ready,
     build_import_report,
@@ -327,6 +328,78 @@ def test_font_embedding_hints_uses_extension_not_referencer():
     assert hints["non_embedded_fonts"] == ["Helvetica-Bold"]
     assert "parent-native font substitution" in hints["font_substitution_note"]
     assert "source-font non-equivalent" in hints["font_substitution_note"]
+
+
+def test_build_import_report_always_emits_fallback_transitions_list():
+    report = build_import_report(
+        host_app="freecad",
+        pdf_path="sample.pdf",
+        primitive_count=1840,
+        import_text=True,
+        text_mode="text",
+    )
+    extra = report.to_dict()["extra"]
+    assert extra["fallback_transitions"] == []
+    assert extra["text_mode"] == "text"
+
+
+def test_build_fallback_transitions_expands_item_scoped_text_mode_fallbacks():
+    transitions = build_fallback_transitions(
+        {
+            "text_mode_fallbacks": [
+                {
+                    "requested": "text",
+                    "delivered": "3d_text",
+                    "reason": "host_representation_unsupported",
+                    "count": 1,
+                    "source_item_ids": ["p1:b0:l0:s0"],
+                    "proof": {
+                        "item_specific_proven_impossible": True,
+                        "page_number": 1,
+                        "importer_identity": "bluecollarsystems.freecad.pdf_vector_importer",
+                        "cleanup_complete": True,
+                    },
+                }
+            ]
+        }
+    )
+    assert transitions == [
+        {
+            "source_span_id": "p1:b0:l0:s0",
+            "from_mode": "text",
+            "to_mode": "3d_text",
+            "reason_code": "host_representation_unsupported",
+            "page_number": 1,
+            "page": 1,
+            "importer_id": "bluecollarsystems.freecad.pdf_vector_importer",
+            "affirmative_impossibility": True,
+            "generic_failure": False,
+            "cleanup_outcome": "verified",
+        }
+    ]
+
+
+def test_build_fallback_transitions_does_not_invent_unproven_delivery_divergence():
+    transitions = build_fallback_transitions(
+        {
+            "text_delivery": {
+                "items": [
+                    {
+                        "source_span_id": "p1:b0:l0:s1",
+                        "requested_representation": "text",
+                        "final_representation": "glyphs",
+                        "fallback_used": False,
+                        "verified": True,
+                    }
+                ]
+            }
+        }
+    )
+    assert transitions == []
+
+
+def test_build_fallback_transitions_keeps_an_explicit_empty_ledger():
+    assert build_fallback_transitions({"fallback_transitions": []}) == []
 
 
 def test_pdf_interactive_note_ignores_null_catalog_keys():

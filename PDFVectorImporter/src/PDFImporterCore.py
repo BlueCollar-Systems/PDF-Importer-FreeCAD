@@ -968,6 +968,7 @@ def write_import_report(
         "raster_fallback_reasons": list(opts.raster_fallback_reasons),
         "model_3d_intent": getattr(opts, "_model3d_intent", None),
         "model_3d": _model3d_report_payload(opts),
+        "host_object_count": int(primitive_count),
     }
     
     # Add text entity info to extra if available

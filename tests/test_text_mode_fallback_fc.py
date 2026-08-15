@@ -274,6 +274,20 @@ def test_report_includes_exact_attempt_ledger_and_proven_fallback(tmp_path):
     assert report["fallback"]["text"]["delivered"] == "glyphs"
     assert report["fallback"]["text"]["source_item_ids"] == ["p1:b0:l0:s0"]
     assert report["extra"]["text_delivery_attempts"] == opts.text_delivery_attempts
+    assert report["extra"]["fallback_transitions"] == [
+        {
+            "source_span_id": "p1:b0:l0:s0",
+            "from_mode": "3d_text",
+            "to_mode": "glyphs",
+            "reason_code": "source glyph has no native text outline",
+            "page_number": 1,
+            "page": 1,
+            "importer_id": "bluecollarsystems.freecad.pdf_vector_importer",
+            "affirmative_impossibility": True,
+            "generic_failure": False,
+            "cleanup_outcome": "verified",
+        }
+    ]
 
 
 def test_report_accepts_mixed_requested_and_proven_fallback_delivery(tmp_path):

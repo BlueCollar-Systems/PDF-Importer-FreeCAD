@@ -5078,9 +5078,6 @@ def _text3d_faces_for_outlines(wire_shapes: List[Any]) -> List[Any]:
             if not faces:
                 raise RuntimeError("face maker returned no faces")
             for face in faces:
-                validate = getattr(face, "validate", None)
-                if callable(validate):
-                    validate()
                 try:
                     if float(face.normalAt(0, 0).z) < 0.0:
                         face.reverse()
@@ -5106,6 +5103,9 @@ class _Text3DOutlineMemo:
         self.solid_misses = 0
         self.evictions = 0
         self.last_solid_volume = 0.0
+        self.last_solid_count = 0
+        self.last_ink_min = 0.0
+        self.last_ink_max = 0.0
 
     def _evict_oldest_if_full(self, cache) -> None:
         if len(cache) < self.MAX_ENTRIES:
@@ -5119,19 +5119,28 @@ class _Text3DOutlineMemo:
         cached = self._cache.get(normalized_key)
         if cached is not None:
             self.hits += 1
-            shape, native_advance, visible_character_count = cached
+            shape, native_advance, visible_character_count, xmin, xmax = cached
+            self.last_ink_min = float(xmin)
+            self.last_ink_max = float(xmax)
             return (
-                shape.copy(),
+                shape,
                 float(native_advance),
                 int(visible_character_count),
             )
         self.misses += 1
         shape, native_advance, visible_character_count = builder()
+        bbox = getattr(shape, "BoundBox", None)
+        xmin = float(getattr(bbox, "XMin", 0.0) or 0.0)
+        xmax = float(getattr(bbox, "XMax", 0.0) or 0.0)
+        self.last_ink_min = xmin
+        self.last_ink_max = xmax
         self._evict_oldest_if_full(self._cache)
         self._cache[normalized_key] = (
-            shape.copy(),
+            shape,
             float(native_advance),
             int(visible_character_count),
+            xmin,
+            xmax,
         )
         return shape, float(native_advance), int(visible_character_count)
 
@@ -5146,8 +5155,16 @@ class _Text3DOutlineMemo:
         cached = self._solid_cache.get(normalized_key)
         if cached is not None:
             self.solid_hits += 1
-            solid, horizontal_scale, native_advance, verified_advance, volume = cached
+            (
+                solid,
+                horizontal_scale,
+                native_advance,
+                verified_advance,
+                volume,
+                solid_count,
+            ) = cached
             self.last_solid_volume = float(volume)
+            self.last_solid_count = int(solid_count)
             return (
                 solid,
                 float(horizontal_scale),
@@ -5156,15 +5173,22 @@ class _Text3DOutlineMemo:
             )
         self.solid_misses += 1
         solid, horizontal_scale, native_advance, verified_advance = builder()
-        volume = float(getattr(solid, "Volume", 0.0) or 0.0)
-        self.last_solid_volume = volume
+        volume = float(self.last_solid_volume)
+        solid_count = int(self.last_solid_count)
+        if volume <= 0.0:
+            volume = float(getattr(solid, "Volume", 0.0) or 0.0)
+            self.last_solid_volume = volume
+        if solid_count <= 0:
+            solid_count = _shape_solid_count(solid)
+            self.last_solid_count = solid_count
         self._evict_oldest_if_full(self._solid_cache)
         self._solid_cache[normalized_key] = (
-            solid.copy(),
+            solid,
             float(horizontal_scale),
             float(native_advance),
             float(verified_advance),
             volume,
+            solid_count,
         )
         return (
             solid,
@@ -5188,15 +5212,22 @@ class _Text3DOutlineMemo:
 
 
 _ACTIVE_TEXT3D_OUTLINE_MEMO: Optional[_Text3DOutlineMemo] = None
-_FONT_KERN_PROBE_CACHE: Dict[str, Tuple[Dict[int, str], List[Dict[Tuple[str, str], float]]]] = {}
+_FONT_KERN_PROBE_CACHE: Dict[
+    str,
+    Tuple[Dict[int, str], List[Dict[Tuple[str, str], float]], Dict[str, Tuple[float, float]]],
+] = {}
+_FONT_ADVANCE_SCALE: Dict[str, float] = {}
 
 
 def _clear_font_kern_probe_cache() -> None:
     _FONT_KERN_PROBE_CACHE.clear()
+    _FONT_ADVANCE_SCALE.clear()
 
 
-def _font_kern_probe_tables(font_path: str) -> Tuple[Dict[int, str], List[Dict[Tuple[str, str], float]]]:
-    """Load cmap + classic kern tables once per font file for this import."""
+def _font_kern_probe_tables(
+    font_path: str,
+) -> Tuple[Dict[int, str], List[Dict[Tuple[str, str], float]], Dict[str, Tuple[float, float]]]:
+    """Load cmap, classic kern, and hmtx tables once per font file for this import."""
     cached = _FONT_KERN_PROBE_CACHE.get(font_path)
     if cached is not None:
         return cached
@@ -5228,7 +5259,21 @@ def _font_kern_probe_tables(font_path: str) -> Tuple[Dict[int, str], List[Dict[T
                         "source font classic kerning table is malformed"
                     )
                 kern_tables.append(dict(raw_pairs))
-        payload = (cmap_table, kern_tables)
+        hmtx_metrics: Dict[str, Tuple[float, float]] = {}
+        if "hmtx" in font:
+            raw_metrics = getattr(font["hmtx"], "metrics", None)
+            if isinstance(raw_metrics, dict):
+                for glyph_name, metric in raw_metrics.items():
+                    if not isinstance(metric, (tuple, list)) or not metric:
+                        continue
+                    try:
+                        width = float(metric[0])
+                        lsb = float(metric[1]) if len(metric) > 1 else 0.0
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(width):
+                        hmtx_metrics[str(glyph_name)] = (width, lsb)
+        payload = (cmap_table, kern_tables, hmtx_metrics)
         _FONT_KERN_PROBE_CACHE[font_path] = payload
         return payload
     except RuntimeError:
@@ -5249,7 +5294,7 @@ def _text3d_zero_kern_probe_candidates(
     """Return visible font glyphs that cannot kern with the source tail."""
     if not isinstance(source_text, str) or not source_text:
         raise RuntimeError("source font tail glyph could not be verified")
-    cmap, kern_tables = _font_kern_probe_tables(font_path)
+    cmap, kern_tables, _hmtx = _font_kern_probe_tables(font_path)
     left_glyph = cmap.get(ord(source_text[-1]))
     if not isinstance(left_glyph, str) or not left_glyph:
         raise RuntimeError("source font tail glyph could not be verified")
@@ -5288,7 +5333,40 @@ def _text3d_zero_kern_probe_candidates(
     return verified_candidates
 
 
-def _measure_text3d_pen_advance(source_text: str, font_path: str) -> float:
+def _font_units_string_advance(source_text: str, font_path: str) -> Optional[float]:
+    """Sum classic kern + hmtx advances in font units for one source string."""
+    cmap, kern_tables, hmtx = _font_kern_probe_tables(font_path)
+    if not hmtx:
+        return None
+    advance = 0.0
+    previous_glyph = None
+    for character in source_text:
+        glyph = cmap.get(ord(character))
+        if not isinstance(glyph, str) or not glyph:
+            return None
+        if previous_glyph is not None:
+            for table in kern_tables:
+                try:
+                    advance += float(table.get((previous_glyph, glyph), 0) or 0)
+                except (TypeError, ValueError):
+                    return None
+        metric = hmtx.get(glyph)
+        if not isinstance(metric, (tuple, list)) or not metric:
+            return None
+        try:
+            width = float(metric[0])
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(width):
+            return None
+        advance += width
+        previous_glyph = glyph
+    if not math.isfinite(advance) or advance <= 0.0:
+        return None
+    return advance
+
+
+def _measure_text3d_pen_advance_via_wires(source_text: str, font_path: str) -> float:
     """Measure the source pen advance without folding outer whitespace into ink."""
     for probe in _text3d_zero_kern_probe_candidates(source_text, font_path):
         try:
@@ -5315,6 +5393,22 @@ def _measure_text3d_pen_advance(source_text: str, font_path: str) -> float:
         if math.isfinite(native_advance) and native_advance > 1e-9:
             return native_advance
     raise RuntimeError("source font pen advance could not be measured")
+
+
+def _measure_text3d_pen_advance(source_text: str, font_path: str) -> float:
+    """Measure unit pen advance; reuse one wire-probe scale per font file."""
+    font_units = _font_units_string_advance(source_text, font_path)
+    scale = _FONT_ADVANCE_SCALE.get(font_path)
+    if font_units is not None and scale is not None:
+        native_advance = font_units * scale
+        if math.isfinite(native_advance) and native_advance > 1e-9:
+            return native_advance
+    probed = _measure_text3d_pen_advance_via_wires(source_text, font_path)
+    if font_units is not None:
+        scale = probed / font_units
+        if math.isfinite(scale) and scale > 1e-12:
+            _FONT_ADVANCE_SCALE[font_path] = scale
+    return probed
 
 
 def _build_exact_text3d_outline_template(source_text: str, font_path: str):
@@ -5387,8 +5481,13 @@ def _bake_exact_text3d_compound_shape(
             )
         )
     try:
-        unit_ink_min = float(face_template.BoundBox.XMin)
-        unit_ink_max = float(face_template.BoundBox.XMax)
+        if _ACTIVE_TEXT3D_OUTLINE_MEMO is not None:
+            unit_ink_min = float(_ACTIVE_TEXT3D_OUTLINE_MEMO.last_ink_min)
+            unit_ink_max = float(_ACTIVE_TEXT3D_OUTLINE_MEMO.last_ink_max)
+        else:
+            bbox = face_template.BoundBox
+            unit_ink_min = float(bbox.XMin)
+            unit_ink_max = float(bbox.XMax)
     except (AttributeError, TypeError, ValueError) as exc:
         raise RuntimeError("source glyph ink bounds could not be measured") from exc
     if (
@@ -5461,6 +5560,9 @@ def _bake_exact_text3d_compound_shape(
         or abs(verified_advance - numeric_values[2]) > tolerance
     ):
         raise RuntimeError("3D Text compound geometry verification failed")
+    if _ACTIVE_TEXT3D_OUTLINE_MEMO is not None:
+        _ACTIVE_TEXT3D_OUTLINE_MEMO.last_solid_volume = volume
+        _ACTIVE_TEXT3D_OUTLINE_MEMO.last_solid_count = int(solid_count)
     return compound, horizontal_scale, native_advance, verified_advance
 
 
@@ -5539,6 +5641,14 @@ def _create_verified_compound_text3d_entity(
         )
     else:
         baked_volume = float(getattr(compound, "Volume", 0.0) or 0.0)
+    if len(baked) > 5:
+        baked_solid_count = int(baked[5])
+    elif _ACTIVE_TEXT3D_OUTLINE_MEMO is not None:
+        baked_solid_count = int(
+            getattr(_ACTIVE_TEXT3D_OUTLINE_MEMO, "last_solid_count", 0) or 0
+        )
+    else:
+        baked_solid_count = 0
     host_obj = None
     try:
         host_obj = doc.addObject("Part::Feature", "PDF_3D_Text")
@@ -5556,7 +5666,10 @@ def _create_verified_compound_text3d_entity(
             str(getattr(host_obj, "TypeId", "") or "") != "Part::Feature"
             or shape is None
             or bool(getattr(shape, "isNull", lambda: True)())
-            or _shape_solid_count(shape) <= 0
+            or (
+                baked_solid_count <= 0
+                and _shape_solid_count(shape) <= 0
+            )
         ):
             raise RuntimeError("Part::Feature did not preserve verified solid 3D text")
         text_group.addObject(host_obj)
@@ -7173,7 +7286,14 @@ def _deliver_text_item_3d(
         verified_anchor_xyz = _host_anchor_xyz(compound_entity)
         expected_anchor_xyz = (float(pos.x), float(pos.y), float(pos.z))
         shape = getattr(compound_entity, "Shape", None)
-        solid_count = _shape_solid_count(shape) if shape is not None else 0
+        if _ACTIVE_TEXT3D_OUTLINE_MEMO is not None:
+            solid_count = int(
+                getattr(_ACTIVE_TEXT3D_OUTLINE_MEMO, "last_solid_count", 0) or 0
+            )
+        else:
+            solid_count = 0
+        if solid_count <= 0:
+            solid_count = _shape_solid_count(shape) if shape is not None else 0
         volume = float(baked_volume)
         if volume <= 0.0:
             volume = float(getattr(shape, "Volume", 0.0) or 0.0) if shape is not None else 0.0

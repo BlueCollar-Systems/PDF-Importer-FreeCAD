@@ -5033,6 +5033,22 @@ def _closed_text3d_wires(wire_shapes: List[Any]) -> List[Any]:
     """Normalize FreeType wire fragments into closed outline wires."""
     closed: List[Any] = []
     for wire_shape in wire_shapes or ():
+        try:
+            if bool(getattr(wire_shape, "isClosed", lambda: False)()):
+                shape_type = str(getattr(wire_shape, "ShapeType", "") or "")
+                if shape_type == "Wire":
+                    closed.append(wire_shape)
+                    continue
+                nested_closed = [
+                    wire
+                    for wire in list(getattr(wire_shape, "Wires", []) or [])
+                    if bool(getattr(wire, "isClosed", lambda: False)())
+                ]
+                if nested_closed:
+                    closed.extend(nested_closed)
+                    continue
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
         edges = list(getattr(wire_shape, "Edges", []) or [])
         if not edges:
             continue
@@ -5089,6 +5105,7 @@ class _Text3DOutlineMemo:
         self.solid_hits = 0
         self.solid_misses = 0
         self.evictions = 0
+        self.last_solid_volume = 0.0
 
     def _evict_oldest_if_full(self, cache) -> None:
         if len(cache) < self.MAX_ENTRIES:
@@ -5129,21 +5146,25 @@ class _Text3DOutlineMemo:
         cached = self._solid_cache.get(normalized_key)
         if cached is not None:
             self.solid_hits += 1
-            solid, horizontal_scale, native_advance, verified_advance = cached
+            solid, horizontal_scale, native_advance, verified_advance, volume = cached
+            self.last_solid_volume = float(volume)
             return (
-                solid.copy(),
+                solid,
                 float(horizontal_scale),
                 float(native_advance),
                 float(verified_advance),
             )
         self.solid_misses += 1
         solid, horizontal_scale, native_advance, verified_advance = builder()
+        volume = float(getattr(solid, "Volume", 0.0) or 0.0)
+        self.last_solid_volume = volume
         self._evict_oldest_if_full(self._solid_cache)
         self._solid_cache[normalized_key] = (
             solid.copy(),
             float(horizontal_scale),
             float(native_advance),
             float(verified_advance),
+            volume,
         )
         return (
             solid,
@@ -5167,14 +5188,18 @@ class _Text3DOutlineMemo:
 
 
 _ACTIVE_TEXT3D_OUTLINE_MEMO: Optional[_Text3DOutlineMemo] = None
+_FONT_KERN_PROBE_CACHE: Dict[str, Tuple[Dict[int, str], List[Dict[Tuple[str, str], float]]]] = {}
 
 
-def _text3d_zero_kern_probe_candidates(
-    source_text: str, font_path: str
-) -> List[str]:
-    """Return visible font glyphs that cannot kern with the source tail."""
-    if not isinstance(source_text, str) or not source_text:
-        raise RuntimeError("source font tail glyph could not be verified")
+def _clear_font_kern_probe_cache() -> None:
+    _FONT_KERN_PROBE_CACHE.clear()
+
+
+def _font_kern_probe_tables(font_path: str) -> Tuple[Dict[int, str], List[Dict[Tuple[str, str], float]]]:
+    """Load cmap + classic kern tables once per font file for this import."""
+    cached = _FONT_KERN_PROBE_CACHE.get(font_path)
+    if cached is not None:
+        return cached
     try:
         from fontTools.ttLib import TTFont
 
@@ -5188,55 +5213,24 @@ def _text3d_zero_kern_probe_candidates(
         cmap = font.getBestCmap()
         if not isinstance(cmap, dict) or not cmap:
             raise RuntimeError("source font character map could not be verified")
-        left_glyph = cmap.get(ord(source_text[-1]))
-        if not isinstance(left_glyph, str) or not left_glyph:
-            raise RuntimeError("source font tail glyph could not be verified")
-
-        kern_tables = []
+        cmap_table = dict(cmap)
+        kern_tables: List[Dict[Tuple[str, str], float]] = []
         if "kern" in font:
-            kern_tables = getattr(font["kern"], "kernTables", None)
-            if not isinstance(kern_tables, (list, tuple)):
+            raw_tables = getattr(font["kern"], "kernTables", None)
+            if not isinstance(raw_tables, (list, tuple)):
                 raise RuntimeError(
                     "source font classic kerning table is malformed"
                 )
-            for table in kern_tables:
-                if not isinstance(getattr(table, "kernTable", None), dict):
+            for table in raw_tables:
+                raw_pairs = getattr(table, "kernTable", None)
+                if not isinstance(raw_pairs, dict):
                     raise RuntimeError(
                         "source font classic kerning table is malformed"
                     )
-
-        candidate_characters = []
-        for character in (*source_text, "M", "I", "0", "|", "."):
-            if character.isspace() or character in candidate_characters:
-                continue
-            candidate_characters.append(character)
-
-        verified_candidates = []
-        for character in candidate_characters:
-            right_glyph = cmap.get(ord(character))
-            if not isinstance(right_glyph, str) or not right_glyph:
-                continue
-            pair_is_zero = True
-            for table in kern_tables:
-                raw_value = table.kernTable.get((left_glyph, right_glyph), 0)
-                try:
-                    kern_value = float(raw_value)
-                except (TypeError, ValueError) as exc:
-                    raise RuntimeError(
-                        "source font classic kerning value is malformed"
-                    ) from exc
-                if not math.isfinite(kern_value):
-                    raise RuntimeError(
-                        "source font classic kerning value is malformed"
-                    )
-                if kern_value != 0.0:
-                    pair_is_zero = False
-                    break
-            if pair_is_zero:
-                verified_candidates.append(character)
-        if not verified_candidates:
-            raise RuntimeError("source font has no verified zero-kern advance probe")
-        return verified_candidates
+                kern_tables.append(dict(raw_pairs))
+        payload = (cmap_table, kern_tables)
+        _FONT_KERN_PROBE_CACHE[font_path] = payload
+        return payload
     except RuntimeError:
         raise
     except Exception as exc:
@@ -5247,6 +5241,51 @@ def _text3d_zero_kern_probe_candidates(
         close = getattr(font, "close", None)
         if callable(close):
             close()
+
+
+def _text3d_zero_kern_probe_candidates(
+    source_text: str, font_path: str
+) -> List[str]:
+    """Return visible font glyphs that cannot kern with the source tail."""
+    if not isinstance(source_text, str) or not source_text:
+        raise RuntimeError("source font tail glyph could not be verified")
+    cmap, kern_tables = _font_kern_probe_tables(font_path)
+    left_glyph = cmap.get(ord(source_text[-1]))
+    if not isinstance(left_glyph, str) or not left_glyph:
+        raise RuntimeError("source font tail glyph could not be verified")
+
+    candidate_characters = []
+    for character in (*source_text, "M", "I", "0", "|", "."):
+        if character.isspace() or character in candidate_characters:
+            continue
+        candidate_characters.append(character)
+
+    verified_candidates = []
+    for character in candidate_characters:
+        right_glyph = cmap.get(ord(character))
+        if not isinstance(right_glyph, str) or not right_glyph:
+            continue
+        pair_is_zero = True
+        for table in kern_tables:
+            raw_value = table.get((left_glyph, right_glyph), 0)
+            try:
+                kern_value = float(raw_value)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "source font classic kerning value is malformed"
+                ) from exc
+            if not math.isfinite(kern_value):
+                raise RuntimeError(
+                    "source font classic kerning value is malformed"
+                )
+            if kern_value != 0.0:
+                pair_is_zero = False
+                break
+        if pair_is_zero:
+            verified_candidates.append(character)
+    if not verified_candidates:
+        raise RuntimeError("source font has no verified zero-kern advance probe")
+    return verified_candidates
 
 
 def _measure_text3d_pen_advance(source_text: str, font_path: str) -> float:
@@ -5389,16 +5428,17 @@ def _bake_exact_text3d_compound_shape(
         raise RuntimeError("source text produced no visible solid glyphs")
 
     extruded = transformed_faces.extrude(Vector(0.0, 0.0, numeric_values[1]))
+    volume = float(getattr(extruded, "Volume", 0.0) or 0.0) if extruded is not None else 0.0
+    solid_count = _shape_solid_count(extruded) if extruded is not None else 0
     if (
         extruded is None
         or bool(getattr(extruded, "isNull", lambda: True)())
-        or _shape_solid_count(extruded) <= 0
-        or float(getattr(extruded, "Volume", 0.0) or 0.0) <= 0.0
+        or solid_count <= 0
+        or not math.isfinite(volume)
+        or volume <= 0.0
     ):
         raise RuntimeError("source glyph extrusion did not produce verified solids")
-    compound = Part.Compound([extruded])
-    solid_count = _shape_solid_count(compound)
-    volume = float(getattr(compound, "Volume", 0.0) or 0.0)
+    compound = extruded
     try:
         verified_ink_min = float(compound.BoundBox.XMin)
         verified_ink_max = float(compound.BoundBox.XMax)
@@ -5483,15 +5523,22 @@ def _create_verified_compound_text3d_entity(
     protected_baseline_ids = set(baseline_object_ids or ())
     if any(type(object_id) is not int for object_id in protected_baseline_ids):
         raise RuntimeError("3D Text ownership baseline is invalid")
-    compound, horizontal_scale, native_advance, verified_advance = (
-        _build_exact_text3d_compound_shape(
-            source_text=source_text,
-            font_path=font_path,
-            font_size_fc=font_size_fc,
-            depth=depth,
-            target_advance_fc=target_advance_fc,
-        )
+    baked = _build_exact_text3d_compound_shape(
+        source_text=source_text,
+        font_path=font_path,
+        font_size_fc=font_size_fc,
+        depth=depth,
+        target_advance_fc=target_advance_fc,
     )
+    compound, horizontal_scale, native_advance, verified_advance = baked[:4]
+    if len(baked) > 4:
+        baked_volume = float(baked[4])
+    elif _ACTIVE_TEXT3D_OUTLINE_MEMO is not None:
+        baked_volume = float(
+            getattr(_ACTIVE_TEXT3D_OUTLINE_MEMO, "last_solid_volume", 0.0) or 0.0
+        )
+    else:
+        baked_volume = float(getattr(compound, "Volume", 0.0) or 0.0)
     host_obj = None
     try:
         host_obj = doc.addObject("Part::Feature", "PDF_3D_Text")
@@ -5510,7 +5557,6 @@ def _create_verified_compound_text3d_entity(
             or shape is None
             or bool(getattr(shape, "isNull", lambda: True)())
             or _shape_solid_count(shape) <= 0
-            or float(getattr(shape, "Volume", 0.0) or 0.0) <= 0.0
         ):
             raise RuntimeError("Part::Feature did not preserve verified solid 3D text")
         text_group.addObject(host_obj)
@@ -5519,6 +5565,7 @@ def _create_verified_compound_text3d_entity(
             float(horizontal_scale),
             float(native_advance),
             float(verified_advance),
+            float(baked_volume),
         )
     except Exception:
         if host_obj is not None:
@@ -5795,7 +5842,7 @@ def _deliver_text_item_native(
 ) -> Dict[str, Any]:
     """Create and reread one exact native Text or Draft Label source item."""
     try:
-        bound_item = copy.deepcopy(item) if isinstance(item, dict) else {}
+        bound_item = item if isinstance(item, dict) else {}
     except Exception:
         bound_item = {}
     source_item_id = str(bound_item.get("source_item_id") or "")
@@ -6224,13 +6271,21 @@ def _resolved_path_key(path: Path) -> str:
         return str(path)
 
 
-def _raster_file_evidence(host_obj, source_asset_path: Path) -> Dict[str, Any]:
+def _raster_file_evidence(
+    host_obj,
+    source_asset_path: Path,
+    source_sha256: Optional[str] = None,
+) -> Dict[str, Any]:
     """Verify both FreeCAD raster-file properties by content, not cache pathname."""
     source_path = Path(source_asset_path)
     if not source_path.is_file() or source_path.stat().st_size <= 0:
         raise RuntimeError("persistent source raster asset is unavailable")
 
     digest_by_resolved_path: Dict[str, str] = {}
+    if isinstance(source_sha256, str):
+        known = source_sha256.strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", known) is not None:
+            digest_by_resolved_path[_resolved_path_key(source_path)] = known
 
     def digest_for(path: Path) -> str:
         cache_key = _resolved_path_key(path)
@@ -6339,7 +6394,7 @@ def _deliver_text_item_raster(
 ) -> Dict[str, Any]:
     """Render one exact source span to a persistent verified ImagePlane patch."""
     try:
-        bound_item = copy.deepcopy(item) if isinstance(item, dict) else {}
+        bound_item = item if isinstance(item, dict) else {}
     except Exception:
         bound_item = {}
     source_item_id = str(bound_item.get("source_item_id") or "")
@@ -6513,18 +6568,18 @@ def _deliver_text_item_raster(
         add_property = getattr(host_obj, "addProperty", None)
         if not callable(add_property):
             raise RuntimeError("ImagePlane cannot embed its raster asset")
-        if "PDFRasterFile" not in set(getattr(host_obj, "PropertiesList", []) or []):
+        properties = set(getattr(host_obj, "PropertiesList", []) or [])
+        if "PDFRasterFile" not in properties:
             add_property("App::PropertyFileIncluded", "PDFRasterFile", "PDF Import")
+            properties.add("PDFRasterFile")
         host_obj.PDFRasterFile = str(image_path)
-        if "PDFSourceSHA256" not in set(
-            getattr(host_obj, "PropertiesList", []) or []
-        ):
+        if "PDFSourceSHA256" not in properties:
             add_property("App::PropertyString", "PDFSourceSHA256", "PDF Import")
+            properties.add("PDFSourceSHA256")
         host_obj.PDFSourceSHA256 = pdf_sha256
-        if "PDFRasterSHA256" not in set(
-            getattr(host_obj, "PropertiesList", []) or []
-        ):
+        if "PDFRasterSHA256" not in properties:
             add_property("App::PropertyString", "PDFRasterSHA256", "PDF Import")
+            properties.add("PDFRasterSHA256")
         host_obj.PDFRasterSHA256 = raster_sha256
         _annotate_text_host_object(host_obj, source_item_id, "raster")
         parent_group.addObject(host_obj)
@@ -6538,7 +6593,9 @@ def _deliver_text_item_raster(
     try:
         entity_id = _host_object_id(host_obj)
         actual_anchor = _host_anchor_xyz(host_obj)
-        raster_file_evidence = _raster_file_evidence(host_obj, image_path)
+        raster_file_evidence = _raster_file_evidence(
+            host_obj, image_path, source_sha256=raster_sha256
+        )
         if (
             not entity_id
             or fc_doc.getObject(entity_id) is not host_obj
@@ -6603,7 +6660,7 @@ def _deliver_text_item_3d(
 ) -> Dict[str, Any]:
     """Deliver and verify exactly one canonical 3D Text source item."""
     try:
-        bound_item = copy.deepcopy(item) if isinstance(item, dict) else {}
+        bound_item = item if isinstance(item, dict) else {}
     except Exception:
         bound_item = {}
     source_item_id = str(bound_item.get("source_item_id") or "")
@@ -7043,12 +7100,7 @@ def _deliver_text_item_3d(
     try:
         creation_started = True
         stage = "compound_3d_text"
-        (
-            compound_entity,
-            horizontal_scale,
-            native_advance_fc,
-            verified_advance_fc,
-        ) = _create_verified_compound_text3d_entity(
+        created = _create_verified_compound_text3d_entity(
             doc,
             source_text=source_text,
             font_path=font_path,
@@ -7060,6 +7112,13 @@ def _deliver_text_item_3d(
             baseline_object_ids=baseline_objects,
             configure_host=_configure_item_host,
         )
+        (
+            compound_entity,
+            horizontal_scale,
+            native_advance_fc,
+            verified_advance_fc,
+        ) = created[:4]
+        baked_volume = float(created[4]) if len(created) > 4 else 0.0
         add_owned(compound_entity)
         stage = "compound_source_metadata"
         _persist_text3d_source_metadata(
@@ -7115,7 +7174,9 @@ def _deliver_text_item_3d(
         expected_anchor_xyz = (float(pos.x), float(pos.y), float(pos.z))
         shape = getattr(compound_entity, "Shape", None)
         solid_count = _shape_solid_count(shape) if shape is not None else 0
-        volume = float(getattr(shape, "Volume", 0.0) or 0.0) if shape is not None else 0.0
+        volume = float(baked_volume)
+        if volume <= 0.0:
+            volume = float(getattr(shape, "Volume", 0.0) or 0.0) if shape is not None else 0.0
         live_object = doc.getObject(compound_id) if compound_id else None
         metadata_verified = bool(
             getattr(compound_entity, "PDFSourceText", None) == source_text
@@ -8020,7 +8081,7 @@ def _deliver_text_item_svg(
 ) -> Dict[str, Any]:
     """Deliver one canonical item as verified SVG Glyphs or raw Geometry."""
     try:
-        bound_item = copy.deepcopy(item) if isinstance(item, dict) else {}
+        bound_item = item if isinstance(item, dict) else {}
     except Exception:
         bound_item = {}
     source_item_id = str(bound_item.get("source_item_id") or "")
@@ -9472,6 +9533,7 @@ def _wirestring_memo_scope(opts: Optional["ImportOptions"] = None):
             except (AttributeError, TypeError):
                 pass
         outline_memo.clear()
+        _clear_font_kern_probe_cache()
 
 
 def _memoized_wirestrings(func):

@@ -1303,6 +1303,30 @@ def test_raster_verifier_hashes_identical_resolved_paths_once(tmp_path, monkeypa
     assert hash_calls == [str(source)]
 
 
+def test_raster_verifier_reuses_precomputed_source_digest(tmp_path, monkeypatch):
+    source = tmp_path / "shared-source.png"
+    source.write_bytes(b"one-source-bound-raster")
+    host = SimpleNamespace(
+        ImageFile=str(source),
+        PDFRasterFile=str(source),
+    )
+    hash_calls = []
+
+    def counted_path_sha256(path):
+        hash_calls.append(str(Path(path)))
+        return "deadbeef"
+
+    monkeypatch.setattr(core, "_path_sha256", counted_path_sha256)
+
+    evidence = core._raster_file_evidence(
+        host, source, source_sha256="a" * 64
+    )
+
+    assert evidence["source_asset_sha256"] == "a" * 64
+    assert evidence["raster_content_verified"] is True
+    assert hash_calls == []
+
+
 def test_explicit_raster_is_requested_output_not_fallback():
     opts = core.ImportOptions(import_mode="raster", import_text=False, text_mode="none")
 

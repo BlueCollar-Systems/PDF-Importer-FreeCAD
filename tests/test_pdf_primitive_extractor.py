@@ -66,7 +66,7 @@ class TestPdfPrimitiveExtractor(unittest.TestCase):
         # an already-merged '3/16' one text height (4.62 mm) below it, i.e. the
         # other side of the weld reference line -- NOT an overlay.  Overlay
         # duplicates coincide (<= _FRAC_OVERLAY_TOL_MM); a neighbouring
-        # fraction is kept, so TWO '3/16' survive.  Evidence: 1011 (1 OF 2)
+        # fraction is kept, so TWO '3/16' survive.  Evidence: private fabrication sheet
         # p1 has 14 stacked-over-stacked weld pairs, e.g. PDF pt spans '316'
         # [949.5,927.5,966.8,941.5] + '/' and '316' [949.5,940.5,966.8,954.6]
         # + '/', that used to collapse to one fraction each.
@@ -129,7 +129,7 @@ class TestPdfPrimitiveExtractor(unittest.TestCase):
         # second '316' + '/' 4.62 mm below it (tiling bboxes).  Each slash must
         # merge with exactly ONE numerator/denominator span -- the one whose
         # own stacked band straddles that slash -- so the symbol yields TWO
-        # '3/16' items and no bare '/'.  Evidence: 1011 (1 OF 2) p1, 14
+        # '3/16' items and no bare '/'.  Evidence: private fabrication sheet p1, 14
         # stacked-over-stacked weld pairs, e.g. PDF pt spans '316'
         # [949.5,927.5,966.8,941.5] + '/' and '316' [949.5,940.5,966.8,954.6]
         # + '/' (each pair used to collapse to a single '3/16').

@@ -179,6 +179,9 @@ class _View:
         self.ShapeColor = (1.0, 1.0, 1.0)
         self.LineColor = (1.0, 1.0, 1.0)
         self.PointColor = (1.0, 1.0, 1.0)
+        # Draft Label defaults: a 1 mm "Dot" marker + leader on every anchor.
+        self.ArrowTypeStart = "Dot"
+        self.Line = True
 
 
 class _HostObject:
@@ -710,6 +713,12 @@ def test_native_item_delivery_rereads_live_text_transform_style_and_metadata(
     assert host.PDFTextColorRGB == "0.2,0.4,0.6"
     assert result["evidence"]["style_verification"] == "gui_view_and_app_metadata"
     assert result["evidence"]["view_style_verified"] is True
+    if attempted_type == "labels":
+        # points=[anchor, anchor] must not grow Draft's default Dot marker.
+        assert host.ViewObject.ArrowTypeStart == "None"
+        assert host.ViewObject.Line is False
+    else:
+        assert host.ViewObject.ArrowTypeStart == "Dot"
     assert core._host_anchor_xyz(host) == pytest.approx(
         result["evidence"]["expected_anchor_xyz"]
     )

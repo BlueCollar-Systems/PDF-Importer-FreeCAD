@@ -1722,10 +1722,122 @@ def _extrude_model3d_obj(obj, opts: ImportOptions) -> bool:
         return False
 
 
-def _apply_style(obj, stroke_rgb, fill_rgb, width, dashes, opts: ImportOptions):
-    """Set source stroke/fill color, line width, and dash style on a ViewObject."""
+def _persist_geometry_style_metadata(
+    obj,
+    stroke_rgb,
+    fill_rgb,
+    width,
+    dashes,
+    opts: ImportOptions,
+) -> bool:
+    """Persist the *effective* view style App-side so it survives a headless save.
+
+    FreeCADCmd has no ViewObject and writes no GuiDocument.xml, so everything
+    ``_apply_style`` puts on the view is lost on GUI open (dashed lines render
+    solid, weights flatten to 2 px, colours default).  These four properties are
+    the same contract text already carries in ``PDFText*`` and are read back by
+    ``PDFStyleRestore`` when the document opens in the GUI.
+
+    ``PDFLineWidthPt`` is 0.0 and ``PDFDashPattern`` is "" whenever the import
+    options disabled that mapping, so the restore reproduces the same look the
+    GUI import produced.  Never raises: hosts without ``addProperty`` are skipped.
+    """
+    add_property = getattr(obj, "addProperty", None)
+    if not callable(add_property):
+        return False
+    try:
+        width_pt = float(width) if (opts.assign_linewidth and width is not None) else 0.0
+        if width_pt != width_pt or width_pt < 0.0:
+            width_pt = 0.0
+    except (TypeError, ValueError):
+        width_pt = 0.0
+    dash_metadata = ""
+    try:
+        if opts.map_dashes and dashes and len(dashes) >= 2 and all(d > 0 for d in dashes):
+            dash_metadata = ",".join(format(float(d), ".9g") for d in dashes)
+    except (TypeError, ValueError):
+        dash_metadata = ""
+    values = (
+        ("App::PropertyString", "PDFStrokeRGB", _format_color_metadata(stroke_rgb)),
+        ("App::PropertyString", "PDFFillRGB", _format_color_metadata(fill_rgb)),
+        ("App::PropertyFloat", "PDFLineWidthPt", width_pt),
+        ("App::PropertyString", "PDFDashPattern", dash_metadata),
+    )
+    try:
+        properties = set(getattr(obj, "PropertiesList", []) or [])
+        for property_kind, property_name, property_value in values:
+            if property_name not in properties:
+                add_property(property_kind, property_name, "PDF Import")
+                properties.add(property_name)
+            setattr(obj, property_name, property_value)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _record_geometry_style_evidence(opts: ImportOptions, *, persisted: bool, view_styled: bool) -> None:
+    """Count what really happened so the import report cannot claim GUI style headless."""
+    try:
+        if persisted:
+            opts._geometry_style_app_objects = int(
+                getattr(opts, "_geometry_style_app_objects", 0) or 0
+            ) + 1
+        if view_styled:
+            opts._geometry_style_view_objects = int(
+                getattr(opts, "_geometry_style_view_objects", 0) or 0
+            ) + 1
+    except (AttributeError, TypeError, ValueError):
+        pass
+
+
+def _geometry_style_report_payload(opts: ImportOptions) -> Dict[str, Any]:
+    """Report block: is geometry look persisted App-side, and was a GUI view styled?"""
+    app_objects = int(getattr(opts, "_geometry_style_app_objects", 0) or 0)
+    view_objects = int(getattr(opts, "_geometry_style_view_objects", 0) or 0)
+    if app_objects == 0 and view_objects == 0:
+        verification = "no_geometry_style_applied"
+    elif view_objects >= app_objects and view_objects > 0:
+        verification = "gui_view_and_app_metadata"
+    elif view_objects > 0:
+        verification = "mixed_view_and_app_metadata"
+    else:
+        verification = "headless_app_metadata"
+    return {
+        "app_metadata_objects": app_objects,
+        "view_styled_objects": view_objects,
+        "style_verification": verification,
+        "view_style_verified": verification == "gui_view_and_app_metadata",
+    }
+
+
+def _apply_style(
+    obj,
+    stroke_rgb,
+    fill_rgb,
+    width,
+    dashes,
+    opts: ImportOptions,
+    *,
+    persist_metadata: bool = True,
+):
+    """Set source stroke/fill color, line width, and dash style on a ViewObject.
+
+    The same style is persisted App-side first (``PDFStrokeRGB`` / ``PDFFillRGB``
+    / ``PDFLineWidthPt`` / ``PDFDashPattern``) so a headless FreeCADCmd save keeps
+    the contract and ``PDFStyleRestore`` can re-apply it on GUI open.  Pass
+    ``persist_metadata=False`` from that restore path (metadata already there).
+    """
+    persisted = False
+    if persist_metadata:
+        persisted = _persist_geometry_style_metadata(
+            obj, stroke_rgb, fill_rgb, width, dashes, opts
+        )
+    view_styled = False
     try:
         vo = obj.ViewObject
+        if vo is None:
+            raise AttributeError("headless host: no ViewObject")
+        view_styled = True
         visible_rgb = stroke_rgb or fill_rgb
         if visible_rgb is not None:
             try:
@@ -1769,6 +1881,10 @@ def _apply_style(obj, stroke_rgb, fill_rgb, width, dashes, opts: ImportOptions):
                     vo.DrawStyle = "Dashdot"
     except (AttributeError, RuntimeError, TypeError, ValueError):
         pass
+    if persist_metadata:
+        _record_geometry_style_evidence(
+            opts, persisted=persisted, view_styled=view_styled
+        )
 
 
 def _make_group(parent, label: str, fc_doc=None):
@@ -3294,6 +3410,12 @@ def _record_text_delivery(opts: ImportOptions, bucket: str, count: int) -> None:
 
 
 FREECAD_TEXT_IMPORTER_IDENTITY = "bluecollarsystems.freecad.pdf_vector_importer"
+
+# Draft Labels are built with points=[anchor, anchor]; Draft's default
+# ArrowTypeStart "Dot" then draws a 1 mm world-sized marker over the first
+# glyph of every span (extra ink not in the PDF).  Same constant as
+# PDFStyleRestore.LABEL_ARROW_TYPE so creation and GUI-open restore agree.
+LABEL_ARROW_TYPE = "None"
 
 
 TEXT_ITEM_FALLBACK_LADDERS = {
@@ -6190,6 +6312,12 @@ def _deliver_text_item_native(
                         color_properties.append(property_name)
                 if not color_properties:
                     raise RuntimeError("native host exposes no writable color property")
+            if attempted_type == "labels":
+                # Zero-length leader: no arrow marker, no leader line.
+                if hasattr(view, "ArrowTypeStart"):
+                    view.ArrowTypeStart = LABEL_ARROW_TYPE
+                if hasattr(view, "Line"):
+                    view.Line = False
     except Exception as exc:
         fail(
             "native_text_creation_or_style_failed",
@@ -10941,6 +11069,8 @@ def _reset_import_run_state(opts: ImportOptions) -> None:
     opts._report_extra = {}
     opts._model3d_solids = 0
     opts._model3d_semantic_objects = 0
+    opts._geometry_style_app_objects = 0
+    opts._geometry_style_view_objects = 0
     opts._model3d_intent = None
     opts._model3d_intent_feasible = False
     opts._model3d_text_evidence = []
@@ -10977,6 +11107,8 @@ _PAGE_RESULT_TELEMETRY_FIELDS = (
     "_shapestring_font_staging_sessions",
     "_report_extra",
     "_model3d_solids",
+    "_geometry_style_app_objects",
+    "_geometry_style_view_objects",
     "_scale_cached_pages",
     "wirestring_cache_stats",
     "text3d_outline_cache_stats",
@@ -11865,6 +11997,9 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         opts._report_extra["result_status"] = (
             "cancelled" if cancelled else "success"
         )
+        # Geometry look is App-side metadata in every host; a GUI view was
+        # styled only when one existed. Headless runs must say so.
+        opts._report_extra["geometry_style"] = _geometry_style_report_payload(opts)
         if session_state is not None:
             opts._report_extra["import_session"] = _session_state_payload(
                 session_state

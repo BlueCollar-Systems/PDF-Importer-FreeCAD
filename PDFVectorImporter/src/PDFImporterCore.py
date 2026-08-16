@@ -44,6 +44,7 @@ except ModuleNotFoundError as exc:
 
 activate_bundled_runtime_if_available(_mod_root)
 from pdfcadcore.fitz_loader import import_fitz as _import_fitz
+from pdfcadcore.primitive_extractor import _composite_alpha, _span_alpha
 
 fitz = _import_fitz()
 
@@ -2285,7 +2286,9 @@ def _fit_font_size_to_span_bbox(
 
 
 def _span_source_color(span: dict) -> Optional[Tuple[float, float, float]]:
-    return _optional_color(span.get("color"))
+    # Constant alpha (/ca) is composited against the white page once, like pdfcadcore
+    # does for the other hosts; FreeCAD's TextColor has no alpha channel.
+    return _composite_alpha(_optional_color(span.get("color")), _span_alpha(span))
 
 
 def _apply_text_color(obj, rgb: Optional[Tuple[float, float, float]]) -> None:
@@ -10459,9 +10462,9 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             continue
 
         stroke = path_group.get("color") or path_group.get("stroke")
-        stroke_rgb = _optional_color(stroke)
+        stroke_rgb = _composite_alpha(_optional_color(stroke), path_group.get("stroke_opacity"))
         fill = path_group.get("fill")
-        fill_rgb = _optional_color(fill)
+        fill_rgb = _composite_alpha(_optional_color(fill), path_group.get("fill_opacity"))
         close_path = path_group.get("closePath", False)
         width = _as_float(path_group.get("width") or path_group.get("lineWidth"))
         dashes, dash_phase = _parse_dashes(path_group.get("dashes"))  # noqa: F841 — dash_phase stored for QA/adapter use; FC DrawStyle has no phase param
@@ -10927,7 +10930,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 if not items:
                     continue
                 stroke = path_group.get("color") or path_group.get("stroke")
-                stroke_rgb = _optional_color(stroke)
+                stroke_rgb = _composite_alpha(_optional_color(stroke), path_group.get("stroke_opacity"))
                 current_pt = None
                 sub_edges = []
                 for item in items:

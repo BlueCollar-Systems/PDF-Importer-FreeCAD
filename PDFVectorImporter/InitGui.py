@@ -46,6 +46,7 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
             "PDFScaleTool",
             "PDFTools",
             "PDFImporterCore",
+            "PDFStyleRestore",
             "PDFImportHandler",
             "PDFVectorImporter.src.PDFImporterCmd",
             "PDFVectorImporter.src.PDFScaleTool",
@@ -257,3 +258,34 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
 
 
 FreeCADGui.addWorkbench(PDFVectorImporterWorkbench())
+
+# ── Headless-save style restore (module level: runs at GUI startup, not on
+#    workbench activation).  A document imported by FreeCADCmd has no
+#    GuiDocument.xml; on GUI open Draft Text/Labels fall back to 3.5 mm default
+#    font and a "Dot" arrow, and Batch/Face geometry to Solid / 2 px / default
+#    colours.  PDFStyleRestore re-applies the App-side PDF* metadata to the view
+#    providers once the document has finished loading.  Inline, no helper
+#    functions (FreeCAD exec()s this file); every failure is non-fatal.
+try:
+    _pdfvi_restore_base = ""
+    for _pdfvi_root in (FreeCAD.getUserAppDataDir(), FreeCAD.getResourceDir()):
+        _pdfvi_dir = os.path.join(_pdfvi_root, "Mod", "PDFVectorImporter")
+        if os.path.isdir(_pdfvi_dir):
+            _pdfvi_restore_base = _pdfvi_dir
+            break
+    if _pdfvi_restore_base:
+        for _pdfvi_path in (
+            os.path.join(_pdfvi_restore_base, "src"),
+            _pdfvi_restore_base,
+            os.path.dirname(_pdfvi_restore_base),
+        ):
+            if _pdfvi_path not in sys.path:
+                sys.path.insert(0, _pdfvi_path)
+        import PDFStyleRestore
+        if PDFStyleRestore.register_document_observer(FreeCAD) is None:
+            FreeCAD.Console.PrintWarning(
+                "PDF Vector Importer: style-restore observer not registered\n")
+except Exception as _pdfvi_exc:  # never block FreeCAD startup
+    FreeCAD.Console.PrintWarning(
+        "PDF Vector Importer: style-restore hook unavailable: "
+        + str(_pdfvi_exc) + "\n")

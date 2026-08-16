@@ -169,6 +169,7 @@ PDFVectorImporter/
 |-- PDFTools.py                 # Toolbar actions (Scale, Quick Scale, Batch)
 |-- src/
 |   |-- PDFImporterCore.py      # Central import pipeline
+|   |-- PDFStyleRestore.py      # Re-applies PDF* App metadata to view providers on GUI open
 |   |-- PDFImporterCmd.py       # FreeCAD command wrappers
 |   |-- PDFScaleTool.py         # Scale by Reference implementation
 |   |-- PDFHatchDetector.py     # Hatch region detection engine
@@ -184,6 +185,25 @@ PDFVectorImporter/
 |   |-- PDFGenericRecognizer.py # Generic pattern recognition
 |   |-- PDFGeometryCleanup.py   # Duplicate/overlap removal
 ```
+
+### Headless (FreeCADCmd) saves keep their look
+
+FreeCAD stores colours, line widths, dash styles, font sizes and visibility on
+the ViewObject (`GuiDocument.xml`), which a FreeCADCmd import never has. The
+importer therefore persists the intended style on the App object as well
+(`PDFTextFontName` / `PDFTextFontSize` / `PDFTextColorRGB` /
+`PDFTextJustification` for text; `PDFStrokeRGB` / `PDFFillRGB` /
+`PDFLineWidthPt` / `PDFDashPattern` for geometry), and `InitGui.py` registers
+`PDFStyleRestore` at GUI startup: when such a document opens in the GUI the
+App metadata is re-applied to the view providers (visibility, Draft text style,
+no Label arrow marker, geometry colour / width / dash) and the view is
+re-fitted. The restore only runs for files that really lack GUI state (an
+`.FCStd` whose zip has no `GuiDocument.xml`); a GUI-saved document -- including
+a headless import that was opened once and saved -- keeps its own view state,
+so user edits are never reverted and nothing is marked Modified on open. The import report's
+`geometry_style` block and each text item's `style_verification` say
+`headless_app_metadata` when no GUI view existed, and
+`gui_view_and_app_metadata` only when one was really styled.
 
 ---
 

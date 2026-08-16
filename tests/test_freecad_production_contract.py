@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import ast
 import concurrent.futures
+import hashlib
 import importlib.util
 import inspect
 import math
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -91,6 +93,62 @@ def test_atomic_raster_publication_survives_concurrent_same_key_writers(tmp_path
 
     assert destination.read_bytes() in payloads
     assert [path for path in tmp_path.iterdir() if path != destination] == []
+
+
+def test_raster_asset_dir_probes_writability_once_per_import(monkeypatch, tmp_path):
+    probes = []
+    real_ntf = tempfile.NamedTemporaryFile
+
+    def counting_ntf(*args, **kwargs):
+        probes.append(kwargs.get("dir") or (args[0] if args else None))
+        return real_ntf(*args, **kwargs)
+
+    monkeypatch.setattr(core.tempfile, "NamedTemporaryFile", counting_ntf)
+    monkeypatch.setattr(
+        core,
+        "FreeCAD",
+        SimpleNamespace(getUserAppDataDir=lambda: str(tmp_path / "appdata")),
+    )
+    core._reset_import_run_state(core.ImportOptions())
+    try:
+        first = core._raster_asset_dir()
+        second = core._raster_asset_dir()
+
+        assert first == second
+        assert first.is_dir()
+        assert len(probes) == 1
+    finally:
+        core._reset_import_run_state(core.ImportOptions())
+
+
+def test_save_pixmap_atomic_hashes_published_bytes_without_reencode(tmp_path):
+    destination = tmp_path / "span.png"
+    pixel_bytes = bytes((255, 0, 0, 0, 255, 0, 0, 0, 255))
+
+    class Pixmap:
+        width = 3
+        height = 1
+        n = 3
+        stride = 9
+        alpha = False
+        samples = pixel_bytes
+        colorspace = SimpleNamespace(n=3)
+
+        def save(self, _path):
+            raise AssertionError("samples path must not fall back to pix.save")
+
+    digest = core._save_pixmap_atomic(Pixmap(), destination)
+
+    assert destination.is_file()
+    assert destination.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+    assert digest == hashlib.sha256(destination.read_bytes()).hexdigest()
+    host = SimpleNamespace(
+        ImageFile=str(destination),
+        PDFRasterFile=str(destination),
+    )
+    evidence = core._raster_file_evidence(host, destination, source_sha256=digest)
+    assert evidence["raster_content_verified"] is True
+    assert evidence["source_asset_sha256"] == digest
 
 
 class _Vector:

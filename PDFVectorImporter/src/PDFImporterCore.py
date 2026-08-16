@@ -3415,7 +3415,10 @@ FREECAD_TEXT_IMPORTER_IDENTITY = "bluecollarsystems.freecad.pdf_vector_importer"
 # ArrowTypeStart "Dot" then draws a 1 mm world-sized marker over the first
 # glyph of every span (extra ink not in the PDF).  Same constant as
 # PDFStyleRestore.LABEL_ARROW_TYPE so creation and GUI-open restore agree.
+# FreeCAD 1.0 Labels have ArrowType (no "None") + ArrowSize instead; there a
+# zero arrow size hides the marker (PDFStyleRestore.LABEL_ARROW_SIZE_FALLBACK).
 LABEL_ARROW_TYPE = "None"
+LABEL_ARROW_SIZE_FALLBACK = 0.0
 
 
 TEXT_ITEM_FALLBACK_LADDERS = {
@@ -6316,6 +6319,10 @@ def _deliver_text_item_native(
                 # Zero-length leader: no arrow marker, no leader line.
                 if hasattr(view, "ArrowTypeStart"):
                     view.ArrowTypeStart = LABEL_ARROW_TYPE
+                elif hasattr(view, "ArrowSize"):
+                    # FreeCAD 1.0 Labels expose ArrowType (no "None" member)
+                    # + ArrowSize; a zero-size marker draws nothing.
+                    view.ArrowSize = LABEL_ARROW_SIZE_FALLBACK
                 if hasattr(view, "Line"):
                     view.Line = False
     except Exception as exc:

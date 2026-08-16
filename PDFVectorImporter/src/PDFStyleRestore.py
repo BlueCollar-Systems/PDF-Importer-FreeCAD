@@ -23,6 +23,14 @@ Contract
 --------
 * Host-free import: nothing here imports FreeCAD at module import time, so the
   logic is unit-testable and the GUI startup path stays cheap.
+* Gated: the observer only restores documents that really lack GUI state, i.e.
+  ``doc.FileName`` names an ``.FCStd`` zip whose members do not include
+  ``GuiDocument.xml`` (a FreeCADCmd save contains only ``Document.xml`` and the
+  ``*.brp`` shapes).  Documents with no file name (File > New, the importer's
+  own in-progress GUI document) and documents that already carry
+  ``GuiDocument.xml`` (a GUI save, including a headless import that was opened
+  once and saved) are left alone, so user edits to importer-created objects
+  survive and the document is not marked Modified on open.
 * Idempotent: text / label / visibility writes compare before setting.  A second
   run over the same document writes nothing to those views.  Geometry reuses
   ``PDFImporterCore._apply_style`` (one copy of the px / floor / dash rule).
@@ -34,12 +42,17 @@ Contract
 from __future__ import annotations
 
 import os
+import zipfile
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
 TEXT_REPRESENTATIONS = frozenset({"text", "labels"})
 LABEL_REPRESENTATION = "labels"
 LABEL_ARROW_TYPE = "None"
+# FreeCAD 1.0 Draft Labels expose ``ArrowType`` (no "None" member) instead of
+# 1.1's ``ArrowTypeStart``; there the marker is hidden by a zero arrow size.
+LABEL_ARROW_SIZE_FALLBACK = 0.0
+GUI_DOCUMENT_MEMBER = "GuiDocument.xml"
 
 GEOMETRY_MARKER = "PDFLineWidthPt"
 GEOMETRY_PROPERTIES = ("PDFStrokeRGB", "PDFFillRGB", "PDFLineWidthPt", "PDFDashPattern")
@@ -212,14 +225,14 @@ def _restore_geometry(obj: Any, view: Any, applier: Callable[..., Any], opts: An
 
 
 def _text_font_value(obj: Any) -> str:
-    """Prefer a still-present cached font file, else the persisted font name."""
-    font_file = getattr(obj, "PDFFontFile", None)
-    if isinstance(font_file, str) and font_file.strip():
-        try:
-            if os.path.isfile(font_file):
-                return font_file
-        except (OSError, TypeError, ValueError):
-            pass
+    """The persisted normalized font name, exactly what creation wrote to the view.
+
+    ``_deliver_text_item_native`` writes ``PDFTextFontName`` (the normalized PDF
+    font name) to both the App object and the view's FontName; the restore must
+    reproduce that same value so a GUI import and a restored headless import
+    look identical.  (``PDFFontFile`` only exists on 3D-text solids, never on
+    Draft Text/Labels, so no font-path branch belongs here.)
+    """
     font_name = getattr(obj, "PDFTextFontName", None)
     return font_name.strip() if isinstance(font_name, str) else ""
 
@@ -252,6 +265,11 @@ def _restore_text(obj: Any, view: Any, representation: str) -> bool:
         # default "Dot" arrow then draws a 1 mm marker over the first glyph.
         if _has_view_property(view, "ArrowTypeStart"):
             written |= _set_if_changed(view, "ArrowTypeStart", LABEL_ARROW_TYPE)
+        elif _has_view_property(view, "ArrowSize"):
+            # FreeCAD 1.0: ArrowType has no "None"; a zero-size marker is invisible.
+            written |= _set_if_changed(
+                view, "ArrowSize", LABEL_ARROW_SIZE_FALLBACK, _floats_match
+            )
         if _has_view_property(view, "Line"):
             written |= _set_if_changed(view, "Line", False)
     return written
@@ -272,6 +290,52 @@ def _is_group(obj: Any) -> bool:
         return str(getattr(obj, "TypeId", "") or "").startswith("App::DocumentObjectGroup")
     except Exception:
         return False
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Gate: only documents that really lack GUI state
+# ──────────────────────────────────────────────────────────────────────
+
+
+def document_needs_style_restore(doc: Any) -> Tuple[bool, str]:
+    """Decide whether ``doc`` is a headless-saved file that needs its look restored.
+
+    Returns ``(needs_restore, reason)``.  ``True`` only when ``doc.FileName``
+    names a readable zip (``.FCStd``) whose members do **not** include
+    ``GuiDocument.xml`` -- exactly what FreeCADCmd writes (``Document.xml`` +
+    ``*.brp``).  Everything else is skipped:
+
+    * ``no_file_name``: File > New, or the importer's own in-progress GUI
+      document (nothing to restore, and re-styling would fight the import).
+    * ``has_gui_document``: a GUI save.  Its view state is authoritative --
+      re-applying the PDF* metadata would silently revert user edits to
+      importer-created objects and mark the document Modified on every open.
+    * ``file_missing`` / ``not_a_zip`` / ``unreadable``: not an ``.FCStd`` we
+      can reason about (e.g. a STEP/DXF opened straight into a new document).
+
+    Never raises.
+    """
+    try:
+        file_name = str(getattr(doc, "FileName", "") or "").strip()
+    except Exception:
+        return False, "no_file_name"
+    if not file_name:
+        return False, "no_file_name"
+    try:
+        if not os.path.isfile(file_name):
+            return False, "file_missing"
+    except (OSError, TypeError, ValueError):
+        return False, "file_missing"
+    try:
+        with zipfile.ZipFile(file_name) as archive:
+            members = archive.namelist()
+    except zipfile.BadZipFile:
+        return False, "not_a_zip"
+    except Exception:
+        return False, "unreadable"
+    if GUI_DOCUMENT_MEMBER in members:
+        return False, "has_gui_document"
+    return True, "headless_file"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -319,8 +383,31 @@ def restore_object_style(
     return result
 
 
-def restore_document_styles(doc: Any, *, log: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
-    """Restore every importer-owned object in ``doc``.  Never raises."""
+def _gui_view_fit() -> bool:
+    """Fit the active 3D view; False when there is no GUI.  Never raises."""
+    try:
+        import FreeCADGui  # type: ignore
+
+        FreeCADGui.SendMsgToActiveView("ViewFit")
+    except Exception:
+        return False
+    return True
+
+
+def restore_document_styles(
+    doc: Any,
+    *,
+    log: Optional[Callable[[str], None]] = None,
+    view_fit: Optional[Callable[[], Any]] = None,
+) -> Dict[str, Any]:
+    """Restore every importer-owned object in ``doc``.  Never raises.
+
+    This is the unconditional worker; ``PDFStyleRestoreObserver`` gates it with
+    ``document_needs_style_restore`` so only headless-saved files are touched.
+    When visibility was restored for at least one object the view is re-fitted
+    (``view_fit``, default ``FreeCADGui.SendMsgToActiveView("ViewFit")``) so
+    the previously invisible geometry is on screen.
+    """
     summary: Dict[str, Any] = {
         "document": "",
         "objects_scanned": 0,
@@ -329,6 +416,7 @@ def restore_document_styles(doc: Any, *, log: Optional[Callable[[str], None]] = 
         "geometry_restored": 0,
         "visibility_restored": 0,
         "groups_restored": 0,
+        "view_fit": False,
         "errors": [],
     }
     try:
@@ -398,6 +486,12 @@ def restore_document_styles(doc: Any, *, log: Optional[Callable[[str], None]] = 
                 )
             pending.append(parent)
 
+    if summary["visibility_restored"] > 0:
+        try:
+            summary["view_fit"] = bool((view_fit or _gui_view_fit)())
+        except Exception:
+            summary["view_fit"] = False
+
     if log is not None and summary["objects_marked"]:
         try:
             log(
@@ -455,6 +549,12 @@ class PDFStyleRestoreObserver:
     which only resumes after the synchronous open completes.  If the document
     still reports ``Restoring`` (a progress bar pumped events mid-load) the
     callback re-arms itself a bounded number of times.
+
+    Once the document has loaded, ``gate`` (default
+    ``document_needs_style_restore``) decides whether it is a headless-saved
+    file at all; documents without a file name or with a ``GuiDocument.xml``
+    are skipped untouched.  The gate runs *after* the load completes because
+    ``FileName`` is only set once ``newDocument`` has returned.
     """
 
     def __init__(
@@ -462,11 +562,13 @@ class PDFStyleRestoreObserver:
         *,
         schedule: Optional[Callable[[Callable[[], None], int], bool]] = None,
         restore: Optional[Callable[[Any], Dict[str, Any]]] = None,
+        gate: Optional[Callable[[Any], Tuple[bool, str]]] = None,
         log: Optional[Callable[[str], None]] = None,
         max_retries: int = _RESTORE_MAX_RETRIES,
     ):
         self._schedule = schedule or _qt_schedule
         self._restore = restore or (lambda doc: restore_document_styles(doc, log=self._log))
+        self._gate = gate or document_needs_style_restore
         self._log = log or _console_log
         self._max_retries = int(max_retries)
 
@@ -499,6 +601,19 @@ class PDFStyleRestoreObserver:
         if still_restoring:
             if attempt < self._max_retries:
                 self._arm(doc, attempt + 1)
+            return
+        try:
+            needs_restore, reason = self._gate(doc)
+        except Exception as exc:
+            needs_restore, reason = False, "gate_error: %s" % exc
+        if not needs_restore:
+            try:
+                self._log(
+                    "PDF Vector Importer: style restore skipped for %s (%s)\n"
+                    % (str(getattr(doc, "Name", "") or "document"), reason)
+                )
+            except Exception:
+                pass
             return
         try:
             self._restore(doc)

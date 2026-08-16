@@ -17,7 +17,10 @@ The fix has two halves that these tests pin host-free:
 * ``PDFStyleRestore`` re-applies the App-side contract to the view providers
   when a document opens in the GUI (visibility, Draft text style, Label arrow
   removal, geometry style via the same ``_apply_style`` rule), idempotently and
-  without raising on partial data.
+  without raising on partial data -- but only for documents that really lack
+  GUI state (``doc.FileName`` is an ``.FCStd`` zip without ``GuiDocument.xml``);
+  GUI-saved files and file-less documents are never touched, so user edits are
+  not reverted and nothing is marked Modified on open.
 """
 
 from __future__ import annotations
@@ -397,7 +400,11 @@ class TestRestoreDocumentStyles:
         assert summary["objects_scanned"] == 6
         assert isinstance(summary["errors"], list)
 
-    def test_font_file_path_is_preferred_over_font_name_when_it_exists(self, tmp_path):
+    def test_restore_writes_the_same_normalized_font_name_creation_wrote(self, tmp_path):
+        # Creation writes PDFTextFontName (normalized) to both the App object and
+        # the view; restore must reproduce exactly that, never a font file path
+        # (PDFFontFile only exists on 3D-text solids, and even a stray one must
+        # not leak into a Draft view's FontName).
         font_file = tmp_path / "romant.ttf"
         font_file.write_bytes(b"\0")
         view = _text_view()
@@ -407,15 +414,77 @@ class TestRestoreDocumentStyles:
             PDFTextFontSize=5.0, PDFFontFile=str(font_file),
         )
         restore.restore_document_styles(_FakeDocument([obj]))
-        assert view.FontName == str(font_file)
+        assert view.FontName == "RomanT"
+        assert restore._text_font_value(obj) == "RomanT"
+        assert restore._text_font_value(_FakeObject("no_font", view=None)) == ""
 
-        missing = _FakeObject(
-            "PDF_Text2", "App::FeaturePython", view=_text_view(),
-            PDFRepresentation="text", PDFTextFontName="RomanT",
-            PDFTextFontSize=5.0, PDFFontFile=str(tmp_path / "gone.ttf"),
+    def test_label_arrow_falls_back_to_zero_size_on_freecad_1_0_views(self):
+        # FreeCAD 1.0 Draft Labels expose ArrowType (no "None") + ArrowSize
+        # instead of 1.1's ArrowTypeStart; the marker is hidden by size 0.
+        legacy_view = _FakeView(
+            FontSize=3.5, FontName="", Justification="Center",
+            TextColor=(0.0, 0.0, 0.0, 1.0), ArrowType="Dot", ArrowSize=1.0,
+            Line=True, Visibility=True,
         )
-        restore.restore_document_styles(_FakeDocument([missing]))
-        assert missing.ViewObject.FontName == "RomanT"
+        label = _FakeObject(
+            "PDF_Label_legacy", "App::FeaturePython", view=legacy_view,
+            PDFRepresentation="labels", PDFTextFontName="Arial",
+            PDFTextFontSize=2.0,
+        )
+        restore.restore_document_styles(_FakeDocument([label]))
+        assert legacy_view.ArrowSize == 0.0
+        assert legacy_view.ArrowType == "Dot"  # never written: "None" is not a 1.0 member
+        assert legacy_view.Line is False
+        assert core.LABEL_ARROW_SIZE_FALLBACK == restore.LABEL_ARROW_SIZE_FALLBACK == 0.0
+
+        # 1.1 view: ArrowTypeStart wins and ArrowSize is left alone.
+        modern_view = _label_view(ArrowSize=1.0)
+        modern = _FakeObject(
+            "PDF_Label_modern", "App::FeaturePython", view=modern_view,
+            PDFRepresentation="labels", PDFTextFontName="Arial",
+            PDFTextFontSize=2.0,
+        )
+        restore.restore_document_styles(_FakeDocument([modern]))
+        assert modern_view.ArrowTypeStart == "None"
+        assert modern_view.ArrowSize == 1.0
+
+    def test_view_is_refitted_only_when_visibility_was_restored(self):
+        doc, _objs = _build_document()
+        fits = []
+        first = restore.restore_document_styles(doc, view_fit=lambda: fits.append(1) or True)
+        assert first["visibility_restored"] > 0
+        assert first["view_fit"] is True and fits == [1]
+
+        # Second pass: nothing becomes visible, so no ViewFit.
+        second = restore.restore_document_styles(doc, view_fit=lambda: fits.append(2) or True)
+        assert second["visibility_restored"] == 0
+        assert second["view_fit"] is False and fits == [1]
+
+        # A raising view_fit never escapes.
+        doc2, _ = _build_document()
+
+        def boom():
+            raise RuntimeError("no active view")
+
+        third = restore.restore_document_styles(doc2, view_fit=boom)
+        assert third["view_fit"] is False and third["errors"] == []
+
+    def test_gui_view_fit_sends_viewfit_and_never_raises(self, monkeypatch):
+        import types
+
+        sent = []
+        fake_gui = types.SimpleNamespace(SendMsgToActiveView=lambda msg: sent.append(msg))
+        monkeypatch.setitem(sys.modules, "FreeCADGui", fake_gui)
+        assert restore._gui_view_fit() is True
+        assert sent == ["ViewFit"]
+
+        def raising(_msg):
+            raise RuntimeError("no active view")
+
+        monkeypatch.setitem(
+            sys.modules, "FreeCADGui", types.SimpleNamespace(SendMsgToActiveView=raising)
+        )
+        assert restore._gui_view_fit() is False
 
     def test_geometry_style_uses_the_importer_apply_style_rule(self):
         # The restore path must reuse PDFImporterCore._apply_style rather than
@@ -426,6 +495,10 @@ class TestRestoreDocumentStyles:
 # ---------------------------------------------------------------------------
 # Observer wiring: deferred until the restore is finished, registered once.
 # ---------------------------------------------------------------------------
+
+
+def _headless_gate(_doc):
+    return True, "headless_file"
 
 
 class TestObserver:
@@ -442,6 +515,7 @@ class TestObserver:
         observer = restore.PDFStyleRestoreObserver(
             schedule=schedule,
             restore=lambda d: restored.append(d) or {"errors": []},
+            gate=_headless_gate,
         )
 
         observer.slotCreatedDocument(doc)
@@ -457,20 +531,173 @@ class TestObserver:
     def test_restore_gives_up_after_bounded_retries_without_raising(self):
         doc = _FakeDocument([], restoring=True)
         scheduled = []
+        total_scheduled = []
+        gated = []
+
+        def schedule(cb, ms):
+            scheduled.append(cb)
+            total_scheduled.append(ms)
+            return True
+
+        def gate(d):
+            gated.append(d)
+            return True, "headless_file"
+
         observer = restore.PDFStyleRestoreObserver(
-            schedule=lambda cb, ms: scheduled.append(cb) or True,
+            schedule=schedule,
             restore=lambda d: pytest.fail("must not restore a document still restoring"),
+            gate=gate,
             max_retries=3,
         )
         observer.slotCreatedDocument(doc)
+        drained = 0
         while scheduled:
             scheduled.pop(0)()
-        # bounded: initial + 3 retries, then silence
+            drained += 1
+        # Bounded: exactly the initial callback + 3 retries, then silence; the
+        # gate and restore are never consulted for a document still restoring.
+        assert drained == 4
+        assert len(total_scheduled) == 1 + 3
+        assert total_scheduled[0] == 0
+        assert all(ms == restore._RESTORE_RETRY_DELAY_MS for ms in total_scheduled[1:])
+        assert gated == []
 
     def test_slot_never_raises_when_scheduling_is_unavailable(self):
         observer = restore.PDFStyleRestoreObserver(schedule=lambda cb, ms: False)
         observer.slotCreatedDocument(_FakeDocument([]))
         observer.slotDeletedDocument(_FakeDocument([]))
+
+    @pytest.mark.parametrize(
+        "verdict",
+        [(False, "no_file_name"), (False, "has_gui_document"), (True, "headless_file")],
+    )
+    def test_observer_only_restores_when_the_gate_says_headless(self, verdict):
+        doc = _FakeDocument([])
+        scheduled = []
+        restored = []
+        logged = []
+        observer = restore.PDFStyleRestoreObserver(
+            schedule=lambda cb, ms: scheduled.append(cb) or True,
+            restore=lambda d: restored.append(d) or {"errors": []},
+            gate=lambda d: verdict,
+            log=logged.append,
+        )
+        observer.slotCreatedDocument(doc)
+        scheduled.pop(0)()
+        if verdict[0]:
+            assert restored == [doc]
+            assert logged == []
+        else:
+            assert restored == []
+            assert len(logged) == 1 and verdict[1] in logged[0]
+
+    def test_gate_error_skips_the_restore_instead_of_raising(self):
+        scheduled = []
+        restored = []
+        logged = []
+
+        def exploding_gate(_doc):
+            raise RuntimeError("zip is on fire")
+
+        observer = restore.PDFStyleRestoreObserver(
+            schedule=lambda cb, ms: scheduled.append(cb) or True,
+            restore=lambda d: restored.append(d) or {"errors": []},
+            gate=exploding_gate,
+            log=logged.append,
+        )
+        observer.slotCreatedDocument(_FakeDocument([]))
+        scheduled.pop(0)()
+        assert restored == []
+        assert len(logged) == 1 and "gate_error" in logged[0]
+
+    def test_default_gate_is_the_gui_state_check(self):
+        observer = restore.PDFStyleRestoreObserver(schedule=lambda cb, ms: True)
+        assert observer._gate is restore.document_needs_style_restore
+
+
+# ---------------------------------------------------------------------------
+# Gate: only files that really lack GUI state get their look re-applied.
+# ---------------------------------------------------------------------------
+
+
+def _write_fcstd(path, members):
+    import zipfile
+
+    with zipfile.ZipFile(path, "w") as archive:
+        for name in members:
+            archive.writestr(name, "<xml/>")
+    return str(path)
+
+
+class TestDocumentNeedsStyleRestoreGate:
+    def test_headless_save_without_guidocument_needs_restore(self, tmp_path):
+        # Verified in FreeCADCmd 1.1: a headless save holds only Document.xml
+        # and the *.brp shapes -- no GuiDocument.xml.
+        path = _write_fcstd(tmp_path / "headless.FCStd", ["Document.xml", "Batch.Shape.brp"])
+        doc = _FakeDocument([])
+        doc.FileName = path
+        assert restore.document_needs_style_restore(doc) == (True, "headless_file")
+
+    def test_gui_save_with_guidocument_is_left_alone(self, tmp_path):
+        # A GUI import save, or a headless import opened once and saved: its
+        # view state is authoritative and must not be reverted on every open.
+        path = _write_fcstd(
+            tmp_path / "gui.FCStd", ["Document.xml", "GuiDocument.xml", "Batch.Shape.brp"]
+        )
+        doc = _FakeDocument([])
+        doc.FileName = path
+        assert restore.document_needs_style_restore(doc) == (False, "has_gui_document")
+
+    def test_document_without_file_name_is_skipped(self):
+        # File > New and the importer's own in-progress GUI document.
+        for file_name in ("", None, "   "):
+            doc = _FakeDocument([])
+            doc.FileName = file_name
+            assert restore.document_needs_style_restore(doc) == (False, "no_file_name")
+        assert restore.document_needs_style_restore(_FakeDocument([])) == (False, "no_file_name")
+
+    def test_missing_or_non_zip_files_are_skipped(self, tmp_path):
+        doc = _FakeDocument([])
+        doc.FileName = str(tmp_path / "gone.FCStd")
+        assert restore.document_needs_style_restore(doc) == (False, "file_missing")
+
+        plain = tmp_path / "model.step"
+        plain.write_text("ISO-10303-21;", encoding="utf-8")
+        doc.FileName = str(plain)
+        assert restore.document_needs_style_restore(doc) == (False, "not_a_zip")
+
+    def test_gate_never_raises_on_hostile_documents(self):
+        class Hostile:
+            @property
+            def FileName(self):
+                raise RuntimeError("document is gone")
+
+        assert restore.document_needs_style_restore(Hostile()) == (False, "no_file_name")
+
+    def test_gate_skips_stop_the_restore_end_to_end(self, tmp_path):
+        # Full path with the real gate: a GUI-saved file opened through the
+        # observer never has its (already GUI-owned) views touched, a headless
+        # one does.
+        gui_doc, gui_objs = _build_document()
+        gui_doc.FileName = _write_fcstd(
+            tmp_path / "gui.FCStd", ["Document.xml", "GuiDocument.xml"]
+        )
+        headless_doc, headless_objs = _build_document()
+        headless_doc.FileName = _write_fcstd(tmp_path / "headless.FCStd", ["Document.xml"])
+        scheduled = []
+        observer = restore.PDFStyleRestoreObserver(
+            schedule=lambda cb, ms: scheduled.append(cb) or True,
+            restore=lambda d: restore.restore_document_styles(d, view_fit=lambda: True),
+        )
+        observer.slotCreatedDocument(gui_doc)
+        observer.slotCreatedDocument(headless_doc)
+        while scheduled:
+            scheduled.pop(0)()
+        for obj in gui_objs.values():
+            assert obj.ViewObject.writes == [], obj.Name
+        assert gui_objs["text"].ViewObject.FontSize == 3.5
+        assert headless_objs["text"].ViewObject.FontSize == pytest.approx(11.52)
+        assert headless_objs["batch"].ViewObject.DrawStyle == "Dashed"
 
     def test_register_document_observer_is_idempotent(self):
         class FakeFreeCAD:

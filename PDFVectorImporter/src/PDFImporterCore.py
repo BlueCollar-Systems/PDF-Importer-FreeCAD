@@ -18,10 +18,12 @@ import math
 from contextlib import contextmanager
 import os
 import re
+import struct
 import sys
 import tempfile
 import time
 import traceback
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -6322,24 +6324,97 @@ def _deliver_text_item_native(
     }
 
 
+_RASTER_ASSET_DIR_CACHE = None
+
+
 def _raster_asset_dir() -> Path:
-    """Persistent, content-addressed raster assets owned by this importer."""
+    """Persistent, content-addressed raster assets owned by this importer.
+
+    Writability is probed once per import. Dense text-raster pages create one
+    ImagePlane per source span; re-probing the same folder for every span is
+    pure Windows create/delete traffic and does not change the published PNG.
+    """
+    global _RASTER_ASSET_DIR_CACHE
+    cached = _RASTER_ASSET_DIR_CACHE
+    if isinstance(cached, Path):
+        return cached
     try:
         root = Path(FreeCAD.getUserAppDataDir())
-        return _ensure_writable_cache_dir(
+        path = _ensure_writable_cache_dir(
             root / "Mod" / "PDFVectorImporter" / "raster_cache",
             ".bc-raster-cache-write-",
         )
     except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
-        return _ensure_writable_cache_dir(
+        path = _ensure_writable_cache_dir(
             Path(tempfile.gettempdir()) / "bc_fc_pdf_raster_cache",
             ".bc-raster-cache-write-",
         )
+    _RASTER_ASSET_DIR_CACHE = path
+    return path
 
 
-def _save_pixmap_atomic(pix, image_path: Path) -> None:
-    """Publish a complete raster atomically so concurrent imports cannot tear it."""
+def _encode_png_rgba_or_rgb(width: int, height: int, color_type: int, raw: bytes) -> bytes:
+    """Lossless PNG, filter-none, zlib level 1. Decoded pixels match ``raw``."""
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(tag)
+        crc = zlib.crc32(data, crc) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, color_type, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(raw, 1))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _png_bytes_from_pixmap(pix) -> Optional[bytes]:
+    """Encode RGB/Gray pixmap samples as PNG without MuPDF's slower default zlib."""
+    try:
+        width = int(getattr(pix, "width", 0) or 0)
+        height = int(getattr(pix, "height", 0) or 0)
+        n = int(getattr(pix, "n", 0) or 0)
+        stride = int(getattr(pix, "stride", 0) or 0)
+        samples = getattr(pix, "samples", None)
+        colorspace = getattr(pix, "colorspace", None)
+        cs_n = int(getattr(colorspace, "n", 0) or 0)
+        alpha = bool(getattr(pix, "alpha", False))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if (
+        width <= 0
+        or height <= 0
+        or cs_n not in (1, 3)
+        or n != cs_n + (1 if alpha else 0)
+        or n not in (1, 2, 3, 4)
+        or stride < width * n
+        or not isinstance(samples, (bytes, bytearray, memoryview))
+        or len(samples) < stride * height
+    ):
+        return None
+    color_type = {1: 0, 2: 4, 3: 2, 4: 6}[n]
+    row_bytes = width * n
+    raw = bytearray(height * (1 + row_bytes))
+    view = memoryview(samples)
+    cursor = 0
+    for row in range(height):
+        raw[cursor] = 0
+        cursor += 1
+        start = row * stride
+        raw[cursor:cursor + row_bytes] = view[start:start + row_bytes]
+        cursor += row_bytes
+    try:
+        return _encode_png_rgba_or_rgb(width, height, color_type, bytes(raw))
+    except (TypeError, ValueError, OverflowError, zlib.error, struct.error):
+        return None
+
+
+def _save_pixmap_atomic(pix, image_path: Path) -> str:
+    """Publish a complete raster atomically. Return SHA-256 of published bytes."""
     image_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = _png_bytes_from_pixmap(pix)
     fd, temporary_name = tempfile.mkstemp(
         prefix=image_path.stem + ".",
         suffix=".png",
@@ -6348,9 +6423,16 @@ def _save_pixmap_atomic(pix, image_path: Path) -> None:
     os.close(fd)
     temporary_path = Path(temporary_name)
     try:
-        pix.save(str(temporary_path))
-        if not temporary_path.is_file() or temporary_path.stat().st_size <= 0:
-            raise RuntimeError("raster renderer produced an empty temporary asset")
+        if payload is None:
+            pix.save(str(temporary_path))
+            if not temporary_path.is_file() or temporary_path.stat().st_size <= 0:
+                raise RuntimeError("raster renderer produced an empty temporary asset")
+            digest = _path_sha256(temporary_path)
+        else:
+            temporary_path.write_bytes(payload)
+            if temporary_path.stat().st_size <= 0:
+                raise RuntimeError("raster renderer produced an empty temporary asset")
+            digest = hashlib.sha256(payload).hexdigest()
         for attempt_index in range(8):
             try:
                 os.replace(str(temporary_path), str(image_path))
@@ -6361,6 +6443,7 @@ def _save_pixmap_atomic(pix, image_path: Path) -> None:
                 # Windows can briefly deny replacement while another importer
                 # publishes the same content-addressed key. Keep retries bounded.
                 time.sleep(0.005 * (attempt_index + 1))
+        return digest
     finally:
         try:
             if temporary_path.exists():
@@ -6489,8 +6572,13 @@ def _cached_text_raster_pixmap(
     pixel_rect &= full_pixmap.irect
     if pixel_rect.is_empty or pixel_rect.width <= 0 or pixel_rect.height <= 0:
         raise RuntimeError("source item raster cache crop is empty")
-    cropped = fitz.Pixmap(full_pixmap.colorspace, pixel_rect, bool(full_pixmap.alpha))
-    cropped.copy(full_pixmap, pixel_rect)
+    try:
+        cropped = fitz.Pixmap(full_pixmap, pixel_rect)
+    except (TypeError, ValueError, RuntimeError, AttributeError):
+        cropped = fitz.Pixmap(
+            full_pixmap.colorspace, pixel_rect, bool(full_pixmap.alpha)
+        )
+        cropped.copy(full_pixmap, pixel_rect)
     return cropped, effective_dpi
 
 
@@ -6640,10 +6728,9 @@ def _deliver_text_item_raster(
         ).hexdigest()
         asset_dir = _raster_asset_dir()
         image_path = asset_dir / ("text_%s.png" % cache_key)
-        _save_pixmap_atomic(pix, image_path)
+        raster_sha256 = _save_pixmap_atomic(pix, image_path)
         if not image_path.is_file() or image_path.stat().st_size <= 0:
             raise RuntimeError("source item raster was not persisted")
-        raster_sha256 = _path_sha256(image_path)
     except Exception as exc:
         fail(
             "raster_text_render_failed",
@@ -8953,12 +9040,11 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
     asset_dir.mkdir(parents=True, exist_ok=True)
     img_path = asset_dir / ("page_%s_p%d_%ddpi.png" % (digest, page_num, dpi))
     try:
-        _save_pixmap_atomic(pix, img_path)
+        raster_sha256 = _save_pixmap_atomic(pix, img_path)
     except (RuntimeError, OSError, ValueError, TypeError) as exc:
         raise RuntimeError("Raster asset could not be persisted: %s" % exc) from exc
     if not img_path.is_file() or img_path.stat().st_size <= 0:
         raise RuntimeError("Raster asset was not persisted")
-    raster_sha256 = _path_sha256(img_path)
 
     # Match the vector/text transform exactly: PDF page units multiplied by the
     # effective import scale (MM_PER_PT when scale_to_mm is enabled, plus any
@@ -9234,8 +9320,7 @@ def _import_embedded_images_as_planes(pdf_doc, page, page_num: int,
                     "img_%s_p%d_composite_%ddpi.png"
                     % (digest[:16], page_num, dpi)
                 )
-                _save_pixmap_atomic(pix, img_path)
-                raster_sha256 = _path_sha256(img_path)
+                raster_sha256 = _save_pixmap_atomic(pix, img_path)
                 manifest_sha256 = _embedded_image_manifest_sha256(
                     instances,
                     pdf_sha256=digest,
@@ -9405,8 +9490,7 @@ def _import_embedded_images_as_planes(pdf_doc, page, page_num: int,
                     "img_%s_p%d_i%d_%ddpi.png"
                     % (digest[:16], page_num, idx, dpi)
                 )
-                _save_pixmap_atomic(pix, img_path)
-                raster_sha256 = _path_sha256(img_path)
+                raster_sha256 = _save_pixmap_atomic(pix, img_path)
 
                 corners = [
                     _to_fc(point, page_h, opts, scale)
@@ -10837,6 +10921,7 @@ def _page_stack_step(page_height: float, arrangement: str, gap_ratio: float) -> 
 
 def _reset_import_run_state(opts: ImportOptions) -> None:
     """Clear output evidence from a prior run while preserving user choices."""
+    global _RASTER_ASSET_DIR_CACHE
     opts.phase_timings_ms.clear()
     opts.shapestring_skips.clear()
     opts.text_mode_fallbacks.clear()
@@ -10866,6 +10951,7 @@ def _reset_import_run_state(opts: ImportOptions) -> None:
     opts._svg_source_snapshot_cache = {}
     opts._defer_page_recompute = False
     opts._native_text_object_index = None
+    _RASTER_ASSET_DIR_CACHE = None
     opts._page_complexity_profiles = []
     opts._active_page_index = 0
     opts._active_page_total = 0

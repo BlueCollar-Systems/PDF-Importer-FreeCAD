@@ -112,10 +112,15 @@ class BoundedGeometry:
         )
 
     def transformGeometry(self, matrix):
+        scale_x = float(matrix.A11)
+        scale_y = float(getattr(matrix, "A22", 1.0) or 1.0)
+        scale_z = float(getattr(matrix, "A33", 1.0) or 1.0)
         return BoundedGeometry(
-            self.BoundBox.XMin * float(matrix.A11),
-            self.BoundBox.XMax * float(matrix.A11),
+            self.BoundBox.XMin * scale_x,
+            self.BoundBox.XMax * scale_x,
             face_count=len(self.Faces),
+            solid_count=len(self.Solids),
+            volume=float(self.Volume) * abs(scale_x * scale_y * scale_z),
         )
 
     def extrude(self, _vector):
@@ -224,6 +229,7 @@ def test_compound_scales_pen_advance_without_stretching_inset_ink(monkeypatch):
         def __init__(self):
             self.A11 = 1.0
             self.A22 = 1.0
+            self.A33 = 1.0
 
     monkeypatch.setattr(core, "Part", BoundedPart)
     monkeypatch.setattr(core, "FreeCAD", SimpleNamespace(Matrix=FakeMatrix))
@@ -249,6 +255,67 @@ def test_compound_scales_pen_advance_without_stretching_inset_ink(monkeypatch):
     assert compound.BoundBox.XMin == pytest.approx(3.0)
     assert compound.BoundBox.XMax == pytest.approx(9.0)
     assert verified_advance == pytest.approx(15.0)
+
+
+def test_compound_reuses_baked_solid_only_for_identical_dimensions(monkeypatch):
+    extrude_calls = []
+    original_extrude = BoundedGeometry.extrude
+
+    def counting_extrude(self, vector):
+        extrude_calls.append(tuple(vector))
+        return original_extrude(self, vector)
+
+    class FakeMatrix:
+        def __init__(self):
+            self.A11 = 1.0
+            self.A22 = 1.0
+            self.A33 = 1.0
+
+    monkeypatch.setattr(BoundedGeometry, "extrude", counting_extrude)
+    monkeypatch.setattr(core, "Part", BoundedPart)
+    monkeypatch.setattr(core, "FreeCAD", SimpleNamespace(Matrix=FakeMatrix))
+    monkeypatch.setattr(core, "Vector", lambda x, y, z: (x, y, z))
+    monkeypatch.setattr(
+        core,
+        "_build_exact_text3d_outline_template",
+        lambda *_args: (BoundedGeometry(2.0, 6.0, face_count=1), 10.0, 1),
+    )
+
+    memo = core._Text3DOutlineMemo()
+    prior = core._ACTIVE_TEXT3D_OUTLINE_MEMO
+    core._ACTIVE_TEXT3D_OUTLINE_MEMO = memo
+    try:
+        first = core._build_exact_text3d_compound_shape(
+            source_text="A36",
+            font_path="C:/fonts/source.ttf",
+            font_size_fc=3.0,
+            depth=0.3,
+            target_advance_fc=15.0,
+        )
+        second = core._build_exact_text3d_compound_shape(
+            source_text="A36",
+            font_path="C:/fonts/source.ttf",
+            font_size_fc=3.0,
+            depth=0.3,
+            target_advance_fc=15.0,
+        )
+        third = core._build_exact_text3d_compound_shape(
+            source_text="A36",
+            font_path="C:/fonts/source.ttf",
+            font_size_fc=6.0,
+            depth=0.6,
+            target_advance_fc=30.0,
+        )
+    finally:
+        core._ACTIVE_TEXT3D_OUTLINE_MEMO = prior
+
+    assert extrude_calls == [(0.0, 0.0, 0.3), (0.0, 0.0, 0.6)]
+    assert memo.solid_hits == 1
+    assert memo.solid_misses == 2
+    assert first[0] is not second[0]
+    assert first[0].BoundBox.XMin == pytest.approx(3.0)
+    assert second[0].BoundBox.XMin == pytest.approx(3.0)
+    assert third[0].BoundBox.XMin == pytest.approx(6.0)
 
 
 def test_compound_3d_text_is_one_verified_host_object_without_recompute(monkeypatch):
@@ -361,6 +428,21 @@ def test_text3d_outline_memo_returns_fresh_shapes_and_tracks_hits():
     assert first[0] is not second[0]
     assert first[1:] == second[1:] == (4.0, 3)
     assert third[1:] == (4.0, 3)
+
+
+def test_text3d_outline_memo_holds_a_dense_page_of_unique_strings():
+    memo = core._Text3DOutlineMemo()
+    unique_strings = 800
+
+    for index in range(unique_strings):
+        memo.get_or_build(
+            ("SPAN-%d" % index, "C:/fonts/source.ttf"),
+            lambda: (FakeShape(width=4.0), 4.0, 1),
+        )
+
+    assert memo.evictions == 0
+    assert memo.misses == unique_strings
+    assert memo.hits == 0
 
 
 def test_complete_nonspace_item_with_zero_exact_font_outlines_is_typed_and_private(

@@ -4698,10 +4698,12 @@ def _host_object_id(obj) -> str:
     return str(getattr(obj, "Name", "") or getattr(obj, "Label", "") or "")
 
 
-def _document_objects(doc) -> List[Any]:
+def _document_objects(doc, *, required: bool = False) -> List[Any]:
     try:
         return list(getattr(doc, "Objects", []) or [])
     except (AttributeError, RuntimeError, TypeError):
+        if required:
+            raise
         return []
 
 
@@ -4710,6 +4712,7 @@ def _prepare_native_text_object_index(
     doc,
     *,
     refresh: bool = False,
+    required: bool = False,
 ) -> Dict[str, Any]:
     """Index document membership once per text-delivery batch.
 
@@ -4729,7 +4732,7 @@ def _prepare_native_text_object_index(
         }
         refresh = True
     if refresh:
-        objects = _document_objects(doc)
+        objects = _document_objects(doc, required=required)
         index["object_ids"] = {id(host_obj) for host_obj in objects}
         index["entity_ids"] = {
             entity_id
@@ -4738,6 +4741,20 @@ def _prepare_native_text_object_index(
         }
     opts._native_text_object_index = index
     return index
+
+
+def _remember_native_text_object(opts: ImportOptions, host_obj) -> None:
+    """Extend the page object index after a verified delivery. O(1)."""
+    index = getattr(opts, "_native_text_object_index", None)
+    if not isinstance(index, dict):
+        return
+    object_ids = index.get("object_ids")
+    entity_ids = index.get("entity_ids")
+    if isinstance(object_ids, set):
+        object_ids.add(id(host_obj))
+    entity_id = _host_object_id(host_obj)
+    if entity_id and isinstance(entity_ids, set):
+        entity_ids.add(entity_id)
 
 
 def _text_host_document(shape_string, text_group):
@@ -5060,15 +5077,25 @@ def _text3d_faces_for_outlines(wire_shapes: List[Any]) -> List[Any]:
 
 
 class _Text3DOutlineMemo:
-    """Bounded import-scoped cache of exact unit-size counter-aware faces."""
+    """Bounded import-scoped cache of exact unit faces and unit extrusions."""
 
-    MAX_ENTRIES = 256
+    MAX_ENTRIES = 2048
 
     def __init__(self):
         self._cache: Dict[Tuple[str, str], Tuple[Any, float, int]] = {}
+        self._solid_cache: Dict[tuple, Tuple[Any, float, float, float]] = {}
         self.hits = 0
         self.misses = 0
+        self.solid_hits = 0
+        self.solid_misses = 0
         self.evictions = 0
+
+    def _evict_oldest_if_full(self, cache) -> None:
+        if len(cache) < self.MAX_ENTRIES:
+            return
+        oldest_key = next(iter(cache))
+        cache.pop(oldest_key, None)
+        self.evictions += 1
 
     def get_or_build(self, key, builder):
         normalized_key = (str(key[0]), str(key[1]))
@@ -5083,10 +5110,7 @@ class _Text3DOutlineMemo:
             )
         self.misses += 1
         shape, native_advance, visible_character_count = builder()
-        if len(self._cache) >= self.MAX_ENTRIES:
-            oldest_key = next(iter(self._cache))
-            self._cache.pop(oldest_key, None)
-            self.evictions += 1
+        self._evict_oldest_if_full(self._cache)
         self._cache[normalized_key] = (
             shape.copy(),
             float(native_advance),
@@ -5094,8 +5118,52 @@ class _Text3DOutlineMemo:
         )
         return shape, float(native_advance), int(visible_character_count)
 
+    def get_or_build_compound(self, key, builder):
+        normalized_key = (
+            str(key[0]),
+            str(key[1]),
+            round(float(key[2]), 9),
+            round(float(key[3]), 9),
+            round(float(key[4]), 9),
+        )
+        cached = self._solid_cache.get(normalized_key)
+        if cached is not None:
+            self.solid_hits += 1
+            solid, horizontal_scale, native_advance, verified_advance = cached
+            return (
+                solid.copy(),
+                float(horizontal_scale),
+                float(native_advance),
+                float(verified_advance),
+            )
+        self.solid_misses += 1
+        solid, horizontal_scale, native_advance, verified_advance = builder()
+        self._evict_oldest_if_full(self._solid_cache)
+        self._solid_cache[normalized_key] = (
+            solid.copy(),
+            float(horizontal_scale),
+            float(native_advance),
+            float(verified_advance),
+        )
+        return (
+            solid,
+            float(horizontal_scale),
+            float(native_advance),
+            float(verified_advance),
+        )
+
+    def snapshot_stats(self) -> Dict[str, int]:
+        return {
+            "hits": int(self.hits),
+            "misses": int(self.misses),
+            "evictions": int(self.evictions),
+            "solid_hits": int(self.solid_hits),
+            "solid_misses": int(self.solid_misses),
+        }
+
     def clear(self) -> None:
         self._cache.clear()
+        self._solid_cache.clear()
 
 
 _ACTIVE_TEXT3D_OUTLINE_MEMO: Optional[_Text3DOutlineMemo] = None
@@ -5259,7 +5327,7 @@ def _build_exact_text3d_outline_template(source_text: str, font_path: str):
     return face_compound, native_advance, visible_character_count
 
 
-def _build_exact_text3d_compound_shape(
+def _bake_exact_text3d_compound_shape(
     *,
     source_text: str,
     font_path: str,
@@ -5267,19 +5335,7 @@ def _build_exact_text3d_compound_shape(
     depth: float,
     target_advance_fc: float,
 ):
-    """Bake one source span into exact, width-calibrated glyph solids."""
-    if Part is None or FreeCAD is None or Vector is None:
-        raise RuntimeError("FreeCAD Part geometry API unavailable")
-    numeric_values = (
-        float(font_size_fc),
-        float(depth),
-        float(target_advance_fc),
-    )
-    if any(not math.isfinite(value) or value <= 0.0 for value in numeric_values):
-        raise RuntimeError("3D Text compound dimensions are invalid")
-    if not isinstance(source_text, str) or not source_text or source_text.isspace():
-        raise RuntimeError("3D Text compound source is empty")
-
+    """Scale unit faces, extrude to depth, and verify one span's solids."""
     build_template = lambda: _build_exact_text3d_outline_template(
         source_text, font_path
     )
@@ -5303,6 +5359,11 @@ def _build_exact_text3d_compound_shape(
     ):
         raise RuntimeError("source glyph ink bounds could not be measured")
 
+    numeric_values = (
+        float(font_size_fc),
+        float(depth),
+        float(target_advance_fc),
+    )
     native_advance = unit_advance * numeric_values[0]
     horizontal_scale = numeric_values[2] / native_advance
     if (
@@ -5361,6 +5422,48 @@ def _build_exact_text3d_compound_shape(
     ):
         raise RuntimeError("3D Text compound geometry verification failed")
     return compound, horizontal_scale, native_advance, verified_advance
+
+
+def _build_exact_text3d_compound_shape(
+    *,
+    source_text: str,
+    font_path: str,
+    font_size_fc: float,
+    depth: float,
+    target_advance_fc: float,
+):
+    """Bake one source span into exact, width-calibrated glyph solids."""
+    if Part is None or FreeCAD is None or Vector is None:
+        raise RuntimeError("FreeCAD Part geometry API unavailable")
+    numeric_values = (
+        float(font_size_fc),
+        float(depth),
+        float(target_advance_fc),
+    )
+    if any(not math.isfinite(value) or value <= 0.0 for value in numeric_values):
+        raise RuntimeError("3D Text compound dimensions are invalid")
+    if not isinstance(source_text, str) or not source_text or source_text.isspace():
+        raise RuntimeError("3D Text compound source is empty")
+
+    bake = lambda: _bake_exact_text3d_compound_shape(
+        source_text=source_text,
+        font_path=font_path,
+        font_size_fc=numeric_values[0],
+        depth=numeric_values[1],
+        target_advance_fc=numeric_values[2],
+    )
+    if _ACTIVE_TEXT3D_OUTLINE_MEMO is None:
+        return bake()
+    return _ACTIVE_TEXT3D_OUTLINE_MEMO.get_or_build_compound(
+        (
+            source_text,
+            font_path,
+            numeric_values[0],
+            numeric_values[1],
+            numeric_values[2],
+        ),
+        bake,
+    )
 
 
 def _create_verified_compound_text3d_entity(
@@ -6028,8 +6131,7 @@ def _deliver_text_item_native(
             {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
         )
 
-    object_index["object_ids"].add(id(host_obj))
-    object_index["entity_ids"].add(entity_id)
+    _remember_native_text_object(opts, host_obj)
 
     return {
         "source_item_id": source_item_id,
@@ -6115,13 +6217,31 @@ def _path_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _resolved_path_key(path: Path) -> str:
+    try:
+        return str(Path(path).resolve())
+    except OSError:
+        return str(path)
+
+
 def _raster_file_evidence(host_obj, source_asset_path: Path) -> Dict[str, Any]:
     """Verify both FreeCAD raster-file properties by content, not cache pathname."""
     source_path = Path(source_asset_path)
     if not source_path.is_file() or source_path.stat().st_size <= 0:
         raise RuntimeError("persistent source raster asset is unavailable")
 
-    source_sha256 = _path_sha256(source_path)
+    digest_by_resolved_path: Dict[str, str] = {}
+
+    def digest_for(path: Path) -> str:
+        cache_key = _resolved_path_key(path)
+        cached = digest_by_resolved_path.get(cache_key)
+        if cached is not None:
+            return cached
+        digest = _path_sha256(path)
+        digest_by_resolved_path[cache_key] = digest
+        return digest
+
+    source_sha256 = digest_for(source_path)
     evidence: Dict[str, Any] = {
         "source_asset_path": str(source_path),
         "source_asset_sha256": source_sha256,
@@ -6133,7 +6253,7 @@ def _raster_file_evidence(host_obj, source_asset_path: Path) -> Dict[str, Any]:
         actual_path = Path(str(getattr(host_obj, property_name, "") or ""))
         if not actual_path.is_file() or actual_path.stat().st_size <= 0:
             raise RuntimeError("%s raster file is unavailable" % property_name)
-        actual_sha256 = _path_sha256(actual_path)
+        actual_sha256 = digest_for(actual_path)
         if actual_sha256 != source_sha256:
             raise RuntimeError("%s raster content does not match source" % property_name)
         evidence[evidence_name] = str(actual_path)
@@ -6295,7 +6415,8 @@ def _deliver_text_item_raster(
             or float(scale) <= 0.0
         ):
             raise ValueError("canonical raster item delivery context is invalid")
-        baseline_ids = {id(host_obj) for host_obj in _document_objects(fc_doc)}
+        object_index = _prepare_native_text_object_index(opts, fc_doc)
+        baseline_ids = object_index["object_ids"]
     except Exception as exc:
         fail(
             "invalid_raster_text_source_item",
@@ -6442,6 +6563,7 @@ def _deliver_text_item_raster(
             {"exception": "%s: %s" % (exc.__class__.__name__, exc)},
         )
 
+    _remember_native_text_object(opts, host_obj)
     return {
         "source_item_id": source_item_id,
         "requested_type": requested_type,
@@ -6838,9 +6960,8 @@ def _deliver_text_item_3d(
             {"attempted_source_results": source_results},
         )
     try:
-        baseline_objects = {
-            id(host_obj) for host_obj in list(getattr(doc, "Objects", []) or [])
-        }
+        object_index = _prepare_native_text_object_index(opts, doc, required=True)
+        baseline_objects = object_index["object_ids"]
         baseline_valid = True
     except Exception as exc:
         terminal_failure(
@@ -6940,9 +7061,6 @@ def _deliver_text_item_3d(
             configure_host=_configure_item_host,
         )
         add_owned(compound_entity)
-        collection_error = collect_owned()
-        if collection_error:
-            raise RuntimeError("owned object collection failed: %s" % collection_error)
         stage = "compound_source_metadata"
         _persist_text3d_source_metadata(
             compound_entity,
@@ -6998,7 +7116,7 @@ def _deliver_text_item_3d(
         shape = getattr(compound_entity, "Shape", None)
         solid_count = _shape_solid_count(shape) if shape is not None else 0
         volume = float(getattr(shape, "Volume", 0.0) or 0.0) if shape is not None else 0.0
-        live_objects = list(getattr(doc, "Objects", []) or [])
+        live_object = doc.getObject(compound_id) if compound_id else None
         metadata_verified = bool(
             getattr(compound_entity, "PDFSourceText", None) == source_text
             and getattr(compound_entity, "PDFSourceTextSHA256", None)
@@ -7028,7 +7146,7 @@ def _deliver_text_item_3d(
         if (
             not ids_complete
             or created_ids != [compound_id]
-            or not any(candidate is compound_entity for candidate in live_objects)
+            or live_object is not compound_entity
             or getattr(compound_entity, "PDFSourceItemId", None) != source_item_id
             or getattr(compound_entity, "PDFRepresentation", None) != "3d_text"
             or str(getattr(compound_entity, "TypeId", "") or "") != "Part::Feature"
@@ -7052,6 +7170,7 @@ def _deliver_text_item_3d(
         ):
             raise RuntimeError("compound 3D Text host evidence could not be verified")
 
+        _remember_native_text_object(opts, compound_entity)
         return {
             "source_item_id": source_item_id,
             "requested_type": requested_type,
@@ -7279,12 +7398,16 @@ def _deliver_text_item_3d(
         shape = getattr(extrusion, "Shape", None)
         solids = list(getattr(shape, "Solids", []) or []) if shape is not None else []
         volume = float(getattr(shape, "Volume", 0.0) or 0.0) if shape is not None else 0.0
-        live_objects = list(getattr(doc, "Objects", []) or [])
+        live_owned = all(
+            bool(_host_object_id(host_obj))
+            and doc.getObject(_host_object_id(host_obj)) is host_obj
+            for host_obj in owned
+        )
         if (
             not ids_complete
             or not created_ids
             or any(not entity_id or entity_id not in created_ids for entity_id in required_ids)
-            or any(not any(candidate is host_obj for candidate in live_objects) for host_obj in owned)
+            or not live_owned
             or not source_text_preserved
             or not source_item_id_verified
             or str(getattr(extrusion, "TypeId", "") or "") != "Part::Extrusion"
@@ -7446,6 +7569,8 @@ def _deliver_text_item_3d(
             },
         )
 
+    for host_obj in owned:
+        _remember_native_text_object(opts, host_obj)
     return {
         "source_item_id": source_item_id,
         "requested_type": requested_type,
@@ -9343,11 +9468,7 @@ def _wirestring_memo_scope(opts: Optional["ImportOptions"] = None):
                     "hits": int(memo.hits),
                     "misses": int(memo.misses),
                 }
-                opts.text3d_outline_cache_stats = {
-                    "hits": int(outline_memo.hits),
-                    "misses": int(outline_memo.misses),
-                    "evictions": int(outline_memo.evictions),
-                }
+                opts.text3d_outline_cache_stats = outline_memo.snapshot_stats()
             except (AttributeError, TypeError):
                 pass
         outline_memo.clear()
@@ -11491,6 +11612,11 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                 )
             )
         opts._report_extra.pop("terminal_failure", None)
+        active_outline_memo = _ACTIVE_TEXT3D_OUTLINE_MEMO
+        if active_outline_memo is not None:
+            outline_stats = active_outline_memo.snapshot_stats()
+            opts.text3d_outline_cache_stats = outline_stats
+            opts._report_extra["text3d_outline_cache_stats"] = outline_stats
 
         write_import_report(
             pdf_path=pdf_path,

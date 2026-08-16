@@ -671,9 +671,9 @@ def test_native_item_delivery_indexes_document_once_for_many_spans(monkeypatch):
     real_document_objects = core._document_objects
     scans = []
 
-    def counted_document_objects(doc):
+    def counted_document_objects(doc, *, required=False):
         scans.append(len(doc.Objects))
-        return real_document_objects(doc)
+        return real_document_objects(doc, required=required)
 
     monkeypatch.setattr(core, "_document_objects", counted_document_objects)
     opts = core.ImportOptions(
@@ -691,6 +691,158 @@ def test_native_item_delivery_indexes_document_once_for_many_spans(monkeypatch):
         result = core._deliver_text_item_native(
             item,
             "text",
+            opts,
+            text_group=group,
+            page_h=100.0,
+            scale=1.0,
+        )
+        created_ids.extend(result["created_entity_ids"])
+
+    assert len(created_ids) == 25
+    assert len(set(created_ids)) == 25
+    assert scans == [100]
+    assert all(document.getObject(entity_id) is not None for entity_id in created_ids)
+
+
+def test_raster_item_delivery_indexes_document_once_for_many_spans(monkeypatch, tmp_path):
+    document, group = _install_native_host(monkeypatch)
+    for index in range(100):
+        document.addObject("Part::Feature", "Existing_%03d" % index)
+
+    real_document_objects = core._document_objects
+    scans = []
+
+    def counted_document_objects(doc, *, required=False):
+        scans.append(len(doc.Objects))
+        return real_document_objects(doc, required=required)
+
+    monkeypatch.setattr(core, "_document_objects", counted_document_objects)
+    monkeypatch.setattr(core, "_raster_asset_dir", lambda: tmp_path)
+    opts = core.ImportOptions(
+        text_mode="raster",
+        import_text=True,
+        scale_to_mm=False,
+        user_scale=1.0,
+        raster_dpi=144,
+    )
+    opts._defer_page_recompute = True
+
+    class Pixmap:
+        width = 16
+        height = 24
+
+        def save(self, path):
+            Path(path).write_bytes(b"verified-raster-patch")
+
+    class Page:
+        rect = SimpleNamespace(x0=0.0, y0=0.0, x1=100.0, y1=100.0)
+
+        def get_pixmap(self, **_kwargs):
+            return Pixmap()
+
+    page = Page()
+    created_ids = []
+    for span_index in range(25):
+        item = _canonical_item("raster")
+        item["source_item_id"] = "p1:b0:l0:s%d" % span_index
+        item["span_index"] = span_index
+        result = core._deliver_text_item_raster(
+            item,
+            "raster",
+            opts,
+            page=page,
+            page_h=100.0,
+            scale=1.0,
+            fc_doc=document,
+            parent_group=group,
+        )
+        created_ids.extend(result["created_entity_ids"])
+
+    assert len(created_ids) == 25
+    assert len(set(created_ids)) == 25
+    assert scans == [100]
+    assert all(document.getObject(entity_id) is not None for entity_id in created_ids)
+
+
+def test_3d_text_item_delivery_indexes_document_once_for_many_spans(monkeypatch):
+    document, group = _install_native_host(monkeypatch)
+    for index in range(100):
+        document.addObject("Part::Feature", "Existing_%03d" % index)
+
+    real_document_objects = core._document_objects
+    scans = []
+
+    def counted_document_objects(doc, *, required=False):
+        scans.append(len(doc.Objects))
+        return real_document_objects(doc, required=required)
+
+    monkeypatch.setattr(core, "_document_objects", counted_document_objects)
+
+    def fake_compound(
+        doc,
+        *,
+        source_text,
+        font_path,
+        font_size_fc,
+        depth,
+        target_advance_fc,
+        placement,
+        text_group,
+        baseline_object_ids=None,
+        configure_host=None,
+    ):
+        host = doc.addObject("Part::Feature", "PDF_3D_Text")
+        host.TypeId = "Part::Feature"
+        host.Shape = SimpleNamespace(
+            isNull=lambda: False,
+            Solids=[object(), object()],
+            Volume=12.5,
+        )
+        host.Placement = placement
+        if callable(configure_host):
+            configure_host(host)
+        text_group.addObject(host)
+        return host, 1.0, float(target_advance_fc), float(target_advance_fc)
+
+    monkeypatch.setattr(core, "_create_verified_compound_text3d_entity", fake_compound)
+
+    def fake_font_resolution(font_name, _opts, **context):
+        identity = core._canonical_font_identity(font_name)
+        path = "C:/fonts/source.ttf"
+        return path, [
+            {
+                "source": "embedded_font",
+                "outcome": "found",
+                "font_identity": identity,
+                "path": path,
+                "sha256": "b" * 64,
+                "pdf_sha256": context["pdf_sha256"],
+                "page_number": context["page_number"],
+                "staging_complete": True,
+            }
+        ]
+
+    monkeypatch.setattr(
+        core,
+        "_resolve_shapestring_font_path_with_evidence",
+        fake_font_resolution,
+    )
+    opts = core.ImportOptions(
+        text_mode="3d_text",
+        import_text=True,
+        scale_to_mm=False,
+        user_scale=1.0,
+    )
+
+    created_ids = []
+    for span_index in range(25):
+        item = _canonical_item("3d_text")
+        item["font_identity"] = core._canonical_font_identity(item["span"]["font"])
+        item["source_item_id"] = "p1:b0:l0:s%d" % span_index
+        item["span_index"] = span_index
+        result = core._deliver_text_item_3d(
+            item,
+            "3d_text",
             opts,
             text_group=group,
             page_h=100.0,
@@ -1127,6 +1279,28 @@ def test_raster_verifier_accepts_freecad_cache_rewrites_only_when_bytes_match(tm
     included_cache.write_bytes(b"wrong-raster")
     with pytest.raises(RuntimeError, match="does not match source"):
         core._raster_file_evidence(host, source)
+
+
+def test_raster_verifier_hashes_identical_resolved_paths_once(tmp_path, monkeypatch):
+    source = tmp_path / "shared-source.png"
+    source.write_bytes(b"one-source-bound-raster")
+    host = SimpleNamespace(
+        ImageFile=str(source),
+        PDFRasterFile=str(source),
+    )
+    hash_calls = []
+    real_path_sha256 = core._path_sha256
+
+    def counted_path_sha256(path):
+        hash_calls.append(str(Path(path)))
+        return real_path_sha256(path)
+
+    monkeypatch.setattr(core, "_path_sha256", counted_path_sha256)
+
+    evidence = core._raster_file_evidence(host, source)
+
+    assert evidence["raster_content_verified"] is True
+    assert hash_calls == [str(source)]
 
 
 def test_explicit_raster_is_requested_output_not_fallback():

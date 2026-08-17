@@ -44,6 +44,7 @@ except ModuleNotFoundError as exc:
 
 activate_bundled_runtime_if_available(_mod_root)
 from pdfcadcore.fitz_loader import import_fitz as _import_fitz
+from pdfcadcore.primitive_extractor import _composite_alpha, _span_alpha
 
 fitz = _import_fitz()
 
@@ -2285,7 +2286,9 @@ def _fit_font_size_to_span_bbox(
 
 
 def _span_source_color(span: dict) -> Optional[Tuple[float, float, float]]:
-    return _optional_color(span.get("color"))
+    # Constant alpha (/ca) is composited against the white page once, like pdfcadcore
+    # does for the other hosts; FreeCAD's TextColor has no alpha channel.
+    return _composite_alpha(_optional_color(span.get("color")), _span_alpha(span))
 
 
 def _apply_text_color(obj, rgb: Optional[Tuple[float, float, float]]) -> None:
@@ -9113,6 +9116,16 @@ def _preprocess_text_blocks(tdict: dict) -> dict:
 # ──────────────────────────────────────────────────────────────────────
 # Raster page import (scanned PDF fallback)
 # ──────────────────────────────────────────────────────────────────────
+def _full_page_raster_anchor(w_units: float, h_units: float) -> Tuple[float, float, float]:
+    """Placement base of the full-page raster underlay.
+
+    ``Image::ImagePlane`` is drawn centred on its Placement while the page's
+    vectors and text occupy ``(0..w_units, 0..h_units)``: the underlay belongs
+    at the page centre, 0.1 unit behind the vectors.
+    """
+    return (float(w_units) / 2.0, float(h_units) / 2.0, -0.1)
+
+
 def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
                            opts: ImportOptions, scale: float,
                            parent, fc_doc):
@@ -9196,7 +9209,13 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
         ip.ImageFile = str(img_path)
         ip.XSize = w_units
         ip.YSize = h_units
-        ip.Placement = Placement(_v(0, 0, -0.1), Rotation())  # slightly behind vectors
+        # Image::ImagePlane renders CENTERED on its Placement (see the per-image
+        # patch placement below); the vector/text content spans (0..W, 0..H), so
+        # the full-page underlay must be anchored at the page centre -- at the
+        # origin it sat half a page down-left of the vectors it underlays
+        # (visual oracle, garden-map sheet, 2026-08-16).
+        anchor_xyz = _full_page_raster_anchor(w_units, h_units)
+        ip.Placement = Placement(_v(*anchor_xyz), Rotation())  # slightly behind vectors
         add_property = getattr(ip, "addProperty", None)
         if not callable(add_property):
             raise RuntimeError("ImagePlane cannot embed its raster asset")
@@ -9228,7 +9247,7 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
             or anchor is None
             or any(
                 abs(anchor[index] - expected) > 1e-7
-                for index, expected in enumerate((0.0, 0.0, -0.1))
+                for index, expected in enumerate(anchor_xyz)
             )
             or getattr(ip, "PDFSourceItemId", None) != "p%d:page" % int(page_num)
             or getattr(ip, "PDFRepresentation", None) != "raster"
@@ -10459,9 +10478,9 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             continue
 
         stroke = path_group.get("color") or path_group.get("stroke")
-        stroke_rgb = _optional_color(stroke)
+        stroke_rgb = _composite_alpha(_optional_color(stroke), path_group.get("stroke_opacity"))
         fill = path_group.get("fill")
-        fill_rgb = _optional_color(fill)
+        fill_rgb = _composite_alpha(_optional_color(fill), path_group.get("fill_opacity"))
         close_path = path_group.get("closePath", False)
         width = _as_float(path_group.get("width") or path_group.get("lineWidth"))
         dashes, dash_phase = _parse_dashes(path_group.get("dashes"))  # noqa: F841 — dash_phase stored for QA/adapter use; FC DrawStyle has no phase param
@@ -10927,7 +10946,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 if not items:
                     continue
                 stroke = path_group.get("color") or path_group.get("stroke")
-                stroke_rgb = _optional_color(stroke)
+                stroke_rgb = _composite_alpha(_optional_color(stroke), path_group.get("stroke_opacity"))
                 current_pt = None
                 sub_edges = []
                 for item in items:

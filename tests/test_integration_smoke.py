@@ -12,7 +12,7 @@ sys.path.insert(0, REPO_ROOT)
 sys.path.insert(0, os.path.join(REPO_ROOT, 'PDFVectorImporter'))
 
 from corpus_paths import resolve_manifest_entry  # noqa: E402
-from pdfcadcore.primitive_extractor import extract_page, _FRAC_STACKED_SCALE
+from pdfcadcore.primitive_extractor import extract_page
 from pdfcadcore.import_report import TextEntityVerification, ImportReport
 import fitz  # PyMuPDF
 
@@ -20,10 +20,12 @@ import fitz  # PyMuPDF
 class TestIntegrationSmoke:
     """Smoke test integration of all changes."""
 
-    def test_fraction_stack_scale_constant(self):
-        """Test that the fraction stack scale constant is defined."""
+    def test_fraction_stack_requires_observed_layout(self):
+        """The extractor is available without a synthetic fraction scale."""
         assert callable(extract_page), "extract_page should be callable"
-        assert _FRAC_STACKED_SCALE == 0.6, f"Expected 0.6, got {_FRAC_STACKED_SCALE}"
+        from pdfcadcore import primitive_extractor
+
+        assert not hasattr(primitive_extractor, "_FRAC_STACKED_SCALE")
 
     def test_text_entity_verification_dataclass(self):
         """Test that TextEntityVerification dataclass exists and works."""
@@ -104,8 +106,10 @@ class TestIntegrationSmoke:
         except Exception as e:
             pytest.skip(f"PDF processing failed: {e}")
 
-    def test_merged_bbox_function_with_scaling(self):
-        """Test that _merged_bbox supports width scaling."""
+    def test_merged_bbox_preserves_full_union(self):
+        """Merged bounds preserve the complete observed footprint."""
+        import inspect
+
         from pdfcadcore.primitive_extractor import _merged_bbox
         
         # Test normal merge (no scaling)
@@ -115,10 +119,7 @@ class TestIntegrationSmoke:
         expected = (0, 0, 15, 7)
         assert merged == expected, f"Expected {expected}, got {merged}"
         
-        # Test scaled merge
-        merged_scaled = _merged_bbox(bbox1, bbox2, scale_width=0.6)
-        expected_scaled = (3, 0, 12, 7)  # Center at 7.5, width reduced to 9 (15*0.6)
-        assert merged_scaled == expected_scaled, f"Expected {expected_scaled}, got {merged_scaled}"
+        assert "scale_width" not in inspect.signature(_merged_bbox).parameters
 
     def test_svg_text_renderer_returns_entity_type(self):
         """Test that SVG text renderer includes entity_type in results."""
@@ -134,12 +135,10 @@ class TestIntegrationSmoke:
         except ImportError:
             pytest.skip("PDFSvgTextRenderer not available without full environment")
 
-    def test_all_constants_defined(self):
-        """Test that all new constants are properly defined."""
-        from pdfcadcore.primitive_extractor import _FRAC_STACKED_SCALE
+    def test_import_report_schema_defined(self):
+        """Test that the import-report schema remains defined."""
         from pdfcadcore.import_report import SCHEMA
-        
-        assert _FRAC_STACKED_SCALE == 0.6
+
         assert SCHEMA == "bcs.import_report/1.1"
 
 

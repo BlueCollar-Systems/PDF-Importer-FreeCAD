@@ -9116,6 +9116,16 @@ def _preprocess_text_blocks(tdict: dict) -> dict:
 # ──────────────────────────────────────────────────────────────────────
 # Raster page import (scanned PDF fallback)
 # ──────────────────────────────────────────────────────────────────────
+def _full_page_raster_anchor(w_units: float, h_units: float) -> Tuple[float, float, float]:
+    """Placement base of the full-page raster underlay.
+
+    ``Image::ImagePlane`` is drawn centred on its Placement while the page's
+    vectors and text occupy ``(0..w_units, 0..h_units)``: the underlay belongs
+    at the page centre, 0.1 unit behind the vectors.
+    """
+    return (float(w_units) / 2.0, float(h_units) / 2.0, -0.1)
+
+
 def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
                            opts: ImportOptions, scale: float,
                            parent, fc_doc):
@@ -9199,7 +9209,13 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
         ip.ImageFile = str(img_path)
         ip.XSize = w_units
         ip.YSize = h_units
-        ip.Placement = Placement(_v(0, 0, -0.1), Rotation())  # slightly behind vectors
+        # Image::ImagePlane renders CENTERED on its Placement (see the per-image
+        # patch placement below); the vector/text content spans (0..W, 0..H), so
+        # the full-page underlay must be anchored at the page centre -- at the
+        # origin it sat half a page down-left of the vectors it underlays
+        # (visual oracle, garden-map sheet, 2026-08-16).
+        anchor_xyz = _full_page_raster_anchor(w_units, h_units)
+        ip.Placement = Placement(_v(*anchor_xyz), Rotation())  # slightly behind vectors
         add_property = getattr(ip, "addProperty", None)
         if not callable(add_property):
             raise RuntimeError("ImagePlane cannot embed its raster asset")
@@ -9231,7 +9247,7 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
             or anchor is None
             or any(
                 abs(anchor[index] - expected) > 1e-7
-                for index, expected in enumerate((0.0, 0.0, -0.1))
+                for index, expected in enumerate(anchor_xyz)
             )
             or getattr(ip, "PDFSourceItemId", None) != "p%d:page" % int(page_num)
             or getattr(ip, "PDFRepresentation", None) != "raster"

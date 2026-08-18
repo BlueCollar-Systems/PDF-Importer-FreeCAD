@@ -8,8 +8,8 @@ same number lives in four places, and every one of them is verified:
 
     PDFVectorImporter/package.xml   <version>X.Y.Z</version>
     pyproject.toml                  version = "X.Y.Z"
-    README.md                       Version-X.Y.Z-green.svg   (badge)
-    PDFVectorImporter/README.md     Version-X.Y.Z-green.svg   (badge)
+    README.md                       Version-X.Y.Z-green.svg   (badge + alt text)
+    PDFVectorImporter/README.md     Version-X.Y.Z-green.svg   (badge + alt text)
 
 Editing those by hand is how releases break. Miss one and "Read committed
 version" fails with a mismatch; miss all four and the build runs for minutes
@@ -136,10 +136,17 @@ def bump(new_version: str) -> int:
             replacement = template.format(v=new_version)
             updated = text[: match.start()] + replacement + text[match.end():]
         else:
-            # Rewrite only the captured number, preserving the badge colour.
-            updated = (
-                text[: match.start(1)] + new_version + text[match.end(1):]
-            )
+            # Rewrite the whole badge line, preserving the badge colour: the
+            # markdown alt text carries the version too ("![Version: X.Y.Z](...
+            # Version-X.Y.Z-green.svg)") and drifted for several releases while
+            # only the URL was bumped.
+            line_start = text.rfind("\n", 0, match.start()) + 1
+            line_end = text.find("\n", match.end())
+            if line_end == -1:
+                line_end = len(text)
+            line = text[line_start:line_end]
+            new_line = re.sub(r"\d+\.\d+\.\d+", new_version, line)
+            updated = text[:line_start] + new_line + text[line_end:]
         if updated != text:
             path.write_text(updated, encoding="utf-8")
             changed.append(path)

@@ -9128,9 +9128,15 @@ def _full_page_raster_anchor(w_units: float, h_units: float) -> Tuple[float, flo
 
 def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
                            opts: ImportOptions, scale: float,
-                           parent, fc_doc):
-    """Render, persist, place, and reread one verified full-page ImagePlane."""
-    del pdf_doc, page_h
+                           parent, fc_doc, suppress_text: bool = False):
+    """Render, persist, place, and reread one verified full-page ImagePlane.
+
+    ``suppress_text`` renders the underlay from a text-redacted copy of the page. Set it
+    whenever the requested text is *also* delivered natively on top of this underlay:
+    without it the page's glyphs appear twice, once rasterized and once as native
+    entities.
+    """
+    del page_h
     dpi = opts.raster_dpi or 200
 
     # Adaptive DPI: scale with page physical size so the image is always
@@ -9160,18 +9166,41 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
     for candidate in (dpi, max(96, dpi // 2), 96):
         if candidate not in retry_dpis:
             retry_dpis.append(candidate)
-    for candidate in retry_dpis:
+
+    # Render source: the page itself, or a text-redacted copy when the text is being
+    # delivered natively on top of this underlay.
+    render_doc = None
+    render_page = page
+    text_suppressed = False
+    if suppress_text:
         try:
-            zoom = candidate / 72.0
-            mat = fitz.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=mat)
-            dpi = candidate
-            break
-        except (RuntimeError, MemoryError, ValueError, OverflowError) as e:
-            last_error = e
+            render_doc, render_page = _text_free_page_copy(pdf_doc, page)
+            text_suppressed = True
+        except Exception as exc:  # noqa: BLE001 - never fail the import for this
+            render_doc, render_page = None, page
             _warn(
-                f"Page {page_num}: raster render failed at {candidate} DPI: {e}"
+                f"Page {page_num}: could not suppress text in the raster underlay "
+                f"({exc}); the underlay will duplicate the natively delivered text"
             )
+    try:
+        for candidate in retry_dpis:
+            try:
+                zoom = candidate / 72.0
+                mat = fitz.Matrix(zoom, zoom)
+                pix = render_page.get_pixmap(matrix=mat)
+                dpi = candidate
+                break
+            except (RuntimeError, MemoryError, ValueError, OverflowError) as e:
+                last_error = e
+                _warn(
+                    f"Page {page_num}: raster render failed at {candidate} DPI: {e}"
+                )
+    finally:
+        if render_doc is not None:
+            try:
+                render_doc.close()
+            except Exception:
+                pass
     if pix is None:
         raise RuntimeError(
             "Raster render failed after retries: %s" % (last_error or "unknown error")
@@ -9274,6 +9303,11 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
             "raster_file": str(img_path),
             "raster_file_included": True,
             "pdf_sha256": digest,
+            # Whether this underlay was rendered from a text-redacted page copy. When the
+            # text is delivered natively on top, a False here means the page's glyphs are
+            # drawn twice.
+            "text_suppressed": bool(text_suppressed),
+            "text_suppression_requested": bool(suppress_text),
             "dpi": int(dpi),
             "pixel_width": int(getattr(pix, "width", 0) or 0),
             "pixel_height": int(getattr(pix, "height", 0) or 0),
@@ -9344,6 +9378,35 @@ def _images_only_page_copy(pdf_doc, page):
         )
     except TypeError:
         # Older PyMuPDF without graphics/text kwargs still removes text.
+        tmp_page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+    return tmp_doc, tmp_page
+
+
+def _text_free_page_copy(pdf_doc, page):
+    """Return (tmp_doc, tmp_page): a single-page copy with ONLY the text removed.
+
+    Distinct from :func:`_images_only_page_copy`, which also strips line art. When a
+    full-page raster underlay is placed *and* the requested text is delivered natively on
+    top, the underlay must keep its graphics (it is the graphics delivery) but must not
+    carry the text as well -- otherwise every glyph is drawn twice, once in the raster and
+    once as a native entity. On the garden-map sheet that overprint rendered the title as
+    ``ALVORDCTX x GARDEN MAP AFINAS N MORTHCATTOP`` (visual oracle, 2026-08-18).
+
+    The caller must close tmp_doc.
+    """
+    tmp_doc = fitz.open()
+    tmp_doc.insert_pdf(pdf_doc, from_page=page.number, to_page=page.number)
+    tmp_page = tmp_doc[0]
+    tmp_page.add_redact_annot(tmp_page.rect)
+    try:
+        tmp_page.apply_redactions(
+            images=fitz.PDF_REDACT_IMAGE_NONE,
+            graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+            text=fitz.PDF_REDACT_TEXT_REMOVE,
+        )
+    except TypeError:
+        # Older PyMuPDF without the graphics/text kwargs still removes text; it may also
+        # drop touched line art, which degrades the underlay but never duplicates text.
         tmp_page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
     return tmp_doc, tmp_page
 
@@ -10266,9 +10329,13 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         _record_raster_page(opts, opts.auto_reason or "raster mode")
         _msg(f"Page {page_num}: rendering at {opts.raster_dpi} DPI (raster mode)")
         _progress_update(5, f"Rendering raster image at {opts.raster_dpi} DPI...")
+        # When the requested text is delivered natively over this underlay, the underlay
+        # must not carry the text as well: rasterized glyphs plus native glyphs is a
+        # visible overprint, not a redundancy.
         full_page_raster_result = _import_page_as_raster(
             pdf_doc, page, page_num, page_h, opts, scale,
-            top_group or fc_doc, fc_doc)
+            top_group or fc_doc, fc_doc,
+            suppress_text=bool(auto_raster_text_overlay))
         if auto_raster_text_overlay:
             placed_full_page_raster_background = True
             drawings = []

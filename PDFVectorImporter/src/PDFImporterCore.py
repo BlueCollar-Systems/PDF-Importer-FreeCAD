@@ -1382,14 +1382,29 @@ def write_import_report(
 # ──────────────────────────────────────────────────────────────────────
 # Coordinate transform
 # ──────────────────────────────────────────────────────────────────────
+_IDENTITY_PAGE_MATRIX = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+
 def _page_matrix_values(opts: ImportOptions) -> Tuple[float, float, float, float, float, float]:
     raw = getattr(opts, "_page_rotation_matrix", None)
+    # Called once per transformed point (1.1 million times on a 550k-path
+    # sheet).  The six floats are memoized against the identity of the raw
+    # matrix object, so a page that installs a new matrix is re-read and the
+    # values are exactly what the conversion below produced.
+    cached = getattr(opts, "_page_matrix_values_cache", None)
+    if cached is not None and cached[0] is raw:
+        return cached[1]
+    values = _IDENTITY_PAGE_MATRIX
     if raw and len(raw) >= 6:
         try:
-            return tuple(float(value) for value in raw[:6])
+            values = tuple(float(value) for value in raw[:6])
         except (TypeError, ValueError):
-            pass
-    return (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+            values = _IDENTITY_PAGE_MATRIX
+    try:
+        opts._page_matrix_values_cache = (raw, values)
+    except AttributeError:
+        pass
+    return values
 
 
 def _transform_pdf_direction(
@@ -10345,7 +10360,10 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         grp_rect = path_group.get("rect")
         if grp_rect and _is_rect(grp_rect):
             grp_area = abs(grp_rect.width * grp_rect.height)
-            page_area = page.rect.width * page.rect.height
+            # page_w / page_h are float(page.rect.width/height) read once per
+            # page above; reading page.rect here built two PyMuPDF Rects per
+            # path group (1.1 million on a 550k-path sheet, 15 s).
+            page_area = page_w * page_h
             if grp_area > page_area * 0.95:
                 continue
 

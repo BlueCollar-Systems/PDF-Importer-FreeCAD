@@ -10153,7 +10153,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
 
     # ── Legacy raster fallback (vectors mode, backwards compat) ──
     if effective_mode == "vector" and opts.raster_fallback and n_drawings < 5:
-        tdict = page.get_text("dict")
+        tdict = raw_tdict if raw_tdict is not None else page.get_text("dict")
         n_text = sum(1 for b in tdict.get("blocks", []) if b.get("type") == 0)
         if n_text == 0:
             _msg(f"Page {page_num}: appears to be scanned/raster — "

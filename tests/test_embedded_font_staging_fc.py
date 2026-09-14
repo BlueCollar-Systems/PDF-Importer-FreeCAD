@@ -1940,3 +1940,425 @@ def test_absence_records_unattributed_page_failures_so_the_proof_is_honest():
     assert embedded["outcome"] == "not_found"
     assert embedded["absent_from_completed_inventory"] is True
     assert embedded["unattributed_page_staging_failures"] == 1
+
+
+# ---------------------------------------------------------------------------
+# GDI-printed symbolic TrueType subsets: (1,0) + (3,0) cmap only, ToUnicode
+# ---------------------------------------------------------------------------
+
+_SYMBOLIC_FIXTURE_TEXT = "GRID"
+_SYMBOLIC_FIXTURE_CODES = {1: "G", 2: "R", 3: "I", 4: "D"}
+_SYMBOLIC_FIXTURE_SOURCE_FONT = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "arial.ttf"
+
+_FREECADCMD_CANDIDATES = (
+    os.environ.get("BCS_FREECADCMD", ""),
+    r"C:\Program Files\FreeCAD 1.1\bin\FreeCADCmd.exe",
+    r"C:\Program Files\FreeCAD 1.0\bin\FreeCADCmd.exe",
+)
+
+
+def _find_freecadcmd() -> str:
+    import shutil
+
+    for candidate in _FREECADCMD_CANDIDATES:
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return shutil.which("FreeCADCmd") or ""
+
+
+def _gdi_style_symbolic_subset(font_path: Path) -> bytes:
+    """Subset a system TrueType font the way a Windows GDI print driver does.
+
+    The subset keeps only the fixture glyphs, drops glyph names (post format
+    3) and carries exactly two cmap subtables: (1,0) Macintosh Roman keyed by
+    the PDF character code and (3,0) Microsoft Symbol keyed by 0xF000 + code.
+    No Unicode subtable survives, so fontTools ``getBestCmap()`` is ``None``.
+    """
+    from fontTools import subset
+    from fontTools.ttLib import newTable
+    from fontTools.ttLib.tables._c_m_a_p import CmapSubtable
+
+    font = TTFont(str(font_path), lazy=False)
+    options = subset.Options()
+    options.glyph_names = False
+    options.notdef_outline = True
+    options.hinting = False
+    options.layout_features = []
+    options.name_IDs = ["*"]
+    options.name_legacy = True
+    subsetter = subset.Subsetter(options=options)
+    subsetter.populate(text=_SYMBOLIC_FIXTURE_TEXT)
+    subsetter.subset(font)
+    unicode_cmap = font.getBestCmap()
+    glyph_for_code = {
+        code: unicode_cmap[ord(char)]
+        for code, char in _SYMBOLIC_FIXTURE_CODES.items()
+    }
+    mac = CmapSubtable.newSubtable(0)
+    mac.platformID, mac.platEncID, mac.language = 1, 0, 0
+    mac.cmap = dict(glyph_for_code)
+    symbol = CmapSubtable.newSubtable(4)
+    symbol.platformID, symbol.platEncID, symbol.language = 3, 0, 0
+    symbol.cmap = {0xF000 + code: name for code, name in glyph_for_code.items()}
+    cmap = newTable("cmap")
+    cmap.tableVersion = 0
+    cmap.tables = [mac, symbol]
+    font["cmap"] = cmap
+    font.recalcTimestamp = False
+    output = io.BytesIO()
+    font.save(output)
+    return output.getvalue()
+
+
+def _write_symbolic_truetype_pdf(
+    path: Path,
+    font_bytes: bytes,
+    *,
+    with_to_unicode: bool = True,
+    encoding_entry: str = "",
+) -> None:
+    """Hand-write a one-page PDF embedding ``font_bytes`` as a simple TrueType font.
+
+    Mirrors the object layout of a GDI-printed sheet: /Subtype /TrueType,
+    symbolic /Flags 4, /FirstChar 1 with single-byte codes, a /ToUnicode CMap
+    of ``<cc><cc><uuuu>`` bfranges, and the subset in /FontFile2.
+    """
+    codes = _SYMBOLIC_FIXTURE_CODES
+    font = TTFont(io.BytesIO(font_bytes), lazy=False)
+    mac = [t for t in font["cmap"].tables if (t.platformID, t.platEncID) == (1, 0)][0]
+    units_per_em = font["head"].unitsPerEm
+    widths = [
+        font["hmtx"].metrics[mac.cmap[code]][0] * 1000 // units_per_em
+        for code in sorted(codes)
+    ]
+    to_unicode = (
+        b"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n"
+        b"/CMapType 2 def\n/CMapName/R1 def\n"
+        b"1 begincodespacerange\n<00><ff>\nendcodespacerange\n"
+        + ("%d beginbfrange\n" % len(codes)).encode("ascii")
+        + b"".join(
+            ("<%02x><%02x><%04x>\n" % (code, code, ord(char))).encode("ascii")
+            for code, char in sorted(codes.items())
+        )
+        + b"endbfrange\nendcmap\nCMapName currentdict /CMap defineresource pop\nend end\n"
+    )
+    content = (
+        "BT /TT0 24 Tf 40 100 Td <%s> Tj ET\n"
+        % "".join("%02x" % code for code in sorted(codes))
+    ).encode("ascii")
+    font_dict = (
+        b"<< /Type /Font /Subtype /TrueType /BaseFont /ABCDEF+ArialSubset"
+        b" /FirstChar 1 /LastChar %d /Widths [%s] /FontDescriptor 6 0 R"
+        % (len(codes), " ".join(str(width) for width in widths).encode("ascii"))
+    )
+    if with_to_unicode:
+        font_dict += b" /ToUnicode 7 0 R"
+    if encoding_entry:
+        font_dict += b" /Encoding " + encoding_entry.encode("ascii")
+    font_dict += b" >>"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents 4 0 R"
+        b" /Resources << /Font << /TT0 5 0 R >> >> >>",
+        b"<< /Length %d >>\nstream\n" % len(content) + content + b"endstream",
+        font_dict,
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+ArialSubset /Flags 4"
+        b" /FontBBox [-100 -200 1000 900] /ItalicAngle 0 /Ascent 905 /Descent -212"
+        b" /CapHeight 716 /StemV 80 /FontFile2 8 0 R >>",
+        b"<< /Length %d >>\nstream\n" % len(to_unicode) + to_unicode + b"endstream",
+        b"<< /Length %d /Length1 %d >>\nstream\n" % (len(font_bytes), len(font_bytes))
+        + font_bytes
+        + b"endstream",
+    ]
+    output = io.BytesIO()
+    output.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(output.tell())
+        output.write(b"%d 0 obj\n" % number + body + b"\nendobj\n")
+    xref_at = output.tell()
+    output.write(b"xref\n0 %d\n" % (len(objects) + 1))
+    output.write(b"0000000000 65535 f \n")
+    for offset in offsets:
+        output.write(b"%010d 00000 n \n" % offset)
+    output.write(
+        b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"
+        % (len(objects) + 1, xref_at)
+    )
+    path.write_bytes(output.getvalue())
+
+
+def _symbolic_fixture(tmp_path: Path, **pdf_kwargs):
+    fitz = pytest.importorskip("fitz")
+    if not _SYMBOLIC_FIXTURE_SOURCE_FONT.is_file():
+        pytest.skip("arial.ttf not available to subset for the fixture")
+    font_bytes = _gdi_style_symbolic_subset(_SYMBOLIC_FIXTURE_SOURCE_FONT)
+    fixture_font = TTFont(io.BytesIO(font_bytes), lazy=False)
+    assert fixture_font.getBestCmap() is None
+    assert sorted(
+        (t.platformID, t.platEncID) for t in fixture_font["cmap"].tables
+    ) == [(1, 0), (3, 0)]
+    assert fixture_font["post"].formatType == 3.0
+    pdf_path = tmp_path / "gdi_symbolic_truetype.pdf"
+    _write_symbolic_truetype_pdf(pdf_path, font_bytes, **pdf_kwargs)
+    return fitz, pdf_path, font_bytes
+
+
+def test_gdi_symbolic_truetype_subset_gets_unicode_cmap_from_pdf_tounicode(tmp_path):
+    import PDFEmbeddedFonts as embedded
+
+    fitz, pdf_path, font_bytes = _symbolic_fixture(tmp_path)
+    with fitz.open(str(pdf_path)) as pdf_doc:
+        page = pdf_doc[0]
+        rows = page.get_fonts(full=True)
+        assert [(row[2], row[3], row[4]) for row in rows] == [
+            ("TrueType", "ABCDEF+ArialSubset", "TT0")
+        ]
+        spans = [
+            span["text"]
+            for block in page.get_text("dict")["blocks"]
+            for line in block.get("lines", [])
+            for span in line.get("spans", [])
+        ]
+        assert spans == [_SYMBOLIC_FIXTURE_TEXT]
+        failures = []
+        staged = embedded.stage_page_fonts(
+            pdf_doc, page, tmp_path / "cache", failures=failures
+        )
+
+    assert failures == []
+    record = staged["arialsubset"]
+    assert record["cmap_source"] == "pdf_tounicode_symbolic_truetype"
+    assert record["cmap_entries"] == len(_SYMBOLIC_FIXTURE_CODES)
+    assert record["cmap_lookup_subtables"] == ["3,0"]
+    assert staged["tt0"] == record
+
+    staged_font = TTFont(record["path"], lazy=False)
+    best = staged_font.getBestCmap()
+    assert best is not None
+    subtables = sorted(
+        (t.platformID, t.platEncID) for t in staged_font["cmap"].tables
+    )
+    # The original symbol/Mac tables survive next to the synthesized Unicode ones.
+    assert subtables == [(1, 0), (3, 0), (3, 1), (3, 10)]
+    symbol = [
+        t for t in staged_font["cmap"].tables
+        if (t.platformID, t.platEncID) == (3, 0)
+    ][0]
+    for code, char in _SYMBOLIC_FIXTURE_CODES.items():
+        assert staged_font.getGlyphID(best[ord(char)]) == staged_font.getGlyphID(
+            symbol.cmap[0xF000 + code]
+        )
+    # 'G' resolves to the subset's own outline: identical contours to the
+    # source font's 'G', never a substitute program.
+    source_font = TTFont(str(_SYMBOLIC_FIXTURE_SOURCE_FONT), lazy=False)
+    source_glyph = source_font["glyf"]["G"]
+    staged_glyph = staged_font["glyf"][best[ord("G")]]
+    assert list(staged_glyph.coordinates) == list(source_glyph.coordinates)
+    assert list(staged_glyph.endPtsOfContours) == list(source_glyph.endPtsOfContours)
+    assert staged_font.getGlyphID(best[ord("G")]) != 0
+
+
+def test_symbolic_cmap_repair_leaves_fonts_with_unicode_cmaps_untouched():
+    import PDFEmbeddedFonts as embedded
+
+    builder = FontBuilder(1000, isTTF=True)
+    glyph_order = [".notdef", "one"]
+    builder.setupGlyphOrder(glyph_order)
+    builder.setupCharacterMap({0x31: "one"})
+    builder.setupHorizontalMetrics({name: (600, 0) for name in glyph_order})
+    builder.setupHorizontalHeader(ascent=800, descent=-200)
+    builder.setupNameTable({"familyName": "Unicode Subset", "styleName": "Regular"})
+    builder.setupOS2()
+    builder.setupPost()
+    glyphs = {}
+    for name in glyph_order:
+        pen = TTGlyphPen(None)
+        pen.moveTo((0, 0))
+        pen.lineTo((0, 700))
+        pen.lineTo((400, 700))
+        pen.closePath()
+        glyphs[name] = pen.glyph()
+    builder.setupGlyf(glyphs)
+    builder.setupMaxp()
+    output = io.BytesIO()
+    builder.font.save(output)
+    payload = output.getvalue()
+
+    class ExplodingPdf:
+        @staticmethod
+        def xref_get_key(xref, key):
+            raise AssertionError("a font with a Unicode cmap must not consult the PDF")
+
+    repaired, metadata = embedded._repair_symbolic_truetype_cmap(payload, ExplodingPdf(), 5)
+
+    assert repaired == payload
+    assert metadata == {}
+
+
+def test_symbolic_cmap_repair_requires_pdf_tounicode(tmp_path):
+    import PDFEmbeddedFonts as embedded
+
+    fitz, pdf_path, _font_bytes = _symbolic_fixture(tmp_path, with_to_unicode=False)
+    with fitz.open(str(pdf_path)) as pdf_doc:
+        failures = []
+        staged = embedded.stage_page_fonts(
+            pdf_doc, pdf_doc[0], tmp_path / "cache", failures=failures
+        )
+
+    # Without the PDF's own code-to-Unicode statement there is nothing to
+    # synthesize from; the font stays rejected rather than guessed at.
+    assert staged == {}
+    assert [(f["xref"], f["reason"]) for f in failures] == [
+        (5, "embedded_font_has_no_unicode_cmap")
+    ]
+
+
+def test_symbolic_cmap_repair_falls_back_to_mac_roman_only_without_pdf_encoding(tmp_path):
+    import PDFEmbeddedFonts as embedded
+    from fontTools.ttLib import newTable
+
+    fitz, _pdf_path, font_bytes = _symbolic_fixture(tmp_path)
+    font = TTFont(io.BytesIO(font_bytes), lazy=False)
+    mac_only = newTable("cmap")
+    mac_only.tableVersion = 0
+    mac_only.tables = [
+        t for t in font["cmap"].tables if (t.platformID, t.platEncID) == (1, 0)
+    ]
+    font["cmap"] = mac_only
+    font.recalcTimestamp = False
+    output = io.BytesIO()
+    font.save(output)
+    mac_only_bytes = output.getvalue()
+
+    plain = tmp_path / "mac_only_plain.pdf"
+    _write_symbolic_truetype_pdf(plain, mac_only_bytes)
+    encoded = tmp_path / "mac_only_encoded.pdf"
+    _write_symbolic_truetype_pdf(encoded, mac_only_bytes, encoding_entry="/WinAnsiEncoding")
+
+    with fitz.open(str(plain)) as pdf_doc:
+        staged = embedded.stage_page_fonts(pdf_doc, pdf_doc[0], tmp_path / "cache_plain")
+    record = staged["arialsubset"]
+    assert record["cmap_source"] == "pdf_tounicode_symbolic_truetype"
+    assert record["cmap_lookup_subtables"] == ["1,0"]
+    staged_font = TTFont(record["path"], lazy=False)
+    mac = [
+        t for t in staged_font["cmap"].tables if (t.platformID, t.platEncID) == (1, 0)
+    ][0]
+    assert staged_font.getGlyphID(staged_font.getBestCmap()[ord("G")]) == (
+        staged_font.getGlyphID(mac.cmap[1])
+    )
+
+    # With /Encoding present the (1,0) lookup goes through encoding names,
+    # which a raw-code lookup cannot prove; the guard stays closed.
+    with fitz.open(str(encoded)) as pdf_doc:
+        failures = []
+        staged = embedded.stage_page_fonts(
+            pdf_doc, pdf_doc[0], tmp_path / "cache_encoded", failures=failures
+        )
+    assert staged == {}
+    assert [f["reason"] for f in failures] == ["embedded_font_has_no_unicode_cmap"]
+
+
+_SYMBOLIC_HOST_PROBE = r"""
+import json, os, sys, traceback
+out_path, report_path, pdf_path = sys.argv[-3], sys.argv[-2], sys.argv[-1]
+result = {"ok": False}
+try:
+    import FreeCAD
+    repo = %(repo)r
+    for entry in (os.path.join(repo, "PDFVectorImporter", "src"),
+                  os.path.join(repo, "PDFVectorImporter")):
+        sys.path.insert(0, entry)
+    import PDFImporterCore as core
+    from fontTools.ttLib import TTFont
+    opts = core.ImportOptions()
+    opts.verbose = False
+    opts.import_report_path = report_path
+    result["text_mode"] = opts.text_mode
+    completed = core.import_pdf(pdf_path, opts)
+    result["completed"] = bool(completed)
+    result["delivered_counts"] = dict(getattr(opts, "text_delivered_counts", {}) or {})
+    staged = dict(getattr(opts, "_shapestring_font_paths", {}) or {})
+    record = staged.get("arialsubset") or {}
+    result["staged_record"] = {
+        key: value for key, value in record.items() if key != "path"
+    }
+    if record.get("path"):
+        font = TTFont(record["path"], lazy=False)
+        best = font.getBestCmap() or {}
+        result["staged_cmap_subtables"] = sorted(
+            [t.platformID, t.platEncID] for t in font["cmap"].tables
+        )
+        result["staged_glyph_ids"] = {
+            char: font.getGlyphID(best[ord(char)]) for char in "GRID" if ord(char) in best
+        }
+    doc = FreeCAD.ActiveDocument
+    result["object_types"] = sorted(
+        str(getattr(obj, "TypeId", "")) for obj in doc.Objects
+    ) if doc is not None else []
+    result["ok"] = True
+except Exception:
+    result["error"] = traceback.format_exc()
+with open(out_path, "w", encoding="utf-8") as handle:
+    json.dump(result, handle)
+"""
+
+
+def test_gdi_symbolic_truetype_subset_delivers_native_3d_text_in_freecad(tmp_path):
+    import json
+    import subprocess
+
+    freecadcmd = _find_freecadcmd()
+    if not freecadcmd:
+        pytest.skip("FreeCADCmd.exe not found - native 3D Text delivery not exercised")
+    _fitz, pdf_path, _font_bytes = _symbolic_fixture(tmp_path)
+
+    probe_path = tmp_path / "symbolic_probe.py"
+    probe_path.write_text(_SYMBOLIC_HOST_PROBE % {"repo": str(REPO_ROOT)}, encoding="utf-8")
+    out_path = tmp_path / "symbolic_result.json"
+    report_path = tmp_path / "symbolic_import_report.json"
+    completed = subprocess.run(
+        [freecadcmd, str(probe_path), str(out_path), str(report_path), str(pdf_path)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert out_path.is_file(), (
+        "probe produced no result (rc=%s)\nstdout tail: %s\nstderr tail: %s"
+        % (completed.returncode, completed.stdout[-800:], completed.stderr[-800:])
+    )
+    result = json.loads(out_path.read_text(encoding="utf-8"))
+    assert result.get("ok"), "probe failed: %s" % result.get("error", "")
+    assert result["text_mode"] == "3d_text"
+    assert result["completed"] is True
+    assert result["delivered_counts"].get("native_3d_text") == 1
+    assert result["staged_record"]["cmap_source"] == "pdf_tounicode_symbolic_truetype"
+    assert result["staged_record"]["cmap_entries"] == len(_SYMBOLIC_FIXTURE_CODES)
+    assert result["staged_cmap_subtables"] == [[1, 0], [3, 0], [3, 1], [3, 10]]
+    assert sorted(result["staged_glyph_ids"]) == sorted("GRID")
+    assert all(glyph_id > 0 for glyph_id in result["staged_glyph_ids"].values())
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    extra = report["extra"]
+    assert extra["result_status"] == "success"
+    assert extra["text_mode"] == "3d_text"
+    assert "rollback" not in extra
+    actual_types = extra["actual_text_entity_types"]
+    assert actual_types["entity_type"] == "3d_text"
+    assert actual_types["native_3d_text"] == 1
+    assert actual_types["count"] == 1
+    assert report["result"]["text_entities"] == 1
+    attempts = extra["text_delivery_attempts"]
+    assert len(attempts) == 1
+    attempt = attempts[0]
+    assert attempt["final_type"] == "3d_text"
+    assert attempt["outcome"] == "verified"
+    evidence = attempt["evidence"]
+    assert evidence["source_text"] == _SYMBOLIC_FIXTURE_TEXT
+    font_source = evidence["font_source_result"]
+    assert font_source["source"] == "embedded_font"
+    assert font_source["outcome"] == "found"
+    assert font_source["font_identity"]["normalized_key"] == "arialsubset"
+    assert font_source["sha256"] == result["staged_record"]["sha256"]

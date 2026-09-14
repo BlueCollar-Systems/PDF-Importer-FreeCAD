@@ -1541,7 +1541,11 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
         for placement_index, (gid, use_x, use_y, matrix) in enumerate(placements):
             shape = glyph_shapes.get(gid)
             if shape is None:
-                if gid in all_glyph_defs and not all_glyph_defs[gid].strip():
+                definition = all_glyph_defs.get(gid) if gid in all_glyph_defs else None
+                if definition is not None and (
+                    not definition.strip()
+                    or _svg_glyph_definition_draws_no_ink(definition)
+                ):
                     empty_placement_indices.append(placement_index)
                 else:
                     failed_placement_indices.append(placement_index)
@@ -2819,6 +2823,35 @@ def _shape_affine_2d(shape, a11: float, a12: float, a21: float, a22: float,
         return cp
     except (AttributeError, RuntimeError, TypeError, ValueError):
         return None
+
+
+# Shortest segment _svg_path_to_edges turns into an edge (mm).
+_SVG_EDGE_EPSILON_MM = 1e-4
+
+_SVG_PATH_NUMBER = re.compile(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?')
+
+
+def _svg_glyph_definition_draws_no_ink(d: str) -> bool:
+    """True when a glyph definition is fully readable and every point coincides.
+
+    pdftocairo writes a whitespace glyph -- the leading space of a rotated
+    dimension string -- as ``M 0 0 Z M 0 0``: a non-blank ``d`` that draws
+    nothing. That is as empty as an empty ``<g>``, and telling the two apart
+    from an outline the parser could not read (``M 0 0 Q``, one point and a
+    truncated curve) is the difference between an empty placement and a failed
+    one. Judged on the coordinates alone, so a caller that substitutes its own
+    edge builder is unaffected: a path whose numbers span more than the edge
+    epsilon has ink somewhere, whoever parses it.
+    """
+    values = [float(value) for value in _SVG_PATH_NUMBER.findall(d or "")]
+    if len(values) < 4 or len(values) % 2:
+        return False  # fewer than two points, or an odd operand count we cannot pair
+    xs = values[0::2]
+    ys = values[1::2]
+    return (
+        max(xs) - min(xs) <= _SVG_EDGE_EPSILON_MM
+        and max(ys) - min(ys) <= _SVG_EDGE_EPSILON_MM
+    )
 
 
 def _svg_path_to_edges(d: str, scale_x: float, scale_y: Optional[float] = None) -> List:

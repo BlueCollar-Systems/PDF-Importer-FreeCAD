@@ -2159,3 +2159,35 @@ def test_core_item_svg_rejects_source_id_index_mismatch_before_render(monkeypatc
     assert caught.value.attempt["cleanup_complete"] is True
     assert [obj.Name for obj in doc.Objects] == ["UserObject"]
     assert group.objects == []
+
+
+# pdftocairo writes the leading space of the rotated dimension string on the
+# owner's foundation sheet exactly like this: a non-blank d that draws nothing.
+DEGENERATE_SPACE_GLYPH = "M 0 0 Z M 0 0 "
+
+
+def test_a_whitespace_glyph_definition_draws_no_ink():
+    assert renderer._svg_glyph_definition_draws_no_ink(DEGENERATE_SPACE_GLYPH) is True
+    assert renderer._svg_glyph_definition_draws_no_ink("M 1.5 -2 L 1.5 -2 Z") is True
+    assert renderer._svg_glyph_definition_draws_no_ink("M 0 0 C 0 0 0 0 0 0") is True
+
+
+def test_an_outline_the_parser_could_not_read_is_never_inkless():
+    """Fail-closed: too few coordinates to judge means the placement stays failed."""
+    assert renderer._svg_glyph_definition_draws_no_ink("M 0 0 Q") is False
+    assert renderer._svg_glyph_definition_draws_no_ink("M 0 0") is False
+    assert renderer._svg_glyph_definition_draws_no_ink("") is False
+    assert renderer._svg_glyph_definition_draws_no_ink("M 0 0 L 5 0 L") is False  # odd count
+
+
+def test_a_glyph_with_real_extent_is_never_inkless():
+    assert renderer._svg_glyph_definition_draws_no_ink("M 0 0 L 5 0 L 5 5 Z") is False
+    assert renderer._svg_glyph_definition_draws_no_ink("M 0 0 L 0 5") is False  # y only
+    assert renderer._svg_glyph_definition_draws_no_ink("M 0 0 L 5 0") is False  # x only
+
+
+def test_inkless_threshold_is_the_edge_epsilon():
+    below = renderer._SVG_EDGE_EPSILON_MM / 2.0
+    above = renderer._SVG_EDGE_EPSILON_MM * 10.0
+    assert renderer._svg_glyph_definition_draws_no_ink(f"M 0 0 L {below} 0") is True
+    assert renderer._svg_glyph_definition_draws_no_ink(f"M 0 0 L {above} 0") is False

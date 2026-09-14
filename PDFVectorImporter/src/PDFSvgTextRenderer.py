@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# PDFSvgTextRenderer.py — Pixel-perfect text via SVG glyph paths
-# BlueCollar Systems — BUILT. NOT BOUGHT.
+# PDFSvgTextRenderer.py â€” Pixel-perfect text via SVG glyph paths
+# BlueCollar Systems â€” BUILT. NOT BOUGHT.
 #
 # Renders text as vector glyph outlines using pdftocairo, or bundled PyMuPDF
 # when Poppler is absent.
@@ -37,15 +37,29 @@ except ImportError:
 PDF_PT_TO_MM = 25.4 / 72.0
 
 
+def _svg_path_is_move_only(path_d: str) -> bool:
+    """Prove a path has no drawable segment, without hiding parse failures.
+
+    Cairo can encode an empty glyph as ``M 0 0 Z M 0 0``. Each explicit
+    move here has exactly two coordinates; extra pairs (implicit lines),
+    curves, unknown commands and malformed coordinates remain failures.
+    """
+    if not path_d.strip():
+        return True
+    number = r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+    move = rf"[Mm]\s*{number}(?:\s*,\s*|\s+|(?=[+-])){number}\s*[Zz]?\s*"
+    return re.fullmatch(rf"(?:{move})+", path_d.strip()) is not None
+
+
 def find_pdftocairo() -> Optional[str]:
     """Find pdftocairo executable on the system.
 
     Resolution order:
       1. BC_PDFTOCAIRO_PATH environment variable (manual override)
-      2. Plugin bundled bin/ directory — place pdftocairo here to make
+      2. Plugin bundled bin/ directory â€” place pdftocairo here to make
          the plugin self-contained without any system install:
            <FreeCAD Mod>/PDFVectorImporter/src/lib/bin/pdftocairo[.exe]
-      3. System PATH (shutil.which — cross-platform)
+      3. System PATH (shutil.which â€” cross-platform)
       4. Common Windows locations (MiKTeX, Poppler installs)
     """
     # 1) Explicit override
@@ -53,7 +67,7 @@ def find_pdftocairo() -> Optional[str]:
     if env and os.path.isfile(env):
         return env
 
-    # 2) Bundled bin/ inside the plugin — highest-priority so a bundled
+    # 2) Bundled bin/ inside the plugin â€” highest-priority so a bundled
     #    copy always wins over any system version.
     _this_dir = os.path.dirname(os.path.abspath(__file__))
     _lib_bin = os.path.join(_this_dir, "lib", "bin")
@@ -1327,7 +1341,7 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
             else:
                 if FreeCAD:
                     FreeCAD.Console.PrintMessage(
-                        "PDFSvgTextRenderer: pdftocairo not found — using bundled "
+                        "PDFSvgTextRenderer: pdftocairo not found â€” using bundled "
                         "PyMuPDF SVG text fallback.\n"
                     )
                 svg = _render_svg_with_pymupdf(pdf_snapshot_path, page_num)
@@ -1366,7 +1380,7 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 ) from exc
             if FreeCAD:
                 FreeCAD.Console.PrintWarning(
-                    f"PDFSvgTextRenderer: page {page_num} SVG text payload is too large — "
+                    f"PDFSvgTextRenderer: page {page_num} SVG text payload is too large â€” "
                     "requested representation was not created.\n"
                 )
             raise_oversized_svg(
@@ -1422,7 +1436,7 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
     if svg_bytes > max_svg_bytes:
         if FreeCAD:
             FreeCAD.Console.PrintWarning(
-                f"PDFSvgTextRenderer: page {page_num} SVG text payload is too large — "
+                f"PDFSvgTextRenderer: page {page_num} SVG text payload is too large â€” "
                 "requested representation was not created.\n"
             )
         raise_oversized_svg(
@@ -1436,7 +1450,7 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
 
     # Parse page-wide SVG structures exactly once. Canonical item delivery
     # calls this function for every span, so reparsing the same XML payload
-    # turned dense pages into an O(source-items × SVG-size) workload.
+    # turned dense pages into an O(source-items Ã— SVG-size) workload.
     cached_viewbox = cache.get("svg_viewbox") if cache is not None else None
     if cached_viewbox is not None:
         try:
@@ -1541,13 +1555,13 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
         for placement_index, (gid, use_x, use_y, matrix) in enumerate(placements):
             shape = glyph_shapes.get(gid)
             if shape is None:
-                if gid in all_glyph_defs and not all_glyph_defs[gid].strip():
+                if gid in all_glyph_defs and _svg_path_is_move_only(all_glyph_defs[gid]):
                     empty_placement_indices.append(placement_index)
                 else:
                     failed_placement_indices.append(placement_index)
                 continue
 
-            # SVG coords → FreeCAD coords
+            # SVG coords â†’ FreeCAD coords
             # Glyph use positions are in viewBox coordinates.
             placed = None
             if matrix and len(matrix) >= 6:
@@ -2362,7 +2376,7 @@ def _render_svg_with_pdftocairo(exe: str, pdf_path: str, page_num: int) -> Optio
     except subprocess.TimeoutExpired:
         if FreeCAD:
             FreeCAD.Console.PrintWarning(
-                f"PDFSvgTextRenderer: pdftocairo timed out on page {page_num} — "
+                f"PDFSvgTextRenderer: pdftocairo timed out on page {page_num} â€” "
                 "requested SVG text representation was not rendered.\n"
             )
         return None

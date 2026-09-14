@@ -525,17 +525,18 @@ def test_nonempty_unparseable_svg_placement_is_never_silently_dropped(monkeypatc
     assert exc_info.value.evidence["failed_placement_indices"] == [1]
 
 
-def test_empty_path_space_glyph_is_not_a_failed_visible_placement(monkeypatch):
+@pytest.mark.parametrize("empty_path", ["", "M 0 0 Z M 0 0", "m .5,-.5 z"])
+def test_empty_path_space_glyph_is_not_a_failed_visible_placement(monkeypatch, empty_path):
     _install_renderer(monkeypatch)
     monkeypatch.setattr(
         renderer,
         "_render_svg_with_pymupdf",
-        lambda *_args: SPACE_GLYPH_SVG,
+        lambda *_args: SPACE_GLYPH_SVG.replace('d=""', 'd="' + empty_path + '"'),
     )
     monkeypatch.setattr(
         renderer,
         "_svg_path_to_edges",
-        lambda path_d, *_args: [FakeEdge("ok")] if path_d.strip() else [],
+        lambda path_d, *_args: [FakeEdge("ok")] if not renderer._svg_path_is_move_only(path_d) else [],
     )
     doc = FakeDocument()
     group = FakeGroup()
@@ -2159,3 +2160,8 @@ def test_core_item_svg_rejects_source_id_index_mismatch_before_render(monkeypatc
     assert caught.value.attempt["cleanup_complete"] is True
     assert [obj.Name for obj in doc.Objects] == ["UserObject"]
     assert group.objects == []
+
+
+@pytest.mark.parametrize("path", ["M 0 0 1 1", "M 0 0 L 1 1", "M 0 0 Q", "M NaN 0", "M 0", "M 0 0 C 1 2 3 4 5 6"])
+def test_empty_glyph_proof_does_not_hide_visible_or_malformed_paths(path):
+    assert not renderer._svg_path_is_move_only(path)

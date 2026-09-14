@@ -44,6 +44,7 @@ except ModuleNotFoundError as exc:
 
 activate_bundled_runtime_if_available(_mod_root)
 from pdfcadcore.fitz_loader import import_fitz as _import_fitz
+from pdfcadcore.import_bounds import sheet_xy as _sheet_xy
 
 fitz = _import_fitz()
 
@@ -1411,7 +1412,11 @@ def _transform_pdf_direction(
 def _to_fc(xy: Tuple[float, float], page_h: float,
            opts: ImportOptions, scale: float) -> "Vector":
     """Transform a PDF coordinate pair into a FreeCAD Vector."""
-    x, y = float(xy[0]), float(xy[1])
+    pair = _sheet_xy(xy)
+    if pair is None:
+        x, y = float(xy[0]), float(xy[1]) if len(xy) > 1 else 0.0
+    else:
+        x, y = pair
     a, b, c, d, e, f = _page_matrix_values(opts)
     x, y = a * x + c * y + e, b * x + d * y + f
     if opts.flip_y:

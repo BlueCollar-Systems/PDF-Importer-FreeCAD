@@ -432,3 +432,67 @@ def test_pdf_interactive_note_detects_javascript_action():
     note = build_pdf_interactive_note(Doc())
     assert note["pdf_interactive_flags"] == ["JavaScript"]
     assert "scripts are not executed" in note["pdf_interactive_note"]
+
+
+class _UnallocatedObject(Exception):
+    """Shape of pymupdf.mupdf.FzErrorFormat: derives from Exception, not RuntimeError."""
+
+
+def test_pdf_interactive_note_survives_unallocated_xref_numbers():
+    class Doc:
+        def pdf_catalog(self):
+            return 2
+
+        def xref_get_key(self, xref, key):
+            if xref in (1, 4):
+                raise _UnallocatedObject(f"code=7: cannot find object in xref ({xref} 0 R)")
+            if xref == 3 and key == "S":
+                return ("name", "/JavaScript")
+            return ("null", "null")
+
+        def xref_length(self):
+            return 6
+
+    note = build_pdf_interactive_note(Doc())
+    assert note["pdf_interactive_flags"] == ["JavaScript"]
+
+
+def _write_sparse_xref_pdf(path: Path) -> None:
+    """A valid PDF whose xref table allocates objects 2, 3 and 5 only.
+
+    Aspose markup exports write their xref stream with /Index gaps the same way;
+    MuPDF raises "cannot find object in xref" for the unallocated numbers.
+    """
+    objects = {
+        2: b"<< /Type /Catalog /Pages 3 0 R >>",
+        3: b"<< /Type /Pages /Kids [5 0 R] /Count 1 >>",
+        5: b"<< /Type /Page /Parent 3 0 R /MediaBox [0 0 200 100] >>",
+    }
+    buf = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = {}
+    for number, body in objects.items():
+        offsets[number] = len(buf)
+        buf += b"%d 0 obj\n" % number + body + b"\nendobj\n"
+    xref_pos = len(buf)
+    buf += b"xref\n2 2\n"
+    buf += b"%010d 00000 n \n" % offsets[2] + b"%010d 00000 n \n" % offsets[3]
+    buf += b"5 1\n" + b"%010d 00000 n \n" % offsets[5]
+    buf += b"trailer\n<< /Size 6 /Root 2 0 R >>\nstartxref\n%d\n%%%%EOF\n" % xref_pos
+    path.write_bytes(bytes(buf))
+
+
+def test_pdf_audit_extras_completes_on_a_sparse_xref_file(tmp_path):
+    fitz = pytest.importorskip("pymupdf")
+    from pdfcadcore.import_report import _pdf_audit_extras
+
+    pdf_path = tmp_path / "sparse_xref.pdf"
+    _write_sparse_xref_pdf(pdf_path)
+    doc = fitz.open(str(pdf_path))
+    with pytest.raises(Exception) as raised:
+        doc.xref_get_key(1, "JS")
+    assert not isinstance(raised.value, RuntimeError)  # the class the old guards missed
+    doc.close()
+
+    extras = _pdf_audit_extras(str(pdf_path))
+    assert isinstance(extras, dict)
+    assert "pdf_interactive_flags" not in extras

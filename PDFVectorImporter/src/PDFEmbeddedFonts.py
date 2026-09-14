@@ -178,6 +178,16 @@ def _xref_name(pdf_doc, xref: int, key: str) -> str:
     return str(value or "").strip()
 
 
+def _xref_has_key(pdf_doc, xref: int, key: str) -> bool:
+    """True when the object carries ``key``; PyMuPDF reports absence as ('null', 'null')."""
+    try:
+        kind, value = pdf_doc.xref_get_key(int(xref), str(key))
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+    kind = str(kind or "").strip().lower()
+    return bool(kind) and kind != "null" and str(value or "").strip().lower() != "null"
+
+
 def _xref_contained_reference(pdf_doc, xref: int) -> Optional[int]:
     try:
         value = pdf_doc.xref_object(int(xref), compressed=False)
@@ -242,7 +252,21 @@ def _parse_tounicode_cmap(payload: bytes) -> Dict[int, int]:
     return result
 
 
-def _install_unicode_cmap(font, cmap: Dict[int, str]) -> None:
+_UNICODE_CMAP_PLATFORMS = frozenset(
+    {(0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (0, 6), (3, 1), (3, 10)}
+)
+
+
+def _install_unicode_cmap(
+    font, cmap: Dict[int, str], *, preserve_subtables: bool = False
+) -> None:
+    """Replace the font's cmap with Unicode (3,1)/(3,10) subtables for ``cmap``.
+
+    With ``preserve_subtables`` the font's existing non-Unicode subtables (the
+    (3,0) Microsoft Symbol and (1,0) Macintosh Roman tables of a GDI subset)
+    are kept next to the new Unicode ones so the program stays usable by any
+    consumer that still keys glyphs by PDF character code.
+    """
     from fontTools.ttLib import newTable
     from fontTools.ttLib.tables._c_m_a_p import CmapSubtable
 
@@ -254,6 +278,13 @@ def _install_unicode_cmap(font, cmap: Dict[int, str]) -> None:
     table = newTable("cmap")
     table.tableVersion = 0
     table.tables = []
+    if preserve_subtables and "cmap" in font:
+        table.tables.extend(
+            subtable
+            for subtable in list(getattr(font["cmap"], "tables", []) or [])
+            if (int(subtable.platformID), int(subtable.platEncID))
+            not in _UNICODE_CMAP_PLATFORMS
+        )
 
     bmp_map = {codepoint: name for codepoint, name in unicode_map.items() if codepoint <= 0xFFFF}
     if bmp_map:
@@ -343,6 +374,117 @@ def _repair_type0_identity_truetype_cmap(
     return repaired, {
         "cmap_source": "pdf_tounicode_identity_h",
         "cmap_entries": len(restored),
+    }
+
+
+# PDF 32000-1:2008 9.6.6.4: a symbolic TrueType font with a (3,0) subtable
+# keys its glyphs by the single-byte code prefixed with the high byte of one of
+# these ranges; Windows GDI subsets use 0xF000 + code.
+_SYMBOL_CMAP_CODE_PREFIXES = (0x0000, 0xF000, 0xF100, 0xF200)
+
+
+def _repair_symbolic_truetype_cmap(
+    payload: bytes,
+    pdf_doc,
+    font_xref: int,
+) -> Tuple[bytes, Dict[str, Any]]:
+    """Synthesize the Unicode cmap a GDI-printed TrueType subset omits.
+
+    A PDF printed through a Windows GDI driver embeds each TrueType subset
+    with only a (1,0) Macintosh Roman and a (3,0) Microsoft Symbol cmap
+    subtable, keyed by the PDF character code (the (3,0) table by
+    0xF000 + code).  The font dictionary's ToUnicode CMap says which Unicode
+    scalar each of those codes stands for, so combining the two restores a
+    (3,1) Unicode lookup onto the subset's own glyph ids without substituting
+    a font or touching any outline.  Fonts that already carry a Unicode
+    subtable, lack ToUnicode, or map no code to a real glyph are returned
+    unchanged.
+    """
+    from fontTools.ttLib import TTFont
+
+    font = TTFont(io.BytesIO(bytes(payload)), lazy=False)
+    if "cmap" not in font:
+        return bytes(payload), {}
+    if font.getBestCmap():
+        return bytes(payload), {}
+    subtables = list(getattr(font["cmap"], "tables", []) or [])
+    symbol_tables = [
+        table for table in subtables
+        if (int(table.platformID), int(table.platEncID)) == (3, 0)
+    ]
+    mac_tables = [
+        table for table in subtables
+        if (int(table.platformID), int(table.platEncID)) == (1, 0)
+    ]
+    if not symbol_tables and not mac_tables:
+        return bytes(payload), {}
+    if not symbol_tables and _xref_has_key(pdf_doc, font_xref, "Encoding"):
+        # Without a (3,0) table the spec routes codes through /Encoding and
+        # the Macintosh Roman names before the (1,0) lookup; a raw-code
+        # lookup would not be provably the renderer's glyph choice.
+        return bytes(payload), {}
+    to_unicode_xref = _xref_reference(pdf_doc, font_xref, "ToUnicode")
+    if not to_unicode_xref:
+        return bytes(payload), {}
+    try:
+        unicode_by_code = _parse_tounicode_cmap(pdf_doc.xref_stream(to_unicode_xref))
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return bytes(payload), {}
+    if not unicode_by_code:
+        return bytes(payload), {}
+
+    restored: Dict[int, str] = {}
+    restored_gids: Dict[int, int] = {}
+    lookup_subtables = set()
+    for code in sorted(unicode_by_code):
+        unicode_scalar = unicode_by_code[code]
+        if unicode_scalar in restored:
+            # Two codes for one scalar: the lowest code is the deterministic
+            # owner of the Unicode entry; the other keeps its symbol lookup.
+            continue
+        glyph_name = None
+        source = ""
+        for table in symbol_tables:
+            for prefix in _SYMBOL_CMAP_CODE_PREFIXES:
+                glyph_name = table.cmap.get(prefix + code)
+                if glyph_name:
+                    source = "3,0"
+                    break
+            if glyph_name:
+                break
+        if not glyph_name:
+            for table in mac_tables:
+                glyph_name = table.cmap.get(code)
+                if glyph_name:
+                    source = "1,0"
+                    break
+        if not glyph_name:
+            continue
+        glyph_id = font.getGlyphID(glyph_name)
+        if glyph_id <= 0:
+            continue
+        restored[unicode_scalar] = glyph_name
+        restored_gids[unicode_scalar] = glyph_id
+        lookup_subtables.add(source)
+    if not restored:
+        return bytes(payload), {}
+    _install_unicode_cmap(font, restored, preserve_subtables=True)
+    font.recalcTimestamp = False
+    output = io.BytesIO()
+    font.save(output, reorderTables=False)
+    repaired = output.getvalue()
+    validated = TTFont(io.BytesIO(repaired), lazy=False)
+    validated_cmap = dict(validated.getBestCmap() or {})
+    if any(
+        codepoint not in validated_cmap
+        or validated.getGlyphID(validated_cmap[codepoint]) != glyph_id
+        for codepoint, glyph_id in restored_gids.items()
+    ):
+        raise ValueError("repaired symbolic TrueType cmap failed validation")
+    return repaired, {
+        "cmap_source": "pdf_tounicode_symbolic_truetype",
+        "cmap_entries": len(restored),
+        "cmap_lookup_subtables": sorted(lookup_subtables),
     }
 
 
@@ -572,6 +714,10 @@ def stage_page_fonts(
                     pdf_doc,
                     xref,
                     str(row[5] if len(row) > 5 else ""),
+                )
+            else:
+                output_payload, repair_metadata = _repair_symbolic_truetype_cmap(
+                    output_payload, pdf_doc, xref
                 )
 
             # Validate every staged font, not just converted CFF assets.

@@ -525,17 +525,18 @@ def test_nonempty_unparseable_svg_placement_is_never_silently_dropped(monkeypatc
     assert exc_info.value.evidence["failed_placement_indices"] == [1]
 
 
-def test_empty_path_space_glyph_is_not_a_failed_visible_placement(monkeypatch):
+@pytest.mark.parametrize("empty_path", ["", "M 0 0 Z M 0 0", "m .5,-.5 z"])
+def test_empty_path_space_glyph_is_not_a_failed_visible_placement(monkeypatch, empty_path):
     _install_renderer(monkeypatch)
     monkeypatch.setattr(
         renderer,
         "_render_svg_with_pymupdf",
-        lambda *_args: SPACE_GLYPH_SVG,
+        lambda *_args: SPACE_GLYPH_SVG.replace('d=""', 'd="' + empty_path + '"'),
     )
     monkeypatch.setattr(
         renderer,
         "_svg_path_to_edges",
-        lambda path_d, *_args: [FakeEdge("ok")] if path_d.strip() else [],
+        lambda path_d, *_args: [FakeEdge("ok")] if not renderer._svg_path_is_move_only(path_d) else [],
     )
     doc = FakeDocument()
     group = FakeGroup()
@@ -2191,3 +2192,7 @@ def test_inkless_threshold_is_the_edge_epsilon():
     above = renderer._SVG_EDGE_EPSILON_MM * 10.0
     assert renderer._svg_glyph_definition_draws_no_ink(f"M 0 0 L {below} 0") is True
     assert renderer._svg_glyph_definition_draws_no_ink(f"M 0 0 L {above} 0") is False
+
+@pytest.mark.parametrize("path", ["M 0 0 1 1", "M 0 0 L 1 1", "M 0 0 Q", "M NaN 0", "M 0", "M 0 0 C 1 2 3 4 5 6"])
+def test_empty_glyph_proof_does_not_hide_visible_or_malformed_paths(path):
+    assert not renderer._svg_path_is_move_only(path)

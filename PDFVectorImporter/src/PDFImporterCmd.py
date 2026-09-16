@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # PDFImporterCmd.py — GUI command to import PDF with options dialog
-# BlueCollar Systems — BUILT. NOT BOUGHT.
+# BlueCollar-Systems — BUILT. NOT BOUGHT.
 #
 # BCS-ARCH-001 Rule 5 sweep: this dialog exposes only the user-facing
 # controls — Mode, Text rendering, Import text — plus legitimate workflow
@@ -189,7 +189,7 @@ class ImportPDFDialog(QtWidgets.QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Import PDF — BlueCollar Systems")
+        self.setWindowTitle("Import PDF — BlueCollar-Systems")
         self.setMinimumWidth(420)
         self._page_count = None
 

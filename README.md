@@ -10,7 +10,7 @@ Import vector geometry, text, and images from PDF files into FreeCAD as editable
 
 Arc reconstruction, dash mapping, color grouping, OCG layer support, and reference-based scaling -- all powered by pure-Python PDF parsing via PyMuPDF.
 
-> BlueCollar Systems -- BUILT. NOT BOUGHT.
+> BlueCollar-Systems -- BUILT. NOT BOUGHT.
 
 ## Recent fixes (v4.0.87)
 
@@ -407,4 +407,4 @@ FreeCAD refuses bad PDFs at open time (**fail closed**). SketchUp uses the same 
 
 MIT License — see [LICENSE](LICENSE) for details.
 
-Copyright (c) 2024-2026 BlueCollar Systems
+Copyright (c) 2024-2026 BlueCollar-Systems

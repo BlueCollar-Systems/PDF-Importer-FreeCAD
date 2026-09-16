@@ -8,7 +8,7 @@
 
 Arc reconstruction, dash mapping, color grouping, OCG layer support, and reference-based scaling -- all powered by pure-Python PDF parsing via PyMuPDF.
 
-> **BlueCollar Systems** -- BUILT. NOT BOUGHT.
+> **BlueCollar-Systems** -- BUILT. NOT BOUGHT.
 
 ---
 
@@ -271,4 +271,4 @@ python run_pdf_vector_importer_tests.py --init-workbook qa_workbook.xlsx
 
 MIT License. See [LICENSE](LICENSE) for details.
 
-Copyright (c) 2024-2026 BlueCollar Systems
+Copyright (c) 2024-2026 BlueCollar-Systems

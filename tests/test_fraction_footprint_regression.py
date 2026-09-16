@@ -12,7 +12,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "PDFVectorImporter"))
 
-from pdfcadcore.primitive_extractor import _FRAC_STACKED_SCALE, _merge_stacked_fractions  # noqa: E402
+from pdfcadcore.primitive_extractor import _merge_stacked_fractions  # noqa: E402
 from pdfcadcore.primitives import NormalizedText, next_id, reset_ids  # noqa: E402
 
 
@@ -110,27 +110,15 @@ def _vectors() -> list[dict]:
     return list(data["vectors"])
 
 
-def test_stacked_fraction_font_size_reduction() -> None:
+def test_layout_free_positive_vectors_are_preserved_instead_of_invented() -> None:
     for vector in _vectors():
         expected = vector["expected"]
         if not expected["should_merge"]:
             continue
-        merged = _merge_stacked_fractions(_items(vector))
-        item = next(text for text in merged if text.text == expected["merged_text"])
-        assert item.font_size == expected["effective_font_size"]
-
-
-def test_stacked_fraction_bbox_width_reduction() -> None:
-    for vector in _vectors():
-        expected = vector["expected"]
-        if not expected["bbox_width_scaled"]:
-            continue
-        source_boxes = [_bbox(span) for span in vector["input"]["spans"]]
-        source_width = max(box[2] for box in source_boxes) - min(box[0] for box in source_boxes)
-        merged = _merge_stacked_fractions(_items(vector))
-        item = next(text for text in merged if text.text == expected["merged_text"])
-        merged_width = item.bbox[2] - item.bbox[0]
-        assert merged_width <= source_width * (_FRAC_STACKED_SCALE + 1e-6)
+        before = _items(vector)
+        after = _merge_stacked_fractions(before)
+        assert after is before
+        assert [item.text for item in after] == [item.text for item in before]
 
 
 def test_fraction_no_overrun_with_adjacent_digits() -> None:
@@ -138,7 +126,8 @@ def test_fraction_no_overrun_with_adjacent_digits() -> None:
     merged = _merge_stacked_fractions(_items(vector))
     texts = [item.text for item in merged]
     assert "2" in texts
-    assert "1/4" in texts
+    assert texts == ["2", "1", "/", "4"]
+    assert "1/4" not in texts
     assert "2/4" not in texts
 
 

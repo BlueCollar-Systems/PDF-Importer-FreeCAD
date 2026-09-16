@@ -29,7 +29,7 @@ class TestPdfPrimitiveExtractor(unittest.TestCase):
         self.assertAlmostEqual(rgb[1], 0xAA / 255.0, places=4)
         self.assertAlmostEqual(rgb[2], 0x33 / 255.0, places=4)
 
-    def test_stacked_fraction_merge_ignores_full_size_whole_number(self) -> None:
+    def test_layout_free_fraction_near_whole_number_is_preserved(self) -> None:
         items = [
             NormalizedText(
                 id=1, text="2", normalized="2",
@@ -54,13 +54,12 @@ class TestPdfPrimitiveExtractor(unittest.TestCase):
         ]
 
         merged = _merge_stacked_fractions(items)
-        texts = [item.text for item in merged]
+        self.assertEqual([item.text for item in merged], ["2", "1", "4", "/"])
+        self.assertEqual(len(merged), len(items))
+        for actual, original in zip(merged, items, strict=True):
+            self.assertIs(actual, original)
 
-        self.assertIn("2", texts)
-        self.assertIn("1/4", texts)
-        self.assertNotIn("2/4", texts)
-
-    def test_fraction_overlay_artifacts_are_deduped(self) -> None:
+    def test_layout_free_fraction_overlay_candidates_are_preserved(self) -> None:
         items = [
             NormalizedText(
                 id=1, text="316", normalized="316",
@@ -80,13 +79,12 @@ class TestPdfPrimitiveExtractor(unittest.TestCase):
         ]
 
         merged = _merge_stacked_fractions(items)
-        texts = [item.text for item in merged]
+        self.assertEqual([item.text for item in merged], ["316", "/", "3/16"])
+        self.assertEqual(len(merged), len(items))
+        for actual, original in zip(merged, items, strict=True):
+            self.assertIs(actual, original)
 
-        self.assertEqual(texts.count("3/16"), 1)
-        self.assertNotIn("316", texts)
-        self.assertNotIn("/", texts)
-
-    def test_ambiguous_same_fraction_overlay_group_merges_once(self) -> None:
+    def test_ambiguous_layout_free_overlay_group_is_preserved(self) -> None:
         items = [
             NormalizedText(
                 id=1, text="316", normalized="316",
@@ -111,9 +109,10 @@ class TestPdfPrimitiveExtractor(unittest.TestCase):
         ]
 
         merged = _merge_stacked_fractions(items)
-        texts = [item.text for item in merged]
-
-        self.assertEqual(texts, ["3/16"])
+        self.assertEqual([item.text for item in merged], ["316", "/", "316", "/"])
+        self.assertEqual(len(merged), len(items))
+        for actual, original in zip(merged, items, strict=True):
+            self.assertIs(actual, original)
 
 
 if __name__ == "__main__":

@@ -3,14 +3,14 @@
 **BUILT. NOT BOUGHT.**
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
-![Version: 4.0.90](https://img.shields.io/badge/Version-4.0.94-blue.svg)
+![Version: 4.0.103](https://img.shields.io/badge/Version-4.0.103-blue.svg)
 ![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
 
 Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.
 
 Arc reconstruction, dash mapping, color grouping, OCG layer support, and reference-based scaling -- all powered by pure-Python PDF parsing via PyMuPDF.
 
-> BlueCollar Systems -- BUILT. NOT BOUGHT.
+> BlueCollar-Systems -- BUILT. NOT BOUGHT.
 
 ## Recent fixes (v4.0.87)
 
@@ -407,4 +407,4 @@ FreeCAD refuses bad PDFs at open time (**fail closed**). SketchUp uses the same 
 
 MIT License — see [LICENSE](LICENSE) for details.
 
-Copyright (c) 2024-2026 BlueCollar Systems
+Copyright (c) 2024-2026 BlueCollar-Systems

@@ -44,6 +44,7 @@ except ModuleNotFoundError as exc:
 
 activate_bundled_runtime_if_available(_mod_root)
 from pdfcadcore.fitz_loader import import_fitz as _import_fitz
+from pdfcadcore.primitive_extractor import _composite_alpha, _span_alpha
 from pdfcadcore.import_bounds import sheet_xy as _sheet_xy
 
 fitz = _import_fitz()
@@ -1383,14 +1384,29 @@ def write_import_report(
 # ──────────────────────────────────────────────────────────────────────
 # Coordinate transform
 # ──────────────────────────────────────────────────────────────────────
+_IDENTITY_PAGE_MATRIX = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+
 def _page_matrix_values(opts: ImportOptions) -> Tuple[float, float, float, float, float, float]:
     raw = getattr(opts, "_page_rotation_matrix", None)
+    # Called once per transformed point (1.1 million times on a 550k-path
+    # sheet).  The six floats are memoized against the identity of the raw
+    # matrix object, so a page that installs a new matrix is re-read and the
+    # values are exactly what the conversion below produced.
+    cached = getattr(opts, "_page_matrix_values_cache", None)
+    if cached is not None and cached[0] is raw:
+        return cached[1]
+    values = _IDENTITY_PAGE_MATRIX
     if raw and len(raw) >= 6:
         try:
-            return tuple(float(value) for value in raw[:6])
+            values = tuple(float(value) for value in raw[:6])
         except (TypeError, ValueError):
-            pass
-    return (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+            values = _IDENTITY_PAGE_MATRIX
+    try:
+        opts._page_matrix_values_cache = (raw, values)
+    except AttributeError:
+        pass
+    return values
 
 
 def _transform_pdf_direction(
@@ -1727,10 +1743,122 @@ def _extrude_model3d_obj(obj, opts: ImportOptions) -> bool:
         return False
 
 
-def _apply_style(obj, stroke_rgb, fill_rgb, width, dashes, opts: ImportOptions):
-    """Set source stroke/fill color, line width, and dash style on a ViewObject."""
+def _persist_geometry_style_metadata(
+    obj,
+    stroke_rgb,
+    fill_rgb,
+    width,
+    dashes,
+    opts: ImportOptions,
+) -> bool:
+    """Persist the *effective* view style App-side so it survives a headless save.
+
+    FreeCADCmd has no ViewObject and writes no GuiDocument.xml, so everything
+    ``_apply_style`` puts on the view is lost on GUI open (dashed lines render
+    solid, weights flatten to 2 px, colours default).  These four properties are
+    the same contract text already carries in ``PDFText*`` and are read back by
+    ``PDFStyleRestore`` when the document opens in the GUI.
+
+    ``PDFLineWidthPt`` is 0.0 and ``PDFDashPattern`` is "" whenever the import
+    options disabled that mapping, so the restore reproduces the same look the
+    GUI import produced.  Never raises: hosts without ``addProperty`` are skipped.
+    """
+    add_property = getattr(obj, "addProperty", None)
+    if not callable(add_property):
+        return False
+    try:
+        width_pt = float(width) if (opts.assign_linewidth and width is not None) else 0.0
+        if width_pt != width_pt or width_pt < 0.0:
+            width_pt = 0.0
+    except (TypeError, ValueError):
+        width_pt = 0.0
+    dash_metadata = ""
+    try:
+        if opts.map_dashes and dashes and len(dashes) >= 2 and all(d > 0 for d in dashes):
+            dash_metadata = ",".join(format(float(d), ".9g") for d in dashes)
+    except (TypeError, ValueError):
+        dash_metadata = ""
+    values = (
+        ("App::PropertyString", "PDFStrokeRGB", _format_color_metadata(stroke_rgb)),
+        ("App::PropertyString", "PDFFillRGB", _format_color_metadata(fill_rgb)),
+        ("App::PropertyFloat", "PDFLineWidthPt", width_pt),
+        ("App::PropertyString", "PDFDashPattern", dash_metadata),
+    )
+    try:
+        properties = set(getattr(obj, "PropertiesList", []) or [])
+        for property_kind, property_name, property_value in values:
+            if property_name not in properties:
+                add_property(property_kind, property_name, "PDF Import")
+                properties.add(property_name)
+            setattr(obj, property_name, property_value)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _record_geometry_style_evidence(opts: ImportOptions, *, persisted: bool, view_styled: bool) -> None:
+    """Count what really happened so the import report cannot claim GUI style headless."""
+    try:
+        if persisted:
+            opts._geometry_style_app_objects = int(
+                getattr(opts, "_geometry_style_app_objects", 0) or 0
+            ) + 1
+        if view_styled:
+            opts._geometry_style_view_objects = int(
+                getattr(opts, "_geometry_style_view_objects", 0) or 0
+            ) + 1
+    except (AttributeError, TypeError, ValueError):
+        pass
+
+
+def _geometry_style_report_payload(opts: ImportOptions) -> Dict[str, Any]:
+    """Report block: is geometry look persisted App-side, and was a GUI view styled?"""
+    app_objects = int(getattr(opts, "_geometry_style_app_objects", 0) or 0)
+    view_objects = int(getattr(opts, "_geometry_style_view_objects", 0) or 0)
+    if app_objects == 0 and view_objects == 0:
+        verification = "no_geometry_style_applied"
+    elif view_objects >= app_objects and view_objects > 0:
+        verification = "gui_view_and_app_metadata"
+    elif view_objects > 0:
+        verification = "mixed_view_and_app_metadata"
+    else:
+        verification = "headless_app_metadata"
+    return {
+        "app_metadata_objects": app_objects,
+        "view_styled_objects": view_objects,
+        "style_verification": verification,
+        "view_style_verified": verification == "gui_view_and_app_metadata",
+    }
+
+
+def _apply_style(
+    obj,
+    stroke_rgb,
+    fill_rgb,
+    width,
+    dashes,
+    opts: ImportOptions,
+    *,
+    persist_metadata: bool = True,
+):
+    """Set source stroke/fill color, line width, and dash style on a ViewObject.
+
+    The same style is persisted App-side first (``PDFStrokeRGB`` / ``PDFFillRGB``
+    / ``PDFLineWidthPt`` / ``PDFDashPattern``) so a headless FreeCADCmd save keeps
+    the contract and ``PDFStyleRestore`` can re-apply it on GUI open.  Pass
+    ``persist_metadata=False`` from that restore path (metadata already there).
+    """
+    persisted = False
+    if persist_metadata:
+        persisted = _persist_geometry_style_metadata(
+            obj, stroke_rgb, fill_rgb, width, dashes, opts
+        )
+    view_styled = False
     try:
         vo = obj.ViewObject
+        if vo is None:
+            raise AttributeError("headless host: no ViewObject")
+        view_styled = True
         visible_rgb = stroke_rgb or fill_rgb
         if visible_rgb is not None:
             try:
@@ -1774,6 +1902,10 @@ def _apply_style(obj, stroke_rgb, fill_rgb, width, dashes, opts: ImportOptions):
                     vo.DrawStyle = "Dashdot"
     except (AttributeError, RuntimeError, TypeError, ValueError):
         pass
+    if persist_metadata:
+        _record_geometry_style_evidence(
+            opts, persisted=persisted, view_styled=view_styled
+        )
 
 
 def _make_group(parent, label: str, fc_doc=None):
@@ -2174,7 +2306,9 @@ def _fit_font_size_to_span_bbox(
 
 
 def _span_source_color(span: dict) -> Optional[Tuple[float, float, float]]:
-    return _optional_color(span.get("color"))
+    # Constant alpha (/ca) is composited against the white page once, like pdfcadcore
+    # does for the other hosts; FreeCAD's TextColor has no alpha channel.
+    return _composite_alpha(_optional_color(span.get("color")), _span_alpha(span))
 
 
 def _apply_text_color(obj, rgb: Optional[Tuple[float, float, float]]) -> None:
@@ -3299,6 +3433,15 @@ def _record_text_delivery(opts: ImportOptions, bucket: str, count: int) -> None:
 
 
 FREECAD_TEXT_IMPORTER_IDENTITY = "bluecollarsystems.freecad.pdf_vector_importer"
+
+# Draft Labels are built with points=[anchor, anchor]; Draft's default
+# ArrowTypeStart "Dot" then draws a 1 mm world-sized marker over the first
+# glyph of every span (extra ink not in the PDF).  Same constant as
+# PDFStyleRestore.LABEL_ARROW_TYPE so creation and GUI-open restore agree.
+# FreeCAD 1.0 Labels have ArrowType (no "None") + ArrowSize instead; there a
+# zero arrow size hides the marker (PDFStyleRestore.LABEL_ARROW_SIZE_FALLBACK).
+LABEL_ARROW_TYPE = "None"
+LABEL_ARROW_SIZE_FALLBACK = 0.0
 
 
 TEXT_ITEM_FALLBACK_LADDERS = {
@@ -6195,6 +6338,16 @@ def _deliver_text_item_native(
                         color_properties.append(property_name)
                 if not color_properties:
                     raise RuntimeError("native host exposes no writable color property")
+            if attempted_type == "labels":
+                # Zero-length leader: no arrow marker, no leader line.
+                if hasattr(view, "ArrowTypeStart"):
+                    view.ArrowTypeStart = LABEL_ARROW_TYPE
+                elif hasattr(view, "ArrowSize"):
+                    # FreeCAD 1.0 Labels expose ArrowType (no "None" member)
+                    # + ArrowSize; a zero-size marker draws nothing.
+                    view.ArrowSize = LABEL_ARROW_SIZE_FALLBACK
+                if hasattr(view, "Line"):
+                    view.Line = False
     except Exception as exc:
         fail(
             "native_text_creation_or_style_failed",
@@ -8983,11 +9136,27 @@ def _preprocess_text_blocks(tdict: dict) -> dict:
 # ──────────────────────────────────────────────────────────────────────
 # Raster page import (scanned PDF fallback)
 # ──────────────────────────────────────────────────────────────────────
+def _full_page_raster_anchor(w_units: float, h_units: float) -> Tuple[float, float, float]:
+    """Placement base of the full-page raster underlay.
+
+    ``Image::ImagePlane`` is drawn centred on its Placement while the page's
+    vectors and text occupy ``(0..w_units, 0..h_units)``: the underlay belongs
+    at the page centre, 0.1 unit behind the vectors.
+    """
+    return (float(w_units) / 2.0, float(h_units) / 2.0, -0.1)
+
+
 def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
                            opts: ImportOptions, scale: float,
-                           parent, fc_doc):
-    """Render, persist, place, and reread one verified full-page ImagePlane."""
-    del pdf_doc, page_h
+                           parent, fc_doc, suppress_text: bool = False):
+    """Render, persist, place, and reread one verified full-page ImagePlane.
+
+    ``suppress_text`` renders the underlay from a text-redacted copy of the page. Set it
+    whenever the requested text is *also* delivered natively on top of this underlay:
+    without it the page's glyphs appear twice, once rasterized and once as native
+    entities.
+    """
+    del page_h
     dpi = opts.raster_dpi or 200
 
     # Adaptive DPI: scale with page physical size so the image is always
@@ -9017,18 +9186,41 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
     for candidate in (dpi, max(96, dpi // 2), 96):
         if candidate not in retry_dpis:
             retry_dpis.append(candidate)
-    for candidate in retry_dpis:
+
+    # Render source: the page itself, or a text-redacted copy when the text is being
+    # delivered natively on top of this underlay.
+    render_doc = None
+    render_page = page
+    text_suppressed = False
+    if suppress_text:
         try:
-            zoom = candidate / 72.0
-            mat = fitz.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=mat)
-            dpi = candidate
-            break
-        except (RuntimeError, MemoryError, ValueError, OverflowError) as e:
-            last_error = e
+            render_doc, render_page = _text_free_page_copy(pdf_doc, page)
+            text_suppressed = True
+        except Exception as exc:  # noqa: BLE001 - never fail the import for this
+            render_doc, render_page = None, page
             _warn(
-                f"Page {page_num}: raster render failed at {candidate} DPI: {e}"
+                f"Page {page_num}: could not suppress text in the raster underlay "
+                f"({exc}); the underlay will duplicate the natively delivered text"
             )
+    try:
+        for candidate in retry_dpis:
+            try:
+                zoom = candidate / 72.0
+                mat = fitz.Matrix(zoom, zoom)
+                pix = render_page.get_pixmap(matrix=mat)
+                dpi = candidate
+                break
+            except (RuntimeError, MemoryError, ValueError, OverflowError) as e:
+                last_error = e
+                _warn(
+                    f"Page {page_num}: raster render failed at {candidate} DPI: {e}"
+                )
+    finally:
+        if render_doc is not None:
+            try:
+                render_doc.close()
+            except Exception:
+                pass
     if pix is None:
         raise RuntimeError(
             "Raster render failed after retries: %s" % (last_error or "unknown error")
@@ -9066,7 +9258,13 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
         ip.ImageFile = str(img_path)
         ip.XSize = w_units
         ip.YSize = h_units
-        ip.Placement = Placement(_v(0, 0, -0.1), Rotation())  # slightly behind vectors
+        # Image::ImagePlane renders CENTERED on its Placement (see the per-image
+        # patch placement below); the vector/text content spans (0..W, 0..H), so
+        # the full-page underlay must be anchored at the page centre -- at the
+        # origin it sat half a page down-left of the vectors it underlays
+        # (visual oracle, garden-map sheet, 2026-08-16).
+        anchor_xyz = _full_page_raster_anchor(w_units, h_units)
+        ip.Placement = Placement(_v(*anchor_xyz), Rotation())  # slightly behind vectors
         add_property = getattr(ip, "addProperty", None)
         if not callable(add_property):
             raise RuntimeError("ImagePlane cannot embed its raster asset")
@@ -9098,7 +9296,7 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
             or anchor is None
             or any(
                 abs(anchor[index] - expected) > 1e-7
-                for index, expected in enumerate((0.0, 0.0, -0.1))
+                for index, expected in enumerate(anchor_xyz)
             )
             or getattr(ip, "PDFSourceItemId", None) != "p%d:page" % int(page_num)
             or getattr(ip, "PDFRepresentation", None) != "raster"
@@ -9125,6 +9323,11 @@ def _import_page_as_raster(pdf_doc, page, page_num: int, page_h: float,
             "raster_file": str(img_path),
             "raster_file_included": True,
             "pdf_sha256": digest,
+            # Whether this underlay was rendered from a text-redacted page copy. When the
+            # text is delivered natively on top, a False here means the page's glyphs are
+            # drawn twice.
+            "text_suppressed": bool(text_suppressed),
+            "text_suppression_requested": bool(suppress_text),
             "dpi": int(dpi),
             "pixel_width": int(getattr(pix, "width", 0) or 0),
             "pixel_height": int(getattr(pix, "height", 0) or 0),
@@ -9195,6 +9398,35 @@ def _images_only_page_copy(pdf_doc, page):
         )
     except TypeError:
         # Older PyMuPDF without graphics/text kwargs still removes text.
+        tmp_page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+    return tmp_doc, tmp_page
+
+
+def _text_free_page_copy(pdf_doc, page):
+    """Return (tmp_doc, tmp_page): a single-page copy with ONLY the text removed.
+
+    Distinct from :func:`_images_only_page_copy`, which also strips line art. When a
+    full-page raster underlay is placed *and* the requested text is delivered natively on
+    top, the underlay must keep its graphics (it is the graphics delivery) but must not
+    carry the text as well -- otherwise every glyph is drawn twice, once in the raster and
+    once as a native entity. On the garden-map sheet that overprint rendered the title as
+    ``ALVORDCTX x GARDEN MAP AFINAS N MORTHCATTOP`` (visual oracle, 2026-08-18).
+
+    The caller must close tmp_doc.
+    """
+    tmp_doc = fitz.open()
+    tmp_doc.insert_pdf(pdf_doc, from_page=page.number, to_page=page.number)
+    tmp_page = tmp_doc[0]
+    tmp_page.add_redact_annot(tmp_page.rect)
+    try:
+        tmp_page.apply_redactions(
+            images=fitz.PDF_REDACT_IMAGE_NONE,
+            graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+            text=fitz.PDF_REDACT_TEXT_REMOVE,
+        )
+    except TypeError:
+        # Older PyMuPDF without the graphics/text kwargs still removes text; it may also
+        # drop touched line art, which degrades the underlay but never duplicates text.
         tmp_page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
     return tmp_doc, tmp_page
 
@@ -10117,9 +10349,13 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         _record_raster_page(opts, opts.auto_reason or "raster mode")
         _msg(f"Page {page_num}: rendering at {opts.raster_dpi} DPI (raster mode)")
         _progress_update(5, f"Rendering raster image at {opts.raster_dpi} DPI...")
+        # When the requested text is delivered natively over this underlay, the underlay
+        # must not carry the text as well: rasterized glyphs plus native glyphs is a
+        # visible overprint, not a redundancy.
         full_page_raster_result = _import_page_as_raster(
             pdf_doc, page, page_num, page_h, opts, scale,
-            top_group or fc_doc, fc_doc)
+            top_group or fc_doc, fc_doc,
+            suppress_text=bool(auto_raster_text_overlay))
         if auto_raster_text_overlay:
             placed_full_page_raster_background = True
             drawings = []
@@ -10329,9 +10565,9 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             continue
 
         stroke = path_group.get("color") or path_group.get("stroke")
-        stroke_rgb = _optional_color(stroke)
+        stroke_rgb = _composite_alpha(_optional_color(stroke), path_group.get("stroke_opacity"))
         fill = path_group.get("fill")
-        fill_rgb = _optional_color(fill)
+        fill_rgb = _composite_alpha(_optional_color(fill), path_group.get("fill_opacity"))
         close_path = path_group.get("closePath", False)
         width = _as_float(path_group.get("width") or path_group.get("lineWidth"))
         dashes, dash_phase = _parse_dashes(path_group.get("dashes"))  # noqa: F841 — dash_phase stored for QA/adapter use; FC DrawStyle has no phase param
@@ -10350,7 +10586,10 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         grp_rect = path_group.get("rect")
         if grp_rect and _is_rect(grp_rect):
             grp_area = abs(grp_rect.width * grp_rect.height)
-            page_area = page.rect.width * page.rect.height
+            # page_w / page_h are float(page.rect.width/height) read once per
+            # page above; reading page.rect here built two PyMuPDF Rects per
+            # path group (1.1 million on a 550k-path sheet, 15 s).
+            page_area = page_w * page_h
             if grp_area > page_area * 0.95:
                 continue
 
@@ -10797,7 +11036,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 if not items:
                     continue
                 stroke = path_group.get("color") or path_group.get("stroke")
-                stroke_rgb = _optional_color(stroke)
+                stroke_rgb = _composite_alpha(_optional_color(stroke), path_group.get("stroke_opacity"))
                 current_pt = None
                 sub_edges = []
                 for item in items:
@@ -10946,6 +11185,8 @@ def _reset_import_run_state(opts: ImportOptions) -> None:
     opts._report_extra = {}
     opts._model3d_solids = 0
     opts._model3d_semantic_objects = 0
+    opts._geometry_style_app_objects = 0
+    opts._geometry_style_view_objects = 0
     opts._model3d_intent = None
     opts._model3d_intent_feasible = False
     opts._model3d_text_evidence = []
@@ -10982,6 +11223,8 @@ _PAGE_RESULT_TELEMETRY_FIELDS = (
     "_shapestring_font_staging_sessions",
     "_report_extra",
     "_model3d_solids",
+    "_geometry_style_app_objects",
+    "_geometry_style_view_objects",
     "_scale_cached_pages",
     "wirestring_cache_stats",
     "text3d_outline_cache_stats",
@@ -11870,6 +12113,9 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         opts._report_extra["result_status"] = (
             "cancelled" if cancelled else "success"
         )
+        # Geometry look is App-side metadata in every host; a GUI view was
+        # styled only when one existed. Headless runs must say so.
+        opts._report_extra["geometry_style"] = _geometry_style_report_payload(opts)
         if session_state is not None:
             opts._report_extra["import_session"] = _session_state_payload(
                 session_state

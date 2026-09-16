@@ -13,7 +13,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "PDFVectorImporter"))
 
-from pdfcadcore.primitive_extractor import _FRAC_STACKED_SCALE, _merge_stacked_fractions  # noqa: E402
+from pdfcadcore.primitive_extractor import _merge_stacked_fractions  # noqa: E402
 from pdfcadcore.primitives import NormalizedText, next_id, reset_ids  # noqa: E402
 
 
@@ -79,16 +79,13 @@ def _assert_vector(vector: dict) -> None:
         assert forbidden not in texts, vector["id"]
 
     if expected["should_merge"]:
-        assert merged_text in texts, f"{vector['id']}: expected {merged_text!r} in {texts!r}"
-        merged = next(item for item in after if item.text == merged_text)
-        expected_size = expected.get("effective_font_size")
-        if expected_size is not None:
-            assert abs(float(merged.font_size) - float(expected_size)) < 1e-6
-        if expected.get("bbox_width_scaled"):
-            boxes = [_bbox(span) for span in vector["input"]["spans"]]
-            source_width = max(box[2] for box in boxes) - min(box[0] for box in boxes)
-            merged_width = merged.bbox[2] - merged.bbox[0] if merged.bbox else source_width
-            assert merged_width <= source_width * (_FRAC_STACKED_SCALE + 1e-6)
+        # These legacy vectors carry only aggregate spans, not the complete
+        # character-layout bijection now required for a truthful visual merge.
+        # The separately approved visual-layout suite exercises positive merges.
+        assert after is before, vector["id"]
+        assert texts == [item.text for item in before], vector["id"]
+        if merged_text:
+            assert merged_text not in texts, vector["id"]
     else:
         if merged_text:
             assert merged_text not in texts, vector["id"]

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# PDFSvgTextRenderer.py â€” Pixel-perfect text via SVG glyph paths
-# BlueCollar Systems â€” BUILT. NOT BOUGHT.
+# PDFSvgTextRenderer.py — Pixel-perfect text via SVG glyph paths
+# BlueCollar Systems — BUILT. NOT BOUGHT.
 #
 # Renders text as vector glyph outlines using pdftocairo, or bundled PyMuPDF
 # when Poppler is absent.
@@ -56,10 +56,10 @@ def find_pdftocairo() -> Optional[str]:
 
     Resolution order:
       1. BC_PDFTOCAIRO_PATH environment variable (manual override)
-      2. Plugin bundled bin/ directory â€” place pdftocairo here to make
+      2. Plugin bundled bin/ directory — place pdftocairo here to make
          the plugin self-contained without any system install:
            <FreeCAD Mod>/PDFVectorImporter/src/lib/bin/pdftocairo[.exe]
-      3. System PATH (shutil.which â€” cross-platform)
+      3. System PATH (shutil.which — cross-platform)
       4. Common Windows locations (MiKTeX, Poppler installs)
     """
     # 1) Explicit override
@@ -67,7 +67,7 @@ def find_pdftocairo() -> Optional[str]:
     if env and os.path.isfile(env):
         return env
 
-    # 2) Bundled bin/ inside the plugin â€” highest-priority so a bundled
+    # 2) Bundled bin/ inside the plugin — highest-priority so a bundled
     #    copy always wins over any system version.
     _this_dir = os.path.dirname(os.path.abspath(__file__))
     _lib_bin = os.path.join(_this_dir, "lib", "bin")
@@ -1341,7 +1341,7 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
             else:
                 if FreeCAD:
                     FreeCAD.Console.PrintMessage(
-                        "PDFSvgTextRenderer: pdftocairo not found â€” using bundled "
+                        "PDFSvgTextRenderer: pdftocairo not found — using bundled "
                         "PyMuPDF SVG text fallback.\n"
                     )
                 svg = _render_svg_with_pymupdf(pdf_snapshot_path, page_num)
@@ -1380,7 +1380,7 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 ) from exc
             if FreeCAD:
                 FreeCAD.Console.PrintWarning(
-                    f"PDFSvgTextRenderer: page {page_num} SVG text payload is too large â€” "
+                    f"PDFSvgTextRenderer: page {page_num} SVG text payload is too large — "
                     "requested representation was not created.\n"
                 )
             raise_oversized_svg(
@@ -1436,7 +1436,7 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
     if svg_bytes > max_svg_bytes:
         if FreeCAD:
             FreeCAD.Console.PrintWarning(
-                f"PDFSvgTextRenderer: page {page_num} SVG text payload is too large â€” "
+                f"PDFSvgTextRenderer: page {page_num} SVG text payload is too large — "
                 "requested representation was not created.\n"
             )
         raise_oversized_svg(
@@ -1450,7 +1450,7 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
 
     # Parse page-wide SVG structures exactly once. Canonical item delivery
     # calls this function for every span, so reparsing the same XML payload
-    # turned dense pages into an O(source-items Ã— SVG-size) workload.
+    # turned dense pages into an O(source-items × SVG-size) workload.
     cached_viewbox = cache.get("svg_viewbox") if cache is not None else None
     if cached_viewbox is not None:
         try:
@@ -1565,7 +1565,7 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                     failed_placement_indices.append(placement_index)
                 continue
 
-            # SVG coords â†’ FreeCAD coords
+            # SVG coords → FreeCAD coords
             # Glyph use positions are in viewBox coordinates.
             placed = None
             if matrix and len(matrix) >= 6:
@@ -2380,7 +2380,7 @@ def _render_svg_with_pdftocairo(exe: str, pdf_path: str, page_num: int) -> Optio
     except subprocess.TimeoutExpired:
         if FreeCAD:
             FreeCAD.Console.PrintWarning(
-                f"PDFSvgTextRenderer: pdftocairo timed out on page {page_num} â€” "
+                f"PDFSvgTextRenderer: pdftocairo timed out on page {page_num} — "
                 "requested SVG text representation was not rendered.\n"
             )
         return None

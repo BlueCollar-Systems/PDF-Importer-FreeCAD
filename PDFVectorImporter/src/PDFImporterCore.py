@@ -10776,6 +10776,16 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     p2 = _to_fc((x2, y2), page_h, opts, scale)
                     p3 = _to_fc((x3, y3), page_h, opts, scale)
 
+                if path_group.get("bcs_preserve_source_edges"):
+                    # Outlines beside exact clip masks must retain their
+                    # actual cubic boundary, rather than a fitted circle or
+                    # tessellation that can expose slivers around the fill.
+                    curve = Part.BezierCurve()
+                    curve.setPoles([p0, p1, p2, p3])
+                    sub_edges.append(curve.toShape())
+                    current_pt = p3
+                    continue
+
                 # Try arc reconstruction first
                 arc = _arc_from_cubic(p0, p1, p2, p3, opts)
                 if arc is not None:
@@ -10880,7 +10890,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         # monster PDFs are almost certainly contour lines or map features, not
         # arcs from a CAD exporter.  The arc fitter still runs; it just skips
         # chains that are obviously not arc candidates.
-        if opts.detect_arcs:
+        if opts.detect_arcs and not path_group.get("bcs_preserve_source_edges"):
             processed = []
             for edges, is_closed in wires_edges:
                 if _is_heavy and len(edges) > 200:

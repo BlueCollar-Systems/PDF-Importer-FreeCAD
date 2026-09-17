@@ -37,3 +37,24 @@ def test_headless_text_raster_restores_unshaded_source_colors():
     result = restore.restore_object_style(obj)
     assert result["error"] is None
     assert view.DisplayMode == "No shading"
+
+
+@pytest.mark.parametrize("budget", [10000, 16000000])
+def test_translucent_source_highlight_is_composited_once(monkeypatch, budget):
+    fitz = pytest.importorskip("fitz")
+    monkeypatch.setenv("BC_FC_TEXT_RASTER_CACHE_MAX_PIXELS", str(budget))
+    pdf = fitz.open()
+    try:
+        page = pdf.new_page(width=200, height=100)
+        page.draw_rect(fitz.Rect(10, 10, 100, 80), color=None,
+                       fill=(0, 1, 1), fill_opacity=0.25)
+        pix, dpi = core._cached_text_raster_pixmap(
+            page, fitz.Rect(20, 20, 40, 40), requested_dpi=300,
+            page_number=1, opts=core.ImportOptions())
+        assert dpi == 300
+        assert pix.alpha == 0
+        red, green, blue = pix.pixel(pix.width // 2, pix.height // 2)
+        assert 188 <= red <= 194
+        assert green == blue == 255
+    finally:
+        pdf.close()

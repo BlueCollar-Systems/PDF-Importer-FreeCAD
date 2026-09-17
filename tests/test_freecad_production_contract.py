@@ -1260,7 +1260,7 @@ def test_text_raster_cache_preserves_requested_dpi_above_page_cache_budget(
     assert "pixmap" not in opts._text_raster_page_cache
     assert opts._text_raster_page_cache["render_count"] == 2
     expected = page.get_pixmap(matrix=fitz.Matrix(300 / 72, 300 / 72),
-                               clip=fitz.Rect(15.0, 35.0, 80.0, 55.0), alpha=True)
+                               clip=fitz.Rect(15.0, 35.0, 80.0, 55.0), alpha=False)
     assert (first.width, first.height, first.x, first.y) == (expected.width, expected.height, expected.x, expected.y)
     assert first.samples == expected.samples
     pdf.close()

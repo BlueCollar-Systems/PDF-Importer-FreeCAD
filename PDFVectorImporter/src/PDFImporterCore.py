@@ -6814,7 +6814,7 @@ def _cached_text_raster_pixmap(
         }
         if page_area * zoom * zoom <= max_pixels:
             cache["pixmap"] = display_list.get_pixmap(
-                matrix=fitz.Matrix(zoom, zoom), alpha=True,
+                matrix=fitz.Matrix(zoom, zoom), alpha=False,
             )
             cache["render_count"] = 1
         opts._text_raster_page_cache = cache
@@ -6822,8 +6822,10 @@ def _cached_text_raster_pixmap(
     if full_pixmap is None:
         # Reuse parsed drawing commands on large sheets, rendering only each
         # small text patch. A page-sized cache limit must not downsample text.
+        # Complete page colors against the PDF's white background: retaining
+        # alpha would composite highlights a second time over native artwork.
         pixmap = cache["display_list"].get_pixmap(
-            matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=True,
+            matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False,
         )
         cache["render_count"] += 1
         return pixmap, effective_dpi
@@ -6970,7 +6972,7 @@ def _deliver_text_item_raster(
             pix = page.get_pixmap(
                 matrix=fitz.Matrix(zoom, zoom),
                 clip=clip,
-                alpha=True,
+                alpha=False,
             )
         if int(getattr(pix, "width", 0) or 0) <= 0 or int(
             getattr(pix, "height", 0) or 0

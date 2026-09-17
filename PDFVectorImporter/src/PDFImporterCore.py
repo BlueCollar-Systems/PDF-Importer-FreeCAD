@@ -1832,6 +1832,38 @@ def _geometry_style_report_payload(opts: ImportOptions) -> Dict[str, Any]:
     }
 
 
+def _apply_planar_fill_material(obj, view, fill_rgb):
+    """Display planar PDF ink without CAD lighting darkening its source color.
+
+    A native emissive material survives FCStd save/reopen without a custom view
+    provider. Solids and non-XY faces retain the ordinary shaded CAD material.
+    Source RGB remains recorded independently in PDFFillRGB.
+    """
+    shape = getattr(obj, "Shape", None)
+    if shape is None or not shape.Faces or shape.Solids:
+        return False
+    if float(shape.BoundBox.ZLength) > ZERO_TOL:
+        return False
+    if hasattr(view, "ShapeAppearance"):
+        materials = list(view.ShapeAppearance)
+        target = "ShapeAppearance"
+    elif hasattr(view, "ShapeMaterial"):
+        materials = [view.ShapeMaterial]
+        target = "ShapeMaterial"
+    else:
+        return False
+    if not materials:
+        return False
+    for material in materials:
+        material.AmbientColor = (0.0, 0.0, 0.0)
+        material.DiffuseColor = (0.0, 0.0, 0.0)
+        material.SpecularColor = (0.0, 0.0, 0.0)
+        material.EmissiveColor = tuple(fill_rgb)
+        material.Shininess = 0.0
+    setattr(view, target, materials if target == "ShapeAppearance" else materials[0])
+    return True
+
+
 def _apply_style(
     obj,
     stroke_rgb,
@@ -1874,6 +1906,12 @@ def _apply_style(
             try:
                 vo.ShapeColor = fill_rgb
             except (AttributeError, RuntimeError, TypeError, ValueError):
+                pass
+            try:
+                _apply_planar_fill_material(obj, vo, fill_rgb)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                # Older view providers may expose only the original color.
+                # Keep their source-colored material rather than failing import.
                 pass
         if opts.assign_linewidth and width is not None:
             try:

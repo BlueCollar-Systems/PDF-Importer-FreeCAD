@@ -46,6 +46,7 @@ activate_bundled_runtime_if_available(_mod_root)
 from pdfcadcore.fitz_loader import import_fitz as _import_fitz
 from pdfcadcore.primitive_extractor import _composite_alpha, _span_alpha
 from pdfcadcore.import_bounds import sheet_xy as _sheet_xy
+from pdfcadcore.drawing_clips import get_clip_aware_drawings, UnsupportedClipFillError
 
 fitz = _import_fitz()
 
@@ -10025,12 +10026,104 @@ def import_pdf_page(pdf_path: str, page_num: int = 1,
     return result
 
 
+def _compound_clip_fill_shape(path_group, page_h, opts, scale):
+    """Build an exact planar clip mask, retaining all even-odd counter holes.
+
+    Covered clip fills are one painted object, not independent filled wires.
+    Do not apply segment cleanup or arc fitting to the source mask boundaries.
+    """
+    group_id = str(path_group.get("bcs_clip_fill_group_id") or "unknown")
+    contours = []
+    edges = []
+    first = None
+    current = None
+
+    def point(value):
+        return _to_fc(_xy(value), page_h, opts, scale)
+
+    def finish():
+        nonlocal edges, first, current
+        if edges:
+            if _len2d(current, first) > ZERO_TOL:
+                edges.append(Part.LineSegment(current, first).toShape())
+            wire = Part.Wire(edges)
+            if not wire.isClosed():
+                raise RuntimeError("Clipped fill %s has an open contour" % group_id)
+            contours.append(wire)
+        edges, first, current = [], None, None
+
+    def start_segment(start):
+        nonlocal first, current
+        if current is not None and _len2d(current, start) > ZERO_TOL:
+            finish()
+        if first is None:
+            first = start
+        current = start
+
+    for item in path_group.get("items", []):
+        kind = item[0]
+        if kind == "l" and len(item) == 3:
+            start, end = point(item[1]), point(item[2])
+            start_segment(start)
+            if _len2d(start, end) > ZERO_TOL:
+                edges.append(Part.LineSegment(start, end).toShape())
+            current = end
+        elif kind == "c" and len(item) == 5:
+            points = [point(value) for value in item[1:]]
+            start_segment(points[0])
+            curve = Part.BezierCurve()
+            curve.setPoles(points)
+            edges.append(curve.toShape())
+            current = points[-1]
+        elif kind == "re":
+            finish()
+            x, y, w, h = _parse_rect(item[1:])
+            points = [_to_fc(value, page_h, opts, scale) for value in
+                      ((x, y), (x + w, y), (x + w, y + h), (x, y + h))]
+            if len(item) > 2 and item[2] == -1:
+                points.reverse()
+            first = current = points[0]
+            for end in points[1:] + points[:1]:
+                if _len2d(current, end) > ZERO_TOL:
+                    edges.append(Part.LineSegment(current, end).toShape())
+                current = end
+            finish()
+        elif kind == "qu" and len(item) == 2:
+            finish()
+            quad = item[1]
+            points = [point(value) for value in (quad.ul, quad.ur, quad.lr, quad.ll)]
+            first = current = points[0]
+            for end in points[1:] + points[:1]:
+                if _len2d(current, end) > ZERO_TOL:
+                    edges.append(Part.LineSegment(current, end).toShape())
+                current = end
+            finish()
+        else:
+            raise RuntimeError("Clipped fill %s has unsupported path command %r" % (group_id, kind))
+    finish()
+    if not contours:
+        raise RuntimeError("Clipped fill %s has no closed contours" % group_id)
+    if len(contours) > 1 and not path_group.get("even_odd", False):
+        raise RuntimeError("Clipped fill %s requires unsupported compound nonzero winding" % group_id)
+    shape = Part.makeFace(contours, "Part::FaceMakerBullseye")
+    if not shape.Faces or not shape.isValid():
+        raise RuntimeError("Clipped fill %s could not form valid counter-aware faces" % group_id)
+    for face in shape.Faces:
+        if face.normalAt(0, 0).z < 0.0:
+            face.reverse()
+    return shape
+
+
 def _page_visual_inventory(page, import_mode: str):
     """Read vector/image inventory only when the requested strategy needs it."""
     if str(import_mode or "").strip().lower() == "raster":
         return [], 0
     try:
-        drawings = page.get_drawings()
+        drawings = get_clip_aware_drawings(page)
+    except UnsupportedClipFillError:
+        # An unsupported mask must not silently become unmasked artwork or
+        # a whole-page raster import selected from an empty vector inventory.
+        raise
     except Exception as exc:
         _warn(f"get_drawings() failed: {exc}")
         drawings = []
@@ -10594,6 +10687,19 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 continue
 
         parent = _parent_for(stroke_rgb or fill_rgb, layer_name)
+
+        if path_group.get("bcs_compound_clip_fill"):
+            # This is one painted mask with counter holes. Independent faces
+            # would fill its holes; source outlines must also bypass cleanup.
+            shape = _compound_clip_fill_shape(path_group, page_h, opts, scale)
+            obj = fc_doc.addObject("Part::Feature", "ClippedFill")
+            obj.Shape = shape
+            obj.addProperty("App::PropertyString", "PDFClipFillGroupId", "PDF Source")
+            obj.PDFClipFillGroupId = str(path_group["bcs_clip_fill_group_id"])
+            _apply_style(obj, None, fill_rgb, width, dashes, opts)
+            parent.addObject(obj)
+            obj_count += 1
+            continue
 
         # Build edges per sub-path
         current_pt: Optional[Vector] = None

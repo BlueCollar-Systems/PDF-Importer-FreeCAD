@@ -14,10 +14,11 @@ from pdfcadcore import primitive_extractor  # noqa: E402
 
 
 # This is the reviewed integration output: current main's fraction core plus
-# the lossless performance changes. The combined bytes were reviewed together
-# and match the Blender and LibreCAD shared cores.
+# the lossless performance changes and exact covered-clip contour metadata.
+# The combined bytes were reviewed together and match the Blender and LibreCAD
+# shared cores; ordinary paths and the approved fraction logic are unchanged.
 REVIEWED_COMBINED_SUCCESSOR_SHA256 = (
-    "99013f5206aab4f62d545bc28d9bfee740cb39c4017c9bb2adaf4331a7060386"
+    "f3bf788f136ca9a56365b77afd0f5825ba02cb151da3da1e5b255b767d288911"
 )
 
 

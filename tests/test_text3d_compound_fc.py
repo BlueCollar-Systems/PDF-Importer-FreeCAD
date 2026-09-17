@@ -18,8 +18,11 @@ import PDFImporterCore as core  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def _clear_font_kern_probe_cache():
+def _clear_font_kern_probe_cache(monkeypatch):
     core._clear_font_kern_probe_cache()
+    # These host doubles use em-normalized outlines; real metric calibration
+    # has independent tests in test_text3d_em_scale_fc.py.
+    monkeypatch.setattr(core, "_text3d_source_em_scale", lambda *_args: 1.0)
     yield
     core._clear_font_kern_probe_cache()
 

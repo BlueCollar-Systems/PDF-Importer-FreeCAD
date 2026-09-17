@@ -5406,11 +5406,13 @@ _FONT_KERN_PROBE_CACHE: Dict[
     Tuple[Dict[int, str], List[Dict[Tuple[str, str], float]], Dict[str, Tuple[float, float]]],
 ] = {}
 _FONT_ADVANCE_SCALE: Dict[str, float] = {}
+_FONT_EM_SCALE: Dict[str, float] = {}
 
 
 def _clear_font_kern_probe_cache() -> None:
     _FONT_KERN_PROBE_CACHE.clear()
     _FONT_ADVANCE_SCALE.clear()
+    _FONT_EM_SCALE.clear()
 
 
 def _font_kern_probe_tables(
@@ -5600,6 +5602,40 @@ def _measure_text3d_pen_advance(source_text: str, font_path: str) -> float:
     return probed
 
 
+def _text3d_source_em_scale(source_text: str, font_path: str) -> float:
+    """Convert the host's unit wire font to the source font's PDF em size.
+
+    Part.makeWireString(size=1) does not promise a one-em outline. Calibrate
+    its native font-unit scale with the same measured pen advance used for
+    horizontal placement, then use the font's actual unitsPerEm for Y.
+    """
+    cached = _FONT_EM_SCALE.get(font_path)
+    if cached is not None:
+        return cached
+    font_units = _font_units_string_advance(source_text, font_path)
+    if font_units is None or not math.isfinite(font_units) or font_units <= 0.0:
+        raise RuntimeError("source font em calibration requires verified advances")
+    native_advance = _measure_text3d_pen_advance(source_text, font_path)
+    try:
+        from fontTools.ttLib import TTFont
+
+        font = TTFont(font_path, lazy=True, recalcTimestamp=False)
+        try:
+            units_per_em = float(font["head"].unitsPerEm)
+        finally:
+            font.close()
+    except Exception as exc:
+        raise RuntimeError("source font em size could not be verified") from exc
+    if not math.isfinite(units_per_em) or units_per_em <= 0.0:
+        raise RuntimeError("source font em size could not be verified")
+    native_em = native_advance * units_per_em / font_units
+    if not math.isfinite(native_em) or native_em <= 1e-9:
+        raise RuntimeError("source font native em scale could not be verified")
+    scale = 1.0 / native_em
+    _FONT_EM_SCALE[font_path] = scale
+    return scale
+
+
 def _build_exact_text3d_outline_template(source_text: str, font_path: str):
     """Build exact counter-aware faces once at unit font size."""
     characters = Part.makeWireString(source_text, font_path, 1.0, 0)
@@ -5706,7 +5742,9 @@ def _bake_exact_text3d_compound_shape(
     pen_scale = float(numeric_values[2] / unit_advance)
     matrix = matrix_factory()
     matrix.A11 = pen_scale
-    matrix.A22 = float(numeric_values[0])
+    matrix.A22 = float(numeric_values[0]) * _text3d_source_em_scale(
+        source_text, font_path
+    )
     transformed_faces = face_template.transformGeometry(matrix)
     if (
         visible_character_count <= 0
@@ -5979,7 +6017,14 @@ def _create_verified_text3d_entity(
         raise RuntimeError("Draft clone returned a pre-existing baseline object")
     if calibrated_support is shape_string:
         raise RuntimeError("Draft clone returned the source ShapeString")
-    calibrated_support.Scale = Vector(float(x_scale), 1.0, 1.0)
+    calibrated_support.Scale = Vector(
+        float(x_scale),
+        _text3d_source_em_scale(
+            str(getattr(shape_string, "String", "") or ""),
+            str(getattr(shape_string, "FontFile", "") or ""),
+        ),
+        1.0,
+    )
     try:
         calibrated_support.Label = "PDF 3D Text Calibrated Support"
     except (AttributeError, RuntimeError, TypeError, ValueError):

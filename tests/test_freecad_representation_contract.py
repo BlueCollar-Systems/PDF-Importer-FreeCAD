@@ -286,6 +286,8 @@ def _install_host(monkeypatch, *, fail_texts=()):
 
 def _install_document_host(monkeypatch, document, *, fail_texts=()):
     draft = FakeDraft(document, fail_texts=fail_texts)
+    # Synthetic host outlines are already expressed in source em units.
+    monkeypatch.setattr(core, "_text3d_source_em_scale", lambda *_args: 1.0)
     monkeypatch.setattr(core, "Draft", draft)
     monkeypatch.setattr(core, "Vector", FakeVector)
     monkeypatch.setattr(core, "Placement", FakePlacement)

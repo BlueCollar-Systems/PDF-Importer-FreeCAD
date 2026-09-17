@@ -173,6 +173,7 @@ def test_make_shapestring_host_without_any_api_raises(monkeypatch):
 
 def test_configure_host_runs_before_every_recompute(monkeypatch):
     """Each host object's custom writes land before its only recompute."""
+    monkeypatch.setattr(core, "_text3d_source_em_scale", lambda *_args: 1.0)
     log = EventLog()
     doc = FakeDoc(log)
     group = FakeGroup(doc)
@@ -243,6 +244,7 @@ def _entity_kwargs(group, **overrides):
 
 
 def _fake_clone_env(monkeypatch, doc, log, wires_only=False):
+    monkeypatch.setattr(core, "_text3d_source_em_scale", lambda *_args: 1.0)
     class FakeClone(FakeHost):
         @property
         def Scale(self):
@@ -266,6 +268,32 @@ def _fake_clone_env(monkeypatch, doc, log, wires_only=False):
     monkeypatch.setattr(
         core, "Vector", lambda x, y, z: types.SimpleNamespace(x=x, y=y, z=z)
     )
+
+
+def test_parametric_3d_support_uses_source_em_vertical_scale(monkeypatch):
+    log = EventLog()
+    doc = FakeDoc(log)
+    group = FakeGroup(doc)
+    shape_string = FakeHost(doc, "ShapeString", "Part::Part2DObjectPython")
+    shape_string.String = "AB"
+    shape_string.FontFile = "source.ttf"
+    doc.Objects.append(shape_string)
+    _fake_clone_env(monkeypatch, doc, log)
+    calls = []
+
+    def measured_scale(text, font):
+        calls.append((text, font))
+        return 0.7
+
+    monkeypatch.setattr(core, "_text3d_source_em_scale", measured_scale)
+    _extrusion, calibrated, x_scale, advance = core._create_verified_text3d_entity(
+        shape_string, **_entity_kwargs(group)
+    )
+    assert calls == [("AB", "source.ttf")]
+    assert calibrated.Scale.y == pytest.approx(0.7)
+    assert calibrated.Scale.x == pytest.approx(x_scale)
+    assert advance == pytest.approx(6)
+    assert shape_string.Size == pytest.approx(2.5)
 
 
 def test_shapestring_baseline_is_wires_only(monkeypatch):

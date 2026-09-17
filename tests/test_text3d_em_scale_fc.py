@@ -19,15 +19,37 @@ def clear_font_metrics():
     core._clear_font_kern_probe_cache()
 
 
-def install_metrics(monkeypatch, *, units_per_em=2000, advance=14000, native=10):
+class NativeInk:
+    def __init__(self, height=1):
+        self.BoundBox = SimpleNamespace(YLength=height)
+
+    def copy(self):
+        return self
+
+
+def install_metrics(monkeypatch, *, units_per_em=2000, glyph_height=1400):
     import fontTools.ttLib as ttlib
 
     calls = []
+
+    class Glyph:
+        def draw(self, pen):
+            pen.moveTo((0, 0))
+            pen.lineTo((500, 0))
+            pen.lineTo((500, glyph_height))
+            pen.lineTo((0, glyph_height))
+            pen.closePath()
 
     class Font:
         def __getitem__(self, table):
             assert table == "head"
             return SimpleNamespace(unitsPerEm=units_per_em)
+
+        def getBestCmap(self):
+            return {i: "glyph" for i in range(32, 127)}
+
+        def getGlyphSet(self):
+            return {"glyph": Glyph()}
 
         def close(self):
             calls.append("close")
@@ -37,8 +59,6 @@ def install_metrics(monkeypatch, *, units_per_em=2000, advance=14000, native=10)
         return Font()
 
     monkeypatch.setattr(ttlib, "TTFont", open_font)
-    monkeypatch.setattr(core, "_font_units_string_advance", lambda *_args: advance)
-    monkeypatch.setattr(core, "_measure_text3d_pen_advance", lambda *_args: native)
     return calls
 
 
@@ -46,41 +66,41 @@ def test_native_cap_normalization_is_converted_to_source_em(monkeypatch):
     # A font with a 1400-unit cap in a 2000-unit em has a 0.7-em cap.
     # A host normalized to that cap must be reduced by 0.7, not used as-is.
     install_metrics(monkeypatch)
-    assert core._text3d_source_em_scale("AB", "source.ttf") == pytest.approx(0.7)
+    assert core._text3d_source_em_scale("AB", "source.ttf", NativeInk()) == pytest.approx(0.7)
 
 
 def test_em_normalized_host_font_is_unchanged(monkeypatch):
-    install_metrics(monkeypatch, units_per_em=2000, advance=14000, native=7)
-    assert core._text3d_source_em_scale("AB", "source.ttf") == pytest.approx(1)
+    install_metrics(monkeypatch)
+    assert core._text3d_source_em_scale("AB", "source.ttf", NativeInk(0.7)) == pytest.approx(1)
 
 
-def test_valid_scale_is_cached_per_font_and_cleared_per_import(monkeypatch):
+def test_source_ink_is_cached_but_each_host_shape_is_measured(monkeypatch):
     calls = install_metrics(monkeypatch)
-    core._text3d_source_em_scale("AB", "first.ttf")
-    core._text3d_source_em_scale("different span", "first.ttf")
+    assert core._text3d_source_em_scale("AB", "first.ttf", NativeInk(1)) == pytest.approx(0.7)
+    assert core._text3d_source_em_scale("AB", "first.ttf", NativeInk(2)) == pytest.approx(0.35)
     assert calls == ["open", "close"]
-    core._text3d_source_em_scale("AB", "second.ttf")
+    core._text3d_source_em_scale("AB", "second.ttf", NativeInk())
     assert calls == ["open", "close", "open", "close"]
     core._clear_font_kern_probe_cache()
     assert not core._FONT_EM_SCALE
-    core._text3d_source_em_scale("AB", "first.ttf")
+    core._text3d_source_em_scale("AB", "first.ttf", NativeInk())
     assert len(calls) == 6
 
 
 @pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf")])
 def test_invalid_em_metrics_fail_without_caching_a_guess(monkeypatch, value):
     install_metrics(monkeypatch, units_per_em=value)
-    with pytest.raises(RuntimeError, match="em size"):
-        core._text3d_source_em_scale("AB", "source.ttf")
-    assert "source.ttf" not in core._FONT_EM_SCALE
+    with pytest.raises(RuntimeError, match="em ink"):
+        core._text3d_source_em_scale("AB", "source.ttf", NativeInk())
+    assert not core._FONT_EM_SCALE
 
 
-@pytest.mark.parametrize("value", [None, 0, float("nan")])
-def test_missing_source_advances_fail_without_caching(monkeypatch, value):
-    install_metrics(monkeypatch, advance=value)
-    with pytest.raises(RuntimeError, match="verified advances"):
-        core._text3d_source_em_scale("AB", "source.ttf")
-    assert "source.ttf" not in core._FONT_EM_SCALE
+@pytest.mark.parametrize("value", [0, float("nan"), float("inf")])
+def test_invalid_native_ink_fails_without_guessing(monkeypatch, value):
+    install_metrics(monkeypatch)
+    with pytest.raises(RuntimeError, match="native source font ink"):
+        core._text3d_source_em_scale("AB", "source.ttf", NativeInk(value))
+
 
 
 def test_compound_uses_calibrated_y_and_preserves_pdf_x_and_depth(monkeypatch):
@@ -93,7 +113,10 @@ def test_compound_uses_calibrated_y_and_preserves_pdf_x_and_depth(monkeypatch):
         Volume = 10
 
         def __init__(self, xmin=2, xmax=6):
-            self.BoundBox = SimpleNamespace(XMin=xmin, XMax=xmax)
+            self.BoundBox = SimpleNamespace(XMin=xmin, XMax=xmax, YLength=1)
+
+        def copy(self):
+            return self
 
         def isNull(self):
             return False

@@ -281,7 +281,9 @@ def test_parametric_3d_support_uses_source_em_vertical_scale(monkeypatch):
     _fake_clone_env(monkeypatch, doc, log)
     calls = []
 
-    def measured_scale(text, font):
+    def measured_scale(text, font, shape, native_size):
+        assert shape is shape_string.Shape
+        assert native_size == pytest.approx(2.5)
         calls.append((text, font))
         return 0.7
 

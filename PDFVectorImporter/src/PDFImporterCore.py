@@ -5406,7 +5406,7 @@ _FONT_KERN_PROBE_CACHE: Dict[
     Tuple[Dict[int, str], List[Dict[Tuple[str, str], float]], Dict[str, Tuple[float, float]]],
 ] = {}
 _FONT_ADVANCE_SCALE: Dict[str, float] = {}
-_FONT_EM_SCALE: Dict[str, float] = {}
+_FONT_EM_SCALE: Dict[Tuple[str, str], float] = {}
 
 
 def _clear_font_kern_probe_cache() -> None:
@@ -5602,37 +5602,60 @@ def _measure_text3d_pen_advance(source_text: str, font_path: str) -> float:
     return probed
 
 
-def _text3d_source_em_scale(source_text: str, font_path: str) -> float:
-    """Convert the host's unit wire font to the source font's PDF em size.
+def _text3d_source_em_scale(
+    source_text: str, font_path: str, native_shape, native_size: float = 1.0
+) -> float:
+    """Calibrate native outline height to exact source-font ink at PDF em size.
 
-    Part.makeWireString(size=1) does not promise a one-em outline. Calibrate
-    its native font-unit scale with the same measured pen advance used for
-    horizontal placement, then use the font's actual unitsPerEm for Y.
+    Host advance rounding and cap-height normalization must not determine Y.
+    Measure the actual source glyph contours independently in font units and
+    preserve the native baseline while scaling their visible height.
     """
-    cached = _FONT_EM_SCALE.get(font_path)
-    if cached is not None:
-        return cached
-    font_units = _font_units_string_advance(source_text, font_path)
-    if font_units is None or not math.isfinite(font_units) or font_units <= 0.0:
-        raise RuntimeError("source font em calibration requires verified advances")
-    native_advance = _measure_text3d_pen_advance(source_text, font_path)
-    try:
-        from fontTools.ttLib import TTFont
-
-        font = TTFont(font_path, lazy=True, recalcTimestamp=False)
+    key = (font_path, source_text)
+    ink_height_em = _FONT_EM_SCALE.get(key)
+    if ink_height_em is None:
         try:
-            units_per_em = float(font["head"].unitsPerEm)
-        finally:
-            font.close()
+            from fontTools.ttLib import TTFont
+            from fontTools.pens.boundsPen import BoundsPen
+
+            font = TTFont(font_path, lazy=True, recalcTimestamp=False)
+            try:
+                units_per_em = float(font["head"].unitsPerEm)
+                if not math.isfinite(units_per_em) or units_per_em <= 0.0:
+                    raise ValueError("invalid unitsPerEm")
+                cmap = font.getBestCmap()
+                glyphs = font.getGlyphSet()
+                bounds = []
+                for character in source_text:
+                    if character.isspace():
+                        continue
+                    pen = BoundsPen(glyphs)
+                    glyphs[cmap[ord(character)]].draw(pen)
+                    if pen.bounds:
+                        bounds.append(pen.bounds)
+                if not bounds:
+                    raise ValueError("no visible source glyph ink")
+                ink_height_em = (
+                    max(bound[3] for bound in bounds)
+                    - min(bound[1] for bound in bounds)
+                ) / units_per_em
+                if not math.isfinite(ink_height_em) or ink_height_em <= 0.0:
+                    raise ValueError("invalid source glyph ink")
+            finally:
+                font.close()
+        except Exception as exc:
+            raise RuntimeError("source font em ink could not be verified") from exc
+        _FONT_EM_SCALE[key] = ink_height_em
+    try:
+        local_shape = native_shape.copy()
+        if hasattr(local_shape, "Placement"):
+            local_shape.Placement = Placement()
+        native_height = float(local_shape.BoundBox.YLength)
+        scale = float(native_size) * ink_height_em / native_height
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError("invalid native glyph ink")
     except Exception as exc:
-        raise RuntimeError("source font em size could not be verified") from exc
-    if not math.isfinite(units_per_em) or units_per_em <= 0.0:
-        raise RuntimeError("source font em size could not be verified")
-    native_em = native_advance * units_per_em / font_units
-    if not math.isfinite(native_em) or native_em <= 1e-9:
-        raise RuntimeError("source font native em scale could not be verified")
-    scale = 1.0 / native_em
-    _FONT_EM_SCALE[font_path] = scale
+        raise RuntimeError("native source font ink could not be measured") from exc
     return scale
 
 
@@ -5743,7 +5766,7 @@ def _bake_exact_text3d_compound_shape(
     matrix = matrix_factory()
     matrix.A11 = pen_scale
     matrix.A22 = float(numeric_values[0]) * _text3d_source_em_scale(
-        source_text, font_path
+        source_text, font_path, face_template
     )
     transformed_faces = face_template.transformGeometry(matrix)
     if (
@@ -6022,6 +6045,8 @@ def _create_verified_text3d_entity(
         _text3d_source_em_scale(
             str(getattr(shape_string, "String", "") or ""),
             str(getattr(shape_string, "FontFile", "") or ""),
+            support_shape,
+            float(font_size_fc),
         ),
         1.0,
     )
@@ -6763,7 +6788,7 @@ def _cached_text_raster_pixmap(
     page_number: int,
     opts: ImportOptions,
 ):
-    """Crop one item from a bounded, once-rendered page pixmap."""
+    """Reuse page commands or a bounded pixmap without reducing requested DPI."""
     try:
         max_pixels = int(
             os.environ.get("BC_FC_TEXT_RASTER_CACHE_MAX_PIXELS", "16000000")
@@ -6773,37 +6798,35 @@ def _cached_text_raster_pixmap(
     max_pixels = max(10_000, max_pixels)
     page_rect = page.rect
     page_area = max(float(page_rect.width) * float(page_rect.height), 1.0)
-    bounded_dpi = int(
-        math.floor(72.0 * math.sqrt(float(max_pixels) / page_area))
-    )
-    effective_dpi = max(72, min(int(requested_dpi), bounded_dpi))
+    effective_dpi = max(72, int(requested_dpi))
     zoom = effective_dpi / 72.0
     cache_key = (
-        id(page),
-        int(page_number),
-        effective_dpi,
-        float(page_rect.x0),
-        float(page_rect.y0),
-        float(page_rect.x1),
-        float(page_rect.y1),
+        id(page), int(page_number), effective_dpi,
+        float(page_rect.x0), float(page_rect.y0),
+        float(page_rect.x1), float(page_rect.y1),
     )
     cache = getattr(opts, "_text_raster_page_cache", None)
     if not isinstance(cache, dict) or cache.get("key") != cache_key:
-        full_pixmap = page.get_pixmap(
-            matrix=fitz.Matrix(zoom, zoom),
-            alpha=True,
-        )
+        display_list = page.get_displaylist()
         cache = {
-            "key": cache_key,
-            "pixmap": full_pixmap,
-            "effective_dpi": effective_dpi,
-            "render_count": 1,
+            "key": cache_key, "display_list": display_list,
+            "effective_dpi": effective_dpi, "render_count": 0,
         }
+        if page_area * zoom * zoom <= max_pixels:
+            cache["pixmap"] = display_list.get_pixmap(
+                matrix=fitz.Matrix(zoom, zoom), alpha=True,
+            )
+            cache["render_count"] = 1
         opts._text_raster_page_cache = cache
-    else:
-        full_pixmap = cache.get("pixmap")
-        if full_pixmap is None:
-            raise RuntimeError("text raster page cache lost its pixmap")
+    full_pixmap = cache.get("pixmap")
+    if full_pixmap is None:
+        # Reuse parsed drawing commands on large sheets, rendering only each
+        # small text patch. A page-sized cache limit must not downsample text.
+        pixmap = cache["display_list"].get_pixmap(
+            matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=True,
+        )
+        cache["render_count"] += 1
+        return pixmap, effective_dpi
 
     pixel_rect = fitz.IRect(
         int(math.floor(float(full_pixmap.x) + (float(clip.x0) - float(page_rect.x0)) * zoom)),
@@ -6980,20 +7003,31 @@ def _deliver_text_item_raster(
         )
 
     try:
+        rendered_clip = clip
+        if hasattr(pix, "x") and hasattr(pix, "y"):
+            # Raster pixels cover outward-rounded device bounds. Place those
+            # exact bounds instead of stretching them back into the text bbox.
+            zoom = effective_dpi / 72.0
+            rendered_clip = fitz.Rect(
+                pix.x / zoom, pix.y / zoom,
+                (pix.x + pix.width) / zoom, (pix.y + pix.height) / zoom,
+            )
         transformed = [
             _to_fc(point, float(page_h), opts, float(scale))
             for point in (
-                (clip.x0, clip.y0),
-                (clip.x0, clip.y1),
-                (clip.x1, clip.y0),
-                (clip.x1, clip.y1),
+                (rendered_clip.x0, rendered_clip.y0),
+                (rendered_clip.x0, rendered_clip.y1),
+                (rendered_clip.x1, rendered_clip.y0),
+                (rendered_clip.x1, rendered_clip.y1),
             )
         ]
         xs = [float(point.x) for point in transformed]
         ys = [float(point.y) for point in transformed]
         expected_width = max(xs) - min(xs)
         expected_height = max(ys) - min(ys)
-        expected_anchor = (min(xs), min(ys), -0.05)
+        # Native ImagePlane coordinates are centered on Placement. Keep the
+        # completed page patch on the drawing plane, not below white fills.
+        expected_anchor = ((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2, 0.0)
         if expected_width <= 0.0 or expected_height <= 0.0:
             raise ValueError("source item raster placement has no area")
         host_obj = fc_doc.addObject("Image::ImagePlane", "PDF_Text_Raster")
@@ -7024,6 +7058,9 @@ def _deliver_text_item_raster(
             properties.add("PDFRasterSHA256")
         host_obj.PDFRasterSHA256 = raster_sha256
         _annotate_text_host_object(host_obj, source_item_id, "raster")
+        view = getattr(host_obj, "ViewObject", None)
+        if view is not None:
+            view.DisplayMode = "No shading"
         parent_group.addObject(host_obj)
         _recompute_page_if_needed(fc_doc, opts)
     except Exception as exc:
@@ -7082,6 +7119,7 @@ def _deliver_text_item_raster(
             "dpi": effective_dpi,
             "requested_dpi": dpi,
             "source_bbox": bbox,
+            "raster_bbox": tuple(rendered_clip),
             "expected_anchor_xyz": expected_anchor,
             "verified_anchor_xyz": tuple(actual_anchor),
             "x_size": float(expected_width),

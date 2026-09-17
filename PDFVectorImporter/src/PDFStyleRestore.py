@@ -361,6 +361,9 @@ def restore_object_style(
         if view is None:
             return result
         representation = str(getattr(obj, "PDFRepresentation", "") or "")
+        if representation == "raster" and str(getattr(obj, "TypeId", "")) == "Image::ImagePlane":
+            # Source pixels are already lit/composited by the PDF renderer.
+            _set_if_changed(view, "DisplayMode", "No shading")
         if TEXT_MARKER in properties or representation in TEXT_REPRESENTATIONS:
             # Draft Text/Label carry the full contract; 3D text only its colour.
             try:

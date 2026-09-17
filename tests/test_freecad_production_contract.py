@@ -1220,10 +1220,15 @@ def test_item_raster_delivery_is_persistent_verified_and_source_bound(
     assert result["evidence"]["raster_content_verified"] is True
     assert host.XSize == pytest.approx(item["bbox"][2] - item["bbox"][0])
     assert host.YSize == pytest.approx(item["bbox"][3] - item["bbox"][1])
+    bbox = item["bbox"]
+    assert host.Placement.Base.x == pytest.approx((bbox[0] + bbox[2]) / 2)
+    assert host.Placement.Base.y == pytest.approx(100 - (bbox[1] + bbox[3]) / 2)
+    assert host.Placement.Base.z == 0
+    assert host.ViewObject.DisplayMode == "No shading"
     assert document.recompute_calls == 0
 
 
-def test_text_raster_cache_renders_page_once_at_bounded_effective_dpi(
+def test_text_raster_cache_preserves_requested_dpi_above_page_cache_budget(
     monkeypatch,
 ):
     fitz = pytest.importorskip("fitz")
@@ -1248,11 +1253,16 @@ def test_text_raster_cache_renders_page_once_at_bounded_effective_dpi(
         opts=opts,
     )
 
-    assert 72 <= first_dpi < 300
+    assert first_dpi == 300
     assert second_dpi == first_dpi
     assert first.width > 0 and first.height > 0
     assert second.width > 0 and second.height > 0
-    assert opts._text_raster_page_cache["render_count"] == 1
+    assert "pixmap" not in opts._text_raster_page_cache
+    assert opts._text_raster_page_cache["render_count"] == 2
+    expected = page.get_pixmap(matrix=fitz.Matrix(300 / 72, 300 / 72),
+                               clip=fitz.Rect(15.0, 35.0, 80.0, 55.0), alpha=True)
+    assert (first.width, first.height, first.x, first.y) == (expected.width, expected.height, expected.x, expected.y)
+    assert first.samples == expected.samples
     pdf.close()
 
 

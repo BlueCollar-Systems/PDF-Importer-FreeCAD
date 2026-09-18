@@ -670,8 +670,16 @@ def _emit_progress(
 
 
 def _default_import_report_path(pdf_path: str) -> str:
+    """Give each import a private report directory shared by its sidecars.
+
+    The old TEMP/<pdf-name> path could be overwritten by another CAD host
+    importing the same drawing before this import's acceptance reader ran.
+    mkdtemp reserves the directory atomically, including between processes.
+    Explicit operator report paths continue to be selected by the caller.
+    """
     base = os.path.splitext(os.path.basename(pdf_path))[0]
-    return os.path.join(tempfile.gettempdir(), f"{base}_import_report.json")
+    directory = tempfile.mkdtemp(prefix="bcs-freecad-import-")
+    return os.path.join(directory, f"{base}_import_report.json")
 
 
 def _pdf_file_sha256(pdf_path: str) -> str:
@@ -2362,6 +2370,24 @@ def _apply_text_color(obj, rgb: Optional[Tuple[float, float, float]]) -> None:
         try:
             setattr(vo, prop, rgb)
         except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+
+
+def _apply_text3d_display_style(obj) -> None:
+    """Keep screen-width edge outlines from closing small 3D glyph counters.
+
+    The exact source solids remain editable. Only their initial native display
+    changes; operators can still choose wireframe or flat lines explicitly.
+    """
+    view = getattr(obj, "ViewObject", None)
+    if view is not None:
+        try:
+            try:
+                from .PDFStyleRestore import apply_text3d_filled_style, parse_rgb
+            except ImportError:
+                from PDFStyleRestore import apply_text3d_filled_style, parse_rgb
+            apply_text3d_filled_style(view, parse_rgb(getattr(obj, "PDFTextColorRGB", None)))
+        except (AttributeError, RuntimeError, TypeError, ValueError, ImportError):
             pass
 
 
@@ -6350,15 +6376,9 @@ def _deliver_text_item_native(
         if not math.isfinite(font_size_fc) or font_size_fc <= 0.0:
             raise ValueError("native text font size is invalid")
         anchor = _to_fc(origin, float(page_h), opts, float(scale))
-        try:
-            descender = float(span.get("descender", -0.2) or -0.2)
-        except (TypeError, ValueError):
-            descender = -0.2
-        anchor = _apply_text_local_y_offset(
-            anchor,
-            host_rotation_deg,
-            _effective_descender(source_text, descender) * font_size_fc * 0.35,
-        )
+        # Draft's native world text uses a baseline, as does the PDF source.
+        # Character positions are source-bound; a font-metric descender offset
+        # would shift every character away from that authoritative baseline.
         placement = Placement(
             anchor,
             Rotation(Vector(0.0, 0.0, 1.0), host_rotation_deg),
@@ -6849,6 +6869,36 @@ def _cached_text_raster_pixmap(
     return cropped, effective_dpi
 
 
+def _raster_source_coverage_bbox(item, page, opts):
+    """Keep real source glyph quads outside a shorter font bbox in the crop."""
+    bbox = _finite_source_tuple(item.get("bbox"), 4, "item.bbox")
+    if fitz is None or not isinstance(page, fitz.Page):
+        return bbox
+    from pdfcadcore.primitive_extractor import _raw_text_with_source_quads
+    cache = getattr(opts, "_raster_source_quad_cache", None)
+    key = (item.get("pdf_sha256"), item.get("page_number"))
+    if not isinstance(cache, dict) or cache.get("key") != key:
+        cache = {"key": key, "raw": _raw_text_with_source_quads(page)}
+        opts._raster_source_quad_cache = cache
+    block = cache["raw"]["blocks"][item["block_index"]]
+    line = block["lines"][item["line_index"]]
+    span = line["spans"][item["span_index"]]
+    chars = span.get("chars", ())
+    if (block.get("type") != 0 or "".join(c.get("c", "") for c in chars) != item["text"]
+            or tuple(span["bbox"]) != bbox or span.get("font") != item["span"].get("font")
+            or tuple(span["origin"]) != tuple(item["origin"])):
+        raise ValueError("Raster character coverage is not bound to the source item")
+    points = [(bbox[0], bbox[1]), (bbox[2], bbox[3])]
+    for char in chars:
+        quad = char.get("quad")
+        if quad is not None:
+            if len(quad) != 4:
+                raise ValueError("Raster source glyph quad must have four corners")
+            points.extend(_finite_source_tuple(point, 2, "character.quad") for point in quad)
+    return (min(p[0] for p in points), min(p[1] for p in points),
+            max(p[0] for p in points), max(p[1] for p in points))
+
+
 def _deliver_text_item_raster(
     item: Dict[str, Any],
     attempted_type: str,
@@ -6948,7 +6998,8 @@ def _deliver_text_item_raster(
 
     try:
         dpi = max(72, int(getattr(opts, "raster_dpi", 200) or 200))
-        clip = fitz.Rect(*bbox)
+        coverage_bbox = _raster_source_coverage_bbox(bound_item, page, opts)
+        clip = fitz.Rect(*coverage_bbox)
         page_rect = page.rect
         clip &= fitz.Rect(
             float(page_rect.x0),
@@ -7121,6 +7172,7 @@ def _deliver_text_item_raster(
             "dpi": effective_dpi,
             "requested_dpi": dpi,
             "source_bbox": bbox,
+            "source_raster_coverage_bbox": coverage_bbox,
             "raster_bbox": tuple(rendered_clip),
             "expected_anchor_xyz": expected_anchor,
             "verified_anchor_xyz": tuple(actual_anchor),
@@ -7572,6 +7624,7 @@ def _deliver_text_item_3d(
             source_color=source_color,
         )
         _apply_text_color(host_obj, source_color)
+        _apply_text3d_display_style(host_obj)
         stage = "calibration_extrusion"
 
     # Fast exact path: make all glyph solids in memory and persist the entire
@@ -8978,6 +9031,18 @@ def _deliver_text_item_svg(
             )
         ):
             raise ValueError("item-filtered SVG host entities are invalid")
+        for host_obj in delivered_objects:
+            _persist_text_style_metadata(
+                host_obj, font_name=str(span.get("font") or ""),
+                font_size=float(span.get("size") or 0.) * float(scale),
+                source_color=_span_source_color(span),
+            )
+            view = getattr(host_obj, "ViewObject", None)
+            if view is not None:
+                _apply_text_color(host_obj, _span_source_color(span))
+                # Raw outline modes retain every editable source edge. A thin
+                # initial viewport stroke avoids closing small glyph counters.
+                view.LineWidth = 1.0
     except Exception as exc:
         result_summary = {
             "exception": "%s: %s" % (exc.__class__.__name__, exc),
@@ -8993,6 +9058,38 @@ def _deliver_text_item_svg(
         )
 
     return copy.deepcopy(attempt)
+
+
+def _bind_native_source_layout(item, delivered, raw_dict, *, opts, scale, doc, group):
+    """Complete native delivery or roll back every object owned by the attempt."""
+    created_ids = list(delivered["created_entity_ids"])
+    owned = [obj for name in created_ids if (obj := doc.getObject(name)) is not None]
+    try:
+        try:
+            from .PDFTextLayout import build_source_layout, persist_source_layout
+        except ImportError:
+            from PDFTextLayout import build_source_layout, persist_source_layout
+        evidence = delivered["evidence"]
+        layout = build_source_layout(item, raw_dict,
+            scale=scale, font_size=evidence["font_size"], font_name=evidence["font_name"],
+            host_rotation_deg=evidence["rotation_deg"], flip_y=opts.flip_y,
+            page_matrix=_page_matrix_values(opts))
+        if len(owned) != len(created_ids):
+            raise RuntimeError("Native source-layout object disappeared")
+        installed = [persist_source_layout(host, layout) for host in owned]
+        for host, proof in zip(owned, installed, strict=True):
+            if getattr(host, "ViewObject", None) is not None and not proof.get("native_nodes_installed"):
+                raise RuntimeError("Native source-layout display was not installed")
+        evidence["source_character_layout"] = installed
+        return delivered
+    except Exception as exc:
+        removed_ids, cleanup_complete = _remove_owned_text_objects(doc, group, owned)
+        attempt = dict(delivered, outcome="failed", final_type=None,
+            reason="native_source_layout_failed", created_entity_ids=created_ids,
+            removed_entity_ids=removed_ids, cleanup_complete=bool(cleanup_complete and
+                all(doc.getObject(name) is None for name in created_ids)),
+            evidence={"exception": "%s: %s" % (type(exc).__name__, exc)})
+        raise TextRepresentationFailure("Native source character layout failed", attempt) from exc
 
 
 def _render_canonical_text_items(
@@ -9062,23 +9159,20 @@ def _render_canonical_text_items(
             scale=scale,
         )
 
+    source_character_dict = None
+
+    def deliver_native(item, attempted, state):
+        nonlocal source_character_dict
+        if source_character_dict is None:
+            source_character_dict = page.get_text("rawdict")
+        delivered = _deliver_text_item_native(item, attempted, state,
+            text_group=parent_group, page_h=page_h, scale=scale)
+        return _bind_native_source_layout(item, delivered, source_character_dict,
+            opts=opts, scale=scale, doc=fc_doc, group=parent_group)
+
     deliverers = {
-        "text": lambda item, attempted, state: _deliver_text_item_native(
-            item,
-            attempted,
-            state,
-            text_group=parent_group,
-            page_h=page_h,
-            scale=scale,
-        ),
-        "labels": lambda item, attempted, state: _deliver_text_item_native(
-            item,
-            attempted,
-            state,
-            text_group=parent_group,
-            page_h=page_h,
-            scale=scale,
-        ),
+        "text": deliver_native,
+        "labels": deliver_native,
         "3d_text": deliver_3d,
         "glyphs": lambda item, attempted, state: _deliver_text_item_svg(
             item,
@@ -10268,6 +10362,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         raise ValueError(f"Page {page_num} out of range 1..{len(pdf_doc)}")
 
     opts._provenance_page = int(page_num)
+    page_existing_object_names = {obj.Name for obj in getattr(fc_doc, "Objects", ())}
 
     page = pdf_doc.load_page(page_num - 1)
     # PyMuPDF drawing/text coordinates are in unrotated crop-box space.  Apply
@@ -11346,6 +11441,31 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as e:
             _warn(f"Image import failed: {e}")
 
+    # Final source annotation paints belong above earlier native text. Their
+    # display depth is independent of the preserved source-plane geometry.
+    if not placed_full_page_raster_background and drawings:
+        try:
+            from .PDFLatePaint import apply_final_paints
+        except ImportError:
+            from PDFLatePaint import apply_final_paints
+        late_paint = apply_final_paints(
+            page, page_number=int(page_num), pdf_sha256=str(getattr(opts, "_pdf_sha256", "") or _pdf_file_sha256(pdf_path)),
+            doc=fc_doc, parent=top_group or fc_doc,
+            objects=[obj for obj in fc_doc.Objects if obj.Name not in page_existing_object_names],
+            mapper=lambda point: _to_fc(point, page_h, opts, scale), scale=scale,
+        )
+        opts._final_source_paint_displays = list(getattr(opts, "_final_source_paint_displays", [])) + late_paint
+
+    if not placed_full_page_raster_background:
+        try:
+            from .PDFPaperDisplay import create_paper
+        except ImportError:
+            from PDFPaperDisplay import create_paper
+        create_paper(fc_doc, top_group or fc_doc, page_number=int(page_num),
+            source_sha256=str(getattr(opts, "_pdf_sha256", "") or _pdf_file_sha256(pdf_path)),
+            corners=[(0., 0., 0.), (page_w * scale, 0., 0.),
+                     (page_w * scale, page_h * scale, 0.), (0., page_h * scale, 0.)])
+
     # ── Final cleanup / placement ──
     _progress_update(96, "Placing objects in document...")
 
@@ -11438,6 +11558,7 @@ def _reset_import_run_state(opts: ImportOptions) -> None:
     opts._native_text_object_index = None
     _RASTER_ASSET_DIR_CACHE = None
     opts._page_complexity_profiles = []
+    opts._final_source_paint_displays = []
     opts._active_page_index = 0
     opts._active_page_total = 0
     opts._active_page_profile = None
@@ -11467,6 +11588,7 @@ _PAGE_RESULT_TELEMETRY_FIELDS = (
     "_scale_cached_pages",
     "wirestring_cache_stats",
     "text3d_outline_cache_stats",
+    "_final_source_paint_displays",
 )
 
 
@@ -12355,6 +12477,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         # Geometry look is App-side metadata in every host; a GUI view was
         # styled only when one existed. Headless runs must say so.
         opts._report_extra["geometry_style"] = _geometry_style_report_payload(opts)
+        opts._report_extra["final_source_paint_displays"] = list(getattr(opts, "_final_source_paint_displays", []))
         if session_state is not None:
             opts._report_extra["import_session"] = _session_state_payload(
                 session_state

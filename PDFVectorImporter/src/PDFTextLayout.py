@@ -108,7 +108,7 @@ def _validate(payload):
     if (not isinstance(text, str) or not text or not isinstance(chars, list)
             or len(chars) != len(text) or not payload.get("font_name")):
         raise ValueError("source text layout is incomplete")
-    for expected, char in zip(text, chars):
+    for expected, char in zip(text, chars, strict=True):
         if not isinstance(char, dict) or char.get("text") != expected:
             raise ValueError("source text layout lost a character")
         _finite(char.get("local_origin"), 3)
@@ -170,7 +170,7 @@ def _label_correction(obj, proxy, node):
     inverse = (-q[0], -q[1], -q[2], q[3])
     placement = obj.Placement
     base = (float(placement.Base.x), float(placement.Base.y), float(placement.Base.z))
-    delta = tuple(a-b for a, b in zip(base, current))
+    delta = tuple(a-b for a, b in zip(base, current, strict=True))
     node.translation.setValue(_rotate(inverse, delta))
     node.rotation.setValue(_quat_product(inverse, tuple(placement.Rotation.Q)))
 

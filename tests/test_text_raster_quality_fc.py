@@ -58,3 +58,30 @@ def test_translucent_source_highlight_is_composited_once(monkeypatch, budget):
         assert green == blue == 255
     finally:
         pdf.close()
+
+
+def test_original_glyph_quad_expands_short_font_bbox_without_changing_identity(monkeypatch):
+    from pdfcadcore import primitive_extractor
+    fitz = pytest.importorskip("fitz")
+    with fitz.open() as doc:
+        page = doc.new_page(width=300, height=240)
+        page.insert_text((100, 150), "H", fontsize=12)
+        raw = primitive_extractor._raw_text_with_source_quads(page)
+        span = raw["blocks"][0]["lines"][0]["spans"][0]
+        original = tuple(span["bbox"])
+        shortened = (original[0], 145., original[2], original[3])
+        span["bbox"] = shortened
+        item = next(core._iter_text_source_items(page.get_text("dict"), 1, "a"*64, "raster"))
+        item["bbox"] = shortened
+        item["span"]["bbox"] = shortened
+        monkeypatch.setattr(primitive_extractor, "_raw_text_with_source_quads", lambda page: raw)
+        coverage = core._raster_source_coverage_bbox(item, page, core.ImportOptions())
+        assert coverage[1] < 145.
+        assert item["bbox"] == shortened
+        pix, _ = core._cached_text_raster_pixmap(page, fitz.Rect(coverage),
+            requested_dpi=300, page_number=1, opts=core.ImportOptions())
+        rows_above = int(145*300/72) - pix.y
+        assert any(v < 128 for v in pix.samples[:rows_above*pix.stride])
+        item["text"] = "WRONG"
+        with pytest.raises(ValueError, match="not bound"):
+            core._raster_source_coverage_bbox(item, page, core.ImportOptions())

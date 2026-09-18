@@ -17,8 +17,10 @@ from pdfcadcore import primitive_extractor  # noqa: E402
 # the lossless performance changes and exact covered-clip contours and adjacent source-outline protection.
 # The combined bytes were reviewed together and match the Blender and LibreCAD
 # shared cores; ordinary paths and the approved fraction logic are unchanged.
+# September 17 adds raw source RGB/alpha/finite paint order beside the unchanged
+# composite colors. No fraction/layout/source-character proof was modified.
 REVIEWED_COMBINED_SUCCESSOR_SHA256 = (
-    "dcb6ca65da5924eaeae8c7ad4d4a660f0ca8fb0aabecc0f8068cb115090f4be1"
+    "ff061f62ca608e90728f894d81f6a24cca288212c12a0b2a8555bed586089562"
 )
 
 

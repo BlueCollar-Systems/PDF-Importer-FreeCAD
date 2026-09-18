@@ -1,4 +1,10 @@
 """Soft page budgets compare seconds, while accumulated stage timing uses ms."""
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT / 'PDFVectorImporter'), str(ROOT / 'PDFVectorImporter/src')]
+
 from types import SimpleNamespace
 
 import pytest

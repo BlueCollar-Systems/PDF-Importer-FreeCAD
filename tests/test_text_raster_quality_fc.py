@@ -39,6 +39,21 @@ def test_headless_text_raster_restores_unshaded_source_colors():
     assert view.DisplayMode == "No shading"
 
 
+@pytest.mark.parametrize("source_id", ["p1:img1", "p1:page", "p1:b0:l0:s0"])
+def test_every_new_raster_host_preserves_source_pixel_colors(source_id):
+    view = SimpleNamespace(DisplayMode="Shading")
+    obj = SimpleNamespace(TypeId="Image::ImagePlane", PropertiesList=[], ViewObject=view)
+    core._annotate_text_host_object(obj, source_id, "raster")
+    assert obj.PDFSourceItemId == source_id
+    assert view.DisplayMode == "No shading"
+
+
+def test_headless_image_metadata_remains_available_without_a_view():
+    obj = SimpleNamespace(TypeId="Image::ImagePlane", PropertiesList=[], ViewObject=None)
+    core._annotate_text_host_object(obj, "p1:img1", "raster")
+    assert obj.PDFRepresentation == "raster"
+
+
 @pytest.mark.parametrize("budget", [10000, 16000000])
 def test_translucent_source_highlight_is_composited_once(monkeypatch, budget):
     fitz = pytest.importorskip("fitz")

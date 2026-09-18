@@ -5091,6 +5091,12 @@ def _annotate_text_host_object(obj, source_item_id: str, representation: str) ->
             add_property("App::PropertyString", name, "PDF Import")
             properties.add(name)
         setattr(obj, name, str(value))
+    if representation == "raster" and str(getattr(obj, "TypeId", "")) == "Image::ImagePlane":
+        view = getattr(obj, "ViewObject", None)
+        if view is not None:
+            # Source pixels already contain the PDF renderer's colors. Native
+            # material lighting would turn white image backgrounds gray.
+            view.DisplayMode = "No shading"
 
 
 def _format_color_metadata(

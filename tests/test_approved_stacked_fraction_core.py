@@ -20,7 +20,7 @@ from pdfcadcore import primitive_extractor  # noqa: E402
 # September 17 adds raw source RGB/alpha/finite paint order beside the unchanged
 # composite colors. No fraction/layout/source-character proof was modified.
 REVIEWED_COMBINED_SUCCESSOR_SHA256 = (
-    "ff061f62ca608e90728f894d81f6a24cca288212c12a0b2a8555bed586089562"
+    "19649d27cd5e860a243cbbe429a20dfe7d56aebb501335cc53d4482f427cd595"
 )
 
 

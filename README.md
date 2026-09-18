@@ -19,6 +19,7 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 - Verified final rectangle highlights preserve source transparency and physical border widths. A toggleable white paper display keeps dark ink readable without changing the application theme.
 - Headless documents restore their saved visibility and display nodes when opened in the GUI. Concurrent imports use separate report folders.
 - Original renderer character quads and expanded Raster coverage prevent false glyph shear and cropped letter edges. Wholly off-page paints are removed only when complete renderer bounds prove they are invisible.
+- Embedded images and full-page rasters use unshaded source colors, preventing native lighting from turning white image backgrounds gray.
 
 Native wire outlines and general vector lineweights remain screen-dependent; Raster text has finite resolution. Final rectangle highlights are handled only when their complete source paint contract is verified.
 

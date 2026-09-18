@@ -127,6 +127,19 @@ def _geometry_view(**overrides):
     return _FakeView(**props)
 
 
+def test_round_cap_ink_restores_filled_display_without_edge_inflation():
+    view = _geometry_view(DisplayMode="Flat Lines")
+    obj = _FakeObject("PDF_Stroke_Ink", view=view,
+                      PDFStrokeFootprintJSON='{"schema":"bcs.freecad.stroke-footprint/1"}',
+                      PDFStrokeRGB="", PDFFillRGB="1,0.5,0.25", PDFLineWidthPt=0.)
+    result = restore.restore_object_style(obj)
+    assert result["marked"]
+    assert view.DisplayMode == "Shaded"
+    view.writes.clear()
+    restore.restore_object_style(obj)
+    assert not view.writes
+
+
 def test_headless_serialized_visibility_survives_gui_default_sync(tmp_path):
     import zipfile
     file = tmp_path / 'headless.FCStd'

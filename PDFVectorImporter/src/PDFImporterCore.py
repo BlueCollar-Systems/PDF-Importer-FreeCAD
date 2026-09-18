@@ -11069,6 +11069,25 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         progress.setMaximum(100)
     _progress_update(10, f"Processing geometry... 0/{n_drawings}", "geometry")
 
+    try:
+        from .PDFStrokeFootprint import short_round_stroke, unclipped_capsules, bind_similarity_strokes, native_face
+    except ImportError:
+        from PDFStrokeFootprint import short_round_stroke, unclipped_capsules, bind_similarity_strokes, native_face
+    stroke_footprints = {}
+    if opts.assign_linewidth and any(short_round_stroke(row) is not None for row in drawings):
+        page_bounds = page.rect
+        if int(getattr(page, "rotation", 0)):
+            page_bounds = page_bounds * page.derotation_matrix
+        try:
+            source_strokes = page.get_drawings(extended=True)
+            stroke_footprints = bind_similarity_strokes(
+                unclipped_capsules(source_strokes, page_bounds), source_strokes,
+                page.get_svg_image(text_as_path=True),
+            )
+        except (AttributeError, TypeError, RuntimeError, ValueError):
+            # No clipping proof: preserve the ordinary source centerline only.
+            stroke_footprints = {}
+
     for pg_idx, path_group in enumerate(drawings):
         # Throttled progress updates — every 500 on heavy pages, 100 otherwise.
         # Each processEvents() call allocates Qt timers; doing it 19k× is
@@ -11121,6 +11140,41 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 continue
 
         parent = _parent_for(stroke_rgb or fill_rgb, layer_name)
+
+        if opts.assign_linewidth:
+            # A near-zero centerline with round caps is still a full-size ink
+            # mark. GPU line widths are screen pixels and cannot preserve it
+            # when zooming. Add its analytic footprint at the source plane;
+            # the ordinary editable centerline continues through the code below.
+            capsule = short_round_stroke(path_group)
+            proof = stroke_footprints.get(path_group.get("seqno"))
+            if capsule is not None and proof is not None and capsule == proof["capsule"]:
+                shape = native_face(
+                    capsule, lambda point: _to_fc(point, page_h, opts, scale), Part
+                )
+                expected_area = capsule["area"] * scale * scale
+                if not math.isclose(shape.Area, expected_area, rel_tol=1e-7, abs_tol=1e-8):
+                    raise RuntimeError("Round-cap ink footprint differs from source area")
+                obj = fc_doc.addObject("Part::Feature", "PDF_Stroke_Ink")
+                obj.Shape = shape
+                obj.addProperty("App::PropertyString", "PDFStrokeFootprintJSON", "PDF Source")
+                obj.PDFStrokeFootprintJSON = json.dumps(dict(
+                    capsule, schema="bcs.freecad.stroke-footprint/1", page=page_num,
+                    source_paint_order=path_group.get("seqno"), source_line_cap=1,
+                    source_opacity=path_group.get("stroke_opacity", 1),
+                    source_geometry_z=0., native_area=expected_area,
+                    source_clip_bounds=proof["clip_bounds"],
+                    source_blend_modes=proof["source_blend_modes"],
+                    source_svg_stroke=proof["source_svg_stroke"],
+                    centerline_import_policy="unchanged",
+                ), sort_keys=True)
+                obj.addProperty("App::PropertyBool", "PDFDisplayOnlyGeometry", "PDF Source")
+                obj.PDFDisplayOnlyGeometry = True
+                _apply_style(obj, None, stroke_rgb, None, None, opts)
+                if obj.ViewObject is not None:
+                    obj.ViewObject.DisplayMode = "Shaded"
+                parent.addObject(obj)
+                obj_count += 1
 
         if path_group.get("bcs_compound_clip_fill"):
             # This is one painted mask with counter holes. Independent faces

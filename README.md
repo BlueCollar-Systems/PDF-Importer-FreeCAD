@@ -3,7 +3,7 @@
 **BUILT. NOT BOUGHT.**
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
-![Version: 4.0.105](https://img.shields.io/badge/Version-4.0.105-blue.svg)
+![Version: 4.0.106](https://img.shields.io/badge/Version-4.0.106-blue.svg)
 ![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
 
 Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.
@@ -11,6 +11,13 @@ Import vector geometry, text, and images from PDF files into FreeCAD as editable
 Arc reconstruction, dash mapping, color grouping, OCG layer support, and reference-based scaling -- all powered by pure-Python PDF parsing via PyMuPDF.
 
 > BlueCollar-Systems -- BUILT. NOT BOUGHT.
+
+## Recent fixes (v4.0.106)
+
+- Glyphs and Geometry retry the bundled SVG renderer when Cairo's filter graph hides all glyph placements from the parser. Each recovered item still needs its original source binding; an unreadable graph is not evidence that the requested text representation is impossible.
+- Short, solid round-cap strokes keep their source-sized editable ink faces, including point marks that screen-pixel line widths could lose. Source clipping, opacity, uniform transforms, and unique renderer matches must be verified before a face is added. The original centerline import remains unchanged.
+
+These stroke footprints do not implement general PDF blending or image paint order. Those appearance limits remain subject to native visual review.
 
 ## Recent fixes (v4.0.105)
 

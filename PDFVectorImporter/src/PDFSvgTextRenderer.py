@@ -1308,6 +1308,8 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
         )
 
     svg = cache.get("svg") if cache is not None else None
+    renderer_recovery = cache.get("renderer_recovery") if cache is not None else None
+    rendered_placements = None
     exe = None
     renderer_name = (
         str(cache.get("renderer_name") or "pymupdf")
@@ -1338,6 +1340,37 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 svg = _render_svg_with_pdftocairo(
                     exe, pdf_snapshot_path, page_num
                 )
+                # Cairo can keep painted glyphs in definitions reached through
+                # feImage/filter graphs. Ignoring uninstantiated definitions is
+                # intentional, but finding no placements cannot prove that the
+                # source lacks vector text. Retry the same representation from
+                # the same immutable PDF before creating any host entities.
+                if svg and not _svg_too_large(svg):
+                    rendered_placements = _parse_use_placements(svg)
+                    if not rendered_placements:
+                        if _pdf_file_signature(pdf_snapshot_path) != signature_before_render:
+                            source_binding_error(source_mutation_reason)
+                        renderer_recovery = {
+                            "from_renderer": "pdftocairo",
+                            "reason": "source_glyph_placements_unresolved",
+                            "to_renderer": "pymupdf",
+                            "representation_preserved": True,
+                        }
+                        renderer_name = "pymupdf"
+                        rendered_placements = None
+                        svg = _render_svg_with_pymupdf(pdf_snapshot_path, page_num)
+                        if not svg:
+                            raise TextRepresentationRenderError(
+                                "svg_renderer_recovery_failed",
+                                {
+                                    "requested_type": representation,
+                                    "renderer": renderer_name,
+                                    "renderer_recovery": dict(renderer_recovery),
+                                    "created_entity_ids": [],
+                                    "removed_entity_ids": [],
+                                    "cleanup_complete": True,
+                                },
+                            )
             else:
                 if FreeCAD:
                     FreeCAD.Console.PrintMessage(
@@ -1447,6 +1480,10 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
     if cache is not None:
         cache["svg"] = svg
         cache["renderer_name"] = renderer_name
+        if renderer_recovery is not None:
+            cache["renderer_recovery"] = dict(renderer_recovery)
+        if rendered_placements is not None:
+            cache["placements"] = rendered_placements
 
     # Parse page-wide SVG structures exactly once. Canonical item delivery
     # calls this function for every span, so reparsing the same XML payload
@@ -1515,8 +1552,15 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
 
     if not placements:
         raise TextRepresentationRenderError(
-            "svg_has_no_glyph_placements",
-            {"requested_type": representation, "renderer": renderer_name},
+            "svg_source_glyph_placements_unverified",
+            {
+                "requested_type": representation,
+                "renderer": renderer_name,
+                "renderer_recovery": renderer_recovery,
+                "created_entity_ids": [],
+                "removed_entity_ids": [],
+                "cleanup_complete": True,
+            },
         )
 
     # Build Part.Shape for each unique glyph
@@ -2239,6 +2283,8 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 **item_filter_evidence,
                 "child_source_item_ids": list(child_source_ids),
             }
+            if renderer_recovery is not None:
+                attempt_evidence["renderer_recovery"] = dict(renderer_recovery)
             if representation == "glyphs":
                 attempt_evidence.update(
                     {
@@ -2319,6 +2365,7 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
         "entities": len(created_ids),
         "entity_type": representation,
         "renderer": renderer_name,
+        "renderer_recovery": renderer_recovery,
         "created_entity_ids": created_ids,
         "delivery_attempts": attempts,
         "source_item_id": item_filter["source_item_id"] if item_filter else None,

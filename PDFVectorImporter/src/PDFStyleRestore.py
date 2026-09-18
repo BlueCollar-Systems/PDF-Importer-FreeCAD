@@ -423,7 +423,7 @@ def restore_object_style(
         if view is None:
             return result
         representation = str(getattr(obj, "PDFRepresentation", "") or "")
-        if "PDFDisplayPaintJSON" in properties:
+        if "PDFDisplayPaintJSON" in properties or "PDFStrokeFootprintJSON" in properties:
             _set_if_changed(view, "DisplayMode", "Shaded")
         if representation == "raster" and str(getattr(obj, "TypeId", "")) == "Image::ImagePlane":
             # Source pixels are already lit/composited by the PDF renderer.

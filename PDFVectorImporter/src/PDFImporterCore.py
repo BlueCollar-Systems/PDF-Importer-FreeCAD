@@ -1872,6 +1872,24 @@ def _apply_planar_fill_material(obj, view, fill_rgb):
     return True
 
 
+def _apply_planar_outline_display(obj, view, stroke_rgb, fill_rgb):
+    """Keep an editable planar face without inventing a PDF fill.
+
+    Closed source strokes may be delivered as native faces. FreeCAD's default
+    Flat Lines mode paints their interiors gray even when the PDF has no fill.
+    Only the display changes; stroked/fill geometry and source colors remain.
+    """
+    if stroke_rgb is None or fill_rgb is not None:
+        return False
+    shape = getattr(obj, "Shape", None)
+    if shape is None or not shape.Faces or shape.Solids:
+        return False
+    if float(shape.BoundBox.ZLength) > ZERO_TOL:
+        return False
+    view.DisplayMode = "Wireframe"
+    return True
+
+
 def _apply_style(
     obj,
     stroke_rgb,
@@ -1920,6 +1938,11 @@ def _apply_style(
             except (AttributeError, RuntimeError, TypeError, ValueError):
                 # Older view providers may expose only the original color.
                 # Keep their source-colored material rather than failing import.
+                pass
+        else:
+            try:
+                _apply_planar_outline_display(obj, vo, stroke_rgb, fill_rgb)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
                 pass
         if opts.assign_linewidth and width is not None:
             try:

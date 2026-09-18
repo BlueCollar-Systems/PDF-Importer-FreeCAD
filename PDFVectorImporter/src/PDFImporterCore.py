@@ -670,8 +670,16 @@ def _emit_progress(
 
 
 def _default_import_report_path(pdf_path: str) -> str:
+    """Give each import a private report directory shared by its sidecars.
+
+    The old TEMP/<pdf-name> path could be overwritten by another CAD host
+    importing the same drawing before this import's acceptance reader ran.
+    mkdtemp reserves the directory atomically, including between processes.
+    Explicit operator report paths continue to be selected by the caller.
+    """
     base = os.path.splitext(os.path.basename(pdf_path))[0]
-    return os.path.join(tempfile.gettempdir(), f"{base}_import_report.json")
+    directory = tempfile.mkdtemp(prefix="bcs-freecad-import-")
+    return os.path.join(directory, f"{base}_import_report.json")
 
 
 def _pdf_file_sha256(pdf_path: str) -> str:
@@ -1864,6 +1872,24 @@ def _apply_planar_fill_material(obj, view, fill_rgb):
     return True
 
 
+def _apply_planar_outline_display(obj, view, stroke_rgb, fill_rgb):
+    """Keep an editable planar face without inventing a PDF fill.
+
+    Closed source strokes may be delivered as native faces. FreeCAD's default
+    Flat Lines mode paints their interiors gray even when the PDF has no fill.
+    Only the display changes; stroked/fill geometry and source colors remain.
+    """
+    if stroke_rgb is None or fill_rgb is not None:
+        return False
+    shape = getattr(obj, "Shape", None)
+    if shape is None or not shape.Faces or shape.Solids:
+        return False
+    if float(shape.BoundBox.ZLength) > ZERO_TOL:
+        return False
+    view.DisplayMode = "Wireframe"
+    return True
+
+
 def _apply_style(
     obj,
     stroke_rgb,
@@ -1912,6 +1938,11 @@ def _apply_style(
             except (AttributeError, RuntimeError, TypeError, ValueError):
                 # Older view providers may expose only the original color.
                 # Keep their source-colored material rather than failing import.
+                pass
+        else:
+            try:
+                _apply_planar_outline_display(obj, vo, stroke_rgb, fill_rgb)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
                 pass
         if opts.assign_linewidth and width is not None:
             try:
@@ -2362,6 +2393,24 @@ def _apply_text_color(obj, rgb: Optional[Tuple[float, float, float]]) -> None:
         try:
             setattr(vo, prop, rgb)
         except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+
+
+def _apply_text3d_display_style(obj) -> None:
+    """Keep screen-width edge outlines from closing small 3D glyph counters.
+
+    The exact source solids remain editable. Only their initial native display
+    changes; operators can still choose wireframe or flat lines explicitly.
+    """
+    view = getattr(obj, "ViewObject", None)
+    if view is not None:
+        try:
+            try:
+                from .PDFStyleRestore import apply_text3d_filled_style, parse_rgb
+            except ImportError:
+                from PDFStyleRestore import apply_text3d_filled_style, parse_rgb
+            apply_text3d_filled_style(view, parse_rgb(getattr(obj, "PDFTextColorRGB", None)))
+        except (AttributeError, RuntimeError, TypeError, ValueError, ImportError):
             pass
 
 
@@ -5065,6 +5114,12 @@ def _annotate_text_host_object(obj, source_item_id: str, representation: str) ->
             add_property("App::PropertyString", name, "PDF Import")
             properties.add(name)
         setattr(obj, name, str(value))
+    if representation == "raster" and str(getattr(obj, "TypeId", "")) == "Image::ImagePlane":
+        view = getattr(obj, "ViewObject", None)
+        if view is not None:
+            # Source pixels already contain the PDF renderer's colors. Native
+            # material lighting would turn white image backgrounds gray.
+            view.DisplayMode = "No shading"
 
 
 def _format_color_metadata(
@@ -5858,6 +5913,123 @@ def _build_exact_text3d_compound_shape(
     )
 
 
+def _source_em_text3d_pen_advance(source_text, font_path, font_size_fc):
+    """Bake source-font em geometry without fitting ink to declared PDF widths."""
+    builder = lambda: _build_exact_text3d_outline_template(source_text, font_path)
+    template = (builder() if _ACTIVE_TEXT3D_OUTLINE_MEMO is None else
+                _ACTIVE_TEXT3D_OUTLINE_MEMO.get_or_build((source_text, font_path), builder))
+    face_template, unit_advance, _visible_count = template
+    em_scale = _text3d_source_em_scale(source_text, font_path, face_template)
+    advance = float(unit_advance) * float(font_size_fc) * em_scale
+    if not math.isfinite(advance) or advance <= 0.0:
+        raise RuntimeError("source font em advance is invalid")
+    return advance
+
+
+def _build_positioned_text3d_compound_shape(
+    *, source_text, font_path, font_size_fc, depth, target_advance_fc,
+    source_character_layout,
+):
+    """Keep each native solid glyph at its actual PDF character transform."""
+    characters = source_character_layout["characters"]
+    if "".join(row["text"] for row in characters) != source_text:
+        raise ValueError("3D source character layout is incomplete")
+    shapes = []
+    expected_solids = 0
+    expected_total_volume = 0.0
+    for row in characters:
+        if row["text"].isspace():
+            continue
+        try:
+            em_advance = _source_em_text3d_pen_advance(
+                row["text"], font_path, font_size_fc)
+            baked = _build_exact_text3d_compound_shape(
+                source_text=row["text"], font_path=font_path,
+                font_size_fc=font_size_fc, depth=depth,
+                target_advance_fc=em_advance,
+            )
+        except Text3DExactFontOutlinesUnavailable:
+            # One empty glyph is not impossibility proof for the whole item.
+            # Recheck the complete source string before the existing verified
+            # ShapeString/representation ladder is allowed to see that proof.
+            _build_exact_text3d_outline_template(source_text, font_path)
+            raise RuntimeError("isolated source glyph outline is unavailable") from None
+        source_shape = baked[0]
+        expected_solids += _shape_solid_count(source_shape)
+        baseline_scale = float(row["baseline_scale"])
+        up_scale = float(row["up_scale"])
+        if any(not math.isfinite(value) or value <= 0.0
+               for value in (baseline_scale, up_scale)):
+            raise ValueError("3D source character matrix scale is invalid")
+        baseline = [component * baseline_scale for component in row["baseline_axis"]]
+        up = [component * up_scale for component in row["up_axis"]]
+        matrix = FreeCAD.Matrix()
+        matrix.A11, matrix.A21 = baseline[0], baseline[1]
+        matrix.A12, matrix.A22 = up[0], up[1]
+        matrix.A14, matrix.A24, matrix.A34 = row["local_origin"]
+        transformed = source_shape.transformGeometry(matrix)
+        if (transformed is None or transformed.isNull()
+                or _shape_solid_count(transformed) != _shape_solid_count(source_shape)):
+            raise RuntimeError("3D source character transform lost solid geometry")
+        def expected_point(point, baseline=baseline, up=up, origin=tuple(row["local_origin"])):
+            return (baseline[0] * point.x + up[0] * point.y + origin[0],
+                    baseline[1] * point.x + up[1] * point.y + origin[1],
+                    point.z + origin[2])
+
+        def verify_point(source_point, actual_point):
+            expected = expected_point(source_point)
+            actual = (actual_point.x, actual_point.y, actual_point.z)
+            if any(not math.isfinite(value) for value in actual) or any(
+                not math.isclose(a, b, rel_tol=1e-10, abs_tol=1e-8)
+                for a, b in zip(actual, expected, strict=True)
+            ):
+                raise RuntimeError("3D source character affine coordinates were not preserved")
+
+        # OCC exposes a mass center on each Solid, not on a Compound. Derive
+        # the volume-weighted center from live solids so compound glyphs (i,
+        # punctuation, disconnected font contours) receive the same check.
+        def solid_mass_center(shape):
+            # Each property access runs an OCC mass calculation. Reuse those
+            # exact measurements for all three axes instead of recomputing
+            # them seven times per solid; keep the summation order unchanged.
+            masses = [(float(solid.Volume), solid.CenterOfMass) for solid in shape.Solids]
+            total = sum(volume for volume, _center in masses)
+            if not math.isfinite(total) or total <= 0.0:
+                raise RuntimeError("3D source character has no positive solid mass")
+            return FreeCAD.Vector(*(sum(volume * getattr(center, axis)
+                for volume, center in masses) / total
+                for axis in ("x", "y", "z")))
+
+        verify_point(solid_mass_center(source_shape), solid_mass_center(transformed))
+        source_vertices, target_vertices = source_shape.Vertexes, transformed.Vertexes
+        if len(source_vertices) != len(target_vertices):
+            raise RuntimeError("3D source character transform changed vertex inventory")
+        for source_vertex, target_vertex in zip(source_vertices, target_vertices, strict=True):
+            verify_point(source_vertex.Point, target_vertex.Point)
+        determinant = baseline[0] * up[1] - baseline[1] * up[0]
+        expected_volume = float(source_shape.Volume) * abs(determinant)
+        if not math.isclose(float(transformed.Volume), expected_volume,
+                            rel_tol=1e-7, abs_tol=1e-9):
+            raise RuntimeError("3D source character affine volume was not preserved")
+        expected_total_volume += expected_volume
+        shapes.append(transformed)
+    if not shapes or expected_solids <= 0:
+        raise RuntimeError("3D source character layout produced no solids")
+    compound = Part.Compound(shapes)
+    volume = float(compound.Volume)
+    if (compound.isNull() or _shape_solid_count(compound) != expected_solids
+            or not math.isfinite(volume) or volume <= 0.0
+            or not math.isclose(volume, expected_total_volume,
+                                rel_tol=1e-7, abs_tol=1e-9)):
+        raise RuntimeError("3D source character compound failed verification")
+    if _ACTIVE_TEXT3D_OUTLINE_MEMO is not None:
+        _ACTIVE_TEXT3D_OUTLINE_MEMO.last_solid_count = expected_solids
+        _ACTIVE_TEXT3D_OUTLINE_MEMO.last_solid_volume = volume
+    # Each glyph retains its own font matrix and origin. The declared source
+    # advance describes pen positions; it never stretches the glyph ink.
+    return compound, 1.0, target_advance_fc, target_advance_fc, volume, expected_solids
+
+
 def _create_verified_compound_text3d_entity(
     doc,
     *,
@@ -5870,18 +6042,20 @@ def _create_verified_compound_text3d_entity(
     text_group,
     baseline_object_ids: Optional[set] = None,
     configure_host=None,
+    source_character_layout=None,
 ):
     """Create one persistent Part::Feature carrying an exact 3D source span."""
     protected_baseline_ids = set(baseline_object_ids or ())
     if any(type(object_id) is not int for object_id in protected_baseline_ids):
         raise RuntimeError("3D Text ownership baseline is invalid")
-    baked = _build_exact_text3d_compound_shape(
-        source_text=source_text,
-        font_path=font_path,
-        font_size_fc=font_size_fc,
-        depth=depth,
-        target_advance_fc=target_advance_fc,
-    )
+    build_arguments = dict(source_text=source_text, font_path=font_path,
+                           font_size_fc=font_size_fc, depth=depth,
+                           target_advance_fc=target_advance_fc)
+    if source_character_layout is None:
+        baked = _build_exact_text3d_compound_shape(**build_arguments)
+    else:
+        baked = _build_positioned_text3d_compound_shape(
+            **build_arguments, source_character_layout=source_character_layout)
     compound, horizontal_scale, native_advance, verified_advance = baked[:4]
     if len(baked) > 4:
         baked_volume = float(baked[4])
@@ -5922,6 +6096,11 @@ def _create_verified_compound_text3d_entity(
             )
         ):
             raise RuntimeError("Part::Feature did not preserve verified solid 3D text")
+        if source_character_layout is not None and (
+            _shape_solid_count(shape) != baked_solid_count
+            or not math.isclose(float(shape.Volume), baked_volume, rel_tol=1e-7, abs_tol=1e-9)
+        ):
+            raise RuntimeError("Part::Feature changed positioned source glyph geometry")
         text_group.addObject(host_obj)
         return (
             host_obj,
@@ -6350,15 +6529,9 @@ def _deliver_text_item_native(
         if not math.isfinite(font_size_fc) or font_size_fc <= 0.0:
             raise ValueError("native text font size is invalid")
         anchor = _to_fc(origin, float(page_h), opts, float(scale))
-        try:
-            descender = float(span.get("descender", -0.2) or -0.2)
-        except (TypeError, ValueError):
-            descender = -0.2
-        anchor = _apply_text_local_y_offset(
-            anchor,
-            host_rotation_deg,
-            _effective_descender(source_text, descender) * font_size_fc * 0.35,
-        )
+        # Draft's native world text uses a baseline, as does the PDF source.
+        # Character positions are source-bound; a font-metric descender offset
+        # would shift every character away from that authoritative baseline.
         placement = Placement(
             anchor,
             Rotation(Vector(0.0, 0.0, 1.0), host_rotation_deg),
@@ -6849,6 +7022,36 @@ def _cached_text_raster_pixmap(
     return cropped, effective_dpi
 
 
+def _raster_source_coverage_bbox(item, page, opts):
+    """Keep real source glyph quads outside a shorter font bbox in the crop."""
+    bbox = _finite_source_tuple(item.get("bbox"), 4, "item.bbox")
+    if fitz is None or not isinstance(page, fitz.Page):
+        return bbox
+    from pdfcadcore.primitive_extractor import _raw_text_with_source_quads
+    cache = getattr(opts, "_raster_source_quad_cache", None)
+    key = (item.get("pdf_sha256"), item.get("page_number"))
+    if not isinstance(cache, dict) or cache.get("key") != key:
+        cache = {"key": key, "raw": _raw_text_with_source_quads(page)}
+        opts._raster_source_quad_cache = cache
+    block = cache["raw"]["blocks"][item["block_index"]]
+    line = block["lines"][item["line_index"]]
+    span = line["spans"][item["span_index"]]
+    chars = span.get("chars", ())
+    if (block.get("type") != 0 or "".join(c.get("c", "") for c in chars) != item["text"]
+            or tuple(span["bbox"]) != bbox or span.get("font") != item["span"].get("font")
+            or tuple(span["origin"]) != tuple(item["origin"])):
+        raise ValueError("Raster character coverage is not bound to the source item")
+    points = [(bbox[0], bbox[1]), (bbox[2], bbox[3])]
+    for char in chars:
+        quad = char.get("quad")
+        if quad is not None:
+            if len(quad) != 4:
+                raise ValueError("Raster source glyph quad must have four corners")
+            points.extend(_finite_source_tuple(point, 2, "character.quad") for point in quad)
+    return (min(p[0] for p in points), min(p[1] for p in points),
+            max(p[0] for p in points), max(p[1] for p in points))
+
+
 def _deliver_text_item_raster(
     item: Dict[str, Any],
     attempted_type: str,
@@ -6948,7 +7151,8 @@ def _deliver_text_item_raster(
 
     try:
         dpi = max(72, int(getattr(opts, "raster_dpi", 200) or 200))
-        clip = fitz.Rect(*bbox)
+        coverage_bbox = _raster_source_coverage_bbox(bound_item, page, opts)
+        clip = fitz.Rect(*coverage_bbox)
         page_rect = page.rect
         clip &= fitz.Rect(
             float(page_rect.x0),
@@ -7121,6 +7325,7 @@ def _deliver_text_item_raster(
             "dpi": effective_dpi,
             "requested_dpi": dpi,
             "source_bbox": bbox,
+            "source_raster_coverage_bbox": coverage_bbox,
             "raster_bbox": tuple(rendered_clip),
             "expected_anchor_xyz": expected_anchor,
             "verified_anchor_xyz": tuple(actual_anchor),
@@ -7139,6 +7344,7 @@ def _deliver_text_item_3d(
     text_group,
     page_h: float,
     scale: float,
+    raw_source_dict=None,
 ) -> Dict[str, Any]:
     """Deliver and verify exactly one canonical 3D Text source item."""
     try:
@@ -7511,6 +7717,7 @@ def _deliver_text_item_3d(
             },
         )
 
+    source_character_layout = None
     try:
         page_height = float(page_h)
         item_scale = float(scale)
@@ -7544,6 +7751,25 @@ def _deliver_text_item_3d(
             raise ValueError("source span advance is unavailable")
         pos = _to_fc(origin, page_height, opts, item_scale)
         rot = Rotation(Vector(0.0, 0.0, 1.0), host_rotation_deg)
+        if raw_source_dict is not None:
+            try:
+                from .PDFText3DLayout import build_source_character_layout
+            except ImportError:
+                from PDFText3DLayout import build_source_character_layout
+            source_character_layout = build_source_character_layout(
+                bound_item, raw_source_dict, scale=item_scale,
+                font_size=font_size_fc, font_name=source_font,
+                host_rotation_deg=host_rotation_deg,
+                flip_y=bool(getattr(opts, "flip_y", True)),
+                page_matrix=_page_matrix_values(opts),
+            )
+            source_pen_points = [coordinate
+                for char in source_character_layout["characters"]
+                for coordinate in (char["local_origin"][0],
+                    char["local_origin"][0] + char["advance"] * char["baseline_axis"][0])]
+            target_advance_fc = max(source_pen_points) - min(source_pen_points)
+            if not math.isfinite(target_advance_fc) or target_advance_fc <= 1e-9:
+                raise ValueError("positioned source span advance is unavailable")
     except Exception as exc:
         terminal_failure(
             "text_transform_or_dimension_failed",
@@ -7572,6 +7798,7 @@ def _deliver_text_item_3d(
             source_color=source_color,
         )
         _apply_text_color(host_obj, source_color)
+        _apply_text3d_display_style(host_obj)
         stage = "calibration_extrusion"
 
     # Fast exact path: make all glyph solids in memory and persist the entire
@@ -7582,6 +7809,8 @@ def _deliver_text_item_3d(
     try:
         creation_started = True
         stage = "compound_3d_text"
+        positioned_arguments = ({"source_character_layout": source_character_layout}
+                                if source_character_layout is not None else {})
         created = _create_verified_compound_text3d_entity(
             doc,
             source_text=source_text,
@@ -7593,6 +7822,7 @@ def _deliver_text_item_3d(
             text_group=text_group,
             baseline_object_ids=baseline_objects,
             configure_host=_configure_item_host,
+            **positioned_arguments,
         )
         (
             compound_entity,
@@ -7612,6 +7842,11 @@ def _deliver_text_item_3d(
             target_advance_fc=target_advance_fc,
             horizontal_scale=horizontal_scale,
         )
+        if source_character_layout is not None:
+            if "PDFSourceCharacterLayoutJSON" not in compound_entity.PropertiesList:
+                compound_entity.addProperty("App::PropertyString", "PDFSourceCharacterLayoutJSON", "PDF Import")
+            compound_entity.PDFSourceCharacterLayoutJSON = json.dumps(
+                source_character_layout, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
         color_metadata = _format_color_metadata(source_color)
         view = getattr(compound_entity, "ViewObject", None)
@@ -7666,6 +7901,14 @@ def _deliver_text_item_3d(
         volume = float(baked_volume)
         if volume <= 0.0:
             volume = float(getattr(shape, "Volume", 0.0) or 0.0) if shape is not None else 0.0
+        if source_character_layout is not None:
+            actual_solid_count = _shape_solid_count(shape) if shape is not None else 0
+            actual_volume = float(getattr(shape, "Volume", 0.0) or 0.0)
+            if actual_solid_count != solid_count or not math.isclose(
+                actual_volume, volume, rel_tol=1e-7, abs_tol=1e-9
+            ):
+                raise RuntimeError("assigned positioned source glyph geometry changed")
+            solid_count, volume = actual_solid_count, actual_volume
         live_object = doc.getObject(compound_id) if compound_id else None
         metadata_verified = bool(
             getattr(compound_entity, "PDFSourceText", None) == source_text
@@ -7759,6 +8002,9 @@ def _deliver_text_item_3d(
                 "style_verification": style_verification,
                 "view_style_verified": style_verification
                 == "gui_view_and_app_metadata",
+                "source_character_layout": source_character_layout,
+                "advance_verification": ("original_source_character_origins_and_font_matrix"
+                    if source_character_layout is not None else "whole_span_font_pen_advance"),
             },
         }
     except Text3DExactFontOutlinesUnavailable as exc:
@@ -7785,6 +8031,8 @@ def _deliver_text_item_3d(
             "stage": stage,
             "exception": "%s: %s" % (exc.__class__.__name__, exc),
         }
+        if source_character_layout is not None:
+            terminal_failure("positioned_3d_text_failed", compound_failure_evidence)
         if owned:
             collection_error = collect_owned()
             if collection_error:
@@ -7869,6 +8117,10 @@ def _deliver_text_item_3d(
             baseline_object_ids=baseline_objects,
             configure_host=_configure_item_host,
         )
+        if source_character_layout is not None:
+            add_owned(calibrated_support)
+            add_owned(extrusion)
+            terminal_failure("positioned_3d_text_legacy_layout_unverified")
         add_owned(calibrated_support)
         add_owned(extrusion)
         collection_error = collect_owned()
@@ -8978,6 +9230,18 @@ def _deliver_text_item_svg(
             )
         ):
             raise ValueError("item-filtered SVG host entities are invalid")
+        for host_obj in delivered_objects:
+            _persist_text_style_metadata(
+                host_obj, font_name=str(span.get("font") or ""),
+                font_size=float(span.get("size") or 0.) * float(scale),
+                source_color=_span_source_color(span),
+            )
+            view = getattr(host_obj, "ViewObject", None)
+            if view is not None:
+                _apply_text_color(host_obj, _span_source_color(span))
+                # Raw outline modes retain every editable source edge. A thin
+                # initial viewport stroke avoids closing small glyph counters.
+                view.LineWidth = 1.0
     except Exception as exc:
         result_summary = {
             "exception": "%s: %s" % (exc.__class__.__name__, exc),
@@ -8993,6 +9257,38 @@ def _deliver_text_item_svg(
         )
 
     return copy.deepcopy(attempt)
+
+
+def _bind_native_source_layout(item, delivered, raw_dict, *, opts, scale, doc, group):
+    """Complete native delivery or roll back every object owned by the attempt."""
+    created_ids = list(delivered["created_entity_ids"])
+    owned = [obj for name in created_ids if (obj := doc.getObject(name)) is not None]
+    try:
+        try:
+            from .PDFTextLayout import build_source_affine_layout, persist_source_layout
+        except ImportError:
+            from PDFTextLayout import build_source_affine_layout, persist_source_layout
+        evidence = delivered["evidence"]
+        layout = build_source_affine_layout(item, raw_dict,
+            scale=scale, font_size=evidence["font_size"], font_name=evidence["font_name"],
+            host_rotation_deg=evidence["rotation_deg"], flip_y=opts.flip_y,
+            page_matrix=_page_matrix_values(opts))
+        if len(owned) != len(created_ids):
+            raise RuntimeError("Native source-layout object disappeared")
+        installed = [persist_source_layout(host, layout) for host in owned]
+        for host, proof in zip(owned, installed, strict=True):
+            if getattr(host, "ViewObject", None) is not None and not proof.get("native_nodes_installed"):
+                raise RuntimeError("Native source-layout display was not installed")
+        evidence["source_character_layout"] = installed
+        return delivered
+    except Exception as exc:
+        removed_ids, cleanup_complete = _remove_owned_text_objects(doc, group, owned)
+        attempt = dict(delivered, outcome="failed", final_type=None,
+            reason="native_source_layout_failed", created_entity_ids=created_ids,
+            removed_entity_ids=removed_ids, cleanup_complete=bool(cleanup_complete and
+                all(doc.getObject(name) is None for name in created_ids)),
+            evidence={"exception": "%s: %s" % (type(exc).__name__, exc)})
+        raise TextRepresentationFailure("Native source character layout failed", attempt) from exc
 
 
 def _render_canonical_text_items(
@@ -9043,7 +9339,15 @@ def _render_canonical_text_items(
     }
 
     def deliver_3d(item, attempted, state):
-        nonlocal font_stage_complete
+        nonlocal font_stage_complete, source_character_dict, source_3d_character_dict
+        if source_3d_character_dict is None and fitz is not None and isinstance(page, fitz.Page):
+            try:
+                from .PDFText3DLayout import read_source_character_geometry
+            except ImportError:
+                from PDFText3DLayout import read_source_character_geometry
+            source_3d_character_dict = read_source_character_geometry(page)
+            if source_character_dict is None:
+                source_character_dict = source_3d_character_dict
         if not font_stage_complete:
             _stage_page_shapestring_fonts(
                 pdf_doc,
@@ -9053,6 +9357,8 @@ def _render_canonical_text_items(
                 page_number=int(page_num),
             )
             font_stage_complete = True
+        source_arguments = ({"raw_source_dict": source_3d_character_dict}
+                            if source_3d_character_dict is not None else {})
         return _deliver_text_item_3d(
             item,
             attempted,
@@ -9060,25 +9366,29 @@ def _render_canonical_text_items(
             text_group=parent_group,
             page_h=page_h,
             scale=scale,
+            **source_arguments,
         )
 
+    source_character_dict = None
+    source_3d_character_dict = None
+
+    def deliver_native(item, attempted, state):
+        nonlocal source_character_dict, source_3d_character_dict
+        if source_character_dict is None:
+            try:
+                from .PDFText3DLayout import read_source_character_geometry
+            except ImportError:
+                from PDFText3DLayout import read_source_character_geometry
+            source_character_dict = read_source_character_geometry(page)
+            source_3d_character_dict = source_character_dict
+        delivered = _deliver_text_item_native(item, attempted, state,
+            text_group=parent_group, page_h=page_h, scale=scale)
+        return _bind_native_source_layout(item, delivered, source_character_dict,
+            opts=opts, scale=scale, doc=fc_doc, group=parent_group)
+
     deliverers = {
-        "text": lambda item, attempted, state: _deliver_text_item_native(
-            item,
-            attempted,
-            state,
-            text_group=parent_group,
-            page_h=page_h,
-            scale=scale,
-        ),
-        "labels": lambda item, attempted, state: _deliver_text_item_native(
-            item,
-            attempted,
-            state,
-            text_group=parent_group,
-            page_h=page_h,
-            scale=scale,
-        ),
+        "text": deliver_native,
+        "labels": deliver_native,
         "3d_text": deliver_3d,
         "glyphs": lambda item, attempted, state: _deliver_text_item_svg(
             item,
@@ -10268,6 +10578,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         raise ValueError(f"Page {page_num} out of range 1..{len(pdf_doc)}")
 
     opts._provenance_page = int(page_num)
+    page_existing_object_names = {obj.Name for obj in getattr(fc_doc, "Objects", ())}
 
     page = pdf_doc.load_page(page_num - 1)
     # PyMuPDF drawing/text coordinates are in unrotated crop-box space.  Apply
@@ -11346,6 +11657,31 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as e:
             _warn(f"Image import failed: {e}")
 
+    # Final source annotation paints belong above earlier native text. Their
+    # display depth is independent of the preserved source-plane geometry.
+    if not placed_full_page_raster_background and drawings:
+        try:
+            from .PDFLatePaint import apply_final_paints
+        except ImportError:
+            from PDFLatePaint import apply_final_paints
+        late_paint = apply_final_paints(
+            page, page_number=int(page_num), pdf_sha256=str(getattr(opts, "_pdf_sha256", "") or _pdf_file_sha256(pdf_path)),
+            doc=fc_doc, parent=top_group or fc_doc,
+            objects=[obj for obj in fc_doc.Objects if obj.Name not in page_existing_object_names],
+            mapper=lambda point: _to_fc(point, page_h, opts, scale), scale=scale,
+        )
+        opts._final_source_paint_displays = list(getattr(opts, "_final_source_paint_displays", [])) + late_paint
+
+    if not placed_full_page_raster_background:
+        try:
+            from .PDFPaperDisplay import create_paper
+        except ImportError:
+            from PDFPaperDisplay import create_paper
+        create_paper(fc_doc, top_group or fc_doc, page_number=int(page_num),
+            source_sha256=str(getattr(opts, "_pdf_sha256", "") or _pdf_file_sha256(pdf_path)),
+            corners=[(0., 0., 0.), (page_w * scale, 0., 0.),
+                     (page_w * scale, page_h * scale, 0.), (0., page_h * scale, 0.)])
+
     # ── Final cleanup / placement ──
     _progress_update(96, "Placing objects in document...")
 
@@ -11438,6 +11774,7 @@ def _reset_import_run_state(opts: ImportOptions) -> None:
     opts._native_text_object_index = None
     _RASTER_ASSET_DIR_CACHE = None
     opts._page_complexity_profiles = []
+    opts._final_source_paint_displays = []
     opts._active_page_index = 0
     opts._active_page_total = 0
     opts._active_page_profile = None
@@ -11467,6 +11804,7 @@ _PAGE_RESULT_TELEMETRY_FIELDS = (
     "_scale_cached_pages",
     "wirestring_cache_stats",
     "text3d_outline_cache_stats",
+    "_final_source_paint_displays",
 )
 
 
@@ -12355,6 +12693,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         # Geometry look is App-side metadata in every host; a GUI view was
         # styled only when one existed. Headless runs must say so.
         opts._report_extra["geometry_style"] = _geometry_style_report_payload(opts)
+        opts._report_extra["final_source_paint_displays"] = list(getattr(opts, "_final_source_paint_displays", []))
         if session_state is not None:
             opts._report_extra["import_session"] = _session_state_payload(
                 session_state

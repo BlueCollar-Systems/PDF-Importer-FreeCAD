@@ -127,6 +127,84 @@ def _geometry_view(**overrides):
     return _FakeView(**props)
 
 
+def test_headless_serialized_visibility_survives_gui_default_sync(tmp_path):
+    import zipfile
+    file = tmp_path / 'headless.FCStd'
+    xml = '''<Document><ObjectData>
+      <Object name="PDF_Page_1"><Properties><Property name="Visibility"><Bool value="true"/></Property></Properties></Object>
+      <Object name="Ink"><Properties><Property name="Visibility"><Bool value="true"/></Property></Properties></Object>
+      <Object name="Support"><Properties><Property name="Visibility"><Bool value="false"/></Property></Properties></Object>
+      </ObjectData></Document>'''
+    with zipfile.ZipFile(file, 'w') as archive:
+        archive.writestr('Document.xml', xml)
+    group = _FakeObject('PDF_Page_1', 'App::DocumentObjectGroup', view=_FakeView(Visibility=False))
+    ink = _FakeObject('Ink', view=_text_view(), PDFRepresentation='text')
+    support = _FakeObject('Support', view=_text_view(Visibility=True), PDFRepresentation='text')
+    group.Visibility = ink.Visibility = False  # GUI provider synchronized its default.
+    support.Visibility = True
+    ink.InList = support.InList = [group]
+    doc = _FakeDocument([group, ink, support]); doc.FileName = str(file)
+    result = restore.restore_document_styles(doc, view_fit=lambda: True)
+    assert not result['errors']
+    assert ink.ViewObject.Visibility is True
+    assert group.ViewObject.Visibility is True
+    assert support.ViewObject.Visibility is False
+    for obj in (group, ink, support): obj.ViewObject.writes.clear()
+    restore.restore_document_styles(doc, view_fit=lambda: True)
+    assert not any(obj.ViewObject.writes for obj in (group, ink, support))
+    with zipfile.ZipFile(file, 'a') as archive:
+        archive.writestr('GuiDocument.xml', '<Document/>')
+    assert restore._saved_headless_visibility(doc) == {}
+
+
+def test_3d_text_restores_filled_display_without_changing_geometry_or_other_text():
+    shape = object()
+    view = _geometry_view(DisplayMode="Flat Lines")
+    obj = _FakeObject("PDF3DText", view=view, PDFRepresentation="3d_text",
+                      PDFTextFontSize=3.0, PDFTextColorRGB="0,0,0")
+    obj.Shape = shape
+    result = restore.restore_object_style(obj)
+    assert result["error"] is None
+    assert view.DisplayMode == "Shaded"
+    assert obj.Shape is shape
+    view.writes.clear()
+    restore.restore_object_style(obj)
+    assert not view.writes
+
+    for representation in ("text", "labels"):
+        other_view = _text_view(DisplayMode="World")
+        other = _FakeObject("PDFText", view=other_view,
+                            PDFRepresentation=representation, PDFTextFontSize=3.0)
+        restore.restore_object_style(other)
+        assert other_view.DisplayMode == "World"
+
+
+def test_3d_source_material_is_unlit_and_second_restore_changes_nothing():
+    from types import SimpleNamespace
+    material = SimpleNamespace(DiffuseColor=(.8, .8, .8), AmbientColor=(.2, .2, .2),
+                               SpecularColor=(1., 1., 1.), EmissiveColor=(0., 0., 0.), Shininess=90.)
+    view = _FakeView(DisplayMode="Flat Lines", ShapeAppearance=[material])
+    assert restore.apply_text3d_filled_style(view, (.2, .6, .9))
+    assert view.DisplayMode == "Shaded"
+    assert material.DiffuseColor == material.AmbientColor == material.SpecularColor == (0., 0., 0.)
+    assert material.EmissiveColor == (.2, .6, .9)
+    assert material.Shininess == 0.
+    view.writes.clear()
+    assert not restore.apply_text3d_filled_style(view, (.2, .6, .9))
+    assert not view.writes
+
+
+def test_3d_initial_display_style_changes_only_view():
+    shape = object()
+    view = _geometry_view(DisplayMode="Flat Lines")
+    obj = _FakeObject("PDF3DText", view=view)
+    obj.Shape = shape
+    core._apply_text3d_display_style(obj)
+    assert view.DisplayMode == "Shaded"
+    assert obj.Shape is shape
+    assert view.LineWidth == 2.0
+
+
 # ---------------------------------------------------------------------------
 # (a) headless creation persists the geometry style App-side
 # ---------------------------------------------------------------------------
@@ -753,3 +831,18 @@ class TestLabelGuiCreationHasNoArrow:
         # that the creation path and the restore path agree on the contract.
         assert restore.LABEL_ARROW_TYPE == "None"
         assert core.LABEL_ARROW_TYPE == restore.LABEL_ARROW_TYPE
+
+
+@pytest.mark.parametrize("representation", ["glyphs", "geometry"])
+def test_source_outline_style_restores_thin_source_colored_edges(representation):
+    view = _FakeView(LineWidth=2.0, LineColor=(0.1, 0.1, 0.1),
+                     ShapeColor=(0.8, 0.8, 0.8), Visibility=True)
+    obj = _FakeObject("Outline", view=view, PDFRepresentation=representation,
+                      PDFTextFontSize=3.0, PDFTextColorRGB="0.2,0.4,0.6")
+    restored = restore.restore_object_style(obj)
+    assert restored["error"] is None
+    assert view.LineWidth == 1.0
+    assert view.LineColor == (0.2, 0.4, 0.6)
+    writes = list(view.writes)
+    restore.restore_object_style(obj)
+    assert view.writes == writes

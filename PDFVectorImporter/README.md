@@ -1,7 +1,7 @@
 # PDF Vector Importer for FreeCAD
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Version: 4.0.104](https://img.shields.io/badge/Version-4.0.104-green.svg)
+![Version: 4.0.105](https://img.shields.io/badge/Version-4.0.105-green.svg)
 ![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
 
 **Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.**
@@ -11,6 +11,16 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 > **BlueCollar-Systems** -- BUILT. NOT BOUGHT.
 
 ---
+
+## Recent fixes (v4.0.105)
+
+- Native Text and Labels preserve the original PDF character positions and baseline, including after save/reopen, while remaining editable.
+- 3D Text uses filled source-colored display. Glyphs and Geometry retain editable source outlines with a thinner source-colored display.
+- Verified final rectangle highlights preserve source transparency and physical border widths. A toggleable white paper display keeps dark ink readable without changing the application theme.
+- Headless documents restore their saved visibility and display nodes when opened in the GUI. Concurrent imports use separate report folders.
+- Original renderer character quads and expanded Raster coverage prevent false glyph shear and cropped letter edges. Wholly off-page paints are removed only when complete renderer bounds prove they are invisible.
+
+Native wire outlines and general vector lineweights remain screen-dependent; Raster text has finite resolution. Final rectangle highlights are handled only when their complete source paint contract is verified.
 
 ## Recent fixes (v4.0.86)
 

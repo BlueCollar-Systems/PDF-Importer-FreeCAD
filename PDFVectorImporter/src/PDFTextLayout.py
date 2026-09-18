@@ -15,6 +15,7 @@ import re
 
 PROPERTY = "PDFTextLayoutJSON"
 SCHEMA = "bcs.freecad.source_text_layout/1"
+AFFINE_SCHEMA = "mupdf_character_font_matrix/1"
 _observers = None
 
 
@@ -96,6 +97,29 @@ def build_source_layout(item, raw_dict, *, scale, font_size, font_name,
     return payload
 
 
+def build_source_affine_layout(item, raw_dict, *, scale, font_size, font_name,
+                               host_rotation_deg, flip_y=True,
+                               page_matrix=(1., 0., 0., 1., 0., 0.)):
+    """Preserve source glyph stretch/shear as well as character placement.
+
+    MuPDF char.size is sqrt(abs(det(original text matrix))). Together with the
+    independently bound font-Y vector and both axis directions, it determines
+    the font-X magnitude. This reconstructs the source matrix, not a fit to
+    either a native glyph's ink box or the PDF's declared advance width.
+    """
+    # Local import avoids recursion: the 3D builder calls only the base
+    # positions-only build_source_layout above.
+    from PDFText3DLayout import build_source_character_layout
+
+    payload = build_source_character_layout(
+        item, raw_dict, scale=scale, font_size=font_size, font_name=font_name,
+        host_rotation_deg=host_rotation_deg, flip_y=flip_y, page_matrix=page_matrix)
+    payload.update(schema=SCHEMA, source_affine=AFFINE_SCHEMA,
+                   affine_basis="original_font_metrics_and_mupdf_matrix_expansion")
+    _validate(payload)
+    return payload
+
+
 def _validate(payload):
     if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
         raise ValueError("unsupported source text layout")
@@ -105,6 +129,9 @@ def _validate(payload):
         raise ValueError("source text layout has no item identity")
     _positive(payload.get("font_size"))
     text, chars = payload.get("source_text"), payload.get("characters")
+    affine = payload.get("source_affine")
+    if affine is not None and affine != AFFINE_SCHEMA:
+        raise ValueError("unsupported source text affine geometry")
     if (not isinstance(text, str) or not text or not isinstance(chars, list)
             or len(chars) != len(text) or not payload.get("font_name")):
         raise ValueError("source text layout is incomplete")
@@ -114,6 +141,13 @@ def _validate(payload):
         _finite(char.get("local_origin"), 3)
         _finite(char.get("source_origin"), 2)
         _finite(char.get("source_bbox"), 4)
+        if affine:
+            baseline, up = (_finite(char.get(key), 2) for key in ("baseline_axis", "up_axis"))
+            _positive(char.get("baseline_scale")); _positive(char.get("up_scale"))
+            if (any(not math.isclose(math.hypot(*axis), 1., rel_tol=1e-10, abs_tol=1e-10)
+                    for axis in (baseline, up))
+                    or abs(baseline[0]*up[1]-baseline[1]*up[0]) <= 1e-12):
+                raise ValueError("source text affine axes are invalid")
 
 
 def persist_source_layout(obj, payload):
@@ -308,17 +342,27 @@ def restore_object_layout(obj, *, coin_module=None):
     font.name.connectFrom(proxy.font.name)
     font.size.setValue(payload["font_size"])
     group.addChild(font)
-    nodes = []
+    nodes, affines = [], []
     for char in payload["characters"]:
         child, translation, text = coin.SoSeparator(), coin.SoTranslation(), coin.SoAsciiText()
         translation.translation.setValue(tuple(char["local_origin"]))
         text.string.setValues([char["text"]])
         text.justification = coin.SoAsciiText.LEFT
-        child.addChild(translation); child.addChild(text); group.addChild(child)
+        child.addChild(translation)
+        if payload.get("source_affine"):
+            bx, by = (value*char["baseline_scale"] for value in char["baseline_axis"])
+            ux, uy = (value*char["up_scale"] for value in char["up_axis"])
+            affine = coin.SoMatrixTransform()
+            # Coin uses row vectors: first two rows are the local font axes.
+            affine.matrix.setValue(coin.SbMatrix(bx, by, 0., 0., ux, uy, 0., 0.,
+                                                 0., 0., 1., 0., 0., 0., 0., 1.))
+            child.addChild(affine)
+            affines.append(affine)
+        child.addChild(text); group.addChild(child)
         nodes.append((translation, text))
     state = {"digest": digest, "payload": payload, "parent": parent, "stock": stock,
              "group": group, "scale": scaling, "correction": correction,
-             "nodes": nodes, "active": False}
+             "nodes": nodes, "affines": affines, "active": False}
     proxy._bcs_source_layout = state
     _refresh(obj, state)
     return {"persisted": True, "native_nodes_installed": state["active"],

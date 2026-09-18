@@ -1,4 +1,3 @@
-from copy import deepcopy
 import json
 import math
 from pathlib import Path
@@ -14,7 +13,7 @@ import PDFTextLayout as layout
 
 def _source():
     chars = [{"c": c, "origin": (10+x, 20.), "bbox": (10+x, 17., 12+x, 21.)}
-             for c, x in zip("AV Ω ", (0., 2.5, 7., 8.5, 12.))]
+             for c, x in zip("AV Ω ", (0., 2.5, 7., 8.5, 12.), strict=True)]
     span = {"font": "Arial", "size": 3., "origin": (10., 20.), "bbox": (10., 17., 24., 21.),
             "chars": chars}
     item = {"pdf_sha256": "a"*64, "page_number": 1, "block_index": 0,
@@ -29,6 +28,21 @@ def _payload():
     item, raw = _source()
     return layout.build_source_layout(item, raw, scale=2., font_size=6., font_name="Arial",
                                       host_rotation_deg=0.)
+
+
+def _affine_payload():
+    item, raw = _source()
+    for char in raw["blocks"][0]["lines"][0]["spans"][0]["chars"]:
+        x, y = char["origin"]
+        # Genuine affine shear and nonuniform glyph scale. Nominal matrix
+        # expansion is 3, while its font-Y vector is (.375, 6.).
+        quad = ((x+.375, y-6.), (x+1.375, y-6.), (x+.875, y+2.), (x-.125, y+2.))
+        char["quad"] = quad
+        char["source_font_metrics"] = dict(schema="mupdf_original_font_metrics/1",
+            text=char["c"], origin=char["origin"], quad=quad, writing_mode=0,
+            size=3., ascender=1., descender=-1./3.)
+    return layout.build_source_affine_layout(item, raw, scale=2., font_size=6.,
+        font_name="Arial", host_rotation_deg=0.)
 
 
 def test_character_layout_preserves_nonuniform_positions_unicode_and_spaces():
@@ -112,13 +126,14 @@ class Transform:
 
 COIN = SimpleNamespace(SoSeparator=Group, SoTransform=Transform,
     SoScale=lambda: SimpleNamespace(scaleFactor=Field()), SoFont=Font,
-    SoTranslation=lambda: SimpleNamespace(translation=Field()), SoAsciiText=Text)
+    SoTranslation=lambda: SimpleNamespace(translation=Field()), SoAsciiText=Text,
+    SoMatrixTransform=lambda: SimpleNamespace(matrix=Field()), SbMatrix=lambda *values: values)
 
 
-def _object(*, label=False):
+def _object(*, label=False, affine=False):
     obj = SimpleNamespace(Text=["AV Ω "], CustomText=["AV Ω "],
                           PDFSourceItemId="p1:b0:l0:s0", PDFRepresentation="labels" if label else "text")
-    setattr(obj, layout.PROPERTY, json.dumps(_payload()))
+    setattr(obj, layout.PROPERTY, json.dumps(_affine_payload() if affine else _payload()))
     obj.Placement = SimpleNamespace(Base=SimpleNamespace(x=20., y=30., z=0.),
                                     Rotation=SimpleNamespace(Q=(0., 0., 0., 1.)))
     view = SimpleNamespace(Object=obj, FontSize=6., ScaleMultiplier=1., FontName="Arial",
@@ -176,8 +191,9 @@ def test_native_nodes_stay_in_same_editable_draft_object_and_preserve_content():
 
 
 @pytest.mark.parametrize("label", [False, True])
-def test_actual_text_edit_restores_native_renderer_and_undo_reenables_source(label):
-    obj = _object(label=label); proxy = obj.ViewObject.Proxy
+@pytest.mark.parametrize("affine", [False, True])
+def test_actual_text_edit_restores_native_renderer_and_undo_reenables_source(label, affine):
+    obj = _object(label=label, affine=affine); proxy = obj.ViewObject.Proxy
     layout.restore_object_layout(obj, coin_module=COIN)
     prop = "CustomText" if label else "Text"
     _change_data(obj, prop, ["Edited content"])
@@ -187,8 +203,9 @@ def test_actual_text_edit_restores_native_renderer_and_undo_reenables_source(lab
     assert proxy._bcs_source_layout["active"]
 
 
-def test_font_size_and_scale_edits_scale_characters_without_rewriting_source():
-    obj = _object(); view = obj.ViewObject; proxy = view.Proxy
+@pytest.mark.parametrize("affine", [False, True])
+def test_font_size_and_scale_edits_scale_characters_without_rewriting_source(affine):
+    obj = _object(affine=affine); view = obj.ViewObject; proxy = view.Proxy
     encoded = getattr(obj, layout.PROPERTY)
     layout.restore_object_layout(obj, coin_module=COIN)
     _change_view(obj, "FontSize", 12.)
@@ -201,16 +218,18 @@ def test_font_size_and_scale_edits_scale_characters_without_rewriting_source():
 @pytest.mark.parametrize("prop,value", [("FontName", "Other"), ("Justification", "Center"),
                                         ("MaxChars", 5), ("Frame", "Rectangle"),
                                         ("DisplayMode", "Screen"), ("TextAlignment", "Top")])
-def test_view_edits_use_normal_native_behavior(prop, value):
-    obj = _object(); view = obj.ViewObject
+@pytest.mark.parametrize("affine", [False, True])
+def test_view_edits_use_normal_native_behavior(prop, value, affine):
+    obj = _object(affine=affine); view = obj.ViewObject
     layout.restore_object_layout(obj, coin_module=COIN)
     _change_view(obj, prop, value)
     assert not view.Proxy._bcs_source_layout["active"]
     assert getattr(view, prop) == value
 
 
-def test_label_margin_is_cancelled_and_new_placement_is_respected():
-    obj = _object(label=True); proxy = obj.ViewObject.Proxy
+@pytest.mark.parametrize("affine", [False, True])
+def test_label_margin_is_cancelled_and_new_placement_is_respected(affine):
+    obj = _object(label=True, affine=affine); proxy = obj.ViewObject.Proxy
     layout.restore_object_layout(obj, coin_module=COIN)
     correction = proxy._bcs_source_layout["correction"]
     assert correction.translation.value == pytest.approx((-.6, 6., 0.))
@@ -219,8 +238,9 @@ def test_label_margin_is_cancelled_and_new_placement_is_respected():
     assert correction.translation.value == pytest.approx((4.4, 6., 0.))
 
 
-def test_fresh_view_provider_restores_persisted_layout_without_touching_gui_settings():
-    obj = _object(); encoded = getattr(obj, layout.PROPERTY)
+@pytest.mark.parametrize("affine", [False, True])
+def test_fresh_view_provider_restores_persisted_layout_without_touching_gui_settings(affine):
+    obj = _object(affine=affine); encoded = getattr(obj, layout.PROPERTY)
     obj.ViewObject.FontSize = 9.
     result = layout.restore_object_layout(obj, coin_module=COIN)
     assert result["native_nodes_installed"]
@@ -229,6 +249,39 @@ def test_fresh_view_provider_restores_persisted_layout_without_touching_gui_sett
     group = obj.ViewObject.Proxy._bcs_source_layout["group"]
     layout.restore_object_layout(obj, coin_module=COIN)
     assert obj.ViewObject.Proxy._bcs_source_layout["group"] is group
+
+
+def test_affine_scene_keeps_source_origins_and_applies_exact_xy_axes():
+    obj = _object(affine=True)
+    payload = json.loads(getattr(obj, layout.PROPERTY))
+    layout.restore_object_layout(obj, coin_module=COIN)
+    state = obj.ViewObject.Proxy._bcs_source_layout
+    assert len(state["affines"]) == len(payload["characters"])
+    for matrix, (translation, text), char in zip(state["affines"], state["nodes"], payload["characters"], strict=True):
+        assert translation.translation.value == tuple(char["local_origin"])
+        assert text.string.value == [char["text"]]
+        # Native font's one-em basis at size6 must become (3,0),(.75,12).
+        values = matrix.matrix.value
+        assert tuple(value*6. for value in values[:2]) == pytest.approx((3., 0.))
+        assert tuple(value*6. for value in values[4:6]) == pytest.approx((.75, 12.))
+        assert values[12:16] == (0., 0., 0., 1.)
+
+
+@pytest.mark.parametrize("fault", ["missing_scale", "nan", "nonunit", "collinear", "wrong_schema"])
+def test_bad_persisted_affine_is_rejected_before_native_scene_change(fault):
+    obj = _object(affine=True)
+    stock = obj.ViewObject.Proxy.text_wld
+    payload = json.loads(getattr(obj, layout.PROPERTY))
+    char = payload["characters"][0]
+    if fault == "missing_scale": char.pop("baseline_scale")
+    if fault == "nan": char["up_scale"] = float("nan")
+    if fault == "nonunit": char["baseline_axis"] = [2., 0.]
+    if fault == "collinear": char["up_axis"] = list(char["baseline_axis"])
+    if fault == "wrong_schema": payload["source_affine"] = "unsupported"
+    setattr(obj, layout.PROPERTY, json.dumps(payload))
+    with pytest.raises((TypeError, ValueError)):
+        layout.restore_object_layout(obj, coin_module=COIN)
+    assert obj.ViewObject.Proxy.node_wld.findChild(stock) >= 0
 
 
 def test_corrupt_layout_is_rejected_before_changing_visible_nodes():

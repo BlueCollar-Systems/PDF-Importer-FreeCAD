@@ -25,7 +25,7 @@ def test_failed_layout_removes_only_its_owned_native_objects(monkeypatch, failur
                   evidence=dict(font_size=3., font_name='Arial', rotation_deg=0.))
     def fail(*_a, **_kw):
         raise ValueError('invalid source fixture')
-    monkeypatch.setattr(layout, 'build_source_layout', fail if failure == 'invalid_inventory' else lambda *_a, **_kw: {})
+    monkeypatch.setattr(layout, 'build_source_affine_layout', fail if failure == 'invalid_inventory' else lambda *_a, **_kw: {})
     monkeypatch.setattr(layout, 'persist_source_layout', fail if failure == 'native_install' else lambda *_a: {'native_nodes_installed':False})
     with pytest.raises(core.TextRepresentationFailure) as caught:
         core._bind_native_source_layout({}, result, {}, opts=core.ImportOptions(), scale=1., doc=doc, group=group)

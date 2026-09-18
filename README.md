@@ -14,8 +14,8 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 
 ## Recent fixes (v4.0.105)
 
-- Native Text and Labels preserve the original PDF character positions and baseline, including after save/reopen, while remaining editable.
-- 3D Text uses filled source-colored display. Glyphs and Geometry retain editable source outlines with a thinner source-colored display.
+- Native Text and Labels preserve original character positions and font transforms, including after save/reopen, while remaining editable.
+- 3D Text places each solid glyph at its original source position and scale, preserving stacked fractions and stretched or slanted text without fitting glyph ink to declared character advances. It uses filled source-colored display. Glyphs and Geometry retain editable source outlines with a thinner source-colored display.
 - Verified final rectangle highlights preserve source transparency and physical border widths. A toggleable white paper display keeps dark ink readable without changing the application theme.
 - Headless documents restore their saved visibility and display nodes when opened in the GUI. Concurrent imports use separate report folders.
 - Original renderer character quads and expanded Raster coverage prevent false glyph shear and cropped letter edges. Wholly off-page paints are removed only when complete renderer bounds prove they are invisible.

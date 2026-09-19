@@ -46,7 +46,11 @@ activate_bundled_runtime_if_available(_mod_root)
 from pdfcadcore.fitz_loader import import_fitz as _import_fitz
 from pdfcadcore.primitive_extractor import _composite_alpha, _span_alpha
 from pdfcadcore.import_bounds import sheet_xy as _sheet_xy
-from pdfcadcore.drawing_clips import get_clip_aware_drawings, UnsupportedClipFillError
+from pdfcadcore.drawing_clips import (
+    clip_fill_issues,
+    get_clip_aware_drawings,
+    summarize_clip_fill_issues,
+)
 
 fitz = _import_fitz()
 
@@ -729,6 +733,137 @@ def _record_raster_page(opts: ImportOptions, reason: Optional[str] = None) -> No
         opts.raster_fallback_reasons.append(reason)
 
 
+# Warning-level clipped-fill records kept in the import report. Info-level ones
+# (resolved exactly, or never visible) run to thousands per sheet: counted only.
+CLIP_FILL_REPORT_ISSUE_LIMIT = 200
+
+
+def _new_clip_fill_delivery() -> Dict[str, Any]:
+    return {
+        "resolved_exactly": 0,
+        "dropped_invisible": 0,
+        "approximated": 0,
+        "dropped": 0,
+        "by_action": {},
+        "pages_with_warnings": [],
+        "issues": [],
+        "issues_truncated": False,
+    }
+
+
+def _finite_json(value):
+    """A record value as the report writer accepts it: NaN and infinity become None."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, (list, tuple)):
+        return [_finite_json(item) for item in value]
+    return value
+
+
+def _record_clip_fill_issues(opts: ImportOptions, page_num: int, issues, step: int = 1) -> None:
+    """Add one page's clipped-fill issues to this run's delivery record.
+
+    The record lives in ``_report_extra`` so it accumulates over pages and is
+    removed with a cancelled or rolled-back page like every other page result.
+    Host build drops are added on top of what the core resolver recorded;
+    ``step=-1`` first takes back the core's record of that same fill, so a fill
+    this host dropped is not also counted as resolved or approximated.
+    """
+    issues = list(issues or ())
+    if not issues:
+        return
+    report_extra = getattr(opts, "_report_extra", None)
+    if not isinstance(report_extra, dict):
+        report_extra = opts._report_extra = {}
+    block = report_extra.setdefault("clip_fill_delivery", _new_clip_fill_delivery())
+    page = int(page_num)
+    for issue in issues:
+        action = str(issue.get("action") or "unknown")
+        block["by_action"][action] = int(block["by_action"].get(action, 0)) + step
+        if block["by_action"][action] <= 0:
+            del block["by_action"][action]
+        dropped = bool(issue.get("dropped"))
+        if issue.get("severity") != "warning":
+            block["dropped_invisible" if dropped else "resolved_exactly"] += step
+            continue
+        block["dropped" if dropped else "approximated"] += step
+        if step < 0:
+            block["issues"] = [
+                listed for listed in block["issues"]
+                if (listed.get("page"), listed.get("seqno"), listed.get("stage"))
+                != (page, issue.get("seqno"), None)
+            ]
+            continue
+        if page not in block["pages_with_warnings"]:
+            block["pages_with_warnings"].append(page)
+        if len(block["issues"]) < CLIP_FILL_REPORT_ISSUE_LIMIT:
+            # One NaN here would make the report writer refuse the whole report.
+            block["issues"].append(
+                {key: _finite_json(value) for key, value in dict(issue, page=page).items()})
+        else:
+            block["issues_truncated"] = True
+
+
+def _host_clip_fill_issue(path_group, error: BaseException, superseded=()) -> Dict[str, Any]:
+    """Issue record for a compound clip fill this host could not build.
+
+    It is built inside the per-fill ``except``: nothing here may raise, or the
+    failure that was just contained becomes document-fatal again.
+    """
+    try:
+        paint_rect = [float(v) for v in path_group.get("rect")]
+    except Exception:
+        paint_rect = []
+    if not all(math.isfinite(v) for v in paint_rect):
+        paint_rect = []
+    try:
+        fill = [float(v) for v in path_group.get("fill")]
+    except Exception:
+        fill = None
+    try:
+        fill_opacity = float(path_group.get("fill_opacity", 1.0))
+    except Exception:
+        fill_opacity = 1.0
+    try:
+        detail = "%s: %s" % (type(error).__name__, error)
+    except Exception:
+        detail = type(error).__name__
+    issue = {
+        "seqno": path_group.get("seqno"),
+        "reason": "host-build-error",
+        "action": "dropped-unsupported",
+        "exact": False,
+        "severity": "warning",
+        "dropped": True,
+        "detail": detail,
+        "paint_rect": paint_rect,
+        "fill": fill,
+        "fill_opacity": fill_opacity,
+        "stage": "host-build",
+    }
+    for core_issue in superseded:
+        # How the core had delivered the fill this host then could not build.
+        issue["core_action"] = core_issue.get("action")
+    return issue
+
+
+def _clip_fill_warning_line(opts: ImportOptions) -> str:
+    """One operator sentence per import; '' when no visible fill was affected."""
+    block = (getattr(opts, "_report_extra", None) or {}).get("clip_fill_delivery") or {}
+    summary = summarize_clip_fill_issues(block.get("issues"))
+    if not summary:
+        return ""
+    pages = ", ".join(str(page) for page in sorted(block.get("pages_with_warnings") or []))
+    line = f"PDF import: {summary} on page(s) {pages}."
+    if block.get("issues_truncated"):
+        total = int(block.get("dropped", 0)) + int(block.get("approximated", 0))
+        line += (
+            f" {total} fills are affected in all; the import report lists the "
+            f"first {CLIP_FILL_REPORT_ISSUE_LIMIT}."
+        )
+    return line + " See clip_fill_delivery in the import report."
+
+
 def _auto_raster_needs_text_overlay(
     effective_mode: str,
     source_text_blocks: int,
@@ -1276,6 +1411,12 @@ def write_import_report(
         extra["max_page_complexity_units"] = int(
             getattr(opts, "max_page_complexity_units", 0) or 0
         )
+    # Always present, so "nothing needed care" is a statement and not an absence.
+    clip_fill_delivery = extra.setdefault("clip_fill_delivery", _new_clip_fill_delivery())
+    clip_fill_warnings = (
+        int(clip_fill_delivery.get("dropped", 0) or 0)
+        + int(clip_fill_delivery.get("approximated", 0) or 0)
+    )
 
     report = build_import_report(
         host_app="freecad",
@@ -1301,6 +1442,8 @@ def write_import_report(
         text_fallback=text_fallback,
         peak_mb=sample_process_mb(),
         performance_phases=phases or None,
+        # Visible clipped fills that were left out or are approximate.
+        warnings=clip_fill_warnings,
         extra=extra,
     )
 
@@ -10453,6 +10596,11 @@ def import_pdf_page(pdf_path: str, page_num: int = 1,
     finally:
         pdf_doc.close()
 
+    # import_pdf says this once per import; this entry point is its own import.
+    clip_fill_warning = _clip_fill_warning_line(opts)
+    if clip_fill_warning:
+        _warn(clip_fill_warning)
+
     if autofit:
         _autofit_import_view(fc_doc)
 
@@ -10552,11 +10700,10 @@ def _page_visual_inventory(page, import_mode: str):
     if str(import_mode or "").strip().lower() == "raster":
         return [], 0
     try:
+        # A clipped fill the resolver cannot prove is left out on its own and
+        # recorded on the returned rows (clip_fill_issues); it never raises, so
+        # one mask can no longer empty this inventory or abort the document.
         drawings = get_clip_aware_drawings(page)
-    except UnsupportedClipFillError:
-        # An unsupported mask must not silently become unmasked artwork or
-        # a whole-page raster import selected from an empty vector inventory.
-        raise
     except Exception as exc:
         _warn(f"get_drawings() failed: {exc}")
         drawings = []
@@ -10653,6 +10800,9 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
 
     # ── Vector drawings ──
     drawings, n_images = _page_visual_inventory(page, opts.import_mode)
+    # What happened to each clipped fill rides on this list object only. The
+    # raster-overlay and hatch filters below rebuild plain lists; read it now.
+    page_clip_fill_issues = clip_fill_issues(drawings)
     n_drawings = len(drawings)
     if not getattr(opts, "_active_page_profile", None):
         opts._active_page_profile = _page_complexity_profile(drawings, n_images, None)
@@ -10941,6 +11091,11 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             _msg(f"Page {page_num}: imported as raster image")
             return top_group, None
 
+    # Vector geometry is built from here on. A page delivered as raster above
+    # builds no fills, so it reports nothing about them.
+    if not placed_full_page_raster_background:
+        _record_clip_fill_issues(opts, page_num, page_clip_fill_issues)
+
     # ── Hatch detection ──
     hatch_indices = set()
     hatch_drawings = []
@@ -11117,7 +11272,9 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             # page above; reading page.rect here built two PyMuPDF Rects per
             # path group (1.1 million on a 550k-path sheet, 15 s).
             page_area = page_w * page_h
-            if grp_area > page_area * 0.95:
+            # A compound clip fill is a shaped mask (a frame, a ring) whose
+            # bounds are its clip's: sheet-sized bounds are not sheet-sized ink.
+            if grp_area > page_area * 0.95 and not path_group.get("bcs_compound_clip_fill"):
                 continue
 
         parent = _parent_for(stroke_rgb or fill_rgb, layer_name)
@@ -11125,14 +11282,33 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         if path_group.get("bcs_compound_clip_fill"):
             # This is one painted mask with counter holes. Independent faces
             # would fill its holes; source outlines must also bypass cleanup.
-            shape = _compound_clip_fill_shape(path_group, page_h, opts, scale)
-            obj = fc_doc.addObject("Part::Feature", "ClippedFill")
-            obj.Shape = shape
-            obj.addProperty("App::PropertyString", "PDFClipFillGroupId", "PDF Source")
-            obj.PDFClipFillGroupId = str(path_group["bcs_clip_fill_group_id"])
-            _apply_style(obj, None, fill_rgb, width, dashes, opts)
-            parent.addObject(obj)
-            obj_count += 1
+            obj = None
+            try:
+                shape = _compound_clip_fill_shape(path_group, page_h, opts, scale)
+                obj = fc_doc.addObject("Part::Feature", "ClippedFill")
+                obj.Shape = shape
+                obj.addProperty("App::PropertyString", "PDFClipFillGroupId", "PDF Source")
+                obj.PDFClipFillGroupId = str(path_group["bcs_clip_fill_group_id"])
+                _apply_style(obj, None, fill_rgb, width, dashes, opts)
+                parent.addObject(obj)
+                obj_count += 1
+            except ImportCancelled:
+                raise
+            except Exception as exc:
+                # One mask this host cannot build costs that one fill, never the
+                # page: it is left out (never drawn unmasked) and reported.
+                if obj is not None:
+                    try:
+                        fc_doc.removeObject(obj.Name)
+                    except Exception:
+                        pass
+                # Counted once, as this host's drop: what the core recorded for
+                # the same fill (cut exactly, or flattened) is taken back first.
+                superseded = [issue for issue in page_clip_fill_issues
+                              if issue.get("seqno") == path_group.get("seqno")]
+                _record_clip_fill_issues(opts, page_num, superseded, step=-1)
+                _record_clip_fill_issues(
+                    opts, page_num, [_host_clip_fill_issue(path_group, exc, superseded)])
             continue
 
         # Build edges per sub-path
@@ -12673,6 +12849,11 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     except (RuntimeError, OSError, ValueError, TypeError) as e:
         if opts.verbose:
             _warn(f"Scale detection pass skipped: {e}")
+
+    # One line per import, not per fill; silent when every fill resolved exactly.
+    clip_fill_warning = _clip_fill_warning_line(opts)
+    if clip_fill_warning:
+        _warn(clip_fill_warning)
 
     try:
         report_path = opts.import_report_path or _default_import_report_path(pdf_path)

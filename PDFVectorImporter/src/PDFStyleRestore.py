@@ -68,6 +68,8 @@ MARKER_PROPERTIES = frozenset({
     "PDFSourceText",
     "PDFDisplayPaintJSON",
     "PDFPaperDisplayJSON",
+    "PDFNonTextCompositeJSON",
+    "PDFImageOrderDisplayJSON",
 })
 COLOR_VIEW_PROPERTIES = ("TextColor", "ShapeColor", "LineColor", "PointColor")
 FONT_VIEW_PROPERTIES = ("FontName", "Font")
@@ -626,6 +628,12 @@ def _console_log(message: str) -> None:
 def restore_document_display_nodes(doc: Any) -> None:
     """Rebuild explicit source/display transforms without reverting GUI styles."""
     objects = getattr(doc, "Objects", ())
+    if any(getattr(obj, "PDFNonTextCompositeJSON", None) for obj in objects):
+        try:
+            from .PDFNonTextComposite import restore_document_displays
+        except ImportError:
+            from PDFNonTextComposite import restore_document_displays
+        restore_document_displays(doc)
     if any(getattr(obj, "PDFDisplayPaintJSON", None) for obj in objects):
         try:
             from .PDFLatePaint import restore_document_displays
@@ -638,6 +646,12 @@ def restore_document_display_nodes(doc: Any) -> None:
         except ImportError:
             from PDFTextLayout import restore_document_layouts
         restore_document_layouts(doc)
+    if any(getattr(obj, "PDFImageOrderDisplayJSON", None) for obj in objects):
+        try:
+            from .PDFImagePaintOrder import restore_document_displays
+        except ImportError:
+            from PDFImagePaintOrder import restore_document_displays
+        restore_document_displays(doc)
     if any(getattr(obj, "PDFPaperDisplayJSON", None) for obj in objects):
         try:
             from .PDFPaperDisplay import restore_document_paper

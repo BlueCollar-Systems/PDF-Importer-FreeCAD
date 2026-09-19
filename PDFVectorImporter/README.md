@@ -12,6 +12,14 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 
 ---
 
+## Changes prepared for v4.0.106
+
+- Glyphs and Geometry retry the original page with MuPDF when Cairo's SVG has no usable glyph placements. The requested representation and exact source-item ownership remain unchanged.
+- Verified short round-cap strokes retain analytic editable footprints. For qualified Multiply regions containing no text or images, a separate embedded 600 DPI source display plane preserves the original composited colors. Hide that labeled plane to edit the underlying source geometry. Pixel budgets and unsupported clipping or transparency cases are reported without reducing resolution.
+- Qualified opaque images retain their original pixels and affine placement above earlier paint. Later source strokes and verified native text keep their own geometry and requested text representation, with persistent display ordering after save/reopen.
+
+These are bounded source-proven repairs, not a general PDF transparency compositor. Native lineweight display and finite-resolution display planes retain their existing zoom limits.
+
 ## Recent fixes (v4.0.105)
 
 - Native Text and Labels preserve the original PDF character positions and baseline, including after save/reopen, while remaining editable.

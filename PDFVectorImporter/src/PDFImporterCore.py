@@ -10152,8 +10152,22 @@ def _import_embedded_images_as_planes(pdf_doc, page, page_num: int,
             try:
                 dpi = _adaptive_patch_dpi(page, opts, rect)
                 zoom = dpi / 72.0
-                pix = render_page.get_pixmap(
-                    matrix=fitz.Matrix(zoom, zoom), clip=rect)
+                image_plan_matches = [plan for plan in getattr(opts, "_current_image_order_plans", [])
+                                      if plan["page"] == int(page_num)
+                                      and plan["source_xref"] == xref
+                                      and plan["pixel_digest"] == _image_digest
+                                      and tuple(plan["source_bbox_pdf"]) == tuple(rect)]
+                if len(image_plan_matches) > 1:
+                    raise ValueError("Image-order source occurrence is ambiguous")
+                image_plan = image_plan_matches[0] if image_plan_matches else None
+                if image_plan is not None:
+                    try:
+                        from .PDFImagePaintOrderProof import exact_image_bytes
+                    except ImportError:
+                        from PDFImagePaintOrderProof import exact_image_bytes
+                    pix = fitz.Pixmap(exact_image_bytes(page, image_plan, fitz))
+                else:
+                    pix = render_page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=rect)
                 if int(getattr(pix, "width", 0) or 0) <= 0 or int(
                         getattr(pix, "height", 0) or 0) <= 0:
                     raise RuntimeError("image patch contains no pixels")
@@ -10170,6 +10184,9 @@ def _import_embedded_images_as_planes(pdf_doc, page, page_num: int,
                         (rect.x1, rect.y0), (rect.x1, rect.y1),
                     )
                 ]
+                if image_plan is not None:
+                    corners = [_to_fc(point, page_h, opts, scale)
+                               for point in image_plan["source_quad_pdf"]]
                 xs = [float(p.x) for p in corners]
                 ys = [float(p.y) for p in corners]
                 w_units = max(xs) - min(xs)
@@ -10180,7 +10197,7 @@ def _import_embedded_images_as_planes(pdf_doc, page, page_num: int,
                 center_y = (max(ys) + min(ys)) / 2.0
                 # Behind native vectors; staggered against z-fighting where
                 # neighbouring patch bboxes overlap.
-                center_z = -0.1 - 0.002 * ((idx - 1) % 200)
+                center_z = 0. if image_plan is not None else -0.1 - 0.002 * ((idx - 1) % 200)
 
                 ip = fc_doc.addObject(
                     "Image::ImagePlane", "PDF_Image_p%d_i%d" % (page_num, idx))
@@ -10210,6 +10227,9 @@ def _import_embedded_images_as_planes(pdf_doc, page, page_num: int,
                     add_property(
                         "App::PropertyString", "PDFRasterSHA256", "PDF Import")
                 ip.PDFRasterSHA256 = raster_sha256
+                if image_plan is not None:
+                    add_property("App::PropertyString", "PDFOpaqueImageSourceJSON", "PDF Source")
+                    ip.PDFOpaqueImageSourceJSON = json.dumps(image_plan, sort_keys=True)
                 _annotate_text_host_object(
                     ip, "p%d:img%d" % (int(page_num), idx), "raster")
                 img_group.addObject(ip)
@@ -10968,6 +10988,29 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
 
     obj_count = 0
 
+    image_order_plans = []
+    if not opts.ignore_images and not placed_full_page_raster_background and n_images:
+        try:
+            from .PDFImagePaintOrderProof import plan_opaque_images
+        except ImportError:
+            from PDFImagePaintOrderProof import plan_opaque_images
+        source_sha = str(getattr(opts, "_pdf_sha256", "") or _pdf_file_sha256(pdf_path))
+        if _pdf_file_sha256(pdf_path) != source_sha:
+            raise ValueError("Original PDF changed before image-order source proof")
+        image_order_plans = plan_opaque_images(page, fitz, source_sha)
+        if not opts.import_text or opts.text_mode == "none":
+            image_order_plans = [plan for plan in image_order_plans if not plan["later_text"]]
+        if _pdf_file_sha256(pdf_path) != source_sha:
+            raise ValueError("Original PDF changed during image-order source proof")
+    opts._current_image_order_plans = image_order_plans
+    image_order_strokes = {spec["source_draw_order"]: spec for plan in image_order_plans
+                           for spec in plan["later_strokes"].values()}
+
+    def _bind_image_order_stroke(obj, source_order):
+        if source_order in image_order_strokes:
+            obj.addProperty("App::PropertyString", "PDFImageOrderStrokeJSON", "PDF Source")
+            obj.PDFImageOrderStrokeJSON = json.dumps(image_order_strokes[source_order], sort_keys=True)
+
     # ── Heavy-page detection ──
     # When a page has a huge number of drawing groups or path operations,
     # automatically engage
@@ -11036,10 +11079,11 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
     def _add_to_batch(shape, parent, stroke_rgb, fill_rgb, width, dashes):
         """Add a shape to the batch or create immediately if batching disabled."""
         nonlocal obj_count
-        if not _batch_size:
+        if not _batch_size or path_group.get("seqno") in image_order_strokes:
             # No batching — original behavior
             obj = fc_doc.addObject("Part::Feature", "Wire")
             obj.Shape = shape
+            _bind_image_order_stroke(obj, path_group.get("seqno"))
             _apply_style(obj, stroke_rgb, fill_rgb, width, dashes, opts)
             parent.addObject(obj)
             obj_count += 1
@@ -11395,6 +11439,10 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         for edges, is_closed in wires_edges:
             want_face = ((opts.hatch_to_faces and fill is not None)
                          or (opts.make_faces and is_closed))
+            if path_group.get("seqno") in image_order_strokes:
+                # Source-qualified later paint is a stroke; an invisible fs
+                # fill must not acquire an opaque native face above the image.
+                want_face = False
             if _batch_size and not want_face:
                 # Batch wires into compounds to reduce GDI handle count
                 try:
@@ -11413,6 +11461,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 # Faces and non-batchable shapes: create individually
                 obj = _make_shape_obj(edges, is_closed, make_face=want_face, fc_doc=fc_doc)
                 if obj is not None:
+                    _bind_image_order_stroke(obj, path_group.get("seqno"))
                     _apply_style(obj, stroke_rgb, fill_rgb, width, dashes, opts)
                     parent.addObject(obj)
                     obj_count += 1
@@ -11711,6 +11760,23 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as e:
             _warn(f"Image import failed: {e}")
 
+    if image_order_plans:
+        try:
+            from .PDFImagePaintOrder import apply_image_order
+        except ImportError:
+            from PDFImagePaintOrder import apply_image_order
+        image_displays = apply_image_order(
+            page, image_order_plans, pdf_path=pdf_path, source_sha256=source_sha,
+            doc=fc_doc, objects=[obj for obj in fc_doc.Objects if obj.Name not in page_existing_object_names],
+            attempts=list(getattr(opts, "text_delivery_attempts", [])),
+            mapper=lambda point: _to_fc(point, page_h, opts, scale), fitz=fitz,
+        )
+        report_extra = dict(getattr(opts, "_report_extra", {}) or {})
+        report_extra["source_image_order_displays"] = list(
+            report_extra.get("source_image_order_displays", [])
+        ) + image_displays
+        opts._report_extra = report_extra
+
     # Final source annotation paints belong above earlier native text. Their
     # display depth is independent of the preserved source-plane geometry.
     if not placed_full_page_raster_background and drawings:
@@ -11725,6 +11791,40 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             mapper=lambda point: _to_fc(point, page_h, opts, scale), scale=scale,
         )
         opts._final_source_paint_displays = list(getattr(opts, "_final_source_paint_displays", [])) + late_paint
+
+    if not placed_full_page_raster_background and stroke_footprints and opts.hatch_mode == "import":
+        try:
+            from .PDFNonTextComposite import apply_composites
+            from .PDFNonTextCompositeProof import multiply_modes
+        except ImportError:
+            from PDFNonTextComposite import apply_composites
+            from PDFNonTextCompositeProof import multiply_modes
+        composite_displays = apply_composites(
+            page, stroke_footprints, pdf_path=pdf_path,
+            source_sha256=str(getattr(opts, "_pdf_sha256", "") or _pdf_file_sha256(pdf_path)),
+            page_number=int(page_num), doc=fc_doc, parent=top_group or fc_doc,
+            objects=[obj for obj in fc_doc.Objects if obj.Name not in page_existing_object_names],
+            mapper=lambda point: _to_fc(point, page_h, opts, scale),
+            asset_dir=_raster_asset_dir(), fitz=fitz,
+            remaining_pixels=max(0, 64_000_000-int(getattr(opts, "_nontext_composite_pixels", 0))),
+        )
+        opts._nontext_composite_pixels = int(getattr(opts, "_nontext_composite_pixels", 0)) + sum(
+            row["pixels"]["width"] * row["pixels"]["height"] for row in composite_displays
+        )
+        obj_count += len(composite_displays)
+        report_extra = dict(getattr(opts, "_report_extra", {}) or {})
+        report_extra["nontext_source_composite_displays"] = list(
+            report_extra.get("nontext_source_composite_displays", [])
+        ) + composite_displays
+        applied_orders = {row["recipe"]["source_paint_order"] for row in composite_displays}
+        unsupported = [seq for seq, proof in stroke_footprints.items()
+                       if multiply_modes(proof.get("source_blend_modes")) and seq not in applied_orders]
+        report_extra["unsupported_nontext_composites"] = list(
+            report_extra.get("unsupported_nontext_composites", [])
+        ) + ([{"page": int(page_num), "source_paint_orders": unsupported,
+               "reason": "source qualification or exact pixel budget unavailable; editable source geometry retained"}]
+             if unsupported else [])
+        opts._report_extra = report_extra
 
     if not placed_full_page_raster_background:
         try:
@@ -11829,6 +11929,8 @@ def _reset_import_run_state(opts: ImportOptions) -> None:
     _RASTER_ASSET_DIR_CACHE = None
     opts._page_complexity_profiles = []
     opts._final_source_paint_displays = []
+    opts._nontext_composite_pixels = 0
+    opts._current_image_order_plans = []
     opts._active_page_index = 0
     opts._active_page_total = 0
     opts._active_page_profile = None
@@ -11859,6 +11961,7 @@ _PAGE_RESULT_TELEMETRY_FIELDS = (
     "wirestring_cache_stats",
     "text3d_outline_cache_stats",
     "_final_source_paint_displays",
+    "_nontext_composite_pixels",
 )
 
 

@@ -300,6 +300,52 @@ def test_assigned_native_shape_cannot_lose_holes_faces_or_coordinates(mutation):
         fill.verify_shape(shape, proof)
 
 
+def test_native_vertical_edge_ulp_does_not_reverse_coordinate_correspondence():
+    proof = fill.classify_contours([rectangle(0.05, -0.2, 0.1, 0.0)])
+    shape = native_shape(proof)
+    edge = shape.Edges[-1]
+    edge.Vertexes[-1].Point.x = math.nextafter(0.05, math.inf)
+    actual = sorted((v.Point.x, v.Point.y) for v in edge.Vertexes)
+    expected = sorted(proof["contours"][0][-2:])
+    # This is the observed native failure: sorting swaps the vertical endpoints,
+    # making the old positional comparison claim a 0.2 mm error from one ULP.
+    assert not math.isclose(actual[0][1], expected[0][1], rel_tol=1e-10, abs_tol=1e-9)
+    shape.Edges.reverse()
+    for other in shape.Edges:
+        other.Vertexes.reverse()
+    fill.verify_shape(shape, proof)
+
+
+def test_same_tolerance_matching_can_reassign_an_ambiguous_edge():
+    def edge(x):
+        return ((x, 0.0), (x, 1.0))
+
+    # First actual edge can use either expected occurrence; second can only use
+    # the first. A greedy match would falsely reject the available bijection.
+    actual = [edge(0.9e-9), edge(0.0)]
+    expected = [edge(0.0), edge(1.8e-9)]
+    assert fill._edges_have_bijection(actual, expected)
+    assert not fill._edges_have_bijection([edge(0.0), edge(0.0)], expected)
+
+
+@pytest.mark.parametrize("mutation", ["duplicate", "outside-tolerance", "edge-rank"])
+def test_native_edge_matching_retains_multiplicity_and_coordinate_limits(mutation):
+    proof = fill.classify_contours([rectangle(0.0, 0.0, 1.0, 1.0)])
+    shape = native_shape(proof)
+    if mutation == "duplicate":
+        shape.Edges[1] = shape.Edges[0]
+    elif mutation == "outside-tolerance":
+        shape.Edges[0].Vertexes[0].Point.x = math.nextafter(1e-9, math.inf)
+    else:
+        # The same vertex multiset with different pairings is not the same edges.
+        shape.Edges[0].Vertexes[1], shape.Edges[2].Vertexes[1] = (
+            shape.Edges[2].Vertexes[1],
+            shape.Edges[0].Vertexes[1],
+        )
+    with pytest.raises(ValueError, match="changed source contour coordinates"):
+        fill.verify_shape(shape, proof)
+
+
 def test_failed_face_maker_never_falls_back_to_simple():
     calls = []
 

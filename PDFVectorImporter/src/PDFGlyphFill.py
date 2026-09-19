@@ -168,6 +168,66 @@ def classify_contours(contours, fill_rule="nonzero"):
     }
 
 
+def _same_edge(actual, expected):
+    def same_point(a, e):
+        return all(
+            math.isclose(a[axis], e[axis], rel_tol=1e-10, abs_tol=1e-9)
+            for axis in (0, 1)
+        )
+
+    return (
+        same_point(actual[0], expected[0]) and same_point(actual[1], expected[1])
+    ) or (same_point(actual[0], expected[1]) and same_point(actual[1], expected[0]))
+
+
+def _edges_have_bijection(actual, expected):
+    """Match edge occurrences, preserving connectivity and duplicate counts."""
+    if len(actual) != len(expected) or any(
+        len(edge) != 2 for edge in (*actual, *expected)
+    ):
+        return False
+    # Common case: sorted edge ranks agree. Endpoint orientation is not geometry;
+    # one-ULP OCC variation at equal X can reverse lexicographic endpoint order.
+    if all(_same_edge(a, e) for a, e in zip(actual, expected, strict=True)):
+        return True
+
+    compatible = [
+        [index for index, e in enumerate(expected) if _same_edge(a, e)] for a in actual
+    ]
+    if any(not matches for matches in compatible):
+        return False
+    expected_owner = [None] * len(expected)
+    actual_match = [None] * len(actual)
+    for start in range(len(actual)):
+        # Find an augmenting path rather than greedily consuming a near match.
+        # Iteration avoids a recursion limit for glyphs with many contours.
+        pending, seen_actual, parent = [start], {start}, {}
+        free = None
+        for current in pending:
+            for index in compatible[current]:
+                if index in parent:
+                    continue
+                parent[index] = current
+                owner = expected_owner[index]
+                if owner is None:
+                    free = index
+                    break
+                if owner not in seen_actual:
+                    seen_actual.add(owner)
+                    pending.append(owner)
+            if free is not None:
+                break
+        if free is None:
+            return False
+        while free is not None:
+            owner = parent[free]
+            previous = actual_match[owner]
+            expected_owner[free] = owner
+            actual_match[owner] = free
+            free = previous
+    return True
+
+
 def verify_shape(shape, proof, area_scale=1.0):
     """Read live host topology and area; never trust a pre-assignment memo."""
     expected_area = float(proof["area"]) * abs(float(area_scale))
@@ -201,15 +261,7 @@ def verify_shape(shape, proof, area_scale=1.0):
         for loop in proof["contours"]
         for a, b in zip(loop, loop[1:], strict=False)
     )
-    if len(actual) != len(expected) or any(
-        len(actual_edge) != 2
-        or not all(
-            math.isclose(a, e, rel_tol=1e-10, abs_tol=1e-9)
-            for ap, ep in zip(actual_edge, expected_edge, strict=False)
-            for a, e in zip(ap, ep, strict=False)
-        )
-        for actual_edge, expected_edge in zip(actual, expected, strict=False)
-    ):
+    if not _edges_have_bijection(actual, expected):
         raise ValueError("native glyph fill changed source contour coordinates")
 
 

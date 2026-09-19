@@ -69,13 +69,17 @@ def vector(x, y, z=0):
 class Object:
     def __init__(self, name, kind):
         self.Name, self.TypeId = name, kind
-        self.PropertiesList = []
+        self.PropertiesList = ["Shape"] if kind == "Part::Feature" else []
         self.ViewObject = None
         self.Placement = NS(Base=vector(0, 0), toMatrix=lambda: NS(A=[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]))
         self.Placement.Rotation = NS(Q=(0, 0, 0, 1))
 
     def addProperty(self, kind, name, group):
         self.PropertiesList.append(name)
+
+    def getPropertyByName(self, name):
+        assert name in self.PropertiesList
+        return getattr(self, name)
 
 
 class Shape:

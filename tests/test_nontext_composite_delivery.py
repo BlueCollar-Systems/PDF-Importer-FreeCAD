@@ -33,11 +33,15 @@ class Shape:
 class Object:
     def __init__(self, name, kind):
         self.Name, self.TypeId = name, kind
-        self.PropertiesList = []
+        self.PropertiesList = ["Shape"] if kind == "Part::Feature" else []
         self.ViewObject = None
 
     def addProperty(self, kind, name, group):
         self.PropertiesList.append(name)
+
+    def getPropertyByName(self, name):
+        assert name in self.PropertiesList
+        return getattr(self, name)
 
 
 class Document:
@@ -164,7 +168,9 @@ def test_rotated_image_with_correct_base_and_size_is_rejected(case, monkeypatch)
 
 def test_patch_clears_actual_positive_native_and_existing_owned_display_depth(case):
     page, proofs, args, _ = case
-    tall = NS(Shape=NS(BoundBox=NS(ZMax=4)), PDFImageOrderDisplayJSON=json.dumps({"display_offset_z_mm": .7}))
+    tall = Object("Tall", "Part::Feature")
+    tall.Shape = NS(BoundBox=NS(ZMax=4))
+    tall.PDFImageOrderDisplayJSON = json.dumps({"display_offset_z_mm": .7})
     args["objects"].append(tall)
     rows = delivery.apply_composites(page, proofs, **args)
     assert rows[0]["display_z_mm"] == pytest.approx(4.73)

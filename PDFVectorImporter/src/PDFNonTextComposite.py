@@ -33,11 +33,29 @@ def _upright(obj):
             and max(abs(v) for v in q[:3]) <= 1e-12 and abs(abs(q[3])-1) <= 1e-12)
 
 
+def stored_shapes(objects):
+    """Read declared shapes without constructing group compounds.
+
+    Import callers supply every new page object. A plain organizational group
+    contributes no geometry beyond those leaves; refuse incomplete membership
+    or transformed containers instead of silently omitting their geometry.
+    """
+    objects = list(objects)
+    for obj in objects:
+        properties = obj.PropertiesList
+        if "Group" in properties and "Shape" not in properties:
+            if obj.TypeId != "App::DocumentObjectGroup" or "Placement" in properties:
+                raise ValueError("Unsupported shape-less display container")
+            if any(member not in objects for member in obj.getPropertyByName("Group")):
+                raise ValueError("Display depth scan lacks a group member")
+    return [(obj, obj.getPropertyByName("Shape") if "Shape" in obj.PropertiesList else None)
+            for obj in objects]
+
+
 def display_top(objects):
     """Bound current importer geometry plus all owned existing view offsets."""
     top = 0.
-    for obj in objects:
-        shape = getattr(obj, "Shape", None)
+    for obj, shape in stored_shapes(objects):
         placement = getattr(obj, "Placement", None)
         z = float(shape.BoundBox.ZMax) if shape else float(placement.Base.z) if placement else 0.
         for prop, key in (("PDFImageOrderDisplayJSON", "display_offset_z_mm"),

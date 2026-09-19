@@ -16,7 +16,7 @@ def test_embedded_source_image_is_not_a_completed_page_text_crop(monkeypatch):
     monkeypatch.setattr(paint, 'final_rows', lambda _page: [row])
     # This source image has no text-crop checksum/placement contract. It must
     # neither be rejected as a bad text crop nor cut a hole in later paint.
-    image = SimpleNamespace(PDFRepresentation='raster', PDFSourceItemId='p1:img1')
+    image = SimpleNamespace(PropertiesList=[], PDFRepresentation='raster', PDFSourceItemId='p1:img1')
     assert paint.apply_final_paints(None, page_number=1, pdf_sha256='a'*64,
         doc=None, parent=None, objects=[image], scale=1,
         mapper=lambda point: SimpleNamespace(x=point[0],y=point[1])) == []

@@ -36,13 +36,14 @@ def _state(obj):
                 source_id=str(getattr(obj, "PDFSourceItemId", "")))
 
 
-def restore_display(obj):
-    encoded = getattr(obj, PROPERTY, None)
+def restore_display(obj, *, property_name=PROPERTY, node_name=NODE_NAME,
+                    schema="bcs.freecad.image-order-display/1"):
+    encoded = getattr(obj, property_name, None)
     if not encoded or getattr(obj, "ViewObject", None) is None:
         return False
     data = json.loads(encoded)
     depth = data["display_offset_z_mm"]
-    if (data["schema"] != "bcs.freecad.image-order-display/1"
+    if (data["schema"] != schema
             or not math.isfinite(depth) or depth <= 0):
         raise ValueError("Invalid persisted source image-order depth")
     # ImagePlane's included payload remains usable after moving the FCStd away
@@ -59,10 +60,10 @@ def restore_display(obj):
     from pivy import coin
     root = obj.ViewObject.RootNode
     for index in reversed(range(root.getNumChildren())):
-        if str(root.getChild(index).getName()) == NODE_NAME:
+        if str(root.getChild(index).getName()) == node_name:
             root.removeChild(index)
     node = coin.SoTranslation()
-    node.setName(NODE_NAME)
+    node.setName(node_name)
     node.translation.setValue(0, 0, depth)
     root.insertChild(node, 0)
     return True
@@ -173,8 +174,8 @@ def apply_image_order(page, plans, *, pdf_path, source_sha256, doc, objects,
                             page=plan["page"], source_paint_order=seq, source_image_order=plan["source_paint_order"],
                             display_offset_z_mm=top-low, native_state=before,
                             representation_unchanged=representation, source_proof=plan)
-                if obj is image:
-                    data["image_png_sha256"] = hashlib.sha256(Path(str(image.ImageFile)).read_bytes()).hexdigest()
+                if obj.TypeId == "Image::ImagePlane":
+                    data["image_png_sha256"] = hashlib.sha256(Path(str(obj.ImageFile)).read_bytes()).hexdigest()
                 if PROPERTY not in obj.PropertiesList:
                     obj.addProperty("App::PropertyString", PROPERTY, "PDF source display")
                 setattr(obj, PROPERTY, json.dumps(data, sort_keys=True))

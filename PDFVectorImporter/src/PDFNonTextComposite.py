@@ -41,6 +41,7 @@ def display_top(objects):
         placement = getattr(obj, "Placement", None)
         z = float(shape.BoundBox.ZMax) if shape else float(placement.Base.z) if placement else 0.
         for prop, key in (("PDFImageOrderDisplayJSON", "display_offset_z_mm"),
+                          ("PDFRectOrderDisplayJSON", "display_offset_z_mm"),
                           ("PDFDisplayPaintJSON", "display_z_mm"),
                           (PROPERTY, "display_z_mm")):
             encoded = getattr(obj, prop, None)

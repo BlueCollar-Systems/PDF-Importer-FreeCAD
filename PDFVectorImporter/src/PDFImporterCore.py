@@ -9242,6 +9242,13 @@ def _deliver_text_item_svg(
                 # Raw outline modes retain every editable source edge. A thin
                 # initial viewport stroke avoids closing small glyph counters.
                 view.LineWidth = 1.0
+                if attempted_type == "glyphs" and getattr(host_obj, "PDFGlyphFillJSON", ""):
+                    try:
+                        from .PDFStyleRestore import has_source_glyph_fill
+                    except ImportError:
+                        from PDFStyleRestore import has_source_glyph_fill
+                    if has_source_glyph_fill(host_obj):
+                        _apply_text3d_display_style(host_obj)
     except Exception as exc:
         result_summary = {
             "exception": "%s: %s" % (exc.__class__.__name__, exc),
@@ -10988,6 +10995,20 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
 
     obj_count = 0
 
+    source_sha = str(getattr(opts, "_pdf_sha256", "") or _pdf_file_sha256(pdf_path))
+    rect_order_plans = []
+    if (not placed_full_page_raster_background and opts.import_text and opts.text_mode != "none"
+            and opts.hatch_mode == "import" and opts.hatch_to_faces):
+        try:
+            from .PDFOpaqueRectOrderProof import plan_opaque_rectangles
+        except ImportError:
+            from PDFOpaqueRectOrderProof import plan_opaque_rectangles
+        if _pdf_file_sha256(pdf_path) != source_sha:
+            raise ValueError("Original PDF changed before rectangle-order source proof")
+        rect_order_plans = plan_opaque_rectangles(page, source_sha)
+        if _pdf_file_sha256(pdf_path) != source_sha:
+            raise ValueError("Original PDF changed during rectangle-order source proof")
+    rect_order_by_seq = {plan["source_draw_order"]: plan for plan in rect_order_plans}
     image_order_plans = []
     if not opts.ignore_images and not placed_full_page_raster_background and n_images:
         try:
@@ -11010,6 +11031,9 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         if source_order in image_order_strokes:
             obj.addProperty("App::PropertyString", "PDFImageOrderStrokeJSON", "PDF Source")
             obj.PDFImageOrderStrokeJSON = json.dumps(image_order_strokes[source_order], sort_keys=True)
+        if source_order in rect_order_by_seq:
+            obj.addProperty("App::PropertyString", "PDFOpaqueRectSourceJSON", "PDF Source")
+            obj.PDFOpaqueRectSourceJSON = json.dumps(rect_order_by_seq[source_order], sort_keys=True)
 
     # ── Heavy-page detection ──
     # When a page has a huge number of drawing groups or path operations,
@@ -11759,6 +11783,22 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             raise
         except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as e:
             _warn(f"Image import failed: {e}")
+
+    if rect_order_plans:
+        try:
+            from .PDFOpaqueRectOrder import apply_rectangle_order
+        except ImportError:
+            from PDFOpaqueRectOrder import apply_rectangle_order
+        rect_displays = apply_rectangle_order(
+            page, rect_order_plans, pdf_path=pdf_path, source_sha256=source_sha,
+            objects=[obj for obj in fc_doc.Objects if obj.Name not in page_existing_object_names],
+            attempts=list(getattr(opts, "text_delivery_attempts", [])),
+            mapper=lambda point: _to_fc(point, page_h, opts, scale),
+        )
+        report_extra = dict(getattr(opts, "_report_extra", {}) or {})
+        report_extra["source_opaque_rectangle_displays"] = list(
+            report_extra.get("source_opaque_rectangle_displays", [])) + rect_displays
+        opts._report_extra = report_extra
 
     if image_order_plans:
         try:

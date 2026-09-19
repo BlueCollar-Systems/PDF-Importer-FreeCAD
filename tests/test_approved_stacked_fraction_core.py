@@ -15,12 +15,14 @@ from pdfcadcore import primitive_extractor  # noqa: E402
 
 # This is the reviewed integration output: current main's fraction core plus
 # the lossless performance changes and exact covered-clip contours and adjacent source-outline protection.
-# The combined bytes were reviewed together and match the Blender and LibreCAD
-# shared cores; ordinary paths and the approved fraction logic are unchanged.
+# The FreeCAD combined bytes were reviewed together; host-specific optional
+# font-metadata differences from the other importers remain explicitly recorded.
 # September 17 adds raw source RGB/alpha/finite paint order beside the unchanged
 # composite colors. No fraction/layout/source-character proof was modified.
+# September 19 preserves literal single-open-line endpoints before point
+# cleanup, including zero-length and sub-cleanup-tolerance source strokes.
 REVIEWED_COMBINED_SUCCESSOR_SHA256 = (
-    "19649d27cd5e860a243cbbe429a20dfe7d56aebb501335cc53d4482f427cd595"
+    "454aabaff1ea12c82b8e8d6d4c8e9cc35bfbfd9bb68e77773dc1bce2abbdff87"
 )
 
 

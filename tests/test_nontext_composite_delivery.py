@@ -11,6 +11,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "PDFVectorImporter" / "src"))
 import PDFNonTextComposite as delivery
+from fake_image_view_fc import ImageView, Translation
 from test_nontext_composite_proof import originals, sample
 
 
@@ -174,40 +175,33 @@ def test_restore_rebinds_missing_external_file_to_verified_embedded_pixels(case,
     delivery.apply_composites(page, proofs, **args)
     obj = args["doc"].Objects[-1]
 
-    class Node:
-        def __init__(self):
-            self.name = ""
-            self.translation = NS(setValue=lambda *v: setattr(self, "value", v))
-
-        def setName(self, value):
-            self.name = value
-
-        def getName(self):
-            return self.name
-
-    class Root:
-        def __init__(self):
-            self.children = []
-
-        def getNumChildren(self):
-            return len(self.children)
-
-        def getChild(self, i):
-            return self.children[i]
-
-        def removeChild(self, i):
-            self.children.pop(i)
-
-        def insertChild(self, node, i):
-            self.children.insert(i, node)
-
     obj.ImageFile = "missing.png"
-    obj.ViewObject = NS(RootNode=Root(), Lighting="OneSide", Visibility=False)
-    monkeypatch.setitem(sys.modules, "pivy", NS(coin=NS(SoTranslation=Node)))
+    obj.ViewObject = ImageView()
+    monkeypatch.setitem(sys.modules, "pivy", NS(coin=NS(SoTranslation=Translation)))
     assert delivery.restore_display(obj)
     assert delivery.restore_display(obj)
     assert len(obj.ViewObject.RootNode.children) == 1
     assert obj.ViewObject.RootNode.children[0].value == (0, 0, .03)
     assert obj.ImageFile == obj.PDFRasterFile
     assert obj.ViewObject.Visibility is False
+    assert obj.ViewObject.DisplayMode == "No shading"
+    assert obj.ViewObject.Lighting == "One side"
     assert obj.Placement.Base.z == 0
+
+
+def test_new_composite_uses_supported_native_image_mode(case, monkeypatch):
+    page, proofs, args, _ = case
+    original = args["doc"].addObject
+
+    def with_gui(kind, name):
+        obj = original(kind, name)
+        if kind == "Image::ImagePlane":
+            obj.ViewObject = ImageView()
+        return obj
+
+    monkeypatch.setattr(args["doc"], "addObject", with_gui)
+    monkeypatch.setitem(sys.modules, "pivy", NS(coin=NS(SoTranslation=Translation)))
+    assert len(delivery.apply_composites(page, proofs, **args)) == 1
+    view = args["doc"].Objects[-1].ViewObject
+    assert view.DisplayMode == "No shading" and view.Lighting == "One side"
+    assert len(view.RootNode.children) == 1

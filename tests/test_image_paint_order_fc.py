@@ -13,6 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parents[1] / "PDFVectorImporter" / "src"))
 import PDFImagePaintOrderProof as proof
 import PDFImagePaintOrder as delivery
+from fake_image_view_fc import ImageView, Translation
 
 
 def source(*, after="stroke"):
@@ -135,6 +136,23 @@ def test_native_order_metadata_keeps_source_shapes_text_and_plane_geometry_uncha
     assert [r["display_offset_z_mm"] for r in rows] == sorted(r["display_offset_z_mm"] for r in rows)
     assert [delivery._state(obj) for obj in kwargs["objects"]] == before
     assert kwargs["attempts"][0]["final_type"] == "glyphs"
+
+
+def test_image_order_uses_supported_unlit_mode_and_idempotent_owned_nodes(native, monkeypatch):
+    page, plans, kwargs = native
+    before = [delivery._state(obj) for obj in kwargs["objects"]]
+    for obj in kwargs["objects"]:
+        obj.ViewObject = ImageView()
+    monkeypatch.setitem(sys.modules, "pivy", NS(coin=NS(SoTranslation=Translation)))
+    assert len(delivery.apply_image_order(page, plans, **kwargs)) == 3
+    image, stroke, text = kwargs["objects"]
+    assert image.ViewObject.DisplayMode == "No shading"
+    assert image.ViewObject.Lighting == "One side"
+    assert stroke.ViewObject.DisplayMode == text.ViewObject.DisplayMode == "Shaded"
+    for obj in kwargs["objects"]:
+        assert delivery.restore_display(obj)
+        assert len(obj.ViewObject.RootNode.children) == 1
+    assert [delivery._state(obj) for obj in kwargs["objects"]] == before
 
 
 @pytest.mark.parametrize("mutation", ["pixels", "corners", "rotation", "stroke", "text_owner", "missing_text"])

@@ -93,8 +93,8 @@ def restore_display(obj):
         if not included or not Path(included).is_file() or _sha(included) != expected_png:
             raise ValueError("Embedded non-text composite pixels are unavailable or changed")
         obj.ImageFile = included
-    if obj.ViewObject.Lighting != "NoShading":
-        obj.ViewObject.Lighting = "NoShading"
+    if obj.ViewObject.DisplayMode != "No shading":
+        obj.ViewObject.DisplayMode = "No shading"
     from pivy import coin
     root = obj.ViewObject.RootNode
     for index in reversed(range(root.getNumChildren())):
@@ -196,7 +196,7 @@ def apply_composites(page, capsule_proofs, *, pdf_path, source_sha256, page_numb
                     or hashlib.sha256(capsule.Shape.exportBrepToString().encode()).hexdigest() != shape_sha):
                 raise ValueError("Native non-text composite altered source geometry or pixel placement")
             if obj.ViewObject is not None:
-                obj.ViewObject.Lighting = "NoShading"
+                obj.ViewObject.DisplayMode = "No shading"
                 restore_display(obj)
             records.append(dict(data, native_object=obj.Name))
         return records

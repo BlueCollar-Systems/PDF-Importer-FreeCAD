@@ -55,7 +55,7 @@ def restore_display(obj):
             if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
                 raise ValueError("Opaque image's embedded source pixels are unavailable")
             obj.ImageFile = str(path)
-        obj.ViewObject.Lighting = "NoShading"
+        obj.ViewObject.DisplayMode = "No shading"
     from pivy import coin
     root = obj.ViewObject.RootNode
     for index in reversed(range(root.getNumChildren())):

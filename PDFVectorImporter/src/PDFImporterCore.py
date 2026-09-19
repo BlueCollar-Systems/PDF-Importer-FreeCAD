@@ -1175,6 +1175,16 @@ def write_import_report(
     if text_attempts:
         extra["text_delivery_attempts"] = text_attempts
 
+    # Host font honesty: which host font every delivered native text item was
+    # handed, and which of those the host does not draw with the source font.
+    from PDFHostFonts import summarize_host_fonts
+
+    host_font_summary = summarize_host_fonts(text_attempts)
+    extra["host_font_map"] = host_font_summary["host_font_map"]
+    extra["host_font_substitutions"] = host_font_summary["host_font_substitutions"]
+    extra["host_font_unverified"] = host_font_summary["host_font_unverified"]
+    host_font_warnings = len(host_font_summary["host_font_substitutions"])
+
     font_stage_failures = [
         dict(failure)
         for failure in (getattr(opts, "_font_stage_failures", []) or [])
@@ -1442,10 +1452,27 @@ def write_import_report(
         text_fallback=text_fallback,
         peak_mb=sample_process_mb(),
         performance_phases=phases or None,
-        # Visible clipped fills that were left out or are approximate.
-        warnings=clip_fill_warnings,
+        # Visible clipped fills that were left out or are approximate, plus PDF
+        # fonts that are not drawn with the source font itself.
+        warnings=clip_fill_warnings + host_font_warnings,
         extra=extra,
     )
+
+    if host_font_summary["note"]:
+        # The shared core overwrites extra["font_substitution_note"] from its
+        # PDF audit inside build_import_report, so the host note is appended
+        # here and the human summary is rebuilt to carry it.
+        from pdfcadcore.import_report import build_human_summary
+
+        core_font_note = str(
+            report.extra.get("font_substitution_note") or ""
+        ).strip().rstrip(".")
+        report.extra["font_substitution_note"] = ". ".join(
+            part for part in (core_font_note, host_font_summary["note"]) if part
+        )
+        report.extra["human_summary"] = build_human_summary(report)
+        for host_font_warning in host_font_summary["console_warnings"]:
+            _warn(host_font_warning)
 
     if text_fallback and isinstance(getattr(report, "fallback", None), dict):
         fallback_text = report.fallback.get("text")
@@ -2383,42 +2410,26 @@ def _effective_descender(text: str, font_descender: float) -> float:
     return font_descender * 0.08
 
 
-def _normalize_pdf_font_name(font_name: str) -> str:
-    """Normalize PDF font names to practical system font family names.
+def _resolve_pdf_host_font(font_name: str, flags: Any = None) -> Dict[str, Any]:
+    """Host font resolution record for one PDF span font (see PDFHostFonts)."""
+    from PDFHostFonts import resolve_host_font
 
-    PDF fonts often arrive as subset names like "ABCDEE+Helvetica-Bold".
-    Draft accepts family names more reliably than subset/raw PDF names.
+    return resolve_host_font(font_name, flags)
+
+
+def _normalize_pdf_font_name(font_name: str, flags: Any = None) -> str:
+    """Map a PDF span font name to the font name handed to Draft Text/Labels.
+
+    PDF fonts arrive as subset/PostScript names like "ABCDEE+Helvetica-Bold" or
+    "ArialNarrow,Bold"; Draft needs a host family name ("Arial Narrow Bold").
+    A variant is never collapsed to its base family: that silently changes the
+    text width. ``flags`` are the PyMuPDF span flags (bold/italic rescue a name
+    MuPDF truncated). Empty input returns ""; non-empty input never does.
     """
     raw = str(font_name or "").strip()
     if not raw:
         return ""
-
-    if "+" in raw:
-        prefix, rest = raw.split("+", 1)
-        if len(prefix) == 6 and prefix.isupper():
-            raw = rest.strip()
-
-    low = raw.lower()
-    if "helvetica" in low or "arial" in low:
-        family = "Arial"
-    elif "times" in low:
-        family = "Times New Roman"
-    elif "courier" in low:
-        family = "Courier New"
-    elif "calibri" in low:
-        family = "Calibri"
-    else:
-        return raw
-
-    is_bold = bool(re.search(r"\bbold\b|\bbd\b", low))
-    is_italic = bool(re.search(r"\bitalic\b|\boblique\b|\bit\b", low))
-    if is_bold and is_italic:
-        return f"{family} Bold Italic"
-    if is_bold:
-        return f"{family} Bold"
-    if is_italic:
-        return f"{family} Italic"
-    return family
+    return str(_resolve_pdf_host_font(raw, flags).get("host_font") or "") or raw
 
 
 def _line_angle_deg(line: dict, opts: Optional[ImportOptions] = None) -> float:
@@ -2679,7 +2690,9 @@ def _render_text_spans_exact_labels(
                     )
 
                 pos = _to_fc(origin, page_h, opts, scale)
-                font_name = _normalize_pdf_font_name(span.get("font", ""))
+                font_name = _normalize_pdf_font_name(
+                    span.get("font", ""), span.get("flags")
+                )
                 # Draft text is placed from a host text-box anchor while PDF
                 # spans report a baseline origin. Apply the same local-axis
                 # correction for horizontal and rotated exact labels so leader
@@ -2777,6 +2790,9 @@ def _render_text_spans_exact_labels(
                         "source_text_preserved": True,
                         "source_font": str(span.get("font", "") or ""),
                         "font_name": font_name,
+                        "font_status": _resolve_pdf_host_font(
+                            span.get("font", ""), span.get("flags")
+                        )["status"],
                         "rotation_deg": float(span_angle_deg),
                         "font_size": float(font_size_fc),
                     },
@@ -3582,6 +3598,12 @@ def _resolve_shapestring_font_path_with_evidence(
         "arialitalicmt": "ariali.ttf",
         "arialbolditalic": "arialbi.ttf",
         "arialbolditalicmt": "arialbi.ttf",
+        # Arial Narrow / Arial Black are their own families, never "Arial".
+        "arialnarrow": "ARIALN.TTF",
+        "arialnarrowbold": "ARIALNB.TTF",
+        "arialnarrowitalic": "ARIALNI.TTF",
+        "arialnarrowbolditalic": "ARIALNBI.TTF",
+        "arialblack": "ariblk.ttf",
         "calibri": "calibri.ttf",
         "calibriregular": "calibri.ttf",
         "calibribold": "calibrib.ttf",
@@ -6718,7 +6740,9 @@ def _deliver_text_item_native(
         text_group.addObject(host_obj)
         _annotate_text_host_object(host_obj, source_item_id, attempted_type)
 
-        normalized_font = _normalize_pdf_font_name(span.get("font", ""))
+        normalized_font = _normalize_pdf_font_name(
+            span.get("font", ""), span.get("flags")
+        )
         source_color = _span_source_color(span)
         color_metadata = (
             ",".join(format(float(channel), ".9g") for channel in source_color)
@@ -6898,6 +6922,12 @@ def _deliver_text_item_native(
             "verified_anchor_xyz": tuple(actual_anchor),
             "rotation_deg": float(actual_rotation),
             "font_name": normalized_font,
+            # Honest font record: what the PDF asked for, and whether the host
+            # draws it with that font itself or substitutes (PDFHostFonts).
+            "source_font": str(span.get("font", "") or ""),
+            "font_status": _resolve_pdf_host_font(
+                span.get("font", ""), span.get("flags")
+            )["status"],
             "font_size": float(actual_font_size),
             "source_color": source_color,
             "color_verified": bool(color_verified),
@@ -7924,7 +7954,7 @@ def _deliver_text_item_3d(
 
     depth = max(font_size_fc * 0.12, 0.05)
     source_color = _span_source_color(span)
-    normalized_font = _normalize_pdf_font_name(source_font)
+    normalized_font = _normalize_pdf_font_name(source_font, span.get("flags"))
     compound_failure_evidence: Optional[Dict[str, Any]] = None
     compound_zero_outline_evidence: Optional[Dict[str, Any]] = None
     stage = "host_annotation"

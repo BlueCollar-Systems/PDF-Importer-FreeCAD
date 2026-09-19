@@ -270,6 +270,40 @@ def native_shape(proof):
     )
 
 
+def test_native_getter_values_are_reused_only_within_one_verification():
+    proof = fill.classify_contours([rectangle(0, 0, 10, 10)])
+    live = native_shape(proof)
+    counts = {}
+
+    class Counted:
+        def __init__(self, value, prefix):
+            self.value, self.prefix = value, prefix
+
+        def __getattr__(self, name):
+            key = self.prefix + "." + name
+            counts[key] = counts.get(key, 0) + 1
+            value = getattr(self.value, name)
+            if name == "Edges":
+                return [Counted(edge, "edge") for edge in value]
+            if name == "Vertexes":
+                return [Counted(vertex, "vertex") for vertex in value]
+            return value
+
+    observed = Counted(live, "shape")
+    fill.verify_shape(observed, proof)
+    assert counts["shape.Edges"] == counts["shape.Faces"] == counts["shape.Area"] == 1
+    assert counts["edge.Vertexes"] == 4 and counts["vertex.Point"] == 8
+    # A fresh assignment can replace the entire edge collection. Object identity
+    # is unchanged, so cross-call memoization would wrongly accept this change.
+    changed = native_shape(proof)
+    changed.Edges[0].Vertexes[0].Point.x += 0.1
+    live.Edges = changed.Edges
+    with pytest.raises(ValueError, match="source contour coordinates"):
+        fill.verify_shape(observed, proof)
+    assert counts["shape.Edges"] == counts["shape.Faces"] == counts["shape.Area"] == 2
+    assert counts["edge.Vertexes"] == 8 and counts["vertex.Point"] == 16
+
+
 @pytest.mark.parametrize(
     "mutation", ["drop-face", "fill-hole", "wrong-area", "xy", "z", "connectivity"]
 )

@@ -234,11 +234,14 @@ def verify_shape(shape, proof, area_scale=1.0):
     if not math.isfinite(expected_area) or expected_area <= 0:
         raise ValueError("invalid glyph affine determinant")
     faces = list(shape.Faces)
+    if shape.isNull() or not shape.isValid():
+        raise ValueError("native glyph fill lost source topology or area")
+    # Each getter enters the native kernel. Retain its value only for this
+    # invocation; assigned/recomputed shapes are read again at every stage.
+    edges = list(shape.Edges)
     if (
-        shape.isNull()
-        or not shape.isValid()
-        or len(faces) != len(proof["faces"])
-        or len(shape.Edges) != proof["edge_count"]
+        len(faces) != len(proof["faces"])
+        or len(edges) != proof["edge_count"]
         or sum(len(face.Wires) for face in faces)
         != sum(1 + len(row["holes"]) for row in proof["faces"])
         or not math.isclose(
@@ -246,14 +249,19 @@ def verify_shape(shape, proof, area_scale=1.0):
         )
     ):
         raise ValueError("native glyph fill lost source topology or area")
+    coordinates = []
+    for edge in edges:
+        points = [vertex.Point for vertex in edge.Vertexes]
+        coordinates.append(
+            [(float(point.x), float(point.y), float(point.z)) for point in points]
+        )
     actual = sorted(
-        tuple(sorted((float(v.Point.x), float(v.Point.y)) for v in edge.Vertexes))
-        for edge in shape.Edges
+        tuple(sorted((x, y) for x, y, _z in points)) for points in coordinates
     )
     if any(
-        not math.isfinite(float(v.Point.z)) or abs(float(v.Point.z)) > 1e-9
-        for edge in shape.Edges
-        for v in edge.Vertexes
+        not math.isfinite(z) or abs(z) > 1e-9
+        for points in coordinates
+        for _x, _y, z in points
     ):
         raise ValueError("native glyph fill left the source plane")
     expected = sorted(

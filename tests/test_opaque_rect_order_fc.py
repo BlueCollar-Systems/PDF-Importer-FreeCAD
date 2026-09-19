@@ -15,6 +15,62 @@ import PDFOpaqueRectOrderProof as proof
 import PDFOpaqueRectOrder as consumer
 
 
+def test_svg_rectangle_unique_clip_identity_keeps_full_containment_proof():
+    svg = (
+        '<svg><defs><clipPath id="c"><path d="M0 0H100V100H0Z"/>'
+        '</clipPath></defs><g clip-path="url(#c)">'
+        '<path d="M10 10H20V20H10Z" fill="#ffffff"/></g></svg>'
+    )
+    rows = proof._svg_rects(svg)
+    assert len(rows) == 1 and rows[0]["full_clip"] is True
+    assert rows[0]["bounds"] == (10.0, 10.0, 20.0, 20.0)
+
+
+def test_svg_rectangle_duplicate_clip_identity_cannot_choose_last_larger_clip():
+    svg = (
+        '<svg><defs><clipPath id="c"><path d="M0 0H1V1H0Z"/></clipPath>'
+        '<clipPath id="c"><path d="M0 0H100V100H0Z"/></clipPath></defs>'
+        '<g clip-path="url(#c)"><path d="M10 10H20V20H10Z" '
+        'fill="#ffffff"/></g></svg>'
+    )
+    assert proof._svg_rects(svg) == []
+
+
+@pytest.mark.parametrize(
+    "viewport",
+    [
+        'x="100" y="100" width="10" height="10"',
+        'viewBox="0 0 100 100" width="10" height="10"',
+    ],
+)
+def test_svg_rectangle_nested_viewport_is_not_treated_as_page_coordinates(viewport):
+    svg = (
+        "<svg><svg " + viewport + '><path d="M10 10H20V20H10Z" '
+        'fill="#ffffff"/></svg></svg>'
+    )
+    assert proof._svg_rects(svg) == []
+
+
+@pytest.mark.parametrize(
+    "style",
+    [
+        "<style>path { fill-opacity: 0.5; }</style>",
+        "<defs><style>path { display: none; }</style></defs>",
+    ],
+)
+def test_svg_document_styles_cannot_override_certified_opaque_rectangles(style):
+    svg = "<svg>" + style + '<path d="M10 10H20V20H10Z" fill="#ffffff"/></svg>'
+    assert proof._svg_rects(svg) == []
+
+
+def test_svg_stylesheet_instruction_is_not_discarded_before_qualification():
+    svg = (
+        '<?xml-stylesheet type="text/css" href="paint.css"?>'
+        '<svg><path d="M10 10H20V20H10Z" fill="#ffffff"/></svg>'
+    )
+    assert proof._svg_rects(svg) == []
+
+
 def source(*, stroke=True, later="text", opacity=1, clip=False):
     fitz = pytest.importorskip("pymupdf")
     doc = fitz.open()

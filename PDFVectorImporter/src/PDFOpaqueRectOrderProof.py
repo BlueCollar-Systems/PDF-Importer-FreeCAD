@@ -183,10 +183,25 @@ def _source_path_row(raw, order, kind):
 
 
 def _svg_rects(svg):
-    root = ET.fromstring(svg)
-    if not _neutral(root, {"version", "width", "height", "viewBox", "opacity"}):
+    # The proof understands one page viewport and unambiguous local clips;
+    # external/document CSS must not silently override these paint attributes.
+    if re.search(r"<\?xml-stylesheet(?:\s|\?>)", svg):
         return []
-    ids = {node.get("id"): node for node in root.iter() if node.get("id")}
+    root = ET.fromstring(svg)
+    if root.tag.rsplit("}", 1)[-1] != "svg" or not _neutral(
+        root, {"version", "width", "height", "viewBox", "opacity"}
+    ):
+        return []
+    ids = {}
+    for node in root.iter():
+        tag = node.tag.rsplit("}", 1)[-1]
+        if tag == "style" or (tag == "svg" and node is not root):
+            return []
+        node_id = node.get("id")
+        if node_id:
+            if node_id in ids:
+                return []
+            ids[node_id] = node
     result = []
     identity = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 

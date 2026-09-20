@@ -5995,10 +5995,19 @@ def _font_kern_probe_tables(
         ) from exc
 
     try:
-        cmap = font.getBestCmap()
-        if not isinstance(cmap, dict) or not cmap:
-            raise RuntimeError("source font character map could not be verified")
-        cmap_table = dict(cmap)
+        # A cmap or hmtx table fontTools cannot decode is MISSING MEASUREMENT
+        # DATA, not proof that the font is unusable. PDF subsetters routinely
+        # ship an hmtx whose trailing side-bearing array was dropped while hhea
+        # still describes the full face, and fontTools' strict reader refuses
+        # it - while FreeType and OCC draw every one of those glyphs. Both
+        # callers already cope with an absent table (_font_units_string_advance
+        # returns None and _measure_text3d_pen_advance falls back to the wire
+        # probe), so report the table as absent and let them decide.
+        try:
+            cmap = font.getBestCmap()
+        except Exception:
+            cmap = None
+        cmap_table = dict(cmap) if isinstance(cmap, dict) else {}
         kern_tables: List[Dict[Tuple[str, str], float]] = []
         if "kern" in font:
             raw_tables = getattr(font["kern"], "kernTables", None)
@@ -6014,19 +6023,23 @@ def _font_kern_probe_tables(
                     )
                 kern_tables.append(dict(raw_pairs))
         hmtx_metrics: Dict[str, Tuple[float, float]] = {}
-        if "hmtx" in font:
-            raw_metrics = getattr(font["hmtx"], "metrics", None)
-            if isinstance(raw_metrics, dict):
-                for glyph_name, metric in raw_metrics.items():
-                    if not isinstance(metric, (tuple, list)) or not metric:
-                        continue
-                    try:
-                        width = float(metric[0])
-                        lsb = float(metric[1]) if len(metric) > 1 else 0.0
-                    except (TypeError, ValueError):
-                        continue
-                    if math.isfinite(width):
-                        hmtx_metrics[str(glyph_name)] = (width, lsb)
+        try:
+            if "hmtx" in font:
+                raw_metrics = getattr(font["hmtx"], "metrics", None)
+                if isinstance(raw_metrics, dict):
+                    for glyph_name, metric in raw_metrics.items():
+                        if not isinstance(metric, (tuple, list)) or not metric:
+                            continue
+                        try:
+                            width = float(metric[0])
+                            lsb = float(metric[1]) if len(metric) > 1 else 0.0
+                        except (TypeError, ValueError):
+                            continue
+                        if math.isfinite(width):
+                            hmtx_metrics[str(glyph_name)] = (width, lsb)
+        except Exception:
+            # Undecodable advance metrics: measured from the outlines instead.
+            hmtx_metrics = {}
         payload = (cmap_table, kern_tables, hmtx_metrics)
         _FONT_KERN_PROBE_CACHE[font_path] = payload
         return payload
@@ -6049,9 +6062,17 @@ def _text3d_zero_kern_probe_candidates(
     if not isinstance(source_text, str) or not source_text:
         raise RuntimeError("source font tail glyph could not be verified")
     cmap, kern_tables, _hmtx = _font_kern_probe_tables(font_path)
+    if not cmap:
+        # An unreadable character map is not evidence about any one glyph, and
+        # it must never be mistaken for "this font has no glyph for that
+        # codepoint".
+        raise RuntimeError("source font character map could not be verified")
     left_glyph = cmap.get(ord(source_text[-1]))
     if not isinstance(left_glyph, str) or not left_glyph:
-        raise RuntimeError("source font tail glyph could not be verified")
+        raise RuntimeError(
+            "source font has no glyph for source character U+%04X"
+            % ord(source_text[-1])
+        )
 
     candidate_characters = []
     for character in (*source_text, "M", "I", "0", "|", "."):
@@ -6165,6 +6186,47 @@ def _measure_text3d_pen_advance(source_text: str, font_path: str) -> float:
     return probed
 
 
+class _Text3DGlyfOutline:
+    """One ``glyf`` glyph that draws itself without any advance metrics."""
+
+    def __init__(self, glyf_table, glyph):
+        self._glyf_table = glyf_table
+        self._glyph = glyph
+
+    def draw(self, pen) -> None:
+        self._glyph.draw(pen, self._glyf_table)
+
+
+class _Text3DGlyfOutlineSet:
+    """Source glyph outlines read straight from ``glyf``.
+
+    fontTools' own glyph set eagerly loads ``hmtx`` advance widths, and a PDF
+    subset font routinely ships a truncated ``hmtx`` while ``hhea`` still
+    describes the full face. The em-ink measurement needs the outlines and
+    ``unitsPerEm`` only, so an undecodable advance table must not cost the
+    measurement - these are the same contours fontTools would have drawn.
+    """
+
+    def __init__(self, glyf_table):
+        self._glyf_table = glyf_table
+
+    def __getitem__(self, glyph_name):
+        return _Text3DGlyfOutline(self._glyf_table, self._glyf_table[glyph_name])
+
+
+def _text3d_source_glyph_outlines(font):
+    """Return a glyph set for em-ink measurement, advance metrics or not."""
+    try:
+        return font.getGlyphSet()
+    except Exception:
+        # Only for a static TrueType outline font: a variable font's default
+        # instance is not the instance the page uses, and a CFF font has no
+        # glyf table to read instead.
+        if "glyf" not in font or "gvar" in font:
+            raise
+        return _Text3DGlyfOutlineSet(font["glyf"])
+
+
 def _text3d_source_em_scale(
     source_text: str, font_path: str, native_shape, native_size: float = 1.0
 ) -> float:
@@ -6187,7 +6249,7 @@ def _text3d_source_em_scale(
                 if not math.isfinite(units_per_em) or units_per_em <= 0.0:
                     raise ValueError("invalid unitsPerEm")
                 cmap = font.getBestCmap()
-                glyphs = font.getGlyphSet()
+                glyphs = _text3d_source_glyph_outlines(font)
                 bounds = []
                 for character in source_text:
                     if character.isspace():

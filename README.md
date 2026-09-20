@@ -54,6 +54,25 @@ Native wire outlines and general vector lineweights remain screen-dependent; Ras
 - An item-scoped rollback now refreshes the page's native-text object index.
   FreeCAD recycles a removed object's name, and a stale index turned one
   rolled-back item into thousands of induced failures on a dense sheet.
+- **Two root causes fixed, so the spans are delivered at the requested
+  representation instead of degrading.** A `cmap` or `hmtx` table fontTools
+  cannot decode is now reported as absent measurement data rather than a veto:
+  ordinary PDF subset fonts ship an `hmtx` whose trailing side-bearing array
+  was dropped while `hhea` still describes the full face, and the importer
+  already measures the pen advance from the outlines when metrics are missing.
+  The em-ink calibration reads the same outlines straight from `glyf` when
+  fontTools' glyph set cannot be built for the same reason; it refuses that
+  route for a variable or CFF font. Kerning values stay fail-closed, because a
+  wrong kern moves glyph ink. Measured: S05-11 in default 3D-text mode went
+  from writing nothing at all to 183/183 native 3D Text, certified.
+- The zero-advance escape in the source character layout now covers any
+  combining mark, enclosing mark or variation selector, not only whitespace. An
+  emoji followed by `U+FE0F` no longer makes an otherwise exact span
+  undeliverable. Zero-width joiners and other format characters are
+  deliberately not included.
+- An unreadable character map is never reported as "this font has no glyph for
+  that codepoint"; the two are now separate messages, and a genuinely missing
+  glyph names its codepoint.
 
 ## Recent fixes (v4.0.87)
 

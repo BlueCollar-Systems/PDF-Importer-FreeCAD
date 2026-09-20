@@ -115,6 +115,7 @@ _PROPERTIES = (
     ("App::PropertyString", "PDFImporterVersion"),
     ("App::PropertyString", "PDFRequestedPagesJSON"),
     ("App::PropertyString", "PDFCompletedPagesJSON"),
+    ("App::PropertyString", "PDFDegradedPagesJSON"),
     ("App::PropertyString", "PDFPageGroupsJSON"),
     ("App::PropertyString", "PDFImportStatus"),
 )
@@ -174,6 +175,8 @@ def create_session_object(document: Any, identity: Mapping[str, Any]) -> Any:
         "PDFImporterVersion": exact["importer_version"],
         "PDFRequestedPagesJSON": canonical_json(exact["requested_pages"]),
         "PDFCompletedPagesJSON": "[]",
+        # Imported, so a resume will not redo the page - but never certified.
+        "PDFDegradedPagesJSON": "[]",
         "PDFPageGroupsJSON": "{}",
         "PDFImportStatus": "running",
     }
@@ -202,6 +205,16 @@ def read_session_object(host: Any) -> dict[str, Any]:
         completed = []
     if any(page not in identity["requested_pages"] for page in completed):
         raise ValueError("import session completed pages are outside requested pages")
+    # A page whose text degraded was imported but was never certified. It is
+    # read tolerantly so a session written before this property existed still
+    # resumes; it simply carries no degrade.
+    try:
+        degraded = _normalize_pages(
+            json.loads(getattr(host, "PDFDegradedPagesJSON", "[]") or "[]")
+        )
+    except (ValueError, json.JSONDecodeError):
+        degraded = []
+    degraded = [page for page in degraded if page in completed]
     page_groups = json.loads(getattr(host, "PDFPageGroupsJSON", "{}"))
     if not isinstance(page_groups, dict):
         raise ValueError("import session page group map is invalid")
@@ -211,6 +224,7 @@ def read_session_object(host: Any) -> dict[str, Any]:
     return {
         **identity,
         "completed_pages": completed,
+        "degraded_pages": degraded,
         "page_groups": {str(key): str(value) for key, value in page_groups.items()},
         "status": status,
         "host": host,
@@ -223,6 +237,7 @@ def update_session_object(
     status: str,
     completed_pages: Iterable[int],
     page_groups: Mapping[int, str],
+    degraded_pages: Iterable[int] | None = None,
 ) -> None:
     if status not in STATUS_VALUES:
         raise ValueError(f"invalid import session status: {status!r}")
@@ -233,6 +248,12 @@ def update_session_object(
         raise ValueError("completed page is outside the session request")
     groups = {str(int(page)): str(name) for page, name in sorted(page_groups.items())}
     _set_property(host, "PDFCompletedPagesJSON", canonical_json(completed))
+    if degraded_pages is not None:
+        # Uncertified pages are never dropped from the record: a later
+        # invocation of the same session has to keep saying so.
+        degraded_set = {int(page) for page in degraded_pages}
+        degraded = [page for page in completed if page in degraded_set]
+        _set_property(host, "PDFDegradedPagesJSON", canonical_json(degraded))
     _set_property(host, "PDFPageGroupsJSON", canonical_json(groups))
     _set_property(host, "PDFImportStatus", status)
 

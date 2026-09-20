@@ -580,3 +580,185 @@ def test_requested_page_order_is_persisted_for_resume_offsets():
         requested_pages=[3, 1],
     )
     assert identity["requested_pages"] == [3, 1]
+
+
+def _degraded_page_entry(page_number: int) -> dict:
+    return {
+        "source_item_id": f"p{page_number}:b0:l0:s0",
+        "page_number": page_number,
+        "source_text": "EX001",
+        "requested_type": "text",
+        "attempted_types": ["text", "raster"],
+        "rung_outcomes": [],
+        "proof_class": "unproven_failure",
+        "final_representation": None,
+        "delivered": False,
+    }
+
+
+def test_resuming_a_session_whose_page_degraded_never_certifies_it(
+    monkeypatch, tmp_path
+):
+    """Owner directive 2026-09-19: no gate gets weaker, including on resume.
+
+    Page 1 degrades a text item and the operator cancels on page 2. The
+    resumed invocation imports page 2 cleanly and degrades nothing of its own,
+    so before this fix its report said ready:true with zero warnings for a
+    document whose page 1 was never certified.
+    """
+    import json as _json
+
+    document = Document()
+    captured = []
+    reports = []
+    real_write_import_report = core.write_import_report
+
+    def first_import(_pdf, _path, page_number, page_opts, doc):
+        page_opts._report_extra["text_source_spans"] = int(
+            page_opts._report_extra.get("text_source_spans", 0) or 0
+        ) + 1
+        if page_number == 1:
+            core._record_degraded_text_item(page_opts, _degraded_page_entry(1))
+            return doc.addObject("App::DocumentObjectGroup", "PDF_Page_1"), None
+        raise core.ImportCancelled("PDF import cancelled by user")
+
+    _install_import_fakes(monkeypatch, document, first_import, captured)
+
+    def write_real_report(**kwargs):
+        path = str(tmp_path / f"report_{len(reports)}.json")
+        kwargs["output_path"] = path
+        result = real_write_import_report(**kwargs)
+        reports.append(_json.loads(Path(path).read_text(encoding="utf-8")))
+        return result
+
+    monkeypatch.setattr(core, "write_import_report", write_real_report)
+    monkeypatch.setattr(core, "_warn", lambda *_a: None)
+
+    opts = core.ImportOptions(
+        pages=[1, 2],
+        import_text=True,
+        text_mode="text",
+        model3d_mode="off",
+        import_report_path=str(tmp_path / "cancelled.json"),
+    )
+    assert core.import_pdf("fixture.pdf", opts) is False
+
+    first = reports[-1]["extra"]
+    assert first["text_items_degraded"]["total"] == 1
+    assert first["representation_contract_scope"]["uncertified_degraded_pages"] == [1]
+    assert first["import_contract_ready"]["ready"] is False
+
+    session_host = next(
+        host
+        for host in document.Objects
+        if getattr(host, "PDFImportSessionSchema", "") == session.SESSION_SCHEMA
+    )
+    cancelled = session.read_session_object(session_host)
+    assert cancelled["completed_pages"] == [1]
+    # Imported, so page 1 is not redone - but never certified.
+    assert cancelled["degraded_pages"] == [1]
+
+    def resumed_import(_pdf, _path, page_number, page_opts, doc):
+        page_opts._report_extra["text_source_spans"] = int(
+            page_opts._report_extra.get("text_source_spans", 0) or 0
+        ) + 1
+        return doc.addObject("App::DocumentObjectGroup", f"PDF_Page_{page_number}"), None
+
+    monkeypatch.setattr(core, "_import_pdf_page_inner", resumed_import)
+    resumed_opts = core.ImportOptions(
+        pages=[1, 2],
+        import_text=True,
+        text_mode="text",
+        model3d_mode="off",
+        import_report_path=str(tmp_path / "resumed.json"),
+        resume_session_name=session_host.Name,
+    )
+    assert core.import_pdf("fixture.pdf", resumed_opts) is True
+
+    resumed = reports[-1]["extra"]
+    scope = resumed["representation_contract_scope"]
+    # This invocation degraded nothing, and still must not certify page 1.
+    assert "text_items_degraded" not in resumed
+    assert scope["uncertified_degraded_pages"] == [1]
+    assert scope["previously_degraded_pages_excluded"] == [1]
+    assert scope["previously_certified_pages_excluded"] == []
+    assert resumed["session_text_items_degraded"]["pages"] == [1]
+    assert resumed["text_representation_delivery"]["verified"] is False
+    assert resumed["text_representation_delivery"]["session_degraded_pages"] == [1]
+    assert resumed["import_contract_ready"]["checks"]["text_delivery"] is False
+    assert resumed["import_contract_ready"]["ready"] is False
+    assert "not certified" in resumed["human_summary"]
+    # One per page an earlier run left degraded: not a clean run.
+    assert reports[-1]["result"]["warnings"] == 1
+    assert resumed["import_session"]["degraded_pages"] == [1]
+    assert session.read_session_object(session_host)["degraded_pages"] == [1]
+
+
+def test_resuming_a_clean_session_still_certifies_it(monkeypatch, tmp_path):
+    """The control: nothing degraded anywhere, so nothing is withheld."""
+    import json as _json
+
+    document = Document()
+    captured = []
+    reports = []
+    real_write_import_report = core.write_import_report
+
+    def first_import(_pdf, _path, page_number, page_opts, doc):
+        page_opts._report_extra["text_source_spans"] = int(
+            page_opts._report_extra.get("text_source_spans", 0) or 0
+        ) + 1
+        if page_number == 1:
+            return doc.addObject("App::DocumentObjectGroup", "PDF_Page_1"), None
+        raise core.ImportCancelled("PDF import cancelled by user")
+
+    _install_import_fakes(monkeypatch, document, first_import, captured)
+
+    def write_real_report(**kwargs):
+        path = str(tmp_path / f"clean_{len(reports)}.json")
+        kwargs["output_path"] = path
+        result = real_write_import_report(**kwargs)
+        reports.append(_json.loads(Path(path).read_text(encoding="utf-8")))
+        return result
+
+    monkeypatch.setattr(core, "write_import_report", write_real_report)
+    monkeypatch.setattr(core, "_warn", lambda *_a: None)
+
+    opts = core.ImportOptions(
+        pages=[1, 2],
+        import_text=True,
+        text_mode="text",
+        model3d_mode="off",
+        import_report_path=str(tmp_path / "cancelled.json"),
+    )
+    assert core.import_pdf("fixture.pdf", opts) is False
+    session_host = next(
+        host
+        for host in document.Objects
+        if getattr(host, "PDFImportSessionSchema", "") == session.SESSION_SCHEMA
+    )
+    assert session.read_session_object(session_host)["degraded_pages"] == []
+
+    def resumed_import(_pdf, _path, page_number, page_opts, doc):
+        page_opts._report_extra["text_source_spans"] = int(
+            page_opts._report_extra.get("text_source_spans", 0) or 0
+        ) + 1
+        return doc.addObject("App::DocumentObjectGroup", f"PDF_Page_{page_number}"), None
+
+    monkeypatch.setattr(core, "_import_pdf_page_inner", resumed_import)
+    resumed_opts = core.ImportOptions(
+        pages=[1, 2],
+        import_text=True,
+        text_mode="text",
+        model3d_mode="off",
+        import_report_path=str(tmp_path / "resumed.json"),
+        resume_session_name=session_host.Name,
+    )
+    assert core.import_pdf("fixture.pdf", resumed_opts) is True
+
+    resumed = reports[-1]["extra"]
+    assert "session_text_items_degraded" not in resumed
+    assert resumed["representation_contract_scope"]["previously_certified_pages_excluded"] == [1]
+    assert "uncertified_degraded_pages" not in resumed["representation_contract_scope"]
+    assert resumed["text_representation_delivery"]["verified"] is True
+    assert resumed["import_contract_ready"]["ready"] is True
+    assert resumed["result_status"] == "success"

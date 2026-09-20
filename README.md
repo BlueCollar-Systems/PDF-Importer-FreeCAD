@@ -23,6 +23,38 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 
 Native wire outlines and general vector lineweights remain screen-dependent; Raster text has finite resolution. Final rectangle highlights are handled only when their complete source paint contract is verified.
 
+## Recent fixes (unreleased)
+
+- **One text item that cannot be delivered now costs that item, not the
+  document.** The per-item fallback ladder advances past a rung that failed
+  without proof, provided that rung's own attempt shows it removed every host
+  object it created. When every rung is spent the item is returned as a
+  degraded record instead of aborting the import, so the rest of the sheet is
+  still delivered. (Owner directive 2026-09-19.)
+- The failure classification is unchanged: every builder raises exactly the
+  reason code it raised before, and it stays in `extra.text_delivery_attempts`.
+  Only the consequence is different.
+- The degrade is loud and certification stays strict. `extra.text_items_degraded`
+  lists each degraded item (capped at 200, with the total and a truncated flag)
+  with its requested type, every attempted rung and that rung's own reason,
+  `proof_class`, the font identity, and the offending character index and
+  codepoint where the failure names one. `result.warnings` counts them
+  alongside clipped fills and host-font substitutions, one console warning is
+  emitted per item, and the human summary says the import is not certified.
+- `extra.text_source_spans` and `extra.text_representation_delivery` are now
+  reported, so `import_contract_ready.ready` is **false** for any sheet with a
+  degraded item. A page that degraded is named in
+  `representation_contract_scope.uncertified_degraded_pages`, and the QA
+  harness reports that sheet as `DEGRADED`, never `PASS`.
+- Three classes remain document-fatal: an attempt whose cleanup is incomplete
+  or that left unknown host objects behind, an item with no stable source
+  identity, and any importer contract breach (missing deliverer, malformed
+  impossibility proof, unverifiable delivery result). `ImportCancelled`
+  propagates untouched.
+- An item-scoped rollback now refreshes the page's native-text object index.
+  FreeCAD recycles a removed object's name, and a stale index turned one
+  rolled-back item into thousands of induced failures on a dense sheet.
+
 ## Recent fixes (v4.0.87)
 
 - Corrupt embedded font cmap staging (e.g. Arial Italic) is treated as unusable
@@ -349,17 +381,29 @@ Notes:
   per-character outline subshapes and identity metadata inside one source-item
   compound; Geometry exposes raw edge entities. Sharing an SVG source does not
   make the host representations interchangeable.
-- Renderer or font failures stop the transaction unless the failed source item
-  has item-specific impossibility evidence and an implemented, verified next
-  rung. They never authorize a whole-page or whole-mode substitution.
+- Renderer or font failures never authorize a whole-page or whole-mode
+  substitution. A failed source item that has
+  item-specific impossibility evidence and an implemented, verified next rung
+  walks that rung and is certified there. An item **without** that evidence still walks
+  the remaining rungs — one item that cannot be delivered costs that item, not
+  the document (owner directive 2026-09-19) — but it is reported as degraded
+  and it is never certified.
 - Automatic raster classification may add a raster background, but it does not
   discard an explicitly requested text representation. Explicit Raster remains
   raster-only.
-- The invariant is "requested type delivered and verified, or an exact failed
-  attempt is reported and the transaction stops, or a proof-gated per-item
-  fallback is reported." It is locked by
-  `tests/test_textmode1_invariant_fc.py` and
-  `tests/test_freecad_representation_contract.py`.
+- The invariant is "requested type delivered and verified, or a proof-gated
+  per-item fallback is reported, or the item is reported as degraded and the
+  sheet is not certified." The transaction still stops for an attempt whose
+  cleanup is incomplete, for an item with no stable source identity, and for
+  any importer contract breach. It is locked by
+  `tests/test_textmode1_invariant_fc.py`,
+  `tests/test_freecad_representation_contract.py` and
+  `tests/test_text_item_degrade_fc.py`.
+- A degraded item is never silent and never counted as delivered text: it is
+  listed in `extra.text_items_degraded` with every rung's own reason code, it
+  adds one to `result.warnings`, and it makes
+  `extra.text_representation_delivery.verified` false so
+  `import_contract_ready.ready` is false for that sheet.
 
 ## Compatibility
 

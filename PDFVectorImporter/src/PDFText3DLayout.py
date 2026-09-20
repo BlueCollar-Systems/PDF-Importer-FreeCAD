@@ -127,6 +127,21 @@ def _source_quad(char):
     return quad
 
 
+def _mark_source_character(error, index, character):
+    """Name the exact source character a layout failure is about.
+
+    A degraded text item has to say which character it could not place; the
+    message alone ("source character advance is degenerate") does not.
+    """
+    error.source_character_index = int(index)
+    error.source_character_codepoint = (
+        "U+%04X" % ord(character)
+        if isinstance(character, str) and len(character) == 1
+        else ""
+    )
+    return error
+
+
 def build_source_character_layout(item, raw_dict, *, scale, font_size, font_name,
                                   host_rotation_deg, flip_y=True,
                                   page_matrix=(1., 0., 0., 1., 0., 0.)):
@@ -182,7 +197,11 @@ def build_source_character_layout(item, raw_dict, *, scale, font_size, font_name
             direction = local_vector(_finite(item["line_direction"], 2))
             _length, baseline_axis = unit(direction, "baseline")
         else:
-            advance, baseline_axis = unit(baseline, "advance")
+            try:
+                advance, baseline_axis = unit(baseline, "advance")
+            except ValueError as error:
+                _mark_source_character(error, index, char["c"])
+                raise
         determinant = baseline_axis[0]*up_axis[1]-baseline_axis[1]*up_axis[0]
         if not math.isfinite(determinant) or abs(determinant) <= 1e-12:
             raise ValueError("source character axes are collinear")

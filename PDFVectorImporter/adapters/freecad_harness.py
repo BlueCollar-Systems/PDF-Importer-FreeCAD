@@ -29,12 +29,42 @@ def result_exit_code(result: dict) -> int:
     return 0 if str(result.get("status") or "").upper() == "PASS" else 1
 
 
-def import_result_status(core_result) -> tuple[str, str]:
-    """Translate the core contract without treating ``None`` as success."""
+def import_result_status(core_result, degraded_text_items: int = 0) -> tuple[str, str]:
+    """Translate the core contract without treating ``None`` as success.
 
-    if core_result is True:
-        return "PASS", "Import completed."
-    return "FAIL", "core.import_pdf did not return explicit success."
+    A text item that could not be delivered at the requested representation
+    costs that item and not the document, so the import now returns ``True``
+    for a sheet the import report leaves uncertified
+    (``import_contract_ready.ready`` false). That sheet is DEGRADED, never
+    PASS: ``result_exit_code`` keeps returning a non-zero code for it.
+    """
+
+    if core_result is not True:
+        return "FAIL", "core.import_pdf did not return explicit success."
+    degraded = max(0, int(degraded_text_items or 0))
+    if degraded:
+        return (
+            "DEGRADED",
+            f"Import completed, but {degraded} text item(s) could not be "
+            "delivered at the requested representation; this sheet is not "
+            "certified (see text_items_degraded in the import report).",
+        )
+    return "PASS", "Import completed."
+
+
+def degraded_text_item_count(opts) -> int:
+    """How many text items this import degraded, from the core's own record."""
+
+    report_extra = getattr(opts, "_report_extra", None)
+    if not isinstance(report_extra, dict):
+        return 0
+    block = report_extra.get("text_items_degraded")
+    if not isinstance(block, dict):
+        return 0
+    try:
+        return max(0, int(block.get("total", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _page_range_spec(pages) -> str:
@@ -660,13 +690,23 @@ def main() -> int:
             result["message"] = "Source PDF changed during the acceptance cell."
             page_progress["status"] = "failed"
         else:
-            result["status"], result["message"] = import_result_status(ok)
+            degraded_text_items = degraded_text_item_count(opts)
+            result["degraded_text_items"] = degraded_text_items
+            result["status"], result["message"] = import_result_status(
+                ok, degraded_text_items
+            )
             if ok is True:
                 page_progress = complete_page_cell(page_progress)
                 if not page_progress["run_complete"]:
-                    result["message"] = (
+                    resume_message = (
                         "Page cell completed; resume with pages "
                         f"{page_progress['next_page_range']}."
+                    )
+                    # Never drop the degrade answer for a resume hint.
+                    result["message"] = (
+                        f"{result['message']} {resume_message}"
+                        if degraded_text_items
+                        else resume_message
                     )
             else:
                 page_progress["status"] = "failed"

@@ -864,6 +864,106 @@ def _clip_fill_warning_line(opts: ImportOptions) -> str:
     return line + " See clip_fill_delivery in the import report."
 
 
+def _new_text_degrade_block() -> Dict[str, Any]:
+    return {
+        "schema": "bcs.text_items_degraded/1.0",
+        "total": 0,
+        "dropped": 0,
+        "delivered_at_lower_rung": 0,
+        "pages": [],
+        "items": [],
+        "items_truncated": False,
+    }
+
+
+def _degraded_text_item_report_entry(
+    item: Dict[str, Any], record: Dict[str, Any]
+) -> Dict[str, Any]:
+    """One degraded item's report row: what was asked, tried, and drawn."""
+    final_type = record.get("final_type")
+    entry: Dict[str, Any] = {
+        "source_item_id": str(record.get("source_item_id") or ""),
+        "page_number": int(item.get("page_number") or 0),
+        "source_text": _bounded_report_text(item.get("text")),
+        "requested_type": str(record.get("requested_type") or ""),
+        "attempted_types": [
+            str(value) for value in (record.get("attempted_types") or [])
+        ],
+        "rung_outcomes": [dict(entry) for entry in (record.get("rung_outcomes") or [])],
+        "proof_class": str(record.get("proof_class") or "unproven_failure"),
+        "final_representation": final_type,
+        "delivered": bool(final_type),
+    }
+    font_identity = item.get("font_identity")
+    if isinstance(font_identity, dict) and font_identity:
+        entry["font_identity"] = dict(font_identity)
+    return entry
+
+
+def _record_degraded_text_item(opts: ImportOptions, entry: Dict[str, Any]) -> None:
+    """Add one degraded item to this run's degrade record.
+
+    The record lives in ``_report_extra`` so it accumulates over pages and is
+    removed with a cancelled or rolled-back page like every other page result.
+    """
+    report_extra = getattr(opts, "_report_extra", None)
+    if not isinstance(report_extra, dict):
+        report_extra = opts._report_extra = {}
+    block = report_extra.setdefault("text_items_degraded", _new_text_degrade_block())
+    block["total"] = int(block.get("total", 0) or 0) + 1
+    bucket = "delivered_at_lower_rung" if entry.get("delivered") else "dropped"
+    block[bucket] = int(block.get(bucket, 0) or 0) + 1
+    page = int(entry.get("page_number") or 0)
+    if page and page not in block["pages"]:
+        block["pages"].append(page)
+    if len(block["items"]) < TEXT_ITEM_DEGRADE_REPORT_LIMIT:
+        block["items"].append(entry)
+    else:
+        block["items_truncated"] = True
+
+
+def _degraded_text_item_warning_line(entry: Dict[str, Any]) -> str:
+    """One bounded operator sentence per degraded text item."""
+    attempts = ", ".join(
+        "%s:%s" % (outcome.get("attempted_type"), outcome.get("reason"))
+        for outcome in (entry.get("rung_outcomes") or [])
+    )
+    final_type = entry.get("final_representation")
+    consequence = (
+        "drawn as %s instead" % final_type
+        if final_type
+        else "nothing was drawn for it"
+    )
+    line = (
+        "PDF import: text item %s %r on page %s could not be delivered as %s "
+        "- %s. Attempts: %s."
+        % (
+            entry.get("source_item_id"),
+            _bounded_report_text(entry.get("source_text"), 60),
+            entry.get("page_number"),
+            entry.get("requested_type"),
+            consequence,
+            attempts or "none",
+        )
+    )
+    return _bounded_report_text(line, 400)
+
+
+def _text_degrade_summary_note(block: Any) -> str:
+    """The degrade sentence the human summary carries; '' when nothing degraded."""
+    if not isinstance(block, dict) or int(block.get("total", 0) or 0) <= 0:
+        return ""
+    total = int(block.get("total", 0) or 0)
+    dropped = int(block.get("dropped", 0) or 0)
+    lowered = int(block.get("delivered_at_lower_rung", 0) or 0)
+    return (
+        "%d text item%s could not be delivered at the requested representation "
+        "(%d drawn at a lower representation, %d not drawn); this import is not "
+        "certified - see text_items_degraded in the import report"
+        % (total, "" if total == 1 else "s", lowered, dropped)
+    )
+
+
 def _auto_raster_needs_text_overlay(
     effective_mode: str,
     source_text_blocks: int,
@@ -1428,6 +1528,27 @@ def write_import_report(
         + int(clip_fill_delivery.get("approximated", 0) or 0)
     )
 
+    # One text item that could not be delivered costs that item, not the sheet
+    # - but it is never silent and it never certifies. build_import_contract_ready
+    # only reads text_representation_delivery, so the host states it here: this
+    # is the single switch that keeps a degraded sheet out of certification.
+    text_degrade_block = extra.get("text_items_degraded")
+    text_degrade_warnings = (
+        int(text_degrade_block.get("total", 0) or 0)
+        if isinstance(text_degrade_block, dict)
+        else 0
+    )
+    text_source_spans = int(extra.get("text_source_spans") or 0)
+    if text_source_spans > 0:
+        extra["text_representation_delivery"] = {
+            "required": True,
+            "verified": text_degrade_warnings == 0,
+            "requested_type": requested_mode,
+            "source_spans": text_source_spans,
+            "degraded_items": text_degrade_warnings,
+        }
+    text_degrade_note = _text_degrade_summary_note(text_degrade_block)
+
     report = build_import_report(
         host_app="freecad",
         host_version=_freecad_version(),
@@ -1452,13 +1573,14 @@ def write_import_report(
         text_fallback=text_fallback,
         peak_mb=sample_process_mb(),
         performance_phases=phases or None,
-        # Visible clipped fills that were left out or are approximate, plus PDF
-        # fonts that are not drawn with the source font itself.
-        warnings=clip_fill_warnings + host_font_warnings,
+        # Visible clipped fills that were left out or are approximate, PDF
+        # fonts that are not drawn with the source font itself, and text items
+        # that could not be delivered at the requested representation.
+        warnings=clip_fill_warnings + host_font_warnings + text_degrade_warnings,
         extra=extra,
     )
 
-    if host_font_summary["note"]:
+    if host_font_summary["note"] or text_degrade_note:
         # The shared core overwrites extra["font_substitution_note"] from its
         # PDF audit inside build_import_report, so the host note is appended
         # here and the human summary is rebuilt to carry it.
@@ -1468,7 +1590,13 @@ def write_import_report(
             report.extra.get("font_substitution_note") or ""
         ).strip().rstrip(".")
         report.extra["font_substitution_note"] = ". ".join(
-            part for part in (core_font_note, host_font_summary["note"]) if part
+            part
+            for part in (
+                core_font_note,
+                host_font_summary["note"],
+                text_degrade_note,
+            )
+            if part
         )
         report.extra["human_summary"] = build_human_summary(report)
         for host_font_warning in host_font_summary["console_warnings"]:
@@ -3721,6 +3849,132 @@ CLOSED_SVG_ITEM_IMPOSSIBILITY_REASONS = frozenset(
     }
 )
 
+# Both outline rungs share one SVG item renderer, and that renderer refuses a
+# second attempt for glyph placements a rolled-back attempt already claimed
+# (svg_assignment_reuse_detected). A rung that rolled itself back is therefore
+# not replayed for the same item.
+TEXT_ITEM_SVG_RUNGS = ("glyphs", "geometry")
+
+# A degraded item is listed per item in the report. One sheet whose dominant
+# embedded font is unusable degrades every span on the page, so the list is
+# capped and the total plus a truncated flag are always stated.
+TEXT_ITEM_DEGRADE_REPORT_LIMIT = 200
+
+# Evidence a degraded item carries into the report. The builders' evidence
+# dicts also hold whole character layouts; only the identifying fields are
+# copied, and every string value is bounded.
+TEXT_ITEM_DEGRADE_EVIDENCE_KEYS = (
+    "stage",
+    "reason_code",
+    "exception",
+    "font_path",
+    "font_identity",
+    "font_name",
+    "font_source",
+    "source_character_index",
+    "source_character_codepoint",
+    "cleanup_error",
+    "ownership_collection_error",
+    "unknown_post_baseline_entity_ids",
+)
+
+
+def _bounded_report_text(value: Any, limit: int = 120) -> str:
+    """One report/console field's text, bounded so one span cannot flood it."""
+    text = str(value if value is not None else "")
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
+
+
+def _bounded_rung_evidence(evidence: Any) -> Dict[str, Any]:
+    """The identifying part of a builder's failure evidence, bounded."""
+    if not isinstance(evidence, dict):
+        return {}
+    bounded: Dict[str, Any] = {}
+    for key in TEXT_ITEM_DEGRADE_EVIDENCE_KEYS:
+        if key not in evidence:
+            continue
+        value = evidence[key]
+        if isinstance(value, str):
+            bounded[key] = _bounded_report_text(value, 240)
+        elif isinstance(value, dict):
+            bounded[key] = {
+                str(sub_key): _bounded_report_text(sub_value, 120)
+                if isinstance(sub_value, str)
+                else sub_value
+                for sub_key, sub_value in value.items()
+            }
+        elif isinstance(value, (list, tuple)):
+            bounded[key] = [
+                _bounded_report_text(entry, 120) if isinstance(entry, str) else entry
+                for entry in list(value)[:10]
+            ]
+        else:
+            bounded[key] = value
+    return bounded
+
+
+def _text_item_rung_outcome(
+    attempted: str,
+    outcome: str,
+    reason: Any,
+    attempt: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """One ladder rung's verdict exactly as the degrade report states it."""
+    record: Dict[str, Any] = {
+        "attempted_type": str(attempted),
+        "outcome": str(outcome),
+        "reason": str(reason or ""),
+    }
+    evidence = _bounded_rung_evidence((attempt or {}).get("evidence"))
+    if evidence:
+        record["evidence"] = evidence
+    return record
+
+
+def _degraded_text_item_record(
+    item: Dict[str, Any],
+    requested: str,
+    attempted_types: List[str],
+    rung_outcomes: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """The ladder's terminal answer when no rung could deliver this item.
+
+    Owner directive 2026-09-19: one text item that cannot be delivered costs
+    that item, not the document. The classification each builder produced is
+    unchanged and stays in the ledger; only the consequence is different.
+    """
+    outcomes = [dict(entry) for entry in rung_outcomes]
+    attempted_outcomes = [
+        entry for entry in outcomes if entry.get("outcome") != "skipped"
+    ]
+    proof_class = (
+        "proven_impossible"
+        if attempted_outcomes
+        and all(
+            entry.get("outcome") == "proven_impossible" for entry in attempted_outcomes
+        )
+        else "unproven_failure"
+    )
+    return {
+        "source_item_id": str(item.get("source_item_id") or ""),
+        "requested_type": requested,
+        "attempted_type": attempted_types[-1] if attempted_types else requested,
+        "final_type": None,
+        "outcome": "degraded",
+        "verified": False,
+        "reason": "text_item_degraded",
+        "attempted_types": list(attempted_types),
+        "rung_outcomes": outcomes,
+        "proof_class": proof_class,
+        # Every rung the ladder advanced across proved it removed exactly what
+        # it created; an incomplete cleanup is still document-fatal.
+        "created_entity_ids": [],
+        "removed_entity_ids": [],
+        "cleanup_complete": True,
+    }
+
 
 def _normalize_requested_text_type(requested_type: str) -> str:
     if not isinstance(requested_type, str):
@@ -4803,7 +5057,16 @@ def _run_text_item_fallback_ladder(
     deliverers: Dict[str, Any],
     opts: ImportOptions,
 ) -> Dict[str, Any]:
-    """Deliver one source item, advancing only across exact proven impossibility."""
+    """Deliver one source item, or report exactly why it could not be delivered.
+
+    Advancing across an exact proven impossibility is unchanged. A rung that
+    failed *without* proof now also advances, but only when its own attempt
+    shows it removed every host object it made: an orphan object leaves the
+    document in an unknown state and is still fatal. When no rung delivers,
+    the item is returned as a degraded record rather than costing the whole
+    document (owner directive 2026-09-19). The failure classification every
+    builder produces is untouched and stays in the attempt ledger.
+    """
     requested_mode = requested if isinstance(requested, str) else ""
     bound_item = copy.deepcopy(item) if isinstance(item, dict) else {}
     source_item_id = bound_item.get("source_item_id")
@@ -4829,8 +5092,10 @@ def _run_text_item_fallback_ladder(
 
     attempted_types: List[str] = []
     validated_proofs: List[Dict[str, Any]] = []
+    rung_outcomes: List[Dict[str, Any]] = []
+    unproven_rung_failure = False
+    rolled_back_svg_rung = False
     for attempted_mode in TEXT_ITEM_FALLBACK_LADDERS[requested_mode]:
-        attempted_types.append(attempted_mode)
         deliverer = deliverers.get(attempted_mode)
         if not callable(deliverer):
             failed = _failed_text_item_attempt(
@@ -4844,9 +5109,25 @@ def _run_text_item_fallback_ladder(
                 "%s deliverer is unavailable" % attempted_mode,
                 failed,
             )
+        if rolled_back_svg_rung and attempted_mode in TEXT_ITEM_SVG_RUNGS:
+            # The SVG renderer refuses glyph placements a rolled-back attempt
+            # already claimed, so replaying it would report a renderer defect
+            # instead of the real reason this item failed.
+            rung_outcomes.append(
+                _text_item_rung_outcome(
+                    attempted_mode,
+                    "skipped",
+                    "svg_rung_not_replayed_after_rollback",
+                )
+            )
+            continue
+        attempted_types.append(attempted_mode)
 
         try:
             result = deliverer(copy.deepcopy(bound_item), attempted_mode, opts)
+        except ImportCancelled:
+            # Cancellation is the operator's answer, never a delivery failure.
+            raise
         except TextItemImpossible as impossible:
             try:
                 proof = _validate_item_impossibility_proof(
@@ -4878,24 +5159,46 @@ def _run_text_item_fallback_ladder(
                 ) from impossible
             _append_text_item_attempt(opts, proven_attempt)
             validated_proofs.append(proof)
-            if attempted_mode == "raster":
-                raise TextRepresentationFailure(
-                    "Raster is terminal for source item %s" % source_item_id,
+            rung_outcomes.append(
+                _text_item_rung_outcome(
+                    attempted_mode,
+                    "proven_impossible",
+                    proof.get("reason_code"),
                     proven_attempt,
-                ) from impossible
+                )
+            )
+            if attempted_mode == "raster":
+                # The terminal rung proved itself impossible: there is nothing
+                # below it, so the item is degraded rather than the document.
+                break
             continue
         except TextRepresentationFailure as failure:
-            if failure.attempt:
-                _append_text_item_attempt(opts, failure.attempt)
-                raise
-            failed = _failed_text_item_attempt(
-                bound_item,
-                requested_mode,
-                attempted_mode,
-                "text_representation_failure",
-            )
+            if not failure.attempt:
+                # No attempt record means the builder broke its own contract.
+                failed = _failed_text_item_attempt(
+                    bound_item,
+                    requested_mode,
+                    attempted_mode,
+                    "text_representation_failure",
+                )
+                _append_text_item_attempt(opts, failed)
+                raise TextRepresentationFailure(str(failure), failed) from failure
+            failed = dict(failure.attempt)
             _append_text_item_attempt(opts, failed)
-            raise TextRepresentationFailure(str(failure), failed) from failure
+            if failed.get("cleanup_complete") is not True:
+                # Host objects this rung created are still in the document.
+                # That is structural, not one item's problem.
+                raise
+            _refresh_native_text_index_after_item_rollback(opts)
+            unproven_rung_failure = True
+            if attempted_mode in TEXT_ITEM_SVG_RUNGS:
+                rolled_back_svg_rung = True
+            rung_outcomes.append(
+                _text_item_rung_outcome(
+                    attempted_mode, "failed", failed.get("reason"), failed
+                )
+            )
+            continue
         except Exception as error:
             failed = _failed_text_item_attempt(
                 bound_item,
@@ -4904,11 +5207,24 @@ def _run_text_item_fallback_ladder(
                 "generic_exception:%s" % error.__class__.__name__,
             )
             _append_text_item_attempt(opts, failed)
-            raise TextRepresentationFailure(
-                "%s delivery failed without a validated impossibility proof: %s"
-                % (attempted_mode, error),
-                failed,
-            ) from error
+            if failed.get("cleanup_complete") is not True:
+                # An exception that escaped the deliverer carries no cleanup
+                # record at all, so what it left behind is unknown.
+                raise TextRepresentationFailure(
+                    "%s delivery failed without a validated impossibility proof: %s"
+                    % (attempted_mode, error),
+                    failed,
+                ) from error
+            _refresh_native_text_index_after_item_rollback(opts)
+            unproven_rung_failure = True
+            if attempted_mode in TEXT_ITEM_SVG_RUNGS:
+                rolled_back_svg_rung = True
+            rung_outcomes.append(
+                _text_item_rung_outcome(
+                    attempted_mode, "failed", failed.get("reason"), failed
+                )
+            )
+            continue
 
         try:
             normalized = _normalize_verified_text_item_result(
@@ -4934,8 +5250,15 @@ def _run_text_item_fallback_ladder(
 
         normalized["attempted_types"] = list(attempted_types)
         normalized["proof_chain"] = [dict(proof) for proof in validated_proofs]
+        if unproven_rung_failure:
+            # Drawn, but not at the requested representation and without a
+            # proof that the requested one was impossible. That is a degrade:
+            # it is reported per item and it keeps the sheet uncertified.
+            normalized["representation_degraded"] = True
+            normalized["rung_outcomes"] = [dict(entry) for entry in rung_outcomes]
+            normalized["proof_class"] = "unproven_failure"
         _append_text_item_attempt(opts, normalized)
-        if validated_proofs:
+        if validated_proofs and not unproven_rung_failure:
             fallback_proof = _aggregate_text_item_fallback_proof(
                 bound_item,
                 requested_mode,
@@ -4956,14 +5279,14 @@ def _run_text_item_fallback_ladder(
             )
         return normalized
 
-    failed = _failed_text_item_attempt(
-        bound_item,
-        requested_mode,
-        "raster",
-        "fallback_ladder_exhausted",
+    # Every rung is spent, including the terminal raster crop. The item is
+    # degraded: nothing is drawn for it, it is never counted as delivered, and
+    # the report names it with every rung's own verdict.
+    degraded = _degraded_text_item_record(
+        bound_item, requested_mode, attempted_types, rung_outcomes
     )
-    _append_text_item_attempt(opts, failed)
-    raise TextRepresentationFailure("Text item fallback ladder exhausted", failed)
+    _append_text_item_attempt(opts, degraded)
+    return degraded
 
 
 def _build_text_size_crosschecks(opts: ImportOptions) -> Dict[str, Any]:
@@ -5144,6 +5467,26 @@ def _prepare_native_text_object_index(
         }
     opts._native_text_object_index = index
     return index
+
+
+def _refresh_native_text_index_after_item_rollback(opts: ImportOptions) -> None:
+    """Rebuild the page's native-object index after an item-scoped rollback.
+
+    FreeCAD recycles a removed object's ``Name``. A rolled-back item leaves
+    its name in this index, so the next native delivery sees its own brand-new
+    object as one that already existed and fails
+    ``native_text_creation_or_style_failed`` — measured as one degraded item
+    turning into 2,152 on a 2,376-span sheet. ``_restore_page_result_telemetry``
+    does the same thing for page- and import-scoped rollbacks.
+    """
+    index = getattr(opts, "_native_text_object_index", None)
+    if not isinstance(index, dict):
+        return
+    doc = index.get("document")
+    if doc is None:
+        opts._native_text_object_index = None
+        return
+    _prepare_native_text_object_index(opts, doc, refresh=True)
 
 
 def _remember_native_text_object(opts: ImportOptions, host_obj) -> None:
@@ -8203,6 +8546,11 @@ def _deliver_text_item_3d(
         compound_failure_evidence = {
             "stage": stage,
             "exception": "%s: %s" % (exc.__class__.__name__, exc),
+            # Which font file the failure was measured against. Without it a
+            # degraded item names a stage and an exception and nothing an
+            # operator can act on.
+            "font_path": font_path,
+            "font_source": (font_source_result or {}).get("source"),
         }
         if source_character_layout is not None:
             terminal_failure("positioned_3d_text_failed", compound_failure_evidence)
@@ -9456,11 +9804,23 @@ def _bind_native_source_layout(item, delivered, raw_dict, *, opts, scale, doc, g
         return delivered
     except Exception as exc:
         removed_ids, cleanup_complete = _remove_owned_text_objects(doc, group, owned)
+        # Name the character the layout could not place. Without it a degraded
+        # item says only "source character advance is degenerate".
+        failure_evidence = {"exception": "%s: %s" % (type(exc).__name__, exc)}
+        character_index = getattr(exc, "source_character_index", None)
+        if type(character_index) is int:
+            failure_evidence["source_character_index"] = character_index
+            failure_evidence["source_character_codepoint"] = str(
+                getattr(exc, "source_character_codepoint", "") or ""
+            )
+        font_name = (delivered.get("evidence") or {}).get("font_name")
+        if font_name:
+            failure_evidence["font_name"] = str(font_name)
         attempt = dict(delivered, outcome="failed", final_type=None,
             reason="native_source_layout_failed", created_entity_ids=created_ids,
             removed_entity_ids=removed_ids, cleanup_complete=bool(cleanup_complete and
                 all(doc.getObject(name) is None for name in created_ids)),
-            evidence={"exception": "%s: %s" % (type(exc).__name__, exc)})
+            evidence=failure_evidence)
         raise TextRepresentationFailure("Native source character layout failed", attempt) from exc
 
 
@@ -9492,6 +9852,15 @@ def _render_canonical_text_items(
         page_w=float(page_w),
         page_h=float(page_h),
     )
+    # The source roster this import is answerable for. build_import_contract_ready
+    # needs it to judge text_representation_delivery, so it is stated whether or
+    # not anything degrades.
+    run_report_extra = getattr(opts, "_report_extra", None)
+    if not isinstance(run_report_extra, dict):
+        run_report_extra = opts._report_extra = {}
+    run_report_extra["text_source_spans"] = int(
+        run_report_extra.get("text_source_spans", 0) or 0
+    ) + len(items)
 
     font_stage_complete = False
     svg_render_cache: Dict[str, Any] = {
@@ -9632,8 +10001,25 @@ def _render_canonical_text_items(
                 total_units=total_units,
             )
         result = _run_text_item_fallback_ladder(item, requested, deliverers, opts)
-        results.append(result)
         source_item_id = str(result["source_item_id"])
+        if result.get("outcome") == "degraded" or result.get(
+            "representation_degraded"
+        ):
+            # Loud, never silent: the item stays in the page's source roster,
+            # is listed with every rung's own verdict, adds one warning, and
+            # keeps import_contract_ready false for this sheet.
+            degraded_entry = _degraded_text_item_report_entry(item, result)
+            _record_degraded_text_item(opts, degraded_entry)
+            _warn(_degraded_text_item_warning_line(degraded_entry))
+            # Any rung that rolled itself back freed a host object whose name
+            # FreeCAD will hand to the next item.
+            _prepare_native_text_object_index(opts, fc_doc, refresh=True)
+            if result.get("outcome") == "degraded":
+                # Nothing was drawn: no entities, not counted as delivered.
+                delivered_source_ids.append(source_item_id)
+                text_characters_done += len(str(item.get("text") or ""))
+                continue
+        results.append(result)
         final_type = str(result["final_type"])
         delivery_ids = result.get(
             "delivery_entity_ids", result.get("created_entity_ids")
@@ -9674,7 +10060,9 @@ def _render_canonical_text_items(
         ),
         "count": delivered_entity_count,
         "host_entity_count": created_host_entity_count,
-        "source_item_count": len(results),
+        # The full source roster, degraded items included: dropping them here
+        # is what would make the loss invisible.
+        "source_item_count": len(delivered_source_ids),
         "source_item_ids": delivered_source_ids,
         "font_rendered": any(value in {"text", "labels", "3d_text"} for value in final_types),
         "examples": [],
@@ -12375,10 +12763,12 @@ def _representation_contract_scope(
     current_invocation_completed_pages: List[int],
     session_completed_pages: List[int],
     rolled_back_pages: Optional[List[int]] = None,
+    degraded_pages: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """Describe exactly which pages the invocation-scoped proof telemetry covers."""
     prior = [int(page) for page in previously_certified_pages]
-    return {
+    degraded = sorted({int(page) for page in (degraded_pages or [])})
+    scope = {
         "schema": "bcs.representation_contract_scope/1.0",
         "scope": "current_invocation",
         "coverage_status": (
@@ -12394,6 +12784,11 @@ def _representation_contract_scope(
         "session_completed_pages": [int(page) for page in session_completed_pages],
         "complete_session_telemetry": not bool(prior),
     }
+    if degraded:
+        # Imported, so a resume will not redo it - but not certified, and said
+        # so on every run that reports this session.
+        scope["uncertified_degraded_pages"] = degraded
+    return scope
 
 
 def find_resumable_import_session(
@@ -12917,6 +13312,12 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                     current_invocation_completed_pages,
                     list(session_state["completed_pages"]),
                     rolled_back_pages=rolled_back_pages,
+                    degraded_pages=list(
+                        (
+                            opts._report_extra.get("text_items_degraded") or {}
+                        ).get("pages")
+                        or []
+                    ),
                 )
             )
         opts._report_extra.pop("terminal_failure", None)

@@ -379,7 +379,10 @@ or scaling defects are fixed *inside* the requested mode — never by
 substituting a different mode. Substitution is permitted only when the
 requested mode is genuinely impossible for the exact source item. A generic
 exception, a missing helper, an empty result, or a visual defect is not proof
-of impossibility. Any authorized substitution must walk the closest remaining
+of impossibility. An item whose requested representation failed *without* such
+proof is still drawn at the next rung the ladder reaches, so that one item does
+not cost the sheet, but that delivery is reported as degraded and is never
+certified (owner directive 2026-09-19). Any authorized substitution must walk the closest remaining
 representation first and is recorded per source item in `import_report.json`
 with the attempted types, exact created/removed host IDs, cleanup result, and
 the evidence that proved the requested type impossible. It is never silent.
@@ -418,11 +421,21 @@ Notes:
   `tests/test_textmode1_invariant_fc.py`,
   `tests/test_freecad_representation_contract.py` and
   `tests/test_text_item_degrade_fc.py`.
-- A degraded item is never silent and never counted as delivered text: it is
-  listed in `extra.text_items_degraded` with every rung's own reason code, it
-  adds one to `result.warnings`, and it makes
-  `extra.text_representation_delivery.verified` false so
-  `import_contract_ready.ready` is false for that sheet.
+- A degraded item is never silent and is never counted as a delivery of the
+  **requested** representation: it is listed in `extra.text_items_degraded`
+  with every rung's own reason code, it adds one to `result.warnings`, it is
+  kept out of `extra.host_font_map` / `extra.host_font_substitutions`, and it
+  makes `extra.text_representation_delivery.verified` false so
+  `import_contract_ready.ready` is false for that sheet. An item that was
+  drawn at a lower rung is still counted in `result.text_entities` and in
+  `extra.actual_text_entity_types` as what was actually drawn; an item that
+  was dropped contributes nothing.
+- A page with a degraded item is imported once and is not redone on resume,
+  but it is never certified. The page number is persisted with the import
+  session, so every later invocation of that session repeats it in
+  `extra.representation_contract_scope.uncertified_degraded_pages`, keeps
+  `import_contract_ready.ready` false, and keeps the QA harness on `DEGRADED`
+  with a non-zero exit code.
 
 ## Compatibility
 

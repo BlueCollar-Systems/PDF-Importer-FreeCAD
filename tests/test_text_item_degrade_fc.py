@@ -169,8 +169,11 @@ def test_exhausted_ladder_returns_a_degraded_record_instead_of_raising():
         opts,
     )
 
-    # The SVG renderer is not replayed once a rolled-back attempt claimed it.
-    assert calls == ["3d_text", "glyphs", "text", "labels", "raster"]
+    # Every rung of the requested mode's ladder is tried, in order. The SVG
+    # renderer claims an item's glyph placements only when it verifies a
+    # delivery (PDFSvgTextRenderer.py, "claimed_placement_indices"), so a
+    # glyphs rung that failed and cleaned up leaves the geometry rung free.
+    assert calls == ["3d_text", "glyphs", "geometry", "text", "labels", "raster"]
     assert result["outcome"] == "degraded"
     assert result["final_type"] is None
     assert result["verified"] is False
@@ -179,7 +182,7 @@ def test_exhausted_ladder_returns_a_degraded_record_instead_of_raising():
     assert [entry["reason"] for entry in result["rung_outcomes"]] == [
         "3d_text_synthetic_failure",
         "glyphs_synthetic_failure",
-        "svg_rung_not_replayed_after_rollback",
+        "geometry_synthetic_failure",
         "text_synthetic_failure",
         "labels_synthetic_failure",
         "raster_synthetic_failure",

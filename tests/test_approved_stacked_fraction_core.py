@@ -19,8 +19,12 @@ from pdfcadcore import primitive_extractor  # noqa: E402
 # shared cores; ordinary paths and the approved fraction logic are unchanged.
 # September 17 adds raw source RGB/alpha/finite paint order beside the unchanged
 # composite colors. No fraction/layout/source-character proof was modified.
+# September 20 adds six lines on the text path that call glyph_code_recovery
+# before anything derives from the text dictionary. A span whose raw glyph
+# codes are not proven is left byte for byte as MuPDF delivered it, so no
+# fraction predicate, layout rule or source-character proof changed here.
 REVIEWED_COMBINED_SUCCESSOR_SHA256 = (
-    "19649d27cd5e860a243cbbe429a20dfe7d56aebb501335cc53d4482f427cd595"
+    "acac194d440a45734afd52367e49bca8ff4de190869f6153169cbfc14b61860c"
 )
 
 

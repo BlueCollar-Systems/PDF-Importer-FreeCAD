@@ -63,8 +63,9 @@ Native wire outlines and general vector lineweights remain screen-dependent; Ras
   The em-ink calibration reads the same outlines straight from `glyf` when
   fontTools' glyph set cannot be built for the same reason; it refuses that
   route for a variable or CFF font. Kerning values stay fail-closed, because a
-  wrong kern moves glyph ink. Measured: S05-11 in default 3D-text mode went
-  from writing nothing at all to 183/183 native 3D Text, certified.
+  wrong kern moves glyph ink. Measured on a 183-span structural sheet in
+  default 3D-text mode: from writing nothing at all to 183/183 native 3D Text,
+  certified.
 - The zero-advance escape in the source character layout now covers any
   combining mark, enclosing mark or variation selector, not only whitespace. An
   emoji followed by `U+FE0F` no longer makes an otherwise exact span

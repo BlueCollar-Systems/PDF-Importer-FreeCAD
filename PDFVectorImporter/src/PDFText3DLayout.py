@@ -8,6 +8,7 @@ authorization to flatten a positioned span onto a guessed baseline.
 from __future__ import annotations
 
 import math
+import unicodedata
 from collections import defaultdict, deque
 
 from PDFTextLayout import _finite, build_source_layout
@@ -127,6 +128,44 @@ def _source_quad(char):
     return quad
 
 
+def _has_no_source_advance(character):
+    """Whether this source character has no advance width by definition.
+
+    A spacing character, a combining or enclosing mark, and a variation
+    selector all carry no width of their own, and MuPDF gives them a
+    zero-width quad. Retaining the character's true position and identity is
+    exact; deriving a baseline direction from a zero-length quad is not, and
+    fabricating an advance for it would move every later glyph.
+    """
+    if not isinstance(character, str) or len(character) != 1:
+        return False
+    if character.isspace():
+        return True
+    if unicodedata.category(character) in ("Mn", "Me"):
+        return True
+    code = ord(character)
+    return (
+        0xFE00 <= code <= 0xFE0F  # variation selectors 1-16
+        or 0xE0100 <= code <= 0xE01EF  # variation selectors 17-256
+        or 0x180B <= code <= 0x180F  # Mongolian free variation selectors
+    )
+
+
+def _mark_source_character(error, index, character):
+    """Name the exact source character a layout failure is about.
+
+    A degraded text item has to say which character it could not place; the
+    message alone ("source character advance is degenerate") does not.
+    """
+    error.source_character_index = int(index)
+    error.source_character_codepoint = (
+        "U+%04X" % ord(character)
+        if isinstance(character, str) and len(character) == 1
+        else ""
+    )
+    return error
+
+
 def build_source_character_layout(item, raw_dict, *, scale, font_size, font_name,
                                   host_rotation_deg, flip_y=True,
                                   page_matrix=(1., 0., 0., 1., 0., 0.)):
@@ -176,13 +215,18 @@ def build_source_character_layout(item, raw_dict, *, scale, font_size, font_name
         if not math.isfinite(up_scale) or up_scale <= 0:
             raise ValueError("source font-Y scale is invalid")
         advance = math.hypot(*baseline)
-        # A source zero-width spacing/control character has no native ink;
-        # retain its true position and character, without fabricating advance.
-        if advance == 0 and char["c"].isspace():
+        # A source zero-width spacing character, combining mark or variation
+        # selector has no native ink; retain its true position and character,
+        # without fabricating advance.
+        if advance == 0 and _has_no_source_advance(char["c"]):
             direction = local_vector(_finite(item["line_direction"], 2))
             _length, baseline_axis = unit(direction, "baseline")
         else:
-            advance, baseline_axis = unit(baseline, "advance")
+            try:
+                advance, baseline_axis = unit(baseline, "advance")
+            except ValueError as error:
+                _mark_source_character(error, index, char["c"])
+                raise
         determinant = baseline_axis[0]*up_axis[1]-baseline_axis[1]*up_axis[0]
         if not math.isfinite(determinant) or abs(determinant) <= 1e-12:
             raise ValueError("source character axes are collinear")

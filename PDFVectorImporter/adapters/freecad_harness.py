@@ -29,12 +29,42 @@ def result_exit_code(result: dict) -> int:
     return 0 if str(result.get("status") or "").upper() == "PASS" else 1
 
 
-def import_result_status(core_result) -> tuple[str, str]:
-    """Translate the core contract without treating ``None`` as success."""
+def import_result_status(core_result, degraded_text_items: int = 0) -> tuple[str, str]:
+    """Translate the core contract without treating ``None`` as success.
 
-    if core_result is True:
-        return "PASS", "Import completed."
-    return "FAIL", "core.import_pdf did not return explicit success."
+    A text item that could not be delivered at the requested representation
+    costs that item and not the document, so the import now returns ``True``
+    for a sheet the import report leaves uncertified
+    (``import_contract_ready.ready`` false). That sheet is DEGRADED, never
+    PASS: ``result_exit_code`` keeps returning a non-zero code for it.
+    """
+
+    if core_result is not True:
+        return "FAIL", "core.import_pdf did not return explicit success."
+    degraded = max(0, int(degraded_text_items or 0))
+    if degraded:
+        return (
+            "DEGRADED",
+            f"Import completed, but {degraded} text item(s) could not be "
+            "delivered at the requested representation; this sheet is not "
+            "certified (see text_items_degraded in the import report).",
+        )
+    return "PASS", "Import completed."
+
+
+def degraded_text_item_count(opts) -> int:
+    """How many text items this import degraded, from the core's own record."""
+
+    report_extra = getattr(opts, "_report_extra", None)
+    if not isinstance(report_extra, dict):
+        return 0
+    block = report_extra.get("text_items_degraded")
+    if not isinstance(block, dict):
+        return 0
+    try:
+        return max(0, int(block.get("total", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _page_range_spec(pages) -> str:
@@ -85,6 +115,22 @@ def plan_page_cell(
     except (TypeError, ValueError):
         limit = 0
     active = remaining if limit <= 0 else remaining[:limit]
+    # A cell that degraded text items does not become a clean run because a
+    # later cell is clean: the count follows the checkpoint across processes.
+    degraded = 0
+    degraded_pages: List[int] = []
+    if checkpoint_reused:
+        try:
+            degraded = max(0, int(prior.get("degraded_text_items", 0) or 0))
+        except (TypeError, ValueError):
+            degraded = 0
+        degraded_pages = sorted(
+            {
+                int(page)
+                for page in (prior.get("degraded_pages") or [])
+                if int(page) in requested
+            }
+        )
     return {
         "schema": "bcs.freecad_page_progress/1.0",
         "source_pdf_sha256": digest,
@@ -92,6 +138,8 @@ def plan_page_cell(
         "page_budget": max(0, limit),
         "checkpoint_reused": checkpoint_reused,
         "completed_pages": completed,
+        "degraded_text_items": degraded,
+        "degraded_pages": degraded_pages,
         "active_pages": active,
         "remaining_pages": remaining,
         "next_page_range": _page_range_spec(active),
@@ -100,25 +148,48 @@ def plan_page_cell(
     }
 
 
-def complete_page_cell(progress: dict) -> dict:
-    """Return a new checkpoint with the active cell durably completed."""
+def complete_page_cell(progress: dict, degraded_text_items: int = 0) -> dict:
+    """Return a new checkpoint with the active cell durably completed.
 
+    A cell whose import degraded text items is recorded as ``cell_degraded``
+    and its count is added to the run total, so a later clean cell cannot
+    report the whole run PASS for a document this session never certified.
+    """
+
+    active = [int(page) for page in (progress.get("active_pages") or [])]
     completed = sorted(
-        {
-            int(page)
-            for page in list(progress.get("completed_pages") or [])
-            + list(progress.get("active_pages") or [])
-        }
+        {int(page) for page in list(progress.get("completed_pages") or []) + active}
     )
     requested = [int(page) for page in (progress.get("requested_pages") or [])]
     remaining = [page for page in requested if page not in set(completed)]
+    try:
+        cell_degraded = max(0, int(degraded_text_items or 0))
+    except (TypeError, ValueError):
+        cell_degraded = 0
+    try:
+        prior_degraded = max(0, int(progress.get("degraded_text_items", 0) or 0))
+    except (TypeError, ValueError):
+        prior_degraded = 0
+    total_degraded = prior_degraded + cell_degraded
+    degraded_pages = sorted(
+        {int(page) for page in (progress.get("degraded_pages") or [])}
+        | (set(active) if cell_degraded else set())
+    )
     updated = dict(progress)
     updated.update(
         completed_pages=completed,
+        degraded_text_items=total_degraded,
+        degraded_pages=degraded_pages,
         active_pages=[],
         remaining_pages=remaining,
         next_page_range=_page_range_spec(remaining[: max(1, int(progress.get("page_budget") or len(remaining) or 1))]),
-        status="complete" if not remaining else "cell_pass",
+        status=(
+            "complete"
+            if not remaining
+            else "cell_degraded"
+            if total_degraded
+            else "cell_pass"
+        ),
         run_complete=not remaining,
     )
     return updated
@@ -660,13 +731,31 @@ def main() -> int:
             result["message"] = "Source PDF changed during the acceptance cell."
             page_progress["status"] = "failed"
         else:
-            result["status"], result["message"] = import_result_status(ok)
+            degraded_text_items = degraded_text_item_count(opts)
             if ok is True:
-                page_progress = complete_page_cell(page_progress)
+                page_progress = complete_page_cell(
+                    page_progress, degraded_text_items
+                )
+                # Earlier cells of this run count too: a document whose page 1
+                # degraded is not certified because page 2 was clean.
+                degraded_text_items = int(
+                    page_progress.get("degraded_text_items") or 0
+                )
+            result["degraded_text_items"] = degraded_text_items
+            result["status"], result["message"] = import_result_status(
+                ok, degraded_text_items
+            )
+            if ok is True:
                 if not page_progress["run_complete"]:
-                    result["message"] = (
+                    resume_message = (
                         "Page cell completed; resume with pages "
                         f"{page_progress['next_page_range']}."
+                    )
+                    # Never drop the degrade answer for a resume hint.
+                    result["message"] = (
+                        f"{result['message']} {resume_message}"
+                        if degraded_text_items
+                        else resume_message
                     )
             else:
                 page_progress["status"] = "failed"

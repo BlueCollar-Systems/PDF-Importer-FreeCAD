@@ -21,8 +21,12 @@ from pdfcadcore import primitive_extractor  # noqa: E402
 # composite colors. No fraction/layout/source-character proof was modified.
 # September 19 preserves literal single-open-line endpoints before point
 # cleanup, including zero-length and sub-cleanup-tolerance source strokes.
+# September 20 adds six lines on the text path that call glyph_code_recovery
+# before anything derives from the text dictionary. A span whose raw glyph
+# codes are not proven is left byte for byte as MuPDF delivered it, so no
+# fraction predicate, layout rule or source-character proof changed here.
 REVIEWED_COMBINED_SUCCESSOR_SHA256 = (
-    "454aabaff1ea12c82b8e8d6d4c8e9cc35bfbfd9bb68e77773dc1bce2abbdff87"
+    "85d7159f6fd294846528b872fef5f375af4d8a0ec0e44ff949dc34ae8e74a1f9"
 )
 
 

@@ -812,36 +812,75 @@ def test_generic_error_stops_without_calling_next_rung():
     assert opts.text_mode_fallbacks == []
 
 
-def test_text_representation_failure_stops_without_calling_next_rung():
+def _cleaned_up_failure(item, mode, *, cleanup_complete=True):
+    return core.TextRepresentationFailure(
+        "already terminal",
+        {
+            "source_item_id": item["source_item_id"],
+            "requested_type": "labels",
+            "attempted_type": mode,
+            "final_type": None,
+            "outcome": "failed",
+            "reason": "synthetic_rung_failure",
+            "created_entity_ids": [],
+            "removed_entity_ids": [],
+            "cleanup_complete": cleanup_complete,
+        },
+    )
+
+
+def test_cleaned_up_representation_failure_costs_the_item_not_the_document():
+    """Owner directive 2026-09-19: the consequence changed, not the verdict."""
     item = _fallback_item(requested="labels")
     opts = core.ImportOptions(text_mode="labels")
     calls = []
 
     def fail_terminal(_item, mode, _opts):
         calls.append(mode)
-        raise core.TextRepresentationFailure(
-            "already terminal",
-            {
-                "source_item_id": item["source_item_id"],
-                "requested_type": "labels",
-                "attempted_type": "labels",
-                "final_type": None,
-                "outcome": "failed",
-                "created_entity_ids": [],
-                "removed_entity_ids": [],
-                "cleanup_complete": True,
-            },
-        )
+        raise _cleaned_up_failure(item, mode)
 
-    def next_rung(*_args):
-        calls.append("3d_text")
-        return _verified_result(item, "3d_text")
+    def next_rung(_item, mode, _opts):
+        calls.append(mode)
+        return _verified_result(item, mode)
+
+    result = core._run_text_item_fallback_ladder(
+        item,
+        "labels",
+        {"labels": fail_terminal, "text": next_rung},
+        opts,
+    )
+
+    assert calls == ["labels", "text"]
+    assert result["final_type"] == "text"
+    # The rung's own failed attempt is still in the ledger, unchanged.
+    assert opts.text_delivery_attempts[0]["outcome"] == "failed"
+    assert opts.text_delivery_attempts[0]["reason"] == "synthetic_rung_failure"
+    # An unproven descent is never recorded as a proof-gated fallback.
+    assert opts.text_mode_fallbacks == []
+    assert result["representation_degraded"] is True
+    assert result["proof_class"] == "unproven_failure"
+    assert [entry["attempted_type"] for entry in result["rung_outcomes"]] == ["labels"]
+
+
+def test_incomplete_cleanup_representation_failure_still_stops_the_document():
+    """An orphan host object is structural: it must still be fatal."""
+    item = _fallback_item(requested="labels")
+    opts = core.ImportOptions(text_mode="labels")
+    calls = []
+
+    def fail_terminal(_item, mode, _opts):
+        calls.append(mode)
+        raise _cleaned_up_failure(item, mode, cleanup_complete=False)
+
+    def next_rung(_item, mode, _opts):
+        calls.append(mode)
+        return _verified_result(item, mode)
 
     with pytest.raises(core.TextRepresentationFailure, match="already terminal"):
         core._run_text_item_fallback_ladder(
             item,
             "labels",
-            {"labels": fail_terminal, "3d_text": next_rung},
+            {"labels": fail_terminal, "text": next_rung},
             opts,
         )
 

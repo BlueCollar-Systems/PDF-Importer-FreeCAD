@@ -46,7 +46,22 @@ activate_bundled_runtime_if_available(_mod_root)
 from pdfcadcore.fitz_loader import import_fitz as _import_fitz
 from pdfcadcore.primitive_extractor import _composite_alpha, _span_alpha
 from pdfcadcore.import_bounds import sheet_xy as _sheet_xy
-from pdfcadcore.drawing_clips import get_clip_aware_drawings, UnsupportedClipFillError
+from pdfcadcore.drawing_clips import (
+    clip_fill_issues,
+    get_clip_aware_drawings,
+    summarize_clip_fill_issues,
+)
+from pdfcadcore.glyph_code_recovery import (
+    copy_recovered_text,
+    glyph_code_delivery_block,
+    glyph_code_issues,
+    glyph_code_warning_count,
+    merge_glyph_code_records,
+    page_delivers_glyph_codes,
+    record_glyph_code_limitation,
+    recover_glyph_codes_in_place,
+    summarize_glyph_code_issues,
+)
 
 fitz = _import_fitz()
 
@@ -729,6 +744,414 @@ def _record_raster_page(opts: ImportOptions, reason: Optional[str] = None) -> No
         opts.raster_fallback_reasons.append(reason)
 
 
+# Warning-level clipped-fill records kept in the import report. Info-level ones
+# (resolved exactly, or never visible) run to thousands per sheet: counted only.
+CLIP_FILL_REPORT_ISSUE_LIMIT = 200
+
+
+def _new_clip_fill_delivery() -> Dict[str, Any]:
+    return {
+        "resolved_exactly": 0,
+        "dropped_invisible": 0,
+        "approximated": 0,
+        "dropped": 0,
+        "by_action": {},
+        "pages_with_warnings": [],
+        "issues": [],
+        "issues_truncated": False,
+    }
+
+
+def _finite_json(value):
+    """A record value as the report writer accepts it: NaN and infinity become None."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, (list, tuple)):
+        return [_finite_json(item) for item in value]
+    return value
+
+
+def _record_clip_fill_issues(opts: ImportOptions, page_num: int, issues, step: int = 1) -> None:
+    """Add one page's clipped-fill issues to this run's delivery record.
+
+    The record lives in ``_report_extra`` so it accumulates over pages and is
+    removed with a cancelled or rolled-back page like every other page result.
+    Host build drops are added on top of what the core resolver recorded;
+    ``step=-1`` first takes back the core's record of that same fill, so a fill
+    this host dropped is not also counted as resolved or approximated.
+    """
+    issues = list(issues or ())
+    if not issues:
+        return
+    report_extra = getattr(opts, "_report_extra", None)
+    if not isinstance(report_extra, dict):
+        report_extra = opts._report_extra = {}
+    block = report_extra.setdefault("clip_fill_delivery", _new_clip_fill_delivery())
+    page = int(page_num)
+    for issue in issues:
+        action = str(issue.get("action") or "unknown")
+        block["by_action"][action] = int(block["by_action"].get(action, 0)) + step
+        if block["by_action"][action] <= 0:
+            del block["by_action"][action]
+        dropped = bool(issue.get("dropped"))
+        if issue.get("severity") != "warning":
+            block["dropped_invisible" if dropped else "resolved_exactly"] += step
+            continue
+        block["dropped" if dropped else "approximated"] += step
+        if step < 0:
+            block["issues"] = [
+                listed for listed in block["issues"]
+                if (listed.get("page"), listed.get("seqno"), listed.get("stage"))
+                != (page, issue.get("seqno"), None)
+            ]
+            continue
+        if page not in block["pages_with_warnings"]:
+            block["pages_with_warnings"].append(page)
+        if len(block["issues"]) < CLIP_FILL_REPORT_ISSUE_LIMIT:
+            # One NaN here would make the report writer refuse the whole report.
+            block["issues"].append(
+                {key: _finite_json(value) for key, value in dict(issue, page=page).items()})
+        else:
+            block["issues_truncated"] = True
+
+
+def _host_clip_fill_issue(path_group, error: BaseException, superseded=()) -> Dict[str, Any]:
+    """Issue record for a compound clip fill this host could not build.
+
+    It is built inside the per-fill ``except``: nothing here may raise, or the
+    failure that was just contained becomes document-fatal again.
+    """
+    try:
+        paint_rect = [float(v) for v in path_group.get("rect")]
+    except Exception:
+        paint_rect = []
+    if not all(math.isfinite(v) for v in paint_rect):
+        paint_rect = []
+    try:
+        fill = [float(v) for v in path_group.get("fill")]
+    except Exception:
+        fill = None
+    try:
+        fill_opacity = float(path_group.get("fill_opacity", 1.0))
+    except Exception:
+        fill_opacity = 1.0
+    try:
+        detail = "%s: %s" % (type(error).__name__, error)
+    except Exception:
+        detail = type(error).__name__
+    issue = {
+        "seqno": path_group.get("seqno"),
+        "reason": "host-build-error",
+        "action": "dropped-unsupported",
+        "exact": False,
+        "severity": "warning",
+        "dropped": True,
+        "detail": detail,
+        "paint_rect": paint_rect,
+        "fill": fill,
+        "fill_opacity": fill_opacity,
+        "stage": "host-build",
+    }
+    for core_issue in superseded:
+        # How the core had delivered the fill this host then could not build.
+        issue["core_action"] = core_issue.get("action")
+    return issue
+
+
+def _clip_fill_warning_line(opts: ImportOptions) -> str:
+    """One operator sentence per import; '' when no visible fill was affected."""
+    block = (getattr(opts, "_report_extra", None) or {}).get("clip_fill_delivery") or {}
+    summary = summarize_clip_fill_issues(block.get("issues"))
+    if not summary:
+        return ""
+    pages = ", ".join(str(page) for page in sorted(block.get("pages_with_warnings") or []))
+    line = f"PDF import: {summary} on page(s) {pages}."
+    if block.get("issues_truncated"):
+        total = int(block.get("dropped", 0)) + int(block.get("approximated", 0))
+        line += (
+            f" {total} fills are affected in all; the import report lists the "
+            f"first {CLIP_FILL_REPORT_ISSUE_LIMIT}."
+        )
+    return line + " See clip_fill_delivery in the import report."
+
+
+def _recover_page_glyph_codes(page, tdict, opts) -> None:
+    """Recover raw glyph codes in one text dictionary and keep the record.
+
+    The dictionary must be a RAWDICT: the shared module binds a delivered
+    character to the glyph that drew it by that character's own origin, and
+    never infers a glyph id from the character itself.
+    """
+    recover_glyph_codes_in_place(page, tdict)
+    _keep_glyph_code_records(page, opts)
+
+
+def _keep_glyph_code_records(page, opts) -> None:
+    if opts is None:
+        return
+    records = getattr(opts, "_glyph_code_records", None)
+    if not isinstance(records, dict):
+        records = opts._glyph_code_records = {}
+    # One span is one row, whichever dictionary of this page examined it.
+    merge_glyph_code_records(records, glyph_code_issues(page))
+
+
+def _recovered_raw_text_dict(page, opts):
+    """This page's per-character dictionary, recovered once and shared.
+
+    ``_raster_source_coverage_bbox`` compares this host's item text against
+    this same dictionary character for character, so both sides must be the
+    same recovery of the same dictionary - not two recoveries that could
+    disagree.
+    """
+    from pdfcadcore.primitive_extractor import _raw_text_with_source_quads
+
+    key = (id(getattr(page, "parent", None)), int(getattr(page, "number", 0) or 0))
+    cache = getattr(opts, "_glyph_raw_text_cache", None) if opts is not None else None
+    if isinstance(cache, dict) and cache.get("key") == key:
+        return cache["raw"]
+    raw = _raw_text_with_source_quads(page)
+    _recover_page_glyph_codes(page, raw, opts)
+    if opts is not None:
+        opts._glyph_raw_text_cache = {"key": key, "raw": raw}
+    return raw
+
+
+def _page_text_dict(page, opts: Optional["ImportOptions"] = None) -> Dict[str, Any]:
+    """This host's page text dictionary, with proven glyph codes recovered.
+
+    ``page.get_text("dict")`` carries no per-character origins, so nothing in
+    it can say which glyph drew which character - and MuPDF's layout inserts
+    characters no glyph drew. The recovery therefore runs on the core's
+    per-character dictionary of the same page and the result is copied across
+    span for span, which is also what keeps this host's text and the core's
+    identical for the raster cross-check.
+
+    A page that draws no unmapped character at all is answered from its font
+    dictionaries and costs nothing extra.
+    """
+    tdict = page.get_text("dict") or {}
+    try:
+        if not page_delivers_glyph_codes(page):
+            return tdict
+        copy_recovered_text(_recovered_raw_text_dict(page, opts), tdict)
+    except (AssertionError, RuntimeError, TypeError, ValueError, KeyError, IndexError) as exc:
+        # The page's per-character dictionary could not be built, so this run
+        # cannot bind a character to a glyph. The spans stay exactly as the PDF
+        # delivered them and the report says it was this run that could not
+        # look, not the sheet that failed to say.
+        record_glyph_code_limitation(
+            page, "recovered_text_not_transferable", "%s: %s" % (type(exc).__name__, exc)
+        )
+    _keep_glyph_code_records(page, opts)
+    return tdict
+
+
+def _glyph_code_records(opts: "ImportOptions") -> List[Dict[str, Any]]:
+    return list((getattr(opts, "_glyph_code_records", None) or {}).values())
+
+
+def _emit_glyph_code_console_line(opts: "ImportOptions") -> None:
+    """One line per import: what was recovered, and what stayed raw.
+
+    A recovered span is a clean delivery and is stated, not warned about; a
+    span whose characters could not be proven is a warning.
+    """
+    records = _glyph_code_records(opts)
+    if not records:
+        return
+    line = _bounded_report_text(
+        summarize_glyph_code_issues(
+            records, "See text_glyph_codes in the import report."
+        ),
+        600,
+    )
+    if not line:
+        return
+    if any(record.get("status") != "recovered" for record in records):
+        _warn(line)
+    else:
+        _msg(line)
+
+
+def _new_text_degrade_block() -> Dict[str, Any]:
+    return {
+        "schema": "bcs.text_items_degraded/1.0",
+        "total": 0,
+        "dropped": 0,
+        "delivered_at_lower_rung": 0,
+        "pages": [],
+        "items": [],
+        "items_truncated": False,
+    }
+
+
+def _glyph_code_route_for_item(item: Dict[str, Any], opts) -> str:
+    """The route that proved this item's characters, or '' if none did.
+
+    ``source_text`` below is whatever the dictionary held, and on an affected
+    sheet that is a string this run recovered rather than one the PDF carried.
+    A row that says so cannot be read as the PDF's own bytes.
+    """
+    records = getattr(opts, "_glyph_code_records", None)
+    if not isinstance(records, dict) or not records:
+        return ""
+    try:
+        box = tuple(round(float(value), 2) for value in tuple(item.get("bbox") or ())[:4])
+    except (TypeError, ValueError):
+        return ""
+    record = records.get((int(item.get("page_number") or 0), box))
+    if not isinstance(record, dict) or record.get("status") != "recovered":
+        return ""
+    return str(record.get("route") or "")
+
+
+def _degraded_text_item_report_entry(
+    item: Dict[str, Any], record: Dict[str, Any], opts=None
+) -> Dict[str, Any]:
+    """One degraded item's report row: what was asked, tried, and drawn."""
+    final_type = record.get("final_type")
+    entry: Dict[str, Any] = {
+        "source_item_id": str(record.get("source_item_id") or ""),
+        "page_number": int(item.get("page_number") or 0),
+        "source_text": _bounded_report_text(item.get("text")),
+        "requested_type": str(record.get("requested_type") or ""),
+        "attempted_types": [
+            str(value) for value in (record.get("attempted_types") or [])
+        ],
+        "rung_outcomes": [dict(entry) for entry in (record.get("rung_outcomes") or [])],
+        "proof_class": str(record.get("proof_class") or "unproven_failure"),
+        "final_representation": final_type,
+        "delivered": bool(final_type),
+    }
+    font_identity = item.get("font_identity")
+    if isinstance(font_identity, dict) and font_identity:
+        entry["font_identity"] = dict(font_identity)
+    recovered_by = _glyph_code_route_for_item(item, opts) if opts is not None else ""
+    if recovered_by:
+        entry["text_recovered_by"] = recovered_by
+    return entry
+
+
+def _record_degraded_text_item(opts: ImportOptions, entry: Dict[str, Any]) -> None:
+    """Add one degraded item to this run's degrade record.
+
+    The record lives in ``_report_extra`` so it accumulates over pages and is
+    removed with a cancelled or rolled-back page like every other page result.
+    """
+    report_extra = getattr(opts, "_report_extra", None)
+    if not isinstance(report_extra, dict):
+        report_extra = opts._report_extra = {}
+    block = report_extra.setdefault("text_items_degraded", _new_text_degrade_block())
+    block["total"] = int(block.get("total", 0) or 0) + 1
+    bucket = "delivered_at_lower_rung" if entry.get("delivered") else "dropped"
+    block[bucket] = int(block.get(bucket, 0) or 0) + 1
+    page = int(entry.get("page_number") or 0)
+    if page and page not in block["pages"]:
+        block["pages"].append(page)
+    if len(block["items"]) < TEXT_ITEM_DEGRADE_REPORT_LIMIT:
+        block["items"].append(entry)
+    else:
+        block["items_truncated"] = True
+
+
+def _degraded_text_item_warning_line(
+    entry: Dict[str, Any], opts: Optional[ImportOptions] = None
+) -> str:
+    """One bounded operator sentence per degraded text item.
+
+    Returns ``""`` once ``TEXT_ITEM_DEGRADE_CONSOLE_LIMIT`` lines have been
+    emitted for this import: a sheet whose dominant embedded font is unusable
+    degrades every span, and the console is the one surface with no cap of its
+    own. ``_text_degrade_console_overflow_line`` closes the list.
+    """
+    if opts is not None:
+        block = (getattr(opts, "_report_extra", None) or {}).get(
+            "text_items_degraded"
+        )
+        emitted = (
+            int(block.get("total", 0) or 0) if isinstance(block, dict) else 0
+        )
+        if emitted > TEXT_ITEM_DEGRADE_CONSOLE_LIMIT:
+            return ""
+    attempts = ", ".join(
+        "%s:%s" % (outcome.get("attempted_type"), outcome.get("reason"))
+        for outcome in (entry.get("rung_outcomes") or [])
+    )
+    final_type = entry.get("final_representation")
+    consequence = (
+        "drawn as %s instead" % final_type
+        if final_type
+        else "nothing was drawn for it"
+    )
+    line = (
+        "PDF import: text item %s %r on page %s could not be delivered as %s "
+        "- %s. Attempts: %s."
+        % (
+            entry.get("source_item_id"),
+            _bounded_report_text(entry.get("source_text"), 60),
+            entry.get("page_number"),
+            entry.get("requested_type"),
+            consequence,
+            attempts or "none",
+        )
+    )
+    return _bounded_report_text(line, 400)
+
+
+def _text_degrade_console_overflow_line(opts: ImportOptions) -> str:
+    """The one console line that names the degraded items the cap left out."""
+    block = (getattr(opts, "_report_extra", None) or {}).get("text_items_degraded")
+    total = int(block.get("total", 0) or 0) if isinstance(block, dict) else 0
+    if total <= TEXT_ITEM_DEGRADE_CONSOLE_LIMIT:
+        return ""
+    return (
+        "PDF import: ... and %d more text item%s could not be delivered at the "
+        "requested representation; see text_items_degraded in the import report."
+        % (
+            total - TEXT_ITEM_DEGRADE_CONSOLE_LIMIT,
+            "" if total - TEXT_ITEM_DEGRADE_CONSOLE_LIMIT == 1 else "s",
+        )
+    )
+
+
+def _text_degrade_summary_note(
+    block: Any, session_degraded_pages: Optional[List[int]] = None
+) -> str:
+    """The degrade sentence the human summary carries; '' when nothing degraded.
+
+    ``session_degraded_pages`` are pages an earlier invocation of the same
+    import session left degraded. A resumed run did not degrade them itself,
+    but it is reporting that session, so it says so too.
+    """
+    total = int(block.get("total", 0) or 0) if isinstance(block, dict) else 0
+    pages = sorted({int(page) for page in (session_degraded_pages or [])})
+    if total <= 0 and not pages:
+        return ""
+    parts = []
+    if total > 0:
+        dropped = int(block.get("dropped", 0) or 0)
+        lowered = int(block.get("delivered_at_lower_rung", 0) or 0)
+        parts.append(
+            "%d text item%s could not be delivered at the requested "
+            "representation (%d drawn at a lower representation, %d not drawn)"
+            % (total, "" if total == 1 else "s", lowered, dropped)
+        )
+    if pages:
+        parts.append(
+            "an earlier run of this import session left text items degraded on "
+            "page%s %s"
+            % (
+                "" if len(pages) == 1 else "s",
+                ", ".join(str(page) for page in pages),
+            )
+        )
+    return (
+        "%s; this import is not certified - see text_items_degraded in the "
+        "import report" % "; ".join(parts)
+    )
+
+
 def _auto_raster_needs_text_overlay(
     effective_mode: str,
     source_text_blocks: int,
@@ -1040,6 +1463,23 @@ def write_import_report(
     if text_attempts:
         extra["text_delivery_attempts"] = text_attempts
 
+    # Host font honesty: which host font every delivered native text item was
+    # handed, and which of those the host does not draw with the source font.
+    # A degraded item is not a delivery of the requested representation, so it
+    # is listed in text_items_degraded (with its font identity) and never in
+    # this map - a reader of host_font_map is asking what was delivered.
+    from PDFHostFonts import summarize_host_fonts
+
+    host_font_summary = summarize_host_fonts(
+        attempt
+        for attempt in text_attempts
+        if attempt.get("representation_degraded") is not True
+    )
+    extra["host_font_map"] = host_font_summary["host_font_map"]
+    extra["host_font_substitutions"] = host_font_summary["host_font_substitutions"]
+    extra["host_font_unverified"] = host_font_summary["host_font_unverified"]
+    host_font_warnings = len(host_font_summary["host_font_substitutions"])
+
     font_stage_failures = [
         dict(failure)
         for failure in (getattr(opts, "_font_stage_failures", []) or [])
@@ -1276,6 +1716,72 @@ def write_import_report(
         extra["max_page_complexity_units"] = int(
             getattr(opts, "max_page_complexity_units", 0) or 0
         )
+    # Always present, so "nothing needed care" is a statement and not an absence.
+    clip_fill_delivery = extra.setdefault("clip_fill_delivery", _new_clip_fill_delivery())
+    clip_fill_warnings = (
+        int(clip_fill_delivery.get("dropped", 0) or 0)
+        + int(clip_fill_delivery.get("approximated", 0) or 0)
+    )
+
+    # Text a font delivered as raw glyph codes: what was proven and by which
+    # route, and what stayed exactly as the PDF delivered it. A recovered span
+    # is a clean delivery; only an unproven one is a warning.
+    glyph_code_block = glyph_code_delivery_block(_glyph_code_records(opts))
+    glyph_code_warnings = 0
+    if glyph_code_block["spans_examined"]:
+        extra["text_glyph_codes"] = glyph_code_block
+        glyph_code_warnings = glyph_code_warning_count(glyph_code_block)
+
+    # One text item that could not be delivered costs that item, not the sheet
+    # - but it is never silent and it never certifies. build_import_contract_ready
+    # only reads text_representation_delivery, so the host states it here: this
+    # is the single switch that keeps a degraded sheet out of certification.
+    text_degrade_block = extra.get("text_items_degraded")
+    text_degrade_warnings = (
+        int(text_degrade_block.get("total", 0) or 0)
+        if isinstance(text_degrade_block, dict)
+        else 0
+    )
+    session_degrade_block = extra.get("session_text_items_degraded")
+    session_degraded_pages = (
+        sorted({int(page) for page in (session_degrade_block.get("pages") or [])})
+        if isinstance(session_degrade_block, dict)
+        else []
+    )
+    text_source_spans = int(extra.get("text_source_spans") or 0)
+    uncertified_spans = max(text_degrade_warnings, len(session_degraded_pages))
+    if uncertified_spans > text_source_spans:
+        # build_import_contract_ready short-circuits to "ready" on a zero
+        # source-span count, so the count can never be smaller than the
+        # degrade this report carries - otherwise the switch below is vacuous
+        # and a resumed session certifies a sheet it never delivered.
+        text_source_spans = uncertified_spans
+        extra["text_source_spans"] = text_source_spans
+    if text_source_spans > 0:
+        delivery = {
+            "required": True,
+            "verified": text_degrade_warnings == 0 and not session_degraded_pages,
+            "requested_type": requested_mode,
+            "source_spans": text_source_spans,
+            "degraded_items": text_degrade_warnings,
+        }
+        if session_degraded_pages:
+            delivery["session_degraded_pages"] = session_degraded_pages
+        extra["text_representation_delivery"] = delivery
+    text_degrade_note = _text_degrade_summary_note(
+        text_degrade_block, session_degraded_pages
+    )
+    if text_degrade_note:
+        # Its own channel: "which fonts were substituted" is a different
+        # question from "which text items were not delivered".
+        extra["text_degrade_note"] = text_degrade_note
+    if text_degrade_warnings or session_degraded_pages:
+        # The report's top-level "was a fallback used?" must not answer no for
+        # a sheet most of whose text items were drawn as something else. The
+        # proof-gated text_mode_fallbacks channel stays empty on purpose: it is
+        # what keeps representation_contract_violation firing.
+        fallback_used = True
+        fallback_reason = fallback_reason or "text_items_degraded"
 
     report = build_import_report(
         host_app="freecad",
@@ -1301,8 +1807,48 @@ def write_import_report(
         text_fallback=text_fallback,
         peak_mb=sample_process_mb(),
         performance_phases=phases or None,
+        # Visible clipped fills that were left out or are approximate, PDF
+        # fonts that are not drawn with the source font itself, text items
+        # that could not be delivered at the requested representation, text
+        # spans whose raw glyph codes nothing proved, and one per page an
+        # earlier run of this session left degraded - a resumed report must
+        # not read as a clean run.
+        warnings=(
+            clip_fill_warnings
+            + host_font_warnings
+            + text_degrade_warnings
+            + glyph_code_warnings
+            + len(session_degraded_pages)
+        ),
         extra=extra,
     )
+
+    if host_font_summary["note"] or text_degrade_note:
+        # The shared core overwrites extra["font_substitution_note"] from its
+        # PDF audit inside build_import_report, so the host note is appended
+        # here and the human summary is rebuilt to carry it.
+        from pdfcadcore.import_report import build_human_summary
+
+        if host_font_summary["note"]:
+            core_font_note = str(
+                report.extra.get("font_substitution_note") or ""
+            ).strip().rstrip(".")
+            report.extra["font_substitution_note"] = ". ".join(
+                part
+                for part in (core_font_note, host_font_summary["note"])
+                if part
+            )
+        summary = build_human_summary(report)
+        if text_degrade_note:
+            # build_human_summary is in the hash-pinned shared core and only
+            # knows font_substitution_note. "Which fonts were substituted" is
+            # a different question from "which text items were not delivered",
+            # so the degrade sentence is appended to the rebuilt paragraph
+            # instead of being published through that field.
+            summary = "%s %s." % (summary.rstrip(), text_degrade_note.rstrip("."))
+        report.extra["human_summary"] = summary
+        for host_font_warning in host_font_summary["console_warnings"]:
+            _warn(host_font_warning)
 
     if text_fallback and isinstance(getattr(report, "fallback", None), dict):
         fallback_text = report.fallback.get("text")
@@ -2240,42 +2786,26 @@ def _effective_descender(text: str, font_descender: float) -> float:
     return font_descender * 0.08
 
 
-def _normalize_pdf_font_name(font_name: str) -> str:
-    """Normalize PDF font names to practical system font family names.
+def _resolve_pdf_host_font(font_name: str, flags: Any = None) -> Dict[str, Any]:
+    """Host font resolution record for one PDF span font (see PDFHostFonts)."""
+    from PDFHostFonts import resolve_host_font
 
-    PDF fonts often arrive as subset names like "ABCDEE+Helvetica-Bold".
-    Draft accepts family names more reliably than subset/raw PDF names.
+    return resolve_host_font(font_name, flags)
+
+
+def _normalize_pdf_font_name(font_name: str, flags: Any = None) -> str:
+    """Map a PDF span font name to the font name handed to Draft Text/Labels.
+
+    PDF fonts arrive as subset/PostScript names like "ABCDEE+Helvetica-Bold" or
+    "ArialNarrow,Bold"; Draft needs a host family name ("Arial Narrow Bold").
+    A variant is never collapsed to its base family: that silently changes the
+    text width. ``flags`` are the PyMuPDF span flags (bold/italic rescue a name
+    MuPDF truncated). Empty input returns ""; non-empty input never does.
     """
     raw = str(font_name or "").strip()
     if not raw:
         return ""
-
-    if "+" in raw:
-        prefix, rest = raw.split("+", 1)
-        if len(prefix) == 6 and prefix.isupper():
-            raw = rest.strip()
-
-    low = raw.lower()
-    if "helvetica" in low or "arial" in low:
-        family = "Arial"
-    elif "times" in low:
-        family = "Times New Roman"
-    elif "courier" in low:
-        family = "Courier New"
-    elif "calibri" in low:
-        family = "Calibri"
-    else:
-        return raw
-
-    is_bold = bool(re.search(r"\bbold\b|\bbd\b", low))
-    is_italic = bool(re.search(r"\bitalic\b|\boblique\b|\bit\b", low))
-    if is_bold and is_italic:
-        return f"{family} Bold Italic"
-    if is_bold:
-        return f"{family} Bold"
-    if is_italic:
-        return f"{family} Italic"
-    return family
+    return str(_resolve_pdf_host_font(raw, flags).get("host_font") or "") or raw
 
 
 def _line_angle_deg(line: dict, opts: Optional[ImportOptions] = None) -> float:
@@ -2536,7 +3066,9 @@ def _render_text_spans_exact_labels(
                     )
 
                 pos = _to_fc(origin, page_h, opts, scale)
-                font_name = _normalize_pdf_font_name(span.get("font", ""))
+                font_name = _normalize_pdf_font_name(
+                    span.get("font", ""), span.get("flags")
+                )
                 # Draft text is placed from a host text-box anchor while PDF
                 # spans report a baseline origin. Apply the same local-axis
                 # correction for horizontal and rotated exact labels so leader
@@ -2634,6 +3166,9 @@ def _render_text_spans_exact_labels(
                         "source_text_preserved": True,
                         "source_font": str(span.get("font", "") or ""),
                         "font_name": font_name,
+                        "font_status": _resolve_pdf_host_font(
+                            span.get("font", ""), span.get("flags")
+                        )["status"],
                         "rotation_deg": float(span_angle_deg),
                         "font_size": float(font_size_fc),
                     },
@@ -3439,6 +3974,12 @@ def _resolve_shapestring_font_path_with_evidence(
         "arialitalicmt": "ariali.ttf",
         "arialbolditalic": "arialbi.ttf",
         "arialbolditalicmt": "arialbi.ttf",
+        # Arial Narrow / Arial Black are their own families, never "Arial".
+        "arialnarrow": "ARIALN.TTF",
+        "arialnarrowbold": "ARIALNB.TTF",
+        "arialnarrowitalic": "ARIALNI.TTF",
+        "arialnarrowbolditalic": "ARIALNBI.TTF",
+        "arialblack": "ariblk.ttf",
         "calibri": "calibri.ttf",
         "calibriregular": "calibri.ttf",
         "calibribold": "calibrib.ttf",
@@ -3555,6 +4096,131 @@ CLOSED_SVG_ITEM_IMPOSSIBILITY_REASONS = frozenset(
         "svg_item_assignment_empty",
     }
 )
+
+# A degraded item is listed per item in the report. One sheet whose dominant
+# embedded font is unusable degrades every span on the page, so the list is
+# capped and the total plus a truncated flag are always stated.
+TEXT_ITEM_DEGRADE_REPORT_LIMIT = 200
+
+# The console says the same thing, but a report view is not a report: the
+# per-item lines are capped and one closing line names the rest, matching the
+# clipped-fill and host-font console precedents.
+TEXT_ITEM_DEGRADE_CONSOLE_LIMIT = 20
+
+# Evidence a degraded item carries into the report. The builders' evidence
+# dicts also hold whole character layouts; only the identifying fields are
+# copied, and every string value is bounded.
+TEXT_ITEM_DEGRADE_EVIDENCE_KEYS = (
+    "stage",
+    "reason_code",
+    "exception",
+    "font_path",
+    "font_identity",
+    "font_name",
+    "font_source",
+    "source_character_index",
+    "source_character_codepoint",
+    "cleanup_error",
+    "ownership_collection_error",
+    "unknown_post_baseline_entity_ids",
+)
+
+
+def _bounded_report_text(value: Any, limit: int = 120) -> str:
+    """One report/console field's text, bounded so one span cannot flood it."""
+    text = str(value if value is not None else "")
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
+
+
+def _bounded_rung_evidence(evidence: Any) -> Dict[str, Any]:
+    """The identifying part of a builder's failure evidence, bounded."""
+    if not isinstance(evidence, dict):
+        return {}
+    bounded: Dict[str, Any] = {}
+    for key in TEXT_ITEM_DEGRADE_EVIDENCE_KEYS:
+        if key not in evidence:
+            continue
+        value = evidence[key]
+        if isinstance(value, str):
+            bounded[key] = _bounded_report_text(value, 240)
+        elif isinstance(value, dict):
+            bounded[key] = {
+                str(sub_key): _bounded_report_text(sub_value, 120)
+                if isinstance(sub_value, str)
+                else sub_value
+                for sub_key, sub_value in value.items()
+            }
+        elif isinstance(value, (list, tuple)):
+            bounded[key] = [
+                _bounded_report_text(entry, 120) if isinstance(entry, str) else entry
+                for entry in list(value)[:10]
+            ]
+        else:
+            bounded[key] = value
+    return bounded
+
+
+def _text_item_rung_outcome(
+    attempted: str,
+    outcome: str,
+    reason: Any,
+    attempt: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """One ladder rung's verdict exactly as the degrade report states it."""
+    record: Dict[str, Any] = {
+        "attempted_type": str(attempted),
+        "outcome": str(outcome),
+        "reason": str(reason or ""),
+    }
+    evidence = _bounded_rung_evidence((attempt or {}).get("evidence"))
+    if evidence:
+        record["evidence"] = evidence
+    return record
+
+
+def _degraded_text_item_record(
+    item: Dict[str, Any],
+    requested: str,
+    attempted_types: List[str],
+    rung_outcomes: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """The ladder's terminal answer when no rung could deliver this item.
+
+    Owner directive 2026-09-19: one text item that cannot be delivered costs
+    that item, not the document. The classification each builder produced is
+    unchanged and stays in the ledger; only the consequence is different.
+    """
+    outcomes = [dict(entry) for entry in rung_outcomes]
+    attempted_outcomes = [
+        entry for entry in outcomes if entry.get("outcome") != "skipped"
+    ]
+    proof_class = (
+        "proven_impossible"
+        if attempted_outcomes
+        and all(
+            entry.get("outcome") == "proven_impossible" for entry in attempted_outcomes
+        )
+        else "unproven_failure"
+    )
+    return {
+        "source_item_id": str(item.get("source_item_id") or ""),
+        "requested_type": requested,
+        "attempted_type": attempted_types[-1] if attempted_types else requested,
+        "final_type": None,
+        "outcome": "degraded",
+        "verified": False,
+        "reason": "text_item_degraded",
+        "attempted_types": list(attempted_types),
+        "rung_outcomes": outcomes,
+        "proof_class": proof_class,
+        # Every rung the ladder advanced across proved it removed exactly what
+        # it created; an incomplete cleanup is still document-fatal.
+        "created_entity_ids": [],
+        "removed_entity_ids": [],
+        "cleanup_complete": True,
+    }
 
 
 def _normalize_requested_text_type(requested_type: str) -> str:
@@ -4465,6 +5131,46 @@ def _failed_text_item_attempt(
     }
 
 
+def _page_text_setup_failure(
+    item: Dict[str, Any],
+    requested: str,
+    attempted: str,
+    stage: str,
+    error: BaseException,
+) -> TextRepresentationFailure:
+    """A page-scoped setup step failed for this rung, and it owns no host object.
+
+    Reading the page's source character geometry and staging the page's
+    embedded fonts happen inside the native and 3D deliverers but belong to the
+    page, not to the item: the first only reads the PDF and the second only
+    writes the add-on's font cache. Neither can leave a host object behind, so
+    the attempt states an exact empty cleanup and the ladder may walk to a rung
+    that does not need that setup. The ledger reason is the same
+    ``generic_exception:<Class>`` this failure has always produced - the
+    classification is unchanged, only the consequence is.
+    """
+    attempt = _failed_text_item_attempt(
+        item,
+        requested,
+        attempted,
+        "generic_exception:%s" % error.__class__.__name__,
+        {
+            "created_entity_ids": [],
+            "removed_entity_ids": [],
+            "cleanup_complete": True,
+        },
+    )
+    attempt["evidence"] = {
+        "stage": stage,
+        "exception": "%s: %s" % (error.__class__.__name__, error),
+    }
+    return TextRepresentationFailure(
+        "%s delivery failed without a validated impossibility proof: %s page "
+        "setup failed: %s" % (attempted, stage, error),
+        attempt,
+    )
+
+
 def _normalize_impossible_attempt(
     item: Dict[str, Any],
     requested: str,
@@ -4638,7 +5344,16 @@ def _run_text_item_fallback_ladder(
     deliverers: Dict[str, Any],
     opts: ImportOptions,
 ) -> Dict[str, Any]:
-    """Deliver one source item, advancing only across exact proven impossibility."""
+    """Deliver one source item, or report exactly why it could not be delivered.
+
+    Advancing across an exact proven impossibility is unchanged. A rung that
+    failed *without* proof now also advances, but only when its own attempt
+    shows it removed every host object it made: an orphan object leaves the
+    document in an unknown state and is still fatal. When no rung delivers,
+    the item is returned as a degraded record rather than costing the whole
+    document (owner directive 2026-09-19). The failure classification every
+    builder produces is untouched and stays in the attempt ledger.
+    """
     requested_mode = requested if isinstance(requested, str) else ""
     bound_item = copy.deepcopy(item) if isinstance(item, dict) else {}
     source_item_id = bound_item.get("source_item_id")
@@ -4664,8 +5379,9 @@ def _run_text_item_fallback_ladder(
 
     attempted_types: List[str] = []
     validated_proofs: List[Dict[str, Any]] = []
+    rung_outcomes: List[Dict[str, Any]] = []
+    unproven_rung_failure = False
     for attempted_mode in TEXT_ITEM_FALLBACK_LADDERS[requested_mode]:
-        attempted_types.append(attempted_mode)
         deliverer = deliverers.get(attempted_mode)
         if not callable(deliverer):
             failed = _failed_text_item_attempt(
@@ -4679,9 +5395,13 @@ def _run_text_item_fallback_ladder(
                 "%s deliverer is unavailable" % attempted_mode,
                 failed,
             )
+        attempted_types.append(attempted_mode)
 
         try:
             result = deliverer(copy.deepcopy(bound_item), attempted_mode, opts)
+        except ImportCancelled:
+            # Cancellation is the operator's answer, never a delivery failure.
+            raise
         except TextItemImpossible as impossible:
             try:
                 proof = _validate_item_impossibility_proof(
@@ -4713,25 +5433,57 @@ def _run_text_item_fallback_ladder(
                 ) from impossible
             _append_text_item_attempt(opts, proven_attempt)
             validated_proofs.append(proof)
-            if attempted_mode == "raster":
-                raise TextRepresentationFailure(
-                    "Raster is terminal for source item %s" % source_item_id,
+            if proven_attempt.get("removed_entity_ids"):
+                # A proof that built and then removed a host object frees a
+                # name FreeCAD hands straight to the next item.
+                _refresh_native_text_index_after_item_rollback(opts)
+            rung_outcomes.append(
+                _text_item_rung_outcome(
+                    attempted_mode,
+                    "proven_impossible",
+                    proof.get("reason_code"),
                     proven_attempt,
-                ) from impossible
+                )
+            )
+            if attempted_mode == "raster":
+                # The terminal rung proved itself impossible: there is nothing
+                # below it, so the item is degraded rather than the document.
+                break
             continue
         except TextRepresentationFailure as failure:
-            if failure.attempt:
-                _append_text_item_attempt(opts, failure.attempt)
-                raise
-            failed = _failed_text_item_attempt(
-                bound_item,
-                requested_mode,
-                attempted_mode,
-                "text_representation_failure",
-            )
+            if not failure.attempt:
+                # No attempt record means the builder broke its own contract.
+                failed = _failed_text_item_attempt(
+                    bound_item,
+                    requested_mode,
+                    attempted_mode,
+                    "text_representation_failure",
+                )
+                _append_text_item_attempt(opts, failed)
+                raise TextRepresentationFailure(str(failure), failed) from failure
+            failed = dict(failure.attempt)
             _append_text_item_attempt(opts, failed)
-            raise TextRepresentationFailure(str(failure), failed) from failure
+            if failed.get("cleanup_complete") is not True:
+                # Host objects this rung created are still in the document.
+                # That is structural, not one item's problem.
+                raise
+            if failed.get("removed_entity_ids"):
+                _refresh_native_text_index_after_item_rollback(opts)
+            unproven_rung_failure = True
+            rung_outcomes.append(
+                _text_item_rung_outcome(
+                    attempted_mode, "failed", failed.get("reason"), failed
+                )
+            )
+            continue
         except Exception as error:
+            # An exception that escaped the deliverer carries no cleanup record
+            # at all, so what it left behind is unknown and the document is
+            # still the right blast radius. A step that provably owns no host
+            # object - the page-scoped source read and font staging in
+            # ``_render_canonical_text_items`` - states that exactly and raises
+            # TextRepresentationFailure above instead of arriving here, which
+            # is how a locked font cache costs its items and not the sheet.
             failed = _failed_text_item_attempt(
                 bound_item,
                 requested_mode,
@@ -4769,8 +5521,15 @@ def _run_text_item_fallback_ladder(
 
         normalized["attempted_types"] = list(attempted_types)
         normalized["proof_chain"] = [dict(proof) for proof in validated_proofs]
+        if unproven_rung_failure:
+            # Drawn, but not at the requested representation and without a
+            # proof that the requested one was impossible. That is a degrade:
+            # it is reported per item and it keeps the sheet uncertified.
+            normalized["representation_degraded"] = True
+            normalized["rung_outcomes"] = [dict(entry) for entry in rung_outcomes]
+            normalized["proof_class"] = "unproven_failure"
         _append_text_item_attempt(opts, normalized)
-        if validated_proofs:
+        if validated_proofs and not unproven_rung_failure:
             fallback_proof = _aggregate_text_item_fallback_proof(
                 bound_item,
                 requested_mode,
@@ -4791,14 +5550,14 @@ def _run_text_item_fallback_ladder(
             )
         return normalized
 
-    failed = _failed_text_item_attempt(
-        bound_item,
-        requested_mode,
-        "raster",
-        "fallback_ladder_exhausted",
+    # Every rung is spent, including the terminal raster crop. The item is
+    # degraded: nothing is drawn for it, it is never counted as delivered, and
+    # the report names it with every rung's own verdict.
+    degraded = _degraded_text_item_record(
+        bound_item, requested_mode, attempted_types, rung_outcomes
     )
-    _append_text_item_attempt(opts, failed)
-    raise TextRepresentationFailure("Text item fallback ladder exhausted", failed)
+    _append_text_item_attempt(opts, degraded)
+    return degraded
 
 
 def _build_text_size_crosschecks(opts: ImportOptions) -> Dict[str, Any]:
@@ -4979,6 +5738,26 @@ def _prepare_native_text_object_index(
         }
     opts._native_text_object_index = index
     return index
+
+
+def _refresh_native_text_index_after_item_rollback(opts: ImportOptions) -> None:
+    """Rebuild the page's native-object index after an item-scoped rollback.
+
+    FreeCAD recycles a removed object's ``Name``. A rolled-back item leaves
+    its name in this index, so the next native delivery sees its own brand-new
+    object as one that already existed and fails
+    ``native_text_creation_or_style_failed`` — measured as one degraded item
+    turning into 2,152 on a 2,376-span sheet. ``_restore_page_result_telemetry``
+    does the same thing for page- and import-scoped rollbacks.
+    """
+    index = getattr(opts, "_native_text_object_index", None)
+    if not isinstance(index, dict):
+        return
+    doc = index.get("document")
+    if doc is None:
+        opts._native_text_object_index = None
+        return
+    _prepare_native_text_object_index(opts, doc, refresh=True)
 
 
 def _remember_native_text_object(opts: ImportOptions, host_obj) -> None:
@@ -5487,10 +6266,19 @@ def _font_kern_probe_tables(
         ) from exc
 
     try:
-        cmap = font.getBestCmap()
-        if not isinstance(cmap, dict) or not cmap:
-            raise RuntimeError("source font character map could not be verified")
-        cmap_table = dict(cmap)
+        # A cmap or hmtx table fontTools cannot decode is MISSING MEASUREMENT
+        # DATA, not proof that the font is unusable. PDF subsetters routinely
+        # ship an hmtx whose trailing side-bearing array was dropped while hhea
+        # still describes the full face, and fontTools' strict reader refuses
+        # it - while FreeType and OCC draw every one of those glyphs. Both
+        # callers already cope with an absent table (_font_units_string_advance
+        # returns None and _measure_text3d_pen_advance falls back to the wire
+        # probe), so report the table as absent and let them decide.
+        try:
+            cmap = font.getBestCmap()
+        except Exception:
+            cmap = None
+        cmap_table = dict(cmap) if isinstance(cmap, dict) else {}
         kern_tables: List[Dict[Tuple[str, str], float]] = []
         if "kern" in font:
             raw_tables = getattr(font["kern"], "kernTables", None)
@@ -5506,19 +6294,23 @@ def _font_kern_probe_tables(
                     )
                 kern_tables.append(dict(raw_pairs))
         hmtx_metrics: Dict[str, Tuple[float, float]] = {}
-        if "hmtx" in font:
-            raw_metrics = getattr(font["hmtx"], "metrics", None)
-            if isinstance(raw_metrics, dict):
-                for glyph_name, metric in raw_metrics.items():
-                    if not isinstance(metric, (tuple, list)) or not metric:
-                        continue
-                    try:
-                        width = float(metric[0])
-                        lsb = float(metric[1]) if len(metric) > 1 else 0.0
-                    except (TypeError, ValueError):
-                        continue
-                    if math.isfinite(width):
-                        hmtx_metrics[str(glyph_name)] = (width, lsb)
+        try:
+            if "hmtx" in font:
+                raw_metrics = getattr(font["hmtx"], "metrics", None)
+                if isinstance(raw_metrics, dict):
+                    for glyph_name, metric in raw_metrics.items():
+                        if not isinstance(metric, (tuple, list)) or not metric:
+                            continue
+                        try:
+                            width = float(metric[0])
+                            lsb = float(metric[1]) if len(metric) > 1 else 0.0
+                        except (TypeError, ValueError):
+                            continue
+                        if math.isfinite(width):
+                            hmtx_metrics[str(glyph_name)] = (width, lsb)
+        except Exception:
+            # Undecodable advance metrics: measured from the outlines instead.
+            hmtx_metrics = {}
         payload = (cmap_table, kern_tables, hmtx_metrics)
         _FONT_KERN_PROBE_CACHE[font_path] = payload
         return payload
@@ -5541,9 +6333,17 @@ def _text3d_zero_kern_probe_candidates(
     if not isinstance(source_text, str) or not source_text:
         raise RuntimeError("source font tail glyph could not be verified")
     cmap, kern_tables, _hmtx = _font_kern_probe_tables(font_path)
+    if not cmap:
+        # An unreadable character map is not evidence about any one glyph, and
+        # it must never be mistaken for "this font has no glyph for that
+        # codepoint".
+        raise RuntimeError("source font character map could not be verified")
     left_glyph = cmap.get(ord(source_text[-1]))
     if not isinstance(left_glyph, str) or not left_glyph:
-        raise RuntimeError("source font tail glyph could not be verified")
+        raise RuntimeError(
+            "source font has no glyph for source character U+%04X"
+            % ord(source_text[-1])
+        )
 
     candidate_characters = []
     for character in (*source_text, "M", "I", "0", "|", "."):
@@ -5657,6 +6457,47 @@ def _measure_text3d_pen_advance(source_text: str, font_path: str) -> float:
     return probed
 
 
+class _Text3DGlyfOutline:
+    """One ``glyf`` glyph that draws itself without any advance metrics."""
+
+    def __init__(self, glyf_table, glyph):
+        self._glyf_table = glyf_table
+        self._glyph = glyph
+
+    def draw(self, pen) -> None:
+        self._glyph.draw(pen, self._glyf_table)
+
+
+class _Text3DGlyfOutlineSet:
+    """Source glyph outlines read straight from ``glyf``.
+
+    fontTools' own glyph set eagerly loads ``hmtx`` advance widths, and a PDF
+    subset font routinely ships a truncated ``hmtx`` while ``hhea`` still
+    describes the full face. The em-ink measurement needs the outlines and
+    ``unitsPerEm`` only, so an undecodable advance table must not cost the
+    measurement - these are the same contours fontTools would have drawn.
+    """
+
+    def __init__(self, glyf_table):
+        self._glyf_table = glyf_table
+
+    def __getitem__(self, glyph_name):
+        return _Text3DGlyfOutline(self._glyf_table, self._glyf_table[glyph_name])
+
+
+def _text3d_source_glyph_outlines(font):
+    """Return a glyph set for em-ink measurement, advance metrics or not."""
+    try:
+        return font.getGlyphSet()
+    except Exception:
+        # Only for a static TrueType outline font: a variable font's default
+        # instance is not the instance the page uses, and a CFF font has no
+        # glyf table to read instead.
+        if "glyf" not in font or "gvar" in font:
+            raise
+        return _Text3DGlyfOutlineSet(font["glyf"])
+
+
 def _text3d_source_em_scale(
     source_text: str, font_path: str, native_shape, native_size: float = 1.0
 ) -> float:
@@ -5679,7 +6520,7 @@ def _text3d_source_em_scale(
                 if not math.isfinite(units_per_em) or units_per_em <= 0.0:
                     raise ValueError("invalid unitsPerEm")
                 cmap = font.getBestCmap()
-                glyphs = font.getGlyphSet()
+                glyphs = _text3d_source_glyph_outlines(font)
                 bounds = []
                 for character in source_text:
                     if character.isspace():
@@ -6575,7 +7416,9 @@ def _deliver_text_item_native(
         text_group.addObject(host_obj)
         _annotate_text_host_object(host_obj, source_item_id, attempted_type)
 
-        normalized_font = _normalize_pdf_font_name(span.get("font", ""))
+        normalized_font = _normalize_pdf_font_name(
+            span.get("font", ""), span.get("flags")
+        )
         source_color = _span_source_color(span)
         color_metadata = (
             ",".join(format(float(channel), ".9g") for channel in source_color)
@@ -6755,6 +7598,12 @@ def _deliver_text_item_native(
             "verified_anchor_xyz": tuple(actual_anchor),
             "rotation_deg": float(actual_rotation),
             "font_name": normalized_font,
+            # Honest font record: what the PDF asked for, and whether the host
+            # draws it with that font itself or substitutes (PDFHostFonts).
+            "source_font": str(span.get("font", "") or ""),
+            "font_status": _resolve_pdf_host_font(
+                span.get("font", ""), span.get("flags")
+            )["status"],
             "font_size": float(actual_font_size),
             "source_color": source_color,
             "color_verified": bool(color_verified),
@@ -7027,11 +7876,12 @@ def _raster_source_coverage_bbox(item, page, opts):
     bbox = _finite_source_tuple(item.get("bbox"), 4, "item.bbox")
     if fitz is None or not isinstance(page, fitz.Page):
         return bbox
-    from pdfcadcore.primitive_extractor import _raw_text_with_source_quads
     cache = getattr(opts, "_raster_source_quad_cache", None)
     key = (item.get("pdf_sha256"), item.get("page_number"))
     if not isinstance(cache, dict) or cache.get("key") != key:
-        cache = {"key": key, "raw": _raw_text_with_source_quads(page)}
+        # The very dictionary _page_text_dict copied this item's text from, so
+        # the identity below is the one thing it cannot be made to disagree on.
+        cache = {"key": key, "raw": _recovered_raw_text_dict(page, opts)}
         opts._raster_source_quad_cache = cache
     block = cache["raw"]["blocks"][item["block_index"]]
     line = block["lines"][item["line_index"]]
@@ -7781,7 +8631,7 @@ def _deliver_text_item_3d(
 
     depth = max(font_size_fc * 0.12, 0.05)
     source_color = _span_source_color(span)
-    normalized_font = _normalize_pdf_font_name(source_font)
+    normalized_font = _normalize_pdf_font_name(source_font, span.get("flags"))
     compound_failure_evidence: Optional[Dict[str, Any]] = None
     compound_zero_outline_evidence: Optional[Dict[str, Any]] = None
     stage = "host_annotation"
@@ -8030,6 +8880,11 @@ def _deliver_text_item_3d(
         compound_failure_evidence = {
             "stage": stage,
             "exception": "%s: %s" % (exc.__class__.__name__, exc),
+            # Which font file the failure was measured against. Without it a
+            # degraded item names a stage and an exception and nothing an
+            # operator can act on.
+            "font_path": font_path,
+            "font_source": (font_source_result or {}).get("source"),
         }
         if source_character_layout is not None:
             terminal_failure("positioned_3d_text_failed", compound_failure_evidence)
@@ -9290,11 +10145,23 @@ def _bind_native_source_layout(item, delivered, raw_dict, *, opts, scale, doc, g
         return delivered
     except Exception as exc:
         removed_ids, cleanup_complete = _remove_owned_text_objects(doc, group, owned)
+        # Name the character the layout could not place. Without it a degraded
+        # item says only "source character advance is degenerate".
+        failure_evidence = {"exception": "%s: %s" % (type(exc).__name__, exc)}
+        character_index = getattr(exc, "source_character_index", None)
+        if type(character_index) is int:
+            failure_evidence["source_character_index"] = character_index
+            failure_evidence["source_character_codepoint"] = str(
+                getattr(exc, "source_character_codepoint", "") or ""
+            )
+        font_name = (delivered.get("evidence") or {}).get("font_name")
+        if font_name:
+            failure_evidence["font_name"] = str(font_name)
         attempt = dict(delivered, outcome="failed", final_type=None,
             reason="native_source_layout_failed", created_entity_ids=created_ids,
             removed_entity_ids=removed_ids, cleanup_complete=bool(cleanup_complete and
                 all(doc.getObject(name) is None for name in created_ids)),
-            evidence={"exception": "%s: %s" % (type(exc).__name__, exc)})
+            evidence=failure_evidence)
         raise TextRepresentationFailure("Native source character layout failed", attempt) from exc
 
 
@@ -9315,7 +10182,7 @@ def _render_canonical_text_items(
 ) -> Dict[str, Any]:
     """Deliver raw PDF spans through the finite item representation contract."""
     requested = _normalize_requested_text_type(str(opts.text_mode or ""))
-    source_dict = raw_tdict if raw_tdict is not None else page.get_text("dict")
+    source_dict = raw_tdict if raw_tdict is not None else _page_text_dict(page, opts)
     items = list(
         _iter_text_source_items(source_dict, int(page_num), pdf_sha256, requested)
     )
@@ -9326,6 +10193,15 @@ def _render_canonical_text_items(
         page_w=float(page_w),
         page_h=float(page_h),
     )
+    # The source roster this import is answerable for. build_import_contract_ready
+    # needs it to judge text_representation_delivery, so it is stated whether or
+    # not anything degrades.
+    run_report_extra = getattr(opts, "_report_extra", None)
+    if not isinstance(run_report_extra, dict):
+        run_report_extra = opts._report_extra = {}
+    run_report_extra["text_source_spans"] = int(
+        run_report_extra.get("text_source_spans", 0) or 0
+    ) + len(items)
 
     font_stage_complete = False
     svg_render_cache: Dict[str, Any] = {
@@ -9345,23 +10221,59 @@ def _render_canonical_text_items(
         ]
     }
 
+    source_character_dict = None
+    source_3d_character_dict = None
+    page_setup_errors: Dict[str, BaseException] = {}
+
+    def page_text_setup(stage, item, attempted, run):
+        """Run one page-scoped setup step, charged to this item, not the sheet.
+
+        A failure here is remembered so a locked font cache or an unreadable
+        source font is probed once per page instead of once per span, and every
+        later item gets the same exact verdict without re-running it.
+        """
+        remembered = page_setup_errors.get(stage)
+        if remembered is None:
+            try:
+                return run()
+            except (ImportCancelled, KeyboardInterrupt):
+                raise
+            except Exception as setup_error:
+                page_setup_errors[stage] = remembered = setup_error
+        raise _page_text_setup_failure(
+            item, requested, attempted, stage, remembered
+        ) from remembered
+
+    def read_page_character_geometry():
+        try:
+            from .PDFText3DLayout import read_source_character_geometry
+        except ImportError:
+            from PDFText3DLayout import read_source_character_geometry
+        return read_source_character_geometry(page)
+
     def deliver_3d(item, attempted, state):
         nonlocal font_stage_complete, source_character_dict, source_3d_character_dict
         if source_3d_character_dict is None and fitz is not None and isinstance(page, fitz.Page):
-            try:
-                from .PDFText3DLayout import read_source_character_geometry
-            except ImportError:
-                from PDFText3DLayout import read_source_character_geometry
-            source_3d_character_dict = read_source_character_geometry(page)
+            source_3d_character_dict = page_text_setup(
+                "source_character_geometry",
+                item,
+                attempted,
+                read_page_character_geometry,
+            )
             if source_character_dict is None:
                 source_character_dict = source_3d_character_dict
         if not font_stage_complete:
-            _stage_page_shapestring_fonts(
-                pdf_doc,
-                page,
-                opts,
-                pdf_sha256=pdf_sha256,
-                page_number=int(page_num),
+            page_text_setup(
+                "page_shapestring_fonts",
+                item,
+                attempted,
+                lambda: _stage_page_shapestring_fonts(
+                    pdf_doc,
+                    page,
+                    opts,
+                    pdf_sha256=pdf_sha256,
+                    page_number=int(page_num),
+                ),
             )
             font_stage_complete = True
         source_arguments = ({"raw_source_dict": source_3d_character_dict}
@@ -9376,17 +10288,15 @@ def _render_canonical_text_items(
             **source_arguments,
         )
 
-    source_character_dict = None
-    source_3d_character_dict = None
-
     def deliver_native(item, attempted, state):
         nonlocal source_character_dict, source_3d_character_dict
         if source_character_dict is None:
-            try:
-                from .PDFText3DLayout import read_source_character_geometry
-            except ImportError:
-                from PDFText3DLayout import read_source_character_geometry
-            source_character_dict = read_source_character_geometry(page)
+            source_character_dict = page_text_setup(
+                "source_character_geometry",
+                item,
+                attempted,
+                read_page_character_geometry,
+            )
             source_3d_character_dict = source_character_dict
         delivered = _deliver_text_item_native(item, attempted, state,
             text_group=parent_group, page_h=page_h, scale=scale)
@@ -9466,8 +10376,26 @@ def _render_canonical_text_items(
                 total_units=total_units,
             )
         result = _run_text_item_fallback_ladder(item, requested, deliverers, opts)
-        results.append(result)
         source_item_id = str(result["source_item_id"])
+        if result.get("outcome") == "degraded" or result.get(
+            "representation_degraded"
+        ):
+            # Loud, never silent: the item stays in the page's source roster,
+            # is listed with every rung's own verdict, adds one warning, and
+            # keeps import_contract_ready false for this sheet. The ladder has
+            # already refreshed the native-object index for any rung that
+            # actually rolled a host object back.
+            degraded_entry = _degraded_text_item_report_entry(item, result, opts)
+            _record_degraded_text_item(opts, degraded_entry)
+            warning_line = _degraded_text_item_warning_line(degraded_entry, opts)
+            if warning_line:
+                _warn(warning_line)
+            if result.get("outcome") == "degraded":
+                # Nothing was drawn: no entities, not counted as delivered.
+                delivered_source_ids.append(source_item_id)
+                text_characters_done += len(str(item.get("text") or ""))
+                continue
+        results.append(result)
         final_type = str(result["final_type"])
         delivery_ids = result.get(
             "delivery_entity_ids", result.get("created_entity_ids")
@@ -9503,12 +10431,20 @@ def _render_canonical_text_items(
 
     unique_final_types = sorted(set(final_types))
     return {
+        # "mixed" means two or more representations were delivered. A page on
+        # which nothing was drawn delivered none, and says so.
         "entity_type": (
-            unique_final_types[0] if len(unique_final_types) == 1 else "mixed"
+            "none"
+            if not unique_final_types
+            else unique_final_types[0]
+            if len(unique_final_types) == 1
+            else "mixed"
         ),
         "count": delivered_entity_count,
         "host_entity_count": created_host_entity_count,
-        "source_item_count": len(results),
+        # The full source roster, degraded items included: dropping them here
+        # is what would make the loss invisible.
+        "source_item_count": len(delivered_source_ids),
         "source_item_ids": delivered_source_ids,
         "font_rendered": any(value in {"text", "labels", "3d_text"} for value in final_types),
         "examples": [],
@@ -10468,17 +11404,55 @@ def import_pdf_page(pdf_path: str, page_num: int = 1,
     _reset_import_run_state(opts)
     fc_doc = _ensure_doc()  # Store reference — don't rely on ActiveDocument later
 
-    # Validate PDF before opening
-    from pdfcadcore.fitz_loader import PdfOpenError, safe_open
+    # This entry point may run inside a caller-owned transaction.  Do not open
+    # or abort it: remove only objects created by this page, just as the
+    # multi-page importer does for an incomplete active page.
+    from pdfcadcore.fitz_loader import safe_open
 
     try:
+        baseline_objects = _document_objects(fc_doc, required=True)
+        baseline_object_ids = {id(obj) for obj in baseline_objects}
+        baseline_object_names = {_host_object_id(obj) for obj in baseline_objects}
+        telemetry_snapshot = _snapshot_page_result_telemetry(opts)
         pdf_doc = safe_open(pdf_path)
-    except PdfOpenError:
+    except Exception:
+        # No page objects can exist yet; do not recompute the caller's model
+        # merely because the PDF could not be opened or inventoried safely.
+        opts.import_status = "failed"
         raise
     try:
-        result = _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc)
-    finally:
-        pdf_doc.close()
+        try:
+            result = _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc)
+        finally:
+            pdf_doc.close()
+    except Exception as failure:
+        rollback = _remove_post_baseline_document_objects(
+            fc_doc, baseline_object_ids, baseline_object_names
+        )
+        _restore_page_result_telemetry(opts, telemetry_snapshot)
+        opts._report_extra["rollback"] = rollback
+        opts.import_status = (
+            "cancelled" if isinstance(failure, ImportCancelled) else "failed"
+        )
+        if isinstance(failure, TextRepresentationFailure):
+            if not rollback["cleanup_complete"]:
+                failure.attempt["cleanup_complete"] = False
+                failure.attempt["rollback"] = rollback
+            _append_text_item_attempt(opts, dict(failure.attempt))
+        if not rollback["cleanup_complete"]:
+            opts.import_status = "failed"
+            raise RuntimeError(
+                "Single-page import failed and cleanup was incomplete: %s" % rollback
+            ) from failure
+        raise
+
+    opts.import_status = "success"
+
+    # import_pdf says this once per import; this entry point is its own import.
+    clip_fill_warning = _clip_fill_warning_line(opts)
+    if clip_fill_warning:
+        _warn(clip_fill_warning)
+    _emit_glyph_code_console_line(opts)
 
     if autofit:
         _autofit_import_view(fc_doc)
@@ -10579,11 +11553,10 @@ def _page_visual_inventory(page, import_mode: str):
     if str(import_mode or "").strip().lower() == "raster":
         return [], 0
     try:
+        # A clipped fill the resolver cannot prove is left out on its own and
+        # recorded on the returned rows (clip_fill_issues); it never raises, so
+        # one mask can no longer empty this inventory or abort the document.
         drawings = get_clip_aware_drawings(page)
-    except UnsupportedClipFillError:
-        # An unsupported mask must not silently become unmasked artwork or
-        # a whole-page raster import selected from an empty vector inventory.
-        raise
     except Exception as exc:
         _warn(f"get_drawings() failed: {exc}")
         drawings = []
@@ -10680,6 +11653,9 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
 
     # ── Vector drawings ──
     drawings, n_images = _page_visual_inventory(page, opts.import_mode)
+    # What happened to each clipped fill rides on this list object only. The
+    # raster-overlay and hatch filters below rebuild plain lists; read it now.
+    page_clip_fill_issues = clip_fill_issues(drawings)
     n_drawings = len(drawings)
     if not getattr(opts, "_active_page_profile", None):
         opts._active_page_profile = _page_complexity_profile(drawings, n_images, None)
@@ -10693,7 +11669,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         if opts.import_text and opts.text_mode != "none":
             _progress_update(1, "Estimating page complexity...", "planning")
             try:
-                raw_tdict = page.get_text("dict") or {}
+                raw_tdict = _page_text_dict(page, opts)
             except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
                 raise ImportComplexityBudgetExceeded(
                     f"PDF page {int(page_num)} complexity could not be bounded: {exc}"
@@ -10758,7 +11734,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 # delivery. Keep it so a pathological page is interpreted only
                 # once for text instead of once here and again at delivery.
                 if raw_tdict is None:
-                    raw_tdict = page.get_text("dict") or {}
+                    raw_tdict = _page_text_dict(page, opts)
                 n_text_blocks = sum(
                     1
                     for block in raw_tdict.get("blocks", [])
@@ -10948,7 +11924,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
 
     # ── Legacy raster fallback (vectors mode, backwards compat) ──
     if effective_mode == "vector" and opts.raster_fallback and n_drawings < 5:
-        tdict = raw_tdict if raw_tdict is not None else page.get_text("dict")
+        tdict = raw_tdict if raw_tdict is not None else _page_text_dict(page, opts)
         n_text = sum(1 for b in tdict.get("blocks", []) if b.get("type") == 0)
         if n_text == 0:
             _msg(f"Page {page_num}: appears to be scanned/raster — "
@@ -10967,6 +11943,11 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             _recompute_page_if_needed(fc_doc, opts)
             _msg(f"Page {page_num}: imported as raster image")
             return top_group, None
+
+    # Vector geometry is built from here on. A page delivered as raster above
+    # builds no fills, so it reports nothing about them.
+    if not placed_full_page_raster_background:
+        _record_clip_fill_issues(opts, page_num, page_clip_fill_issues)
 
     # ── Hatch detection ──
     hatch_indices = set()
@@ -11204,7 +12185,9 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             # page above; reading page.rect here built two PyMuPDF Rects per
             # path group (1.1 million on a 550k-path sheet, 15 s).
             page_area = page_w * page_h
-            if grp_area > page_area * 0.95:
+            # A compound clip fill is a shaped mask (a frame, a ring) whose
+            # bounds are its clip's: sheet-sized bounds are not sheet-sized ink.
+            if grp_area > page_area * 0.95 and not path_group.get("bcs_compound_clip_fill"):
                 continue
 
         parent = _parent_for(stroke_rgb or fill_rgb, layer_name)
@@ -11247,14 +12230,33 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         if path_group.get("bcs_compound_clip_fill"):
             # This is one painted mask with counter holes. Independent faces
             # would fill its holes; source outlines must also bypass cleanup.
-            shape = _compound_clip_fill_shape(path_group, page_h, opts, scale)
-            obj = fc_doc.addObject("Part::Feature", "ClippedFill")
-            obj.Shape = shape
-            obj.addProperty("App::PropertyString", "PDFClipFillGroupId", "PDF Source")
-            obj.PDFClipFillGroupId = str(path_group["bcs_clip_fill_group_id"])
-            _apply_style(obj, None, fill_rgb, width, dashes, opts)
-            parent.addObject(obj)
-            obj_count += 1
+            obj = None
+            try:
+                shape = _compound_clip_fill_shape(path_group, page_h, opts, scale)
+                obj = fc_doc.addObject("Part::Feature", "ClippedFill")
+                obj.Shape = shape
+                obj.addProperty("App::PropertyString", "PDFClipFillGroupId", "PDF Source")
+                obj.PDFClipFillGroupId = str(path_group["bcs_clip_fill_group_id"])
+                _apply_style(obj, None, fill_rgb, width, dashes, opts)
+                parent.addObject(obj)
+                obj_count += 1
+            except ImportCancelled:
+                raise
+            except Exception as exc:
+                # One mask this host cannot build costs that one fill, never the
+                # page: it is left out (never drawn unmasked) and reported.
+                if obj is not None:
+                    try:
+                        fc_doc.removeObject(obj.Name)
+                    except Exception:
+                        pass
+                # Counted once, as this host's drop: what the core recorded for
+                # the same fill (cut exactly, or flattened) is taken back first.
+                superseded = [issue for issue in page_clip_fill_issues
+                              if issue.get("seqno") == path_group.get("seqno")]
+                _record_clip_fill_issues(opts, page_num, superseded, step=-1)
+                _record_clip_fill_issues(
+                    opts, page_num, [_host_clip_fill_issue(path_group, exc, superseded)])
             continue
 
         # Build edges per sub-path
@@ -11544,7 +12546,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         text_group = _make_group(top_group or fc_doc, "Text", fc_doc)
         try:
             if raw_tdict is None:
-                raw_tdict = page.get_text("dict")
+                raw_tdict = _page_text_dict(page, opts)
         except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
             attempt = {
                 "source_item_id": "p%d:page" % int(page_num),
@@ -12216,15 +13218,20 @@ def _remove_post_baseline_document_objects(
     baseline_object_names: set,
 ) -> Dict[str, Any]:
     """Remove every object created after the import snapshot and verify absence."""
+    errors: List[str] = []
+    try:
+        before_cleanup = _document_objects(fc_doc, required=True)
+    except (AttributeError, RuntimeError, TypeError) as exc:
+        before_cleanup = []
+        errors.append("objects before cleanup: %s" % exc)
     post_baseline = [
         host_obj
-        for host_obj in _document_objects(fc_doc)
+        for host_obj in before_cleanup
         if id(host_obj) not in baseline_object_ids
         and _host_object_id(host_obj) not in baseline_object_names
     ]
     created_ids = [_host_object_id(host_obj) for host_obj in post_baseline]
     removed_ids: List[str] = []
-    errors: List[str] = []
     for host_obj in reversed(post_baseline):
         entity_id = _host_object_id(host_obj)
         if not entity_id:
@@ -12250,9 +13257,14 @@ def _remove_post_baseline_document_objects(
         fc_doc.recompute()
     except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
         errors.append("recompute: %s" % exc)
+    try:
+        after_cleanup = _document_objects(fc_doc, required=True)
+    except (AttributeError, RuntimeError, TypeError) as exc:
+        after_cleanup = []
+        errors.append("objects after cleanup: %s" % exc)
     live_post_baseline_ids = [
         _host_object_id(host_obj)
-        for host_obj in _document_objects(fc_doc)
+        for host_obj in after_cleanup
         if id(host_obj) not in baseline_object_ids
         and _host_object_id(host_obj) not in baseline_object_names
     ]
@@ -12347,6 +13359,9 @@ def _session_state_payload(session_state: Dict[str, Any]) -> Dict[str, Any]:
         "importer_version": session_state["importer_version"],
         "requested_pages": list(session_state["requested_pages"]),
         "completed_pages": list(session_state["completed_pages"]),
+        # Completed, so a resume will not redo them; never certified, so every
+        # invocation that reports this session repeats it.
+        "degraded_pages": list(session_state.get("degraded_pages") or []),
         "remaining_pages": [
             page
             for page in session_state["requested_pages"]
@@ -12366,14 +13381,25 @@ def _representation_contract_scope(
     current_invocation_completed_pages: List[int],
     session_completed_pages: List[int],
     rolled_back_pages: Optional[List[int]] = None,
+    degraded_pages: Optional[List[int]] = None,
+    previously_degraded_pages: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """Describe exactly which pages the invocation-scoped proof telemetry covers."""
     prior = [int(page) for page in previously_certified_pages]
-    return {
+    prior_degraded = sorted({int(page) for page in (previously_degraded_pages or [])})
+    # A page an earlier invocation left degraded was completed, so this
+    # invocation does not re-evaluate it - but it was never certified, and
+    # "previously certified" must not be what the report calls it.
+    prior_certified = [page for page in prior if page not in set(prior_degraded)]
+    excluded = sorted(set(prior) | set(prior_degraded))
+    degraded = sorted(
+        {int(page) for page in (degraded_pages or [])} | set(prior_degraded)
+    )
+    scope = {
         "schema": "bcs.representation_contract_scope/1.0",
         "scope": "current_invocation",
         "coverage_status": (
-            "current_invocation_only" if prior else "full_session_to_date"
+            "current_invocation_only" if excluded else "full_session_to_date"
         ),
         "requested_pages": [int(page) for page in requested_pages],
         "evaluated_pages": [int(page) for page in evaluated_pages],
@@ -12381,10 +13407,17 @@ def _representation_contract_scope(
             int(page) for page in current_invocation_completed_pages
         ],
         "rolled_back_pages": [int(page) for page in (rolled_back_pages or [])],
-        "previously_certified_pages_excluded": prior,
+        "previously_certified_pages_excluded": prior_certified,
         "session_completed_pages": [int(page) for page in session_completed_pages],
-        "complete_session_telemetry": not bool(prior),
+        "complete_session_telemetry": not bool(excluded),
     }
+    if prior_degraded:
+        scope["previously_degraded_pages_excluded"] = prior_degraded
+    if degraded:
+        # Imported, so a resume will not redo it - but not certified, and said
+        # so on every run that reports this session.
+        scope["uncertified_degraded_pages"] = degraded
+    return scope
 
 
 def find_resumable_import_session(
@@ -12550,6 +13583,11 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     evaluated_pages = []
     current_invocation_completed_pages = []
     rolled_back_pages = []
+    # Pages this session imported but never certified. ``resumed`` is what an
+    # earlier invocation left behind; resume must not turn one of those into a
+    # "previously certified" page or let the document report ready.
+    resumed_degraded_pages: List[int] = []
+    session_degraded_pages: List[int] = []
     invocation_telemetry_snapshot = _snapshot_page_result_telemetry(opts)
     active_page_telemetry_snapshot = invocation_telemetry_snapshot
     active_page_baseline_ids = set(baseline_object_ids)
@@ -12589,6 +13627,11 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             session_state = read_session_object(session_host)
 
         completed_pages = list(session_state["completed_pages"])
+        # Completed by an earlier invocation but never certified: carried here
+        # so a resume cannot describe it as certified or report the document
+        # ready (owner directive 2026-09-19).
+        resumed_degraded_pages = list(session_state.get("degraded_pages") or [])
+        session_degraded_pages = list(resumed_degraded_pages)
         previously_certified_pages = list(completed_pages)
         page_groups = {
             int(page): str(group_name)
@@ -12691,11 +13734,23 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             imported_count = len(completed_pages)
             if page_group is not None:
                 page_groups[page_number] = _host_object_id(page_group)
+            # The page is imported and will not be redone, but a degraded item
+            # on it means it was never certified. That has to survive this
+            # invocation or a resume re-certifies the document.
+            degraded_block = (
+                getattr(opts, "_report_extra", None) or {}
+            ).get("text_items_degraded") or {}
+            if (
+                page_number in {int(page) for page in (degraded_block.get("pages") or [])}
+                and page_number not in session_degraded_pages
+            ):
+                session_degraded_pages.append(page_number)
             update_session_object(
                 session_host,
                 status="running",
                 completed_pages=completed_pages,
                 page_groups=page_groups,
+                degraded_pages=session_degraded_pages,
             )
 
         update_session_object(
@@ -12703,6 +13758,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             status="complete",
             completed_pages=completed_pages,
             page_groups=page_groups,
+            degraded_pages=session_degraded_pages,
         )
         session_state = read_session_object(session_host)
         fc_doc.commitTransaction()
@@ -12732,6 +13788,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             status="cancelled",
             completed_pages=completed_pages,
             page_groups=page_groups,
+            degraded_pages=session_degraded_pages,
         )
         session_state = read_session_object(session_host)
         imported_count = len(session_state["completed_pages"])
@@ -12762,6 +13819,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                 [],
                 previously_certified_pages,
                 rolled_back_pages=rolled_back_pages,
+                previously_degraded_pages=resumed_degraded_pages,
             )
         )
         opts._report_extra = report_extra
@@ -12871,6 +13929,19 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         if opts.verbose:
             _warn(f"Scale detection pass skipped: {e}")
 
+    # One line per import, not per fill; silent when every fill resolved exactly.
+    clip_fill_warning = _clip_fill_warning_line(opts)
+    if clip_fill_warning:
+        _warn(clip_fill_warning)
+
+    # One line per import about text a font delivered as raw glyph codes.
+    _emit_glyph_code_console_line(opts)
+
+    # The per-item degrade lines are capped in the page loop; this closes them.
+    text_degrade_overflow = _text_degrade_console_overflow_line(opts)
+    if text_degrade_overflow:
+        _warn(text_degrade_overflow)
+
     try:
         report_path = opts.import_report_path or _default_import_report_path(pdf_path)
         fallback_used, fallback_reason = _report_fallback_state(opts)
@@ -12903,8 +13974,28 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                     current_invocation_completed_pages,
                     list(session_state["completed_pages"]),
                     rolled_back_pages=rolled_back_pages,
+                    degraded_pages=list(
+                        (
+                            opts._report_extra.get("text_items_degraded") or {}
+                        ).get("pages")
+                        or []
+                    ),
+                    previously_degraded_pages=resumed_degraded_pages,
                 )
             )
+        if resumed_degraded_pages:
+            # This invocation did not degrade those pages, but the session it
+            # is reporting never certified them, so the report must not either.
+            opts._report_extra["session_text_items_degraded"] = {
+                "schema": "bcs.session_text_items_degraded/1.0",
+                "scope": "session",
+                "pages": sorted({int(page) for page in resumed_degraded_pages}),
+                "note": (
+                    "an earlier invocation of this import session left text "
+                    "items degraded on these pages; the document is not "
+                    "certified"
+                ),
+            }
         opts._report_extra.pop("terminal_failure", None)
         active_outline_memo = _ACTIVE_TEXT3D_OUTLINE_MEMO
         if active_outline_memo is not None:

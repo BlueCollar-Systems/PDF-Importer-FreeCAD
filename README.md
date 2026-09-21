@@ -30,6 +30,103 @@ These stroke footprints do not implement general PDF blending or image paint ord
 
 Native wire outlines and general vector lineweights remain screen-dependent; Raster text has finite resolution. Final rectangle highlights are handled only when their complete source paint contract is verified.
 
+## Recent fixes (unreleased)
+
+- Direct single-page imports now remove their own incomplete objects and
+  delivery evidence when cancelled or stopped by an error. Pre-existing model
+  objects and caller-owned transactions are retained. If cleanup cannot be
+  verified, the error reports that explicitly instead of leaving a partial
+  drawing that can be mistaken for a completed import.
+- **One text item that cannot be delivered now costs that item, not the
+  document.** The per-item fallback ladder advances past a rung that failed
+  without proof, provided that rung's own attempt shows it removed every host
+  object it created. When every rung is spent the item is returned as a
+  degraded record instead of aborting the import, so the rest of the sheet is
+  still delivered. (Owner directive 2026-09-19.)
+- The failure classification is unchanged: every builder raises exactly the
+  reason code it raised before, and it stays in `extra.text_delivery_attempts`.
+  Only the consequence is different.
+- The degrade is loud and certification stays strict. `extra.text_items_degraded`
+  lists each degraded item (capped at 200, with the total and a truncated flag)
+  with its requested type, every attempted rung and that rung's own reason,
+  `proof_class`, the font identity, and the offending character index and
+  codepoint where the failure names one. `result.warnings` counts them
+  alongside clipped fills and host-font substitutions, one console warning is
+  emitted per item, and the human summary says the import is not certified.
+- `extra.text_source_spans` and `extra.text_representation_delivery` are now
+  reported, so `import_contract_ready.ready` is **false** for any sheet with a
+  degraded item. A page that degraded is named in
+  `representation_contract_scope.uncertified_degraded_pages`, and the QA
+  harness reports that sheet as `DEGRADED`, never `PASS`.
+- Three classes remain document-fatal: an attempt whose cleanup is incomplete
+  or that left unknown host objects behind, an item with no stable source
+  identity, and any importer contract breach (missing deliverer, malformed
+  impossibility proof, unverifiable delivery result). `ImportCancelled`
+  propagates untouched.
+- An item-scoped rollback now refreshes the page's native-text object index.
+  FreeCAD recycles a removed object's name, and a stale index turned one
+  rolled-back item into thousands of induced failures on a dense sheet.
+- **Two root causes fixed, so the spans are delivered at the requested
+  representation instead of degrading.** A `cmap` or `hmtx` table fontTools
+  cannot decode is now reported as absent measurement data rather than a veto:
+  ordinary PDF subset fonts ship an `hmtx` whose trailing side-bearing array
+  was dropped while `hhea` still describes the full face, and the importer
+  already measures the pen advance from the outlines when metrics are missing.
+  The em-ink calibration reads the same outlines straight from `glyf` when
+  fontTools' glyph set cannot be built for the same reason; it refuses that
+  route for a variable or CFF font. Kerning values stay fail-closed, because a
+  wrong kern moves glyph ink. Measured on a 183-span structural sheet in
+  default 3D-text mode: from writing nothing at all to 183/183 native 3D Text,
+  certified.
+- The zero-advance escape in the source character layout now covers any
+  combining mark, enclosing mark or variation selector, not only whitespace. An
+  emoji followed by `U+FE0F` no longer makes an otherwise exact span
+  undeliverable. Zero-width joiners and other format characters are
+  deliberately not included.
+- An unreadable character map is never reported as "this font has no glyph for
+  that codepoint"; the two are now separate messages, and a genuinely missing
+  glyph names its codepoint.
+- **Text the PDF delivers as raw glyph codes is recovered where this tool can
+  prove the characters, and reported either way.** A `/Type0` font with an
+  Identity CMap and no `/ToUnicode`, over a subset program carrying no usable
+  mapping of its own, leaves the content stream holding glyph indices that
+  nothing in the file explains. The engine substitutes the index as the
+  character, so a member mark arrives as `06-3` where the drawing says `MS-3`:
+  already wrong, already legible, and invisible to any check that looks for
+  control characters. The trigger is exactly that structure - a font with any
+  real encoding, including the many that simply lack a `/ToUnicode`, is
+  untouched.
+- Characters are proven per character, stopping at the first route that
+  succeeds: `embedded_cmap` (the subset's own `cmap`, reverse mapped),
+  `post_glyph_name` (a real `post` table's names through the AGL; names
+  fontTools synthesises from the glyph index are never accepted),
+  `outline_identity` (the glyph's contour command list, hashed and matched for
+  exact structural equality against a face-matched installed reference whose
+  `/W` advance agrees), and `blank_glyph_advance` (a glyph that draws nothing,
+  whose advance is a reference face's space). There is no fifth route: no
+  offsets, no standard-glyph-order assumption, no encoding guesses. Where no
+  reference face for the declared family is installed, the last two routes
+  recover nothing and say which family they looked for.
+- **Substitution is all-or-nothing per span.** One unproven character leaves
+  the entire span byte for byte as it was delivered, because a half-read
+  dimension reads as a measurement and is worse than raw codes.
+- `extra.text_glyph_codes` (`bcs.text_glyph_codes/1.0`) records every affected
+  span: the recovered ones with the route that proved them - never as if the
+  PDF had declared them - and the unproven ones with the font, the page, the
+  location and the raw codes, sorted first so the item cap cannot hide one. A
+  character the engine itself resolved, and a space its layout inserted, are
+  counted apart under `characters_left_as_delivered`. A span this run could not
+  examine is reported as a limitation of the import, never as the sheet failing
+  to say. `result.warnings` gains a term for unproven spans only: a span whose
+  characters were proven is a clean delivery, stated once per import rather
+  than warned about. A degraded-item row says when its `source_text` was
+  recovered rather than read.
+- Because the last two routes take their characters from an installed
+  reference face rather than from the file, `text_glyph_codes` is worth reading
+  on any sheet that reports one. `BCS_GLYPH_REFERENCE_FONTS` overrides the
+  search with a path-separated list of directories or files, or the single word
+  `none` to switch reference matching off entirely.
+
 ## Recent fixes (v4.0.87)
 
 - Corrupt embedded font cmap staging (e.g. Arial Italic) is treated as unusable
@@ -335,7 +432,10 @@ or scaling defects are fixed *inside* the requested mode — never by
 substituting a different mode. Substitution is permitted only when the
 requested mode is genuinely impossible for the exact source item. A generic
 exception, a missing helper, an empty result, or a visual defect is not proof
-of impossibility. Any authorized substitution must walk the closest remaining
+of impossibility. An item whose requested representation failed *without* such
+proof is still drawn at the next rung the ladder reaches, so that one item does
+not cost the sheet, but that delivery is reported as degraded and is never
+certified (owner directive 2026-09-19). Any authorized substitution must walk the closest remaining
 representation first and is recorded per source item in `import_report.json`
 with the attempted types, exact created/removed host IDs, cleanup result, and
 the evidence that proved the requested type impossible. It is never silent.
@@ -356,17 +456,39 @@ Notes:
   per-character outline subshapes and identity metadata inside one source-item
   compound; Geometry exposes raw edge entities. Sharing an SVG source does not
   make the host representations interchangeable.
-- Renderer or font failures stop the transaction unless the failed source item
-  has item-specific impossibility evidence and an implemented, verified next
-  rung. They never authorize a whole-page or whole-mode substitution.
+- Renderer or font failures never authorize a whole-page or whole-mode
+  substitution. A failed source item that has
+  item-specific impossibility evidence and an implemented, verified next rung
+  walks that rung and is certified there. An item **without** that evidence still walks
+  the remaining rungs — one item that cannot be delivered costs that item, not
+  the document (owner directive 2026-09-19) — but it is reported as degraded
+  and it is never certified.
 - Automatic raster classification may add a raster background, but it does not
   discard an explicitly requested text representation. Explicit Raster remains
   raster-only.
-- The invariant is "requested type delivered and verified, or an exact failed
-  attempt is reported and the transaction stops, or a proof-gated per-item
-  fallback is reported." It is locked by
-  `tests/test_textmode1_invariant_fc.py` and
-  `tests/test_freecad_representation_contract.py`.
+- The invariant is "requested type delivered and verified, or a proof-gated
+  per-item fallback is reported, or the item is reported as degraded and the
+  sheet is not certified." The transaction still stops for an attempt whose
+  cleanup is incomplete, for an item with no stable source identity, and for
+  any importer contract breach. It is locked by
+  `tests/test_textmode1_invariant_fc.py`,
+  `tests/test_freecad_representation_contract.py` and
+  `tests/test_text_item_degrade_fc.py`.
+- A degraded item is never silent and is never counted as a delivery of the
+  **requested** representation: it is listed in `extra.text_items_degraded`
+  with every rung's own reason code, it adds one to `result.warnings`, it is
+  kept out of `extra.host_font_map` / `extra.host_font_substitutions`, and it
+  makes `extra.text_representation_delivery.verified` false so
+  `import_contract_ready.ready` is false for that sheet. An item that was
+  drawn at a lower rung is still counted in `result.text_entities` and in
+  `extra.actual_text_entity_types` as what was actually drawn; an item that
+  was dropped contributes nothing.
+- A page with a degraded item is imported once and is not redone on resume,
+  but it is never certified. The page number is persisted with the import
+  session, so every later invocation of that session repeats it in
+  `extra.representation_contract_scope.uncertified_degraded_pages`, keeps
+  `import_contract_ready.ready` false, and keeps the QA harness on `DEGRADED`
+  with a non-zero exit code.
 
 ## Compatibility
 

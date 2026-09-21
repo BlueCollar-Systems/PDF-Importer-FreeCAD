@@ -51,6 +51,17 @@ from pdfcadcore.drawing_clips import (
     get_clip_aware_drawings,
     summarize_clip_fill_issues,
 )
+from pdfcadcore.glyph_code_recovery import (
+    copy_recovered_text,
+    glyph_code_delivery_block,
+    glyph_code_issues,
+    glyph_code_warning_count,
+    merge_glyph_code_records,
+    page_delivers_glyph_codes,
+    record_glyph_code_limitation,
+    recover_glyph_codes_in_place,
+    summarize_glyph_code_issues,
+)
 
 fitz = _import_fitz()
 
@@ -864,6 +875,105 @@ def _clip_fill_warning_line(opts: ImportOptions) -> str:
     return line + " See clip_fill_delivery in the import report."
 
 
+def _recover_page_glyph_codes(page, tdict, opts) -> None:
+    """Recover raw glyph codes in one text dictionary and keep the record.
+
+    The dictionary must be a RAWDICT: the shared module binds a delivered
+    character to the glyph that drew it by that character's own origin, and
+    never infers a glyph id from the character itself.
+    """
+    recover_glyph_codes_in_place(page, tdict)
+    _keep_glyph_code_records(page, opts)
+
+
+def _keep_glyph_code_records(page, opts) -> None:
+    if opts is None:
+        return
+    records = getattr(opts, "_glyph_code_records", None)
+    if not isinstance(records, dict):
+        records = opts._glyph_code_records = {}
+    # One span is one row, whichever dictionary of this page examined it.
+    merge_glyph_code_records(records, glyph_code_issues(page))
+
+
+def _recovered_raw_text_dict(page, opts):
+    """This page's per-character dictionary, recovered once and shared.
+
+    ``_raster_source_coverage_bbox`` compares this host's item text against
+    this same dictionary character for character, so both sides must be the
+    same recovery of the same dictionary - not two recoveries that could
+    disagree.
+    """
+    from pdfcadcore.primitive_extractor import _raw_text_with_source_quads
+
+    key = (id(getattr(page, "parent", None)), int(getattr(page, "number", 0) or 0))
+    cache = getattr(opts, "_glyph_raw_text_cache", None) if opts is not None else None
+    if isinstance(cache, dict) and cache.get("key") == key:
+        return cache["raw"]
+    raw = _raw_text_with_source_quads(page)
+    _recover_page_glyph_codes(page, raw, opts)
+    if opts is not None:
+        opts._glyph_raw_text_cache = {"key": key, "raw": raw}
+    return raw
+
+
+def _page_text_dict(page, opts: Optional["ImportOptions"] = None) -> Dict[str, Any]:
+    """This host's page text dictionary, with proven glyph codes recovered.
+
+    ``page.get_text("dict")`` carries no per-character origins, so nothing in
+    it can say which glyph drew which character - and MuPDF's layout inserts
+    characters no glyph drew. The recovery therefore runs on the core's
+    per-character dictionary of the same page and the result is copied across
+    span for span, which is also what keeps this host's text and the core's
+    identical for the raster cross-check.
+
+    A page that draws no unmapped character at all is answered from its font
+    dictionaries and costs nothing extra.
+    """
+    tdict = page.get_text("dict") or {}
+    try:
+        if not page_delivers_glyph_codes(page):
+            return tdict
+        copy_recovered_text(_recovered_raw_text_dict(page, opts), tdict)
+    except (AssertionError, RuntimeError, TypeError, ValueError, KeyError, IndexError) as exc:
+        # The page's per-character dictionary could not be built, so this run
+        # cannot bind a character to a glyph. The spans stay exactly as the PDF
+        # delivered them and the report says it was this run that could not
+        # look, not the sheet that failed to say.
+        record_glyph_code_limitation(
+            page, "recovered_text_not_transferable", "%s: %s" % (type(exc).__name__, exc)
+        )
+    _keep_glyph_code_records(page, opts)
+    return tdict
+
+
+def _glyph_code_records(opts: "ImportOptions") -> List[Dict[str, Any]]:
+    return list((getattr(opts, "_glyph_code_records", None) or {}).values())
+
+
+def _emit_glyph_code_console_line(opts: "ImportOptions") -> None:
+    """One line per import: what was recovered, and what stayed raw.
+
+    A recovered span is a clean delivery and is stated, not warned about; a
+    span whose characters could not be proven is a warning.
+    """
+    records = _glyph_code_records(opts)
+    if not records:
+        return
+    line = _bounded_report_text(
+        summarize_glyph_code_issues(
+            records, "See text_glyph_codes in the import report."
+        ),
+        600,
+    )
+    if not line:
+        return
+    if any(record.get("status") != "recovered" for record in records):
+        _warn(line)
+    else:
+        _msg(line)
+
+
 def _new_text_degrade_block() -> Dict[str, Any]:
     return {
         "schema": "bcs.text_items_degraded/1.0",
@@ -876,8 +986,28 @@ def _new_text_degrade_block() -> Dict[str, Any]:
     }
 
 
+def _glyph_code_route_for_item(item: Dict[str, Any], opts) -> str:
+    """The route that proved this item's characters, or '' if none did.
+
+    ``source_text`` below is whatever the dictionary held, and on an affected
+    sheet that is a string this run recovered rather than one the PDF carried.
+    A row that says so cannot be read as the PDF's own bytes.
+    """
+    records = getattr(opts, "_glyph_code_records", None)
+    if not isinstance(records, dict) or not records:
+        return ""
+    try:
+        box = tuple(round(float(value), 2) for value in tuple(item.get("bbox") or ())[:4])
+    except (TypeError, ValueError):
+        return ""
+    record = records.get((int(item.get("page_number") or 0), box))
+    if not isinstance(record, dict) or record.get("status") != "recovered":
+        return ""
+    return str(record.get("route") or "")
+
+
 def _degraded_text_item_report_entry(
-    item: Dict[str, Any], record: Dict[str, Any]
+    item: Dict[str, Any], record: Dict[str, Any], opts=None
 ) -> Dict[str, Any]:
     """One degraded item's report row: what was asked, tried, and drawn."""
     final_type = record.get("final_type")
@@ -897,6 +1027,9 @@ def _degraded_text_item_report_entry(
     font_identity = item.get("font_identity")
     if isinstance(font_identity, dict) and font_identity:
         entry["font_identity"] = dict(font_identity)
+    recovered_by = _glyph_code_route_for_item(item, opts) if opts is not None else ""
+    if recovered_by:
+        entry["text_recovered_by"] = recovered_by
     return entry
 
 
@@ -1590,6 +1723,15 @@ def write_import_report(
         + int(clip_fill_delivery.get("approximated", 0) or 0)
     )
 
+    # Text a font delivered as raw glyph codes: what was proven and by which
+    # route, and what stayed exactly as the PDF delivered it. A recovered span
+    # is a clean delivery; only an unproven one is a warning.
+    glyph_code_block = glyph_code_delivery_block(_glyph_code_records(opts))
+    glyph_code_warnings = 0
+    if glyph_code_block["spans_examined"]:
+        extra["text_glyph_codes"] = glyph_code_block
+        glyph_code_warnings = glyph_code_warning_count(glyph_code_block)
+
     # One text item that could not be delivered costs that item, not the sheet
     # - but it is never silent and it never certifies. build_import_contract_ready
     # only reads text_representation_delivery, so the host states it here: this
@@ -1667,13 +1809,15 @@ def write_import_report(
         performance_phases=phases or None,
         # Visible clipped fills that were left out or are approximate, PDF
         # fonts that are not drawn with the source font itself, text items
-        # that could not be delivered at the requested representation, and one
-        # per page an earlier run of this session left degraded - a resumed
-        # report must not read as a clean run.
+        # that could not be delivered at the requested representation, text
+        # spans whose raw glyph codes nothing proved, and one per page an
+        # earlier run of this session left degraded - a resumed report must
+        # not read as a clean run.
         warnings=(
             clip_fill_warnings
             + host_font_warnings
             + text_degrade_warnings
+            + glyph_code_warnings
             + len(session_degraded_pages)
         ),
         extra=extra,
@@ -7732,11 +7876,12 @@ def _raster_source_coverage_bbox(item, page, opts):
     bbox = _finite_source_tuple(item.get("bbox"), 4, "item.bbox")
     if fitz is None or not isinstance(page, fitz.Page):
         return bbox
-    from pdfcadcore.primitive_extractor import _raw_text_with_source_quads
     cache = getattr(opts, "_raster_source_quad_cache", None)
     key = (item.get("pdf_sha256"), item.get("page_number"))
     if not isinstance(cache, dict) or cache.get("key") != key:
-        cache = {"key": key, "raw": _raw_text_with_source_quads(page)}
+        # The very dictionary _page_text_dict copied this item's text from, so
+        # the identity below is the one thing it cannot be made to disagree on.
+        cache = {"key": key, "raw": _recovered_raw_text_dict(page, opts)}
         opts._raster_source_quad_cache = cache
     block = cache["raw"]["blocks"][item["block_index"]]
     line = block["lines"][item["line_index"]]
@@ -10030,7 +10175,7 @@ def _render_canonical_text_items(
 ) -> Dict[str, Any]:
     """Deliver raw PDF spans through the finite item representation contract."""
     requested = _normalize_requested_text_type(str(opts.text_mode or ""))
-    source_dict = raw_tdict if raw_tdict is not None else page.get_text("dict")
+    source_dict = raw_tdict if raw_tdict is not None else _page_text_dict(page, opts)
     items = list(
         _iter_text_source_items(source_dict, int(page_num), pdf_sha256, requested)
     )
@@ -10233,7 +10378,7 @@ def _render_canonical_text_items(
             # keeps import_contract_ready false for this sheet. The ladder has
             # already refreshed the native-object index for any rung that
             # actually rolled a host object back.
-            degraded_entry = _degraded_text_item_report_entry(item, result)
+            degraded_entry = _degraded_text_item_report_entry(item, result, opts)
             _record_degraded_text_item(opts, degraded_entry)
             warning_line = _degraded_text_item_warning_line(degraded_entry, opts)
             if warning_line:
@@ -11248,6 +11393,7 @@ def import_pdf_page(pdf_path: str, page_num: int = 1,
     clip_fill_warning = _clip_fill_warning_line(opts)
     if clip_fill_warning:
         _warn(clip_fill_warning)
+    _emit_glyph_code_console_line(opts)
 
     if autofit:
         _autofit_import_view(fc_doc)
@@ -11464,7 +11610,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         if opts.import_text and opts.text_mode != "none":
             _progress_update(1, "Estimating page complexity...", "planning")
             try:
-                raw_tdict = page.get_text("dict") or {}
+                raw_tdict = _page_text_dict(page, opts)
             except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
                 raise ImportComplexityBudgetExceeded(
                     f"PDF page {int(page_num)} complexity could not be bounded: {exc}"
@@ -11529,7 +11675,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 # delivery. Keep it so a pathological page is interpreted only
                 # once for text instead of once here and again at delivery.
                 if raw_tdict is None:
-                    raw_tdict = page.get_text("dict") or {}
+                    raw_tdict = _page_text_dict(page, opts)
                 n_text_blocks = sum(
                     1
                     for block in raw_tdict.get("blocks", [])
@@ -11719,7 +11865,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
 
     # ── Legacy raster fallback (vectors mode, backwards compat) ──
     if effective_mode == "vector" and opts.raster_fallback and n_drawings < 5:
-        tdict = raw_tdict if raw_tdict is not None else page.get_text("dict")
+        tdict = raw_tdict if raw_tdict is not None else _page_text_dict(page, opts)
         n_text = sum(1 for b in tdict.get("blocks", []) if b.get("type") == 0)
         if n_text == 0:
             _msg(f"Page {page_num}: appears to be scanned/raster — "
@@ -12241,7 +12387,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         text_group = _make_group(top_group or fc_doc, "Text", fc_doc)
         try:
             if raw_tdict is None:
-                raw_tdict = page.get_text("dict")
+                raw_tdict = _page_text_dict(page, opts)
         except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
             attempt = {
                 "source_item_id": "p%d:page" % int(page_num),
@@ -13548,6 +13694,9 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     clip_fill_warning = _clip_fill_warning_line(opts)
     if clip_fill_warning:
         _warn(clip_fill_warning)
+
+    # One line per import about text a font delivered as raw glyph codes.
+    _emit_glyph_code_console_line(opts)
 
     # The per-item degrade lines are capped in the page loop; this closes them.
     text_degrade_overflow = _text_degrade_console_overflow_line(opts)

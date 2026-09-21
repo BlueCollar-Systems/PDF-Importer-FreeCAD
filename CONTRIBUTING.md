@@ -6,7 +6,7 @@ This repository is [BlueCollar-Systems/PDF-Importer-FreeCAD](https://github.com/
 
 ## Full private pack (not in git)
 
-`C:\Users\Rowdy Payton\Desktop\PDFTest Files\Q&A\` — `START_HERE.md`, `ONBOARDING.md`, `COMMUNICATION.md`.
+`<Desktop>\PDFTest Files\Q&A\` — `START_HERE.md`, `ONBOARDING.md`, `COMMUNICATION.md`.
 
 Ask the owner for the hub and Desktop `PDFTest Files` (import outputs live there, e.g. `FC_<sheet>_Imports`). **Do not copy shop PDFs into git.** Communicate in the Q&A hub and with GitHub PRs/issues on this repo. No Slack/Discord.
 

@@ -74,6 +74,46 @@ Native wire outlines and general vector lineweights remain screen-dependent; Ras
 - An unreadable character map is never reported as "this font has no glyph for
   that codepoint"; the two are now separate messages, and a genuinely missing
   glyph names its codepoint.
+- **Text the PDF delivers as raw glyph codes is recovered where this tool can
+  prove the characters, and reported either way.** A `/Type0` font with an
+  Identity CMap and no `/ToUnicode`, over a subset program carrying no usable
+  mapping of its own, leaves the content stream holding glyph indices that
+  nothing in the file explains. The engine substitutes the index as the
+  character, so a member mark arrives as `06-3` where the drawing says `MS-3`:
+  already wrong, already legible, and invisible to any check that looks for
+  control characters. The trigger is exactly that structure - a font with any
+  real encoding, including the many that simply lack a `/ToUnicode`, is
+  untouched.
+- Characters are proven per character, stopping at the first route that
+  succeeds: `embedded_cmap` (the subset's own `cmap`, reverse mapped),
+  `post_glyph_name` (a real `post` table's names through the AGL; names
+  fontTools synthesises from the glyph index are never accepted),
+  `outline_identity` (the glyph's contour command list, hashed and matched for
+  exact structural equality against a face-matched installed reference whose
+  `/W` advance agrees), and `blank_glyph_advance` (a glyph that draws nothing,
+  whose advance is a reference face's space). There is no fifth route: no
+  offsets, no standard-glyph-order assumption, no encoding guesses. Where no
+  reference face for the declared family is installed, the last two routes
+  recover nothing and say which family they looked for.
+- **Substitution is all-or-nothing per span.** One unproven character leaves
+  the entire span byte for byte as it was delivered, because a half-read
+  dimension reads as a measurement and is worse than raw codes.
+- `extra.text_glyph_codes` (`bcs.text_glyph_codes/1.0`) records every affected
+  span: the recovered ones with the route that proved them - never as if the
+  PDF had declared them - and the unproven ones with the font, the page, the
+  location and the raw codes, sorted first so the item cap cannot hide one. A
+  character the engine itself resolved, and a space its layout inserted, are
+  counted apart under `characters_left_as_delivered`. A span this run could not
+  examine is reported as a limitation of the import, never as the sheet failing
+  to say. `result.warnings` gains a term for unproven spans only: a span whose
+  characters were proven is a clean delivery, stated once per import rather
+  than warned about. A degraded-item row says when its `source_text` was
+  recovered rather than read.
+- Because the last two routes take their characters from an installed
+  reference face rather than from the file, `text_glyph_codes` is worth reading
+  on any sheet that reports one. `BCS_GLYPH_REFERENCE_FONTS` overrides the
+  search with a path-separated list of directories or files, or the single word
+  `none` to switch reference matching off entirely.
 
 ## Recent fixes (v4.0.87)
 

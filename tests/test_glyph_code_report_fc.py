@@ -34,10 +34,11 @@ def recovered(page=1, codes=(2, 4, 5, 1), route="outline_identity", bbox=(10.0, 
 
 
 def unproven(page=1, codes=(9, 9), reason="no_reference_face_available",
-             bbox=(200.0, 90.0, 240.0, 104.0)):
+             bbox=(200.0, 90.0, 240.0, 104.0), limitation=False):
     return {
         "page_number": page, "font_name": "SampleGothic", "source_xref": 7,
         "status": "unproven", "route": "", "routes": {}, "reason": reason,
+        "limitation": limitation,
         "detail": "no installed face matches 'samplegothic' (0 faces indexed)",
         "glyphs": len(codes), "glyphs_unproven": len(codes),
         "raw_codes": list(codes), "raw_codes_truncated": False,
@@ -49,7 +50,10 @@ def unproven(page=1, codes=(9, 9), reason="no_reference_face_available",
 def seed(opts, *records):
     store = {}
     for index, record in enumerate(records):
-        store[(record["page_number"], tuple(record["bbox_pdf"]), index)] = record
+        # A distinct box per seeded record: one span is one row, so two rows
+        # sharing a box would merge exactly as they do in a real run.
+        box = tuple(value + index for value in record["bbox_pdf"])
+        store[(record["page_number"], box)] = record
     opts._glyph_code_records = store
     return opts
 
@@ -141,56 +145,153 @@ def test_a_document_with_no_glyph_code_spans_publishes_no_block(tmp_path, consol
 # ── the host's own text dictionaries ──
 
 
-def test_every_page_text_dictionary_this_host_builds_goes_through_recovery(monkeypatch):
-    seen = []
-    monkeypatch.setattr(core, "recover_glyph_codes_in_place",
-                        lambda page, tdict: seen.append((page, tdict)))
-    monkeypatch.setattr(core, "glyph_code_issues", lambda page: [unproven()])
+def _one_span_page(monkeypatch, delivered_text, recovered_text):
+    """A page whose plain dictionary and per-character dictionary agree."""
+    plain_span = {"font": "SampleGothic", "bbox": (10.0, 90.0, 60.0, 104.0),
+                  "size": 10.0, "origin": (10.0, 100.0), "text": delivered_text}
+    plain = {"blocks": [{"type": 0, "lines": [{"spans": [plain_span]}]}]}
+    raw_span = {
+        "font": "SampleGothic", "bbox": (10.0, 90.0, 60.0, 104.0),
+        "origin": (10.0, 100.0),
+        "chars": [
+            {"c": character, "origin": (10.0 + index * 7.0, 100.0),
+             "quad": ((10.0, 90.0), (20.0, 90.0), (20.0, 104.0), (10.0, 104.0))}
+            for index, character in enumerate(delivered_text)
+        ],
+    }
+    raw = {"blocks": [{"type": 0, "lines": [{"spans": [raw_span]}]}]}
+
+    def recover(_page, tdict):
+        # Stands in for the shared module: it only ever rewrites a dictionary
+        # that carries per-character origins.
+        if tdict is raw:
+            for index, character in enumerate(recovered_text):
+                raw_span["chars"][index]["c"] = character
+
+    monkeypatch.setattr("pdfcadcore.primitive_extractor._raw_text_with_source_quads",
+                        lambda _page: raw)
+    monkeypatch.setattr(core, "recover_glyph_codes_in_place", recover)
+    monkeypatch.setattr(core, "glyph_code_issues", lambda _page: [])
+    monkeypatch.setattr(core, "page_delivers_glyph_codes", lambda _page: True)
+    return plain, plain_span, raw, raw_span
+
+
+def test_the_host_dictionary_takes_its_text_from_the_per_character_one(monkeypatch):
+    # page.get_text("dict") has no per-character origins, so nothing in it can
+    # bind a character to the glyph that drew it. The host recovers the
+    # dictionary that does and copies the result across.
+    plain, plain_span, raw, _raw_span = _one_span_page(monkeypatch, "\x01\x02\x03\x04", "D042")
+
+    class Page:
+        number = 0
+        parent = object()
+
+        def get_text(self, kind):
+            assert kind == "dict"
+            return plain
+
+    result = core._page_text_dict(Page(), core.ImportOptions())
+
+    assert result is plain
+    assert plain_span["text"] == "D042"
+
+
+def test_a_page_that_draws_no_unmapped_character_costs_nothing(monkeypatch):
+    monkeypatch.setattr(core, "page_delivers_glyph_codes", lambda _page: False)
+    monkeypatch.setattr("pdfcadcore.primitive_extractor._raw_text_with_source_quads",
+                        lambda _page: pytest.fail("a clean page was extracted twice"))
     delivered = {"blocks": [{"type": 0, "lines": []}]}
 
     class Page:
+        number = 0
+        parent = object()
+
         def get_text(self, kind):
-            assert kind == "dict"
             return delivered
 
-    opts = core.ImportOptions()
-    page = Page()
-    result = core._page_text_dict(page, opts)
-
-    assert result is delivered
-    assert seen == [(page, delivered)]
-    assert len(core._glyph_code_records(opts)) == 1
+    assert core._page_text_dict(Page(), core.ImportOptions()) is delivered
 
 
-def test_the_raster_cross_check_dictionary_is_recovered_with_the_same_call(monkeypatch):
-    # _raster_source_coverage_bbox compares the CORE's dictionary against this
-    # host's item text. If only one side were recovered every raster-delivered
-    # text item on an affected sheet would raise.
+def test_the_raster_cross_check_reads_the_very_dictionary_the_text_came_from(monkeypatch):
+    # _raster_source_coverage_bbox compares the core's dictionary against this
+    # host's item text. Two separate recoveries could disagree; one shared
+    # dictionary cannot.
     fitz = core.fitz
     if fitz is None:                                        # pragma: no cover
         pytest.skip("PDF engine is not available in this environment")
     document = fitz.open()
     page = document.new_page()
-    span = {
-        "font": "SampleGothic", "bbox": (10.0, 90.0, 60.0, 104.0),
-        "origin": (10.0, 100.0),
-        "chars": [{"c": "D", "quad": ((10.0, 90.0), (20.0, 90.0), (20.0, 104.0), (10.0, 104.0))}],
-    }
-    raw = {"blocks": [{"type": 0, "lines": [{"spans": [span]}]}]}
-    monkeypatch.setattr("pdfcadcore.primitive_extractor._raw_text_with_source_quads",
-                        lambda _page: raw)
-    recovered_dicts = []
-    monkeypatch.setattr(core, "recover_glyph_codes_in_place",
-                        lambda _page, tdict: recovered_dicts.append(tdict))
-    monkeypatch.setattr(core, "glyph_code_issues", lambda _page: [])
+    plain, plain_span, raw, _raw_span = _one_span_page(monkeypatch, "\x01\x02\x03\x04", "D042")
+    opts = core.ImportOptions()
+
+    class Page:
+        number = 0
+        parent = page.parent
+
+        def get_text(self, _kind):
+            return plain
+
+    core._page_text_dict(Page(), opts)
     item = {
-        "bbox": (10.0, 90.0, 60.0, 104.0), "text": "D", "pdf_sha256": "0" * 64,
+        "bbox": (10.0, 90.0, 60.0, 104.0), "text": plain_span["text"],
+        "pdf_sha256": "0" * 64,
         "page_number": 1, "block_index": 0, "line_index": 0, "span_index": 0,
         "origin": (10.0, 100.0), "span": {"font": "SampleGothic"},
     }
 
-    bbox = core._raster_source_coverage_bbox(item, page, core.ImportOptions())
+    bbox = core._raster_source_coverage_bbox(item, page, opts)
 
-    assert recovered_dicts == [raw]
+    assert item["text"] == "D042"
     assert bbox == (10.0, 90.0, 60.0, 104.0)
     document.close()
+
+
+def test_a_dictionary_that_cannot_be_built_is_reported_as_this_run_s_limit(monkeypatch):
+    monkeypatch.setattr(core, "page_delivers_glyph_codes", lambda _page: True)
+
+    def refuse(_page):
+        raise RuntimeError("EX404")
+
+    monkeypatch.setattr("pdfcadcore.primitive_extractor._raw_text_with_source_quads", refuse)
+    limits = []
+    monkeypatch.setattr(core, "record_glyph_code_limitation",
+                        lambda page, reason, detail="": limits.append((reason, detail)))
+    monkeypatch.setattr(core, "glyph_code_issues", lambda _page: [])
+    delivered = {"blocks": [{"type": 0, "lines": []}]}
+
+    class Page:
+        number = 0
+        parent = object()
+
+        def get_text(self, _kind):
+            return delivered
+
+    assert core._page_text_dict(Page(), core.ImportOptions()) is delivered
+    assert limits and limits[0][0] == "recovered_text_not_transferable"
+
+
+def test_a_degraded_row_says_when_its_text_was_recovered_rather_than_read():
+    # source_text is whatever the dictionary held, and on an affected sheet
+    # that is a string this run recovered. The row has to say so.
+    opts = seed(core.ImportOptions(), recovered(bbox=(10.0, 90.0, 60.0, 104.0)))
+    item = {"page_number": 1, "bbox": (10.0, 90.0, 60.0, 104.0), "text": "D042"}
+    record = {"source_item_id": "p1:b0:l0:s0", "requested_type": "native",
+              "final_type": None}
+
+    entry = core._degraded_text_item_report_entry(item, record, opts)
+
+    assert entry["source_text"] == "D042"
+    assert entry["text_recovered_by"] == "outline_identity"
+    assert "text_recovered_by" not in core._degraded_text_item_report_entry(item, record)
+
+
+def test_a_run_limitation_is_not_reported_as_the_document_failing(tmp_path, console):
+    opts = seed(core.ImportOptions(),
+                unproven(reason="recovered_text_not_transferable", limitation=True))
+
+    report = written_report(tmp_path, opts)
+    assert report["extra"]["text_glyph_codes"]["unproven_from_run_limitation"] == 1
+
+    core._emit_glyph_code_console_line(opts)
+    assert "a limitation of this import, not of the sheet" in console["warn"][0]
+    assert "no usable Unicode map" not in console["warn"][0]

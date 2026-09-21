@@ -15,6 +15,23 @@ from pdfcadcore import primitive_extractor as pe
 from pdfcadcore.fitz_loader import import_fitz
 
 
+@pytest.mark.parametrize("dx", [0., .004, .1])
+def test_literal_open_stroke_retains_exact_two_source_endpoints(monkeypatch, dx):
+    fitz = import_fitz()
+    start, end = fitz.Point(20, 30), fitz.Point(20+dx, 30)
+    row = {"type": "s", "seqno": 1, "level": 0, "items": [("l", start, end)],
+           "rect": fitz.Rect(start.x, start.y, end.x, end.y), "color": (1, .5, .25),
+           "fill": None, "width": 12., "lineCap": (1, 1, 1), "closePath": False}
+    page = SimpleNamespace(rect=fitz.Rect(0, 0, 100, 100))
+    monkeypatch.setattr(pe, "_extract_text", lambda *args, **kwargs: [])
+    result = pe.extract_page(page, 1, detect_arcs=False, drawings=[row])
+    assert len(result.primitives) == 1
+    actual = result.primitives[0]
+    assert len(actual.points) == 2 and not actual.closed
+    assert actual.points[0] == pytest.approx((20*pe.MM_PER_PT, 70*pe.MM_PER_PT))
+    assert actual.points[1] == pytest.approx(((20+dx)*pe.MM_PER_PT, 70*pe.MM_PER_PT))
+
+
 def clip_rows():
     fitz = import_fitz()
     # An open outer contour, a small real vertex, and an independent counter.

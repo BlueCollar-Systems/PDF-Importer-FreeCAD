@@ -42,6 +42,7 @@ Contract
 from __future__ import annotations
 
 import os
+import json
 import zipfile
 import xml.etree.ElementTree as ET
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -68,6 +69,9 @@ MARKER_PROPERTIES = frozenset({
     "PDFSourceText",
     "PDFDisplayPaintJSON",
     "PDFPaperDisplayJSON",
+    "PDFNonTextCompositeJSON",
+    "PDFImageOrderDisplayJSON",
+    "PDFRectOrderDisplayJSON",
 })
 COLOR_VIEW_PROPERTIES = ("TextColor", "ShapeColor", "LineColor", "PointColor")
 FONT_VIEW_PROPERTIES = ("FontName", "Font")
@@ -268,6 +272,18 @@ def apply_text3d_filled_style(view: Any, color: Any = None) -> bool:
     return written
 
 
+def has_source_glyph_fill(obj: Any) -> bool:
+    """Only new, explicitly source-filled glyph entities use shaded ink."""
+    try:
+        proof = json.loads(str(getattr(obj, "PDFGlyphFillJSON", "")))
+        rows = proof["glyphs"]
+        return (proof["schema"] == "source-svg-glyph-fill/1" and bool(rows) and
+                all(row["fill_rule"] in ("nonzero", "evenodd") and row["face_count"] > 0 and
+                    row["area"] > 0 for row in rows))
+    except (AttributeError, ValueError, TypeError, KeyError):
+        return False
+
+
 def _restore_text(obj: Any, view: Any, representation: str) -> bool:
     """Apply persisted Draft text style; return whether anything was written."""
     written = False
@@ -286,14 +302,15 @@ def _restore_text(obj: Any, view: Any, representation: str) -> bool:
     justification = getattr(obj, "PDFTextJustification", None)
     if isinstance(justification, str) and justification and _has_view_property(view, "Justification"):
         written |= _set_if_changed(view, "Justification", justification)
+    source_filled = representation == "3d_text" or (representation == "glyphs" and has_source_glyph_fill(obj))
     color = parse_rgb(getattr(obj, "PDFTextColorRGB", None))
     if color is not None:
         for name in COLOR_VIEW_PROPERTIES:
-            if representation == "3d_text" and name == "ShapeColor" and _has_view_property(view, "ShapeAppearance"):
+            if source_filled and name == "ShapeColor" and _has_view_property(view, "ShapeAppearance"):
                 continue  # Emissive source color below owns the filled appearance.
             if _has_view_property(view, name):
                 written |= _set_if_changed(view, name, color, _colors_match)
-    if representation == "3d_text":
+    if source_filled:
         written |= apply_text3d_filled_style(view, color)
     if representation in ("glyphs", "geometry"):
         written |= _set_if_changed(view, "LineWidth", 1.0, _floats_match)
@@ -423,7 +440,7 @@ def restore_object_style(
         if view is None:
             return result
         representation = str(getattr(obj, "PDFRepresentation", "") or "")
-        if "PDFDisplayPaintJSON" in properties:
+        if "PDFDisplayPaintJSON" in properties or "PDFStrokeFootprintJSON" in properties:
             _set_if_changed(view, "DisplayMode", "Shaded")
         if representation == "raster" and str(getattr(obj, "TypeId", "")) == "Image::ImagePlane":
             # Source pixels are already lit/composited by the PDF renderer.
@@ -626,6 +643,12 @@ def _console_log(message: str) -> None:
 def restore_document_display_nodes(doc: Any) -> None:
     """Rebuild explicit source/display transforms without reverting GUI styles."""
     objects = getattr(doc, "Objects", ())
+    if any(getattr(obj, "PDFNonTextCompositeJSON", None) for obj in objects):
+        try:
+            from .PDFNonTextComposite import restore_document_displays
+        except ImportError:
+            from PDFNonTextComposite import restore_document_displays
+        restore_document_displays(doc)
     if any(getattr(obj, "PDFDisplayPaintJSON", None) for obj in objects):
         try:
             from .PDFLatePaint import restore_document_displays
@@ -638,6 +661,18 @@ def restore_document_display_nodes(doc: Any) -> None:
         except ImportError:
             from PDFTextLayout import restore_document_layouts
         restore_document_layouts(doc)
+    if any(getattr(obj, "PDFImageOrderDisplayJSON", None) for obj in objects):
+        try:
+            from .PDFImagePaintOrder import restore_document_displays
+        except ImportError:
+            from PDFImagePaintOrder import restore_document_displays
+        restore_document_displays(doc)
+    if any(getattr(obj, "PDFRectOrderDisplayJSON", None) for obj in objects):
+        try:
+            from .PDFOpaqueRectOrder import restore_document_displays
+        except ImportError:
+            from PDFOpaqueRectOrder import restore_document_displays
+        restore_document_displays(doc)
     if any(getattr(obj, "PDFPaperDisplayJSON", None) for obj in objects):
         try:
             from .PDFPaperDisplay import restore_document_paper

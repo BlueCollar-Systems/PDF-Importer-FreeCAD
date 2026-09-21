@@ -18,6 +18,7 @@ for path in (REPO_ROOT, REPO_ROOT / "PDFVectorImporter" / "src"):
 
 from PDFVectorImporter.src import PDFSvgTextRenderer as renderer  # noqa: E402
 from PDFVectorImporter.src import PDFImporterCore as core  # noqa: E402
+from PDFVectorImporter.src import PDFGlyphFill as glyph_fill  # noqa: E402
 
 
 PRODUCTION_CREATE_PDF_SNAPSHOT = renderer._create_pdf_snapshot
@@ -429,6 +430,10 @@ class FakeGroup:
 
 
 def _install_renderer(monkeypatch):
+    # This suite isolates ownership/cleanup/assignment with token-only edge
+    # doubles. Real contour and native fill invariants have their own suite.
+    monkeypatch.setattr(glyph_fill, "placement_fill_rules",
+                        lambda _svg, gids, **_kwargs: [{"fill_rule": None, "clips": []} for _ in gids])
     monkeypatch.setattr(renderer, "FreeCAD", None)
     monkeypatch.setattr(renderer, "Part", FakePart)
     monkeypatch.setattr(renderer, "Vector", FakeVector)
@@ -1598,6 +1603,10 @@ def test_real_rotated_page_item_filters_never_cross_relabel(tmp_path, monkeypatc
 
     monkeypatch.setattr(renderer, "FreeCAD", FakeFreeCAD)
     monkeypatch.setattr(renderer, "Part", SmallGlyphPart)
+    # Token-only host double here tests source assignment after page rotation;
+    # filled contour construction is independently exercised in its own suite.
+    monkeypatch.setattr(glyph_fill, "placement_fill_rules",
+                        lambda _svg, gids, **_kwargs: [{"fill_rule": None, "clips": []} for _ in gids])
     monkeypatch.setattr(renderer, "Vector", FakeVector)
     monkeypatch.setattr(renderer, "find_pdftocairo", lambda: None)
     monkeypatch.setattr(

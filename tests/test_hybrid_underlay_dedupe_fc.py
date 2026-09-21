@@ -285,12 +285,28 @@ def _planes_of(doc, copy_prefix=None):
             "representation": str(getattr(obj, "PDFRepresentation", "") or ""),
             "source_sha256": str(getattr(obj, "PDFSourceSHA256", "") or ""),
             "raster_sha256": str(getattr(obj, "PDFRasterSHA256", "") or ""),
+            "image_order_display": json.loads(getattr(obj, "PDFImageOrderDisplayJSON", "{}")),
             "embedded_image_instance_count": int(getattr(
                 obj, "PDFEmbeddedImageInstanceCount", 0) or 0),
             "embedded_image_manifest_sha256": str(getattr(
                 obj, "PDFEmbeddedImageManifestSHA256", "") or ""),
         })
     return planes
+
+
+def _ordered_objects(doc):
+    rows = []
+    for obj in doc.Objects:
+        encoded = getattr(obj, "PDFImageOrderDisplayJSON", None)
+        if not encoded:
+            continue
+        shape = getattr(obj, "Shape", None)
+        low = float(shape.BoundBox.ZMin) if shape else float(obj.Placement.Base.z)
+        high = float(shape.BoundBox.ZMax) if shape else low
+        rows.append({"name": obj.Name, "proof": json.loads(encoded),
+                     "physical_z_bounds": [low, high],
+                     "source_item_id": str(getattr(obj, "PDFSourceItemId", ""))})
+    return rows
 
 
 try:
@@ -335,6 +351,7 @@ try:
     core._import_embedded_images_as_planes = observed_image_import
     core.import_pdf(pdf_path, opts)
     result["image_planes"] = _planes_of(doc, copy_prefix="plane")
+    result["ordered_objects"] = _ordered_objects(doc)
     result["ignore_images"] = bool(getattr(opts, "ignore_images", False))
     result["image_plane_count"] = int(
         getattr(opts, "image_plane_count", 0) or 0)
@@ -351,6 +368,7 @@ try:
     FreeCAD.closeDocument(doc_name)
     reopened = FreeCAD.open(save_path)
     result["reopened_planes"] = _planes_of(reopened)
+    result["reopened_ordered_objects"] = _ordered_objects(reopened)
     result["ok"] = True
 except Exception as exc:
     result["error"] = traceback.format_exc()
@@ -474,7 +492,37 @@ def test_hybrid_delivers_per_image_planes_without_full_page_underlay(tmp_path):
         "— Image::ImagePlane is CENTER-anchored on its Placement"
         % (plane["base"][0], plane["base"][1], want_cx, want_cy)
     )
-    assert plane["base"][2] < 0.0, "image plane must sit behind native vectors"
+    # This opaque image precedes OVER in the original PDF. The bounded source
+    # order path preserves physical XY/Z and persists a separate display-depth
+    # chain; blindly putting every image behind every vector is not faithful.
+    # This headless test binds that source/geometry recipe and its persistence.
+    # Actual Coin application/appearance is covered by the native GUI audit.
+    assert plane["base"][2] == 0.0, "qualified image must retain the source plane"
+    display = plane["image_order_display"]
+    assert display["schema"] == "bcs.freecad.image-order-display/1"
+    assert display["representation_unchanged"] == "embedded_image"
+    assert display["image_png_sha256"] == plane["raster_sha256"]
+    with fitz.open(str(fixture)) as source_doc:
+        source_page = source_doc[0]
+        image_order, = [i for i, row in enumerate(source_page.get_bboxlog())
+                        if row[0] == "fill-image"]
+        later_text_order, = [row["seqno"] for row in source_page.get_texttrace()
+                             if "".join(chr(c[0]) for c in row["chars"]) == SPAN_OVER_TEXT]
+    assert display["source_paint_order"] == image_order < later_text_order
+    assert display["source_sha256"] == hashlib.sha256(fixture.read_bytes()).hexdigest()
+    assert display["source_proof"]["source_bbox_pdf"] == list(IMAGE_RECT_PT)
+    assert set(map(int, display["source_proof"]["later_text"])) == {later_text_order}
+    ordered = sorted(result["ordered_objects"], key=lambda row: row["proof"]["source_paint_order"])
+    assert [row["proof"]["source_paint_order"] for row in ordered] == [image_order, later_text_order]
+    assert ordered[0]["name"] == plane["name"]
+    assert ordered[1]["proof"]["representation_unchanged"] == "3d_text"
+    expected_source_id = display["source_proof"]["later_text"][str(later_text_order)]["source_item_id"]
+    assert ordered[1]["source_item_id"] == expected_source_id
+    image_top = ordered[0]["physical_z_bounds"][1] + display["display_offset_z_mm"]
+    text_bottom = ordered[1]["physical_z_bounds"][0] + ordered[1]["proof"]["display_offset_z_mm"]
+    assert image_top > 0 and text_bottom > image_top
+    assert result["reopened_ordered_objects"] == result["ordered_objects"]
+    assert result["reopened_planes"][0]["image_order_display"] == display
 
     # ── Native text delivery is untouched by the dedupe ──
     delivered = result.get("text_delivered_counts") or {}

@@ -12,6 +12,13 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 
 > BlueCollar-Systems -- BUILT. NOT BOUGHT.
 
+## Recent fixes (v4.0.106)
+
+- Glyphs and Geometry retry the bundled SVG renderer when Cairo's filter graph hides all glyph placements from the parser. Each recovered item still needs its original source binding; an unreadable graph is not evidence that the requested text representation is impossible.
+- Short, solid round-cap strokes keep their source-sized editable ink faces, including point marks that screen-pixel line widths could lose. Source clipping, opacity, uniform transforms, and unique renderer matches must be verified before a face is added. The original centerline import remains unchanged.
+
+These stroke footprints do not implement general PDF blending or image paint order. Those appearance limits remain subject to native visual review.
+
 ## Recent fixes (v4.0.105)
 
 - Native Text and Labels preserve original character positions and font transforms, including after save/reopen, while remaining editable.

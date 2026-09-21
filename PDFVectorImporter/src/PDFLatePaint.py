@@ -13,8 +13,10 @@ from pathlib import Path
 
 try:
     from .PDFPaintProof import final_svg_rectangles
+    from .PDFNonTextComposite import stored_shapes
 except ImportError:
     from PDFPaintProof import final_svg_rectangles
+    from PDFNonTextComposite import stored_shapes
 
 DISPLAY_PROPERTY = "PDFDisplayPaintJSON"
 _NODE_NAMES = ("BCSPDFDisplayTranslation", "BCSPDFDisplayMaterial")
@@ -155,10 +157,11 @@ def apply_final_paints(page, *, page_number, pdf_sha256, doc, parent, objects, m
     if not rows:
         return []
     objects = list(objects)
+    object_shapes = stored_shapes(objects)
     cutters, top = [], 0.
-    for obj in objects:
-        if hasattr(obj, "Shape") and not obj.Shape.isNull():
-            top = max(top, obj.Shape.BoundBox.ZMax)
+    for obj, shape in object_shapes:
+        if shape is not None and not shape.isNull():
+            top = max(top, shape.BoundBox.ZMax)
         if getattr(obj, "PDFRepresentation", "") != "raster":
             continue
         source_id = getattr(obj, "PDFSourceItemId", "")
@@ -184,8 +187,8 @@ def apply_final_paints(page, *, page_number, pdf_sha256, doc, parent, objects, m
         bounds = (min(p.x for p in mapped), min(p.y for p in mapped),
                   max(p.x for p in mapped), max(p.y for p in mapped))
         matches = []
-        for obj in objects:
-            if not getattr(obj, "PDFFillRGB", "") or not hasattr(obj, "Shape") or not obj.Shape.Faces:
+        for obj, shape in object_shapes:
+            if not getattr(obj, "PDFFillRGB", "") or shape is None or not shape.Faces:
                 continue
             try:
                 composite = tuple(float(c) for c in obj.PDFFillRGB.split(","))
@@ -194,7 +197,7 @@ def apply_final_paints(page, *, page_number, pdf_sha256, doc, parent, objects, m
                     continue
             except (TypeError, ValueError):
                 continue
-            b = obj.Shape.BoundBox
+            b = shape.BoundBox
             if abs(b.ZMin) > 1e-9 or abs(b.ZMax) > 1e-9:
                 continue
             if max(abs(a - c) for a, c in zip(bounds, (b.XMin, b.YMin, b.XMax, b.YMax), strict=True)) < 1e-6:

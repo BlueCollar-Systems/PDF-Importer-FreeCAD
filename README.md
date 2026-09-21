@@ -25,6 +25,11 @@ Native wire outlines and general vector lineweights remain screen-dependent; Ras
 
 ## Recent fixes (unreleased)
 
+- Direct single-page imports now remove their own incomplete objects and
+  delivery evidence when cancelled or stopped by an error. Pre-existing model
+  objects and caller-owned transactions are retained. If cleanup cannot be
+  verified, the error reports that explicitly instead of leaving a partial
+  drawing that can be mistaken for a completed import.
 - **One text item that cannot be delivered now costs that item, not the
   document.** The per-item fallback ladder advances past a rung that failed
   without proof, provided that rung's own attempt shows it removed every host

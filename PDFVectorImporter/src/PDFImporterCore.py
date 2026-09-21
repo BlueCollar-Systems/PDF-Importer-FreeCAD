@@ -11377,17 +11377,49 @@ def import_pdf_page(pdf_path: str, page_num: int = 1,
     _reset_import_run_state(opts)
     fc_doc = _ensure_doc()  # Store reference — don't rely on ActiveDocument later
 
-    # Validate PDF before opening
-    from pdfcadcore.fitz_loader import PdfOpenError, safe_open
+    # This entry point may run inside a caller-owned transaction.  Do not open
+    # or abort it: remove only objects created by this page, just as the
+    # multi-page importer does for an incomplete active page.
+    from pdfcadcore.fitz_loader import safe_open
 
     try:
+        baseline_objects = _document_objects(fc_doc, required=True)
+        baseline_object_ids = {id(obj) for obj in baseline_objects}
+        baseline_object_names = {_host_object_id(obj) for obj in baseline_objects}
+        telemetry_snapshot = _snapshot_page_result_telemetry(opts)
         pdf_doc = safe_open(pdf_path)
-    except PdfOpenError:
+    except Exception:
+        # No page objects can exist yet; do not recompute the caller's model
+        # merely because the PDF could not be opened or inventoried safely.
+        opts.import_status = "failed"
         raise
     try:
-        result = _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc)
-    finally:
-        pdf_doc.close()
+        try:
+            result = _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc)
+        finally:
+            pdf_doc.close()
+    except Exception as failure:
+        rollback = _remove_post_baseline_document_objects(
+            fc_doc, baseline_object_ids, baseline_object_names
+        )
+        _restore_page_result_telemetry(opts, telemetry_snapshot)
+        opts._report_extra["rollback"] = rollback
+        opts.import_status = (
+            "cancelled" if isinstance(failure, ImportCancelled) else "failed"
+        )
+        if isinstance(failure, TextRepresentationFailure):
+            if not rollback["cleanup_complete"]:
+                failure.attempt["cleanup_complete"] = False
+                failure.attempt["rollback"] = rollback
+            _append_text_item_attempt(opts, dict(failure.attempt))
+        if not rollback["cleanup_complete"]:
+            opts.import_status = "failed"
+            raise RuntimeError(
+                "Single-page import failed and cleanup was incomplete: %s" % rollback
+            ) from failure
+        raise
+
+    opts.import_status = "success"
 
     # import_pdf says this once per import; this entry point is its own import.
     clip_fill_warning = _clip_fill_warning_line(opts)
@@ -12989,15 +13021,20 @@ def _remove_post_baseline_document_objects(
     baseline_object_names: set,
 ) -> Dict[str, Any]:
     """Remove every object created after the import snapshot and verify absence."""
+    errors: List[str] = []
+    try:
+        before_cleanup = _document_objects(fc_doc, required=True)
+    except (AttributeError, RuntimeError, TypeError) as exc:
+        before_cleanup = []
+        errors.append("objects before cleanup: %s" % exc)
     post_baseline = [
         host_obj
-        for host_obj in _document_objects(fc_doc)
+        for host_obj in before_cleanup
         if id(host_obj) not in baseline_object_ids
         and _host_object_id(host_obj) not in baseline_object_names
     ]
     created_ids = [_host_object_id(host_obj) for host_obj in post_baseline]
     removed_ids: List[str] = []
-    errors: List[str] = []
     for host_obj in reversed(post_baseline):
         entity_id = _host_object_id(host_obj)
         if not entity_id:
@@ -13023,9 +13060,14 @@ def _remove_post_baseline_document_objects(
         fc_doc.recompute()
     except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
         errors.append("recompute: %s" % exc)
+    try:
+        after_cleanup = _document_objects(fc_doc, required=True)
+    except (AttributeError, RuntimeError, TypeError) as exc:
+        after_cleanup = []
+        errors.append("objects after cleanup: %s" % exc)
     live_post_baseline_ids = [
         _host_object_id(host_obj)
-        for host_obj in _document_objects(fc_doc)
+        for host_obj in after_cleanup
         if id(host_obj) not in baseline_object_ids
         and _host_object_id(host_obj) not in baseline_object_names
     ]

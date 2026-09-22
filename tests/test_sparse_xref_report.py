@@ -85,3 +85,16 @@ def test_action_audit_keeps_multiple_unreadable_objects_and_scans_on():
     note = build_pdf_interactive_note(Doc())
     assert note['pdf_interactive_flags'] == ['JavaScript']
     assert note['pdf_interactive_audit']['unreadable_xrefs'] == [1, 3]
+
+
+def test_source_group_declarations_tolerates_unreadable_sparse_xrefs():
+    src_dir = ROOT / 'PDFVectorImporter' / 'src'
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
+    from PDFNonTextCompositeProof import _source_group_declarations
+    fitz = import_fitz()
+    with fitz.open(stream=sparse_pdf(missing_object=True), filetype='pdf') as doc:
+        records = _source_group_declarations(doc[0])
+        assert records == []
+
+

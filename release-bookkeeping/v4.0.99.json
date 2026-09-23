@@ -1,0 +1,22 @@
+{
+  "assets": [
+    {
+      "name": "FreeCAD-PDF-Importer-Setup_v4.0.99.attestation.json",
+      "sha256": "032fd25df1d9729ed0604f994bf2129b23f878dbbebafe2e76fda5d7d4921f46",
+      "size": 810
+    },
+    {
+      "name": "FreeCAD-PDF-Importer-Setup_v4.0.99.exe",
+      "sha256": "86a96d7f1ca095c367210e717d3da8356815e44677d7103e089944fbcc17ed00",
+      "size": 17784878
+    },
+    {
+      "name": "FreeCAD-PDF-Importer_v4.0.99.zip",
+      "sha256": "7f22cd1058a81fdb82fe38124484ebab8e9ec3844784f7d0753707d3d25bb707",
+      "size": 61230114
+    }
+  ],
+  "schema": "bcs.release_bookkeeping/1.0",
+  "tag": "v4.0.99",
+  "target": "5e7e9a83a616519d5b5d8950a8e5151ce049f39e"
+}

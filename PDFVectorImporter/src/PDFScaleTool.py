@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # PDFScaleTool.py — SketchUp-style "Measure & Scale" tool
-# BlueCollar Systems — BUILT. NOT BOUGHT.
+# BlueCollar-Systems — BUILT. NOT BOUGHT.
 """
 Scale imported PDF geometry by picking two reference points and typing the
 known real-world dimension.  Works like SketchUp's tape-measure scale:
@@ -261,7 +261,7 @@ class ScaleDialog(QtWidgets.QDialog):
 
     def __init__(self, measured_mm: float, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Scale by Reference — BlueCollar Systems")
+        self.setWindowTitle("Scale by Reference — BlueCollar-Systems")
         self.setMinimumWidth(440)
 
         self._measured = measured_mm

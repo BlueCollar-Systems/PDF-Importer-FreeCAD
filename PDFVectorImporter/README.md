@@ -1,16 +1,39 @@
 # PDF Vector Importer for FreeCAD
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Version: 4.0.90](https://img.shields.io/badge/Version-4.0.100-green.svg)
+![Version: 4.0.108](https://img.shields.io/badge/Version-4.0.108-green.svg)
 ![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
 
 **Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.**
 
 Arc reconstruction, dash mapping, color grouping, OCG layer support, and reference-based scaling -- all powered by pure-Python PDF parsing via PyMuPDF.
 
-> **BlueCollar Systems** -- BUILT. NOT BOUGHT.
+> **BlueCollar-Systems** -- BUILT. NOT BOUGHT.
 
 ---
+
+## Changes prepared for v4.0.107
+
+- Qualified round-cap ink, dash-dot dots, opaque image paint order, and source-bound Multiply display from the Codex draft now ship on this cut. Text modes stay in-mode; unproven appearance cases are reported.
+
+## Changes prepared for v4.0.106
+
+- The import dialog now keeps source hatching visible. It previously selected hidden hatch groups without exposing that choice. Explicit scripted `group` and `skip` settings remain available and retain their existing behavior.
+- Glyphs and Geometry retry the original page with MuPDF when Cairo's SVG has no usable glyph placements. The requested representation and exact source-item ownership remain unchanged.
+- Verified short round-cap strokes retain analytic editable footprints. For qualified Multiply regions containing no text or images, a separate embedded 600 DPI source display plane preserves the original composited colors. Hide that labeled plane to edit the underlying source geometry. Pixel budgets and unsupported clipping or transparency cases are reported without reducing resolution.
+- Qualified opaque images retain their original pixels and affine placement above earlier paint. Later source strokes and verified native text keep their own geometry and requested text representation, with persistent display ordering after save/reopen.
+
+These are bounded source-proven repairs, not a general PDF transparency compositor. Native lineweight display and finite-resolution display planes retain their existing zoom limits.
+
+## Recent fixes (v4.0.105)
+
+- Native Text and Labels preserve the original PDF character positions and baseline, including after save/reopen, while remaining editable.
+- 3D Text uses filled source-colored display. Glyphs and Geometry retain editable source outlines with a thinner source-colored display.
+- Verified final rectangle highlights preserve source transparency and physical border widths. A toggleable white paper display keeps dark ink readable without changing the application theme.
+- Headless documents restore their saved visibility and display nodes when opened in the GUI. Concurrent imports use separate report folders.
+- Original renderer character quads and expanded Raster coverage prevent false glyph shear and cropped letter edges. Wholly off-page paints are removed only when complete renderer bounds prove they are invisible.
+
+Native wire outlines and general vector lineweights remain screen-dependent; Raster text has finite resolution. Final rectangle highlights are handled only when their complete source paint contract is verified.
 
 ## Recent fixes (v4.0.86)
 
@@ -173,17 +196,7 @@ PDFVectorImporter/
 |   |-- PDFImporterCmd.py       # FreeCAD command wrappers
 |   |-- PDFScaleTool.py         # Scale by Reference implementation
 |   |-- PDFHatchDetector.py     # Hatch region detection engine
-|   |-- PDFPrimitives.py        # Primitive geometry builders
 |   |-- PDFSvgTextRenderer.py   # SVG/text rendering pipeline
-|   |-- PDFPrimitiveExtractor.py
-|   |-- PDFRecognition.py       # Pattern and symbol recognition
-|   |-- PDFRegions.py           # Spatial region analysis
-|   |-- PDFValidation.py        # Import validation checks
-|   |-- PDFDimensionParser.py   # Dimension text extraction
-|   |-- PDFDocumentProfiler.py  # Document type classification
-|   |-- PDFGenericClassifier.py # Generic element classification
-|   |-- PDFGenericRecognizer.py # Generic pattern recognition
-|   |-- PDFGeometryCleanup.py   # Duplicate/overlap removal
 ```
 
 ### Headless (FreeCADCmd) saves keep their look
@@ -271,4 +284,4 @@ python run_pdf_vector_importer_tests.py --init-workbook qa_workbook.xlsx
 
 MIT License. See [LICENSE](LICENSE) for details.
 
-Copyright (c) 2024-2026 BlueCollar Systems
+Copyright (c) 2024-2026 BlueCollar-Systems

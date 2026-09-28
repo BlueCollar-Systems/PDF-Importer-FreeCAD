@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # InitGui.py — FreeCAD workbench registration
-# PDF Vector Importer — BlueCollar Systems — BUILT. NOT BOUGHT.
+# PDF Vector Importer — BlueCollar-Systems — BUILT. NOT BOUGHT.
 #
 # FreeCAD exec()s this file in a restricted namespace.
 # ALL logic must be inside the class or fully inline.
@@ -129,7 +129,7 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
             pass
 
         FreeCAD.Console.PrintMessage(
-            "PDF Vector Importer ready — BlueCollar Systems\n")
+            "PDF Vector Importer ready — BlueCollar-Systems\n")
 
     def Activated(self):
         # Ensure paths every time (in case this is the first activation)

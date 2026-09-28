@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "PDFVectorImporter"))
 
 from pdfcadcore.import_report import (
     build_actual_text_entity_types,
+    build_fallback_transitions,
     build_font_embedding_hints,
     build_import_contract_ready,
     build_import_report,
@@ -329,6 +330,78 @@ def test_font_embedding_hints_uses_extension_not_referencer():
     assert "source-font non-equivalent" in hints["font_substitution_note"]
 
 
+def test_build_import_report_always_emits_fallback_transitions_list():
+    report = build_import_report(
+        host_app="freecad",
+        pdf_path="sample.pdf",
+        primitive_count=1840,
+        import_text=True,
+        text_mode="text",
+    )
+    extra = report.to_dict()["extra"]
+    assert extra["fallback_transitions"] == []
+    assert extra["text_mode"] == "text"
+
+
+def test_build_fallback_transitions_expands_item_scoped_text_mode_fallbacks():
+    transitions = build_fallback_transitions(
+        {
+            "text_mode_fallbacks": [
+                {
+                    "requested": "text",
+                    "delivered": "3d_text",
+                    "reason": "host_representation_unsupported",
+                    "count": 1,
+                    "source_item_ids": ["p1:b0:l0:s0"],
+                    "proof": {
+                        "item_specific_proven_impossible": True,
+                        "page_number": 1,
+                        "importer_identity": "bluecollarsystems.freecad.pdf_vector_importer",
+                        "cleanup_complete": True,
+                    },
+                }
+            ]
+        }
+    )
+    assert transitions == [
+        {
+            "source_span_id": "p1:b0:l0:s0",
+            "from_mode": "text",
+            "to_mode": "3d_text",
+            "reason_code": "host_representation_unsupported",
+            "page_number": 1,
+            "page": 1,
+            "importer_id": "bluecollarsystems.freecad.pdf_vector_importer",
+            "affirmative_impossibility": True,
+            "generic_failure": False,
+            "cleanup_outcome": "verified",
+        }
+    ]
+
+
+def test_build_fallback_transitions_does_not_invent_unproven_delivery_divergence():
+    transitions = build_fallback_transitions(
+        {
+            "text_delivery": {
+                "items": [
+                    {
+                        "source_span_id": "p1:b0:l0:s1",
+                        "requested_representation": "text",
+                        "final_representation": "glyphs",
+                        "fallback_used": False,
+                        "verified": True,
+                    }
+                ]
+            }
+        }
+    )
+    assert transitions == []
+
+
+def test_build_fallback_transitions_keeps_an_explicit_empty_ledger():
+    assert build_fallback_transitions({"fallback_transitions": []}) == []
+
+
 def test_pdf_interactive_note_ignores_null_catalog_keys():
     class Doc:
         def pdf_catalog(self):
@@ -359,3 +432,67 @@ def test_pdf_interactive_note_detects_javascript_action():
     note = build_pdf_interactive_note(Doc())
     assert note["pdf_interactive_flags"] == ["JavaScript"]
     assert "scripts are not executed" in note["pdf_interactive_note"]
+
+
+class _UnallocatedObject(Exception):
+    """Shape of pymupdf.mupdf.FzErrorFormat: derives from Exception, not RuntimeError."""
+
+
+def test_pdf_interactive_note_survives_unallocated_xref_numbers():
+    class Doc:
+        def pdf_catalog(self):
+            return 2
+
+        def xref_get_key(self, xref, key):
+            if xref in (1, 4):
+                raise _UnallocatedObject(f"code=7: cannot find object in xref ({xref} 0 R)")
+            if xref == 3 and key == "S":
+                return ("name", "/JavaScript")
+            return ("null", "null")
+
+        def xref_length(self):
+            return 6
+
+    note = build_pdf_interactive_note(Doc())
+    assert note["pdf_interactive_flags"] == ["JavaScript"]
+
+
+def _write_sparse_xref_pdf(path: Path) -> None:
+    """A valid PDF whose xref table allocates objects 2, 3 and 5 only.
+
+    Aspose markup exports write their xref stream with /Index gaps the same way;
+    MuPDF raises "cannot find object in xref" for the unallocated numbers.
+    """
+    objects = {
+        2: b"<< /Type /Catalog /Pages 3 0 R >>",
+        3: b"<< /Type /Pages /Kids [5 0 R] /Count 1 >>",
+        5: b"<< /Type /Page /Parent 3 0 R /MediaBox [0 0 200 100] >>",
+    }
+    buf = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = {}
+    for number, body in objects.items():
+        offsets[number] = len(buf)
+        buf += b"%d 0 obj\n" % number + body + b"\nendobj\n"
+    xref_pos = len(buf)
+    buf += b"xref\n2 2\n"
+    buf += b"%010d 00000 n \n" % offsets[2] + b"%010d 00000 n \n" % offsets[3]
+    buf += b"5 1\n" + b"%010d 00000 n \n" % offsets[5]
+    buf += b"trailer\n<< /Size 6 /Root 2 0 R >>\nstartxref\n%d\n%%%%EOF\n" % xref_pos
+    path.write_bytes(bytes(buf))
+
+
+def test_pdf_audit_extras_completes_on_a_sparse_xref_file(tmp_path):
+    fitz = pytest.importorskip("pymupdf")
+    from pdfcadcore.import_report import _pdf_audit_extras
+
+    pdf_path = tmp_path / "sparse_xref.pdf"
+    _write_sparse_xref_pdf(pdf_path)
+    doc = fitz.open(str(pdf_path))
+    with pytest.raises(Exception) as raised:
+        doc.xref_get_key(1, "JS")
+    assert not isinstance(raised.value, RuntimeError)  # the class the old guards missed
+    doc.close()
+
+    extras = _pdf_audit_extras(str(pdf_path))
+    assert isinstance(extras, dict)
+    assert "pdf_interactive_flags" not in extras

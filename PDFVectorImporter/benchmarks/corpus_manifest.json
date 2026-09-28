@@ -1,0 +1,14 @@
+{
+  "schema": "bcs.pdfcadcore.corpus_manifest/1.0",
+  "description": "Phase 2 benchmark corpus for pdfcadcore extraction equivalence and timing. Local PDF paths stay out of git; resolve them at run time.",
+  "host_profile_id": "pdfcadcore_freecad_win_py3.12_default",
+  "workloads": [
+    {
+      "workload_id": "1011_1of2",
+      "path": "workloads/1011_1of2.pdf",
+      "category": "short",
+      "notes": "Single-page engineering detail. Baseline: import in <=30s with 100% canonical-IR fidelity.",
+      "baseline_report": "baseline_1011_1of2.json"
+    }
+  ]
+}

@@ -352,10 +352,26 @@ def build_pdf_interactive_note(doc: Any) -> Dict[str, Any]:
     if doc is None:
         return {}
 
+    # Recent PyMuPDF versions expose FzErrorBase directly instead of wrapping
+    # it in RuntimeError. Sparse, otherwise valid PDFs can have free xrefs;
+    # this optional audit must keep scanning later objects and report gaps.
+    audit_errors = (AttributeError, RuntimeError, TypeError, ValueError)
+    try:
+        from .fitz_loader import import_fitz
+
+        mupdf_error = getattr(getattr(import_fitz(), "mupdf", None), "FzErrorBase", None)
+        if isinstance(mupdf_error, type) and issubclass(mupdf_error, Exception):
+            audit_errors += (mupdf_error,)
+    except ImportError:
+        pass
+    unreadable_xrefs: set[int] = set()
+
     def key_present(xref: int, key: str) -> bool:
+        # Keep scanning after a sparse/free object and record the incomplete audit.
         try:
             value = doc.xref_get_key(xref, key)
-        except (AttributeError, RuntimeError, TypeError, ValueError):
+        except Exception:
+            unreadable_xrefs.add(xref)
             return False
         if not value:
             return False
@@ -370,7 +386,7 @@ def build_pdf_interactive_note(doc: Any) -> Dict[str, Any]:
         js = doc.get_js() if hasattr(doc, "get_js") else None
         if js:
             flags.append("JavaScript")
-    except (AttributeError, RuntimeError, TypeError, ValueError):
+    except audit_errors:
         pass
     try:
         catalog = doc.pdf_catalog()
@@ -378,7 +394,7 @@ def build_pdf_interactive_note(doc: Any) -> Dict[str, Any]:
             flags.append("OpenAction")
         if catalog and key_present(catalog, "AA"):
             flags.append("AdditionalActions")
-    except (AttributeError, RuntimeError, TypeError, ValueError):
+    except audit_errors:
         pass
     try:
         for xref in range(1, int(doc.xref_length())):
@@ -387,19 +403,28 @@ def build_pdf_interactive_note(doc: Any) -> Dict[str, Any]:
                 break
             try:
                 subtype = doc.xref_get_key(xref, "S")
-            except (AttributeError, RuntimeError, TypeError, ValueError):
+            except Exception:
+                unreadable_xrefs.add(xref)
                 continue
             raw = " ".join(str(part) for part in subtype) if isinstance(subtype, tuple) else str(subtype)
             if "JavaScript" in raw:
                 flags.append("JavaScript")
                 break
-    except (AttributeError, RuntimeError, TypeError, ValueError):
+    except audit_errors:
         pass
+    audit: Dict[str, Any] = {}
+    if unreadable_xrefs:
+        audit["pdf_interactive_audit"] = {
+            "status": "partial",
+            "unreadable_xrefs": sorted(unreadable_xrefs),
+            "note": "Some PDF objects could not be read during the optional action audit; scripts are never executed.",
+        }
     if not flags:
-        return {}
+        return audit
     flags = _unique_strings(flags)
     joined = ", ".join(flags)
     return {
+        **audit,
         "pdf_interactive_flags": flags,
         "pdf_interactive_note": (
             f"PDF contains document scripts or actions ({joined}) — import uses static "
@@ -466,7 +491,11 @@ def _pdf_audit_extras(pdf_path: str) -> Dict[str, Any]:
         doc = safe_open(path)
         merged.update(build_font_embedding_hints(doc))
         merged.update(build_pdf_interactive_note(doc))
-    except (OSError, RuntimeError, TypeError, ValueError):
+    except Exception:
+        # The audit annotates a finished import; it must never turn one into a
+        # failure.  PyMuPDF's own error classes (FzErrorFormat and friends)
+        # derive from Exception directly, so a narrower tuple let a sparse
+        # xref abort every host after its geometry had been written.
         return merged
     finally:
         if doc is not None:
@@ -984,6 +1013,145 @@ class ImportReport:
         return cls.from_dict(json.loads(Path(input_path).read_text(encoding="utf-8")))
 
 
+def _normalized_transition_mode(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _append_unique_fallback_transition(
+    transitions: List[Dict[str, Any]],
+    entry: Dict[str, Any],
+) -> None:
+    source_id = str(entry.get("source_span_id") or "").strip()
+    from_mode = _normalized_transition_mode(entry.get("from_mode"))
+    to_mode = _normalized_transition_mode(entry.get("to_mode"))
+    reason = str(entry.get("reason_code") or "").strip()
+    if not source_id or not from_mode or not to_mode or from_mode == to_mode or not reason:
+        return
+    for existing in transitions:
+        if (
+            str(existing.get("source_span_id") or "").strip() == source_id
+            and _normalized_transition_mode(existing.get("from_mode")) == from_mode
+            and _normalized_transition_mode(existing.get("to_mode")) == to_mode
+            and str(existing.get("reason_code") or "").strip() == reason
+        ):
+            return
+    payload = {
+        "source_span_id": source_id,
+        "from_mode": from_mode,
+        "to_mode": to_mode,
+        "reason_code": reason,
+    }
+    page_number = entry.get("page_number", entry.get("page"))
+    if type(page_number) is int and page_number > 0:
+        payload["page_number"] = page_number
+        payload["page"] = page_number
+    importer_id = str(entry.get("importer_id") or "").strip()
+    if importer_id:
+        payload["importer_id"] = importer_id
+    if entry.get("affirmative_impossibility") is True:
+        payload["affirmative_impossibility"] = True
+        payload["generic_failure"] = False
+    cleanup = entry.get("cleanup_outcome")
+    if cleanup:
+        payload["cleanup_outcome"] = cleanup
+    transitions.append(payload)
+
+
+def build_fallback_transitions(extra: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return the certified item-transition ledger, never an omitted field.
+
+    An empty list means no certified transitions were recorded. Callers must
+    not invent counts or mark ``fallback.used`` without a matching entry.
+    """
+    extra = extra if isinstance(extra, dict) else {}
+    transitions: List[Dict[str, Any]] = []
+    existing = extra.get("fallback_transitions")
+    if isinstance(existing, list):
+        for item in existing:
+            if isinstance(item, dict):
+                _append_unique_fallback_transition(transitions, dict(item))
+        return transitions
+
+    for event in extra.get("text_mode_fallbacks") or []:
+        if not isinstance(event, dict):
+            continue
+        proof = event.get("proof") if isinstance(event.get("proof"), dict) else {}
+        for source_id in list(event.get("source_item_ids") or []):
+            _append_unique_fallback_transition(
+                transitions,
+                {
+                    "source_span_id": source_id,
+                    "from_mode": event.get("requested"),
+                    "to_mode": event.get("delivered"),
+                    "reason_code": event.get("reason"),
+                    "page_number": proof.get("page_number"),
+                    "importer_id": proof.get("importer_identity"),
+                    "affirmative_impossibility": (
+                        proof.get("item_specific_proven_impossible") is True
+                    ),
+                    "cleanup_outcome": (
+                        "verified" if proof.get("cleanup_complete") is True else None
+                    ),
+                },
+            )
+
+    items: List[Any] = []
+    delivery = extra.get("text_delivery")
+    if isinstance(delivery, dict):
+        items.extend(list(delivery.get("items") or []))
+    representation = extra.get("text_representation_delivery")
+    if isinstance(representation, dict):
+        items.extend(list(representation.get("items") or []))
+
+    for record in items:
+        if not isinstance(record, dict) or record.get("fallback_used") is not True:
+            continue
+        requested = record.get("requested_representation") or record.get("requested")
+        delivered = record.get("final_representation") or record.get("delivered")
+        reason = str(record.get("failure_reason") or record.get("reason") or "").strip()
+        proof: Optional[Dict[str, Any]] = None
+        for attempt in list(record.get("attempts") or []):
+            if not isinstance(attempt, dict):
+                continue
+            status = str(attempt.get("status") or attempt.get("outcome") or "").lower()
+            if status in {"impossible", "failed"}:
+                if not reason:
+                    reason = str(
+                        attempt.get("reason") or attempt.get("failure_reason") or ""
+                    ).strip()
+                evidence = attempt.get("evidence")
+                if isinstance(evidence, dict):
+                    proof = evidence
+                    break
+        if not reason:
+            continue
+        source_id = (
+            record.get("source_span_id")
+            or record.get("source_id")
+            or record.get("item_id")
+        )
+        affirmative = bool(
+            isinstance(proof, dict)
+            and (
+                proof.get("item_specific_proven_impossible") is True
+                or proof.get("host_limit") is True
+            )
+        )
+        _append_unique_fallback_transition(
+            transitions,
+            {
+                "source_span_id": source_id,
+                "from_mode": requested,
+                "to_mode": delivered,
+                "reason_code": reason,
+                "page_number": (proof or {}).get("page_number"),
+                "importer_id": (proof or {}).get("importer_identity"),
+                "affirmative_impossibility": affirmative,
+            },
+        )
+    return transitions
+
+
 def build_import_report(
     *,
     host_app: str,
@@ -1077,6 +1245,7 @@ def build_import_report(
             text_fallback=text_fallback_block,
         ),
     )
+    extra_block["fallback_transitions"] = build_fallback_transitions(extra_block)
 
     performance_block: Dict[str, Any] = {
         "elapsed_ms": float(elapsed_ms),
@@ -1157,5 +1326,6 @@ __all__ = [
     "build_model_3d_extra",
     "build_import_contract_ready",
     "enrich_import_report_extras",
+    "build_fallback_transitions",
     "build_import_report",
 ]

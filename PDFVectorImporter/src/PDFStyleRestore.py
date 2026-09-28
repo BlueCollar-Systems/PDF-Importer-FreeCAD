@@ -42,7 +42,9 @@ Contract
 from __future__ import annotations
 
 import os
+import json
 import zipfile
+import xml.etree.ElementTree as ET
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
@@ -65,6 +67,11 @@ MARKER_PROPERTIES = frozenset({
     "PDFLineWidthPt",
     "PDFRasterFile",
     "PDFSourceText",
+    "PDFDisplayPaintJSON",
+    "PDFPaperDisplayJSON",
+    "PDFNonTextCompositeJSON",
+    "PDFImageOrderDisplayJSON",
+    "PDFRectOrderDisplayJSON",
 })
 COLOR_VIEW_PROPERTIES = ("TextColor", "ShapeColor", "LineColor", "PointColor")
 FONT_VIEW_PROPERTIES = ("FontName", "Font")
@@ -237,6 +244,46 @@ def _text_font_value(obj: Any) -> str:
     return font_name.strip() if isinstance(font_name, str) else ""
 
 
+def apply_text3d_filled_style(view: Any, color: Any = None) -> bool:
+    """Display exact glyph solids as source-colored ink without lit edge halos."""
+    written = _set_if_changed(view, "DisplayMode", "Shaded")
+    if color is None:
+        return written
+    try:
+        materials = list(view.ShapeAppearance)
+        material_changed = False
+        for material in materials:
+            for name, value in (("DiffuseColor", (0., 0., 0.)),
+                                ("AmbientColor", (0., 0., 0.)),
+                                ("SpecularColor", (0., 0., 0.)),
+                                ("EmissiveColor", tuple(color))):
+                if not _colors_match(getattr(material, name), value):
+                    setattr(material, name, value)
+                    material_changed = True
+            if float(material.Shininess) != 0.:
+                material.Shininess = 0.
+                material_changed = True
+        if material_changed:
+            view.ShapeAppearance = materials
+            written = True
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        # Older supported hosts can still use filled-only native display.
+        pass
+    return written
+
+
+def has_source_glyph_fill(obj: Any) -> bool:
+    """Only new, explicitly source-filled glyph entities use shaded ink."""
+    try:
+        proof = json.loads(str(getattr(obj, "PDFGlyphFillJSON", "")))
+        rows = proof["glyphs"]
+        return (proof["schema"] == "source-svg-glyph-fill/1" and bool(rows) and
+                all(row["fill_rule"] in ("nonzero", "evenodd") and row["face_count"] > 0 and
+                    row["area"] > 0 for row in rows))
+    except (AttributeError, ValueError, TypeError, KeyError):
+        return False
+
+
 def _restore_text(obj: Any, view: Any, representation: str) -> bool:
     """Apply persisted Draft text style; return whether anything was written."""
     written = False
@@ -255,11 +302,18 @@ def _restore_text(obj: Any, view: Any, representation: str) -> bool:
     justification = getattr(obj, "PDFTextJustification", None)
     if isinstance(justification, str) and justification and _has_view_property(view, "Justification"):
         written |= _set_if_changed(view, "Justification", justification)
+    source_filled = representation == "3d_text" or (representation == "glyphs" and has_source_glyph_fill(obj))
     color = parse_rgb(getattr(obj, "PDFTextColorRGB", None))
     if color is not None:
         for name in COLOR_VIEW_PROPERTIES:
+            if source_filled and name == "ShapeColor" and _has_view_property(view, "ShapeAppearance"):
+                continue  # Emissive source color below owns the filled appearance.
             if _has_view_property(view, name):
                 written |= _set_if_changed(view, name, color, _colors_match)
+    if source_filled:
+        written |= apply_text3d_filled_style(view, color)
+    if representation in ("glyphs", "geometry"):
+        written |= _set_if_changed(view, "LineWidth", 1.0, _floats_match)
     if representation == LABEL_REPRESENTATION:
         # The importer builds Labels with points=[anchor, anchor]; Draft's
         # default "Dot" arrow then draws a 1 mm marker over the first glyph.
@@ -275,14 +329,38 @@ def _restore_text(obj: Any, view: Any, representation: str) -> bool:
     return written
 
 
-def _restore_visibility(obj: Any, view: Any) -> bool:
+def _restore_visibility(obj: Any, view: Any, saved: Optional[bool] = None) -> bool:
     try:
-        wanted = bool(getattr(obj, "Visibility", True))
+        wanted = bool(getattr(obj, "Visibility", True)) if saved is None else saved
     except Exception:
         wanted = True
     if not _has_view_property(view, "Visibility"):
         return False
     return _set_if_changed(view, "Visibility", wanted)
+
+
+def _saved_headless_visibility(doc: Any) -> Dict[str, bool]:
+    """Read the App-side truth before GUI default visibility can overwrite it.
+
+    A newly attached FreeCAD view can synchronize its default false value back
+    to App.Visibility during open. GUI-saved files are deliberately excluded.
+    """
+    path = str(getattr(doc, "FileName", "") or "")
+    if not path:
+        return {}
+    try:
+        with zipfile.ZipFile(path) as archive:
+            if GUI_DOCUMENT_MEMBER in archive.namelist():
+                return {}
+            root = ET.fromstring(archive.read("Document.xml"))
+        result = {}
+        for obj in root.findall("./ObjectData/Object"):
+            value = obj.find("./Properties/Property[@name='Visibility']/Bool")
+            if value is not None and value.get("value") in ("true", "false"):
+                result[obj.get("name", "")] = value.get("value") == "true"
+        return result
+    except (OSError, KeyError, zipfile.BadZipFile, ET.ParseError):
+        return {}
 
 
 def _is_group(obj: Any) -> bool:
@@ -348,6 +426,7 @@ def restore_object_style(
     *,
     geometry_applier: Optional[Callable[..., Any]] = None,
     geometry_opts: Any = None,
+    saved_visibility: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Restore one object.  Returns what happened; never raises."""
     result = {"marked": False, "text": False, "geometry": False, "visibility": False,
@@ -361,6 +440,8 @@ def restore_object_style(
         if view is None:
             return result
         representation = str(getattr(obj, "PDFRepresentation", "") or "")
+        if "PDFDisplayPaintJSON" in properties or "PDFStrokeFootprintJSON" in properties:
+            _set_if_changed(view, "DisplayMode", "Shaded")
         if representation == "raster" and str(getattr(obj, "TypeId", "")) == "Image::ImagePlane":
             # Source pixels are already lit/composited by the PDF renderer.
             _set_if_changed(view, "DisplayMode", "No shading")
@@ -378,7 +459,7 @@ def restore_object_style(
             except Exception as exc:  # pragma: no cover - defensive
                 result["error"] = "geometry: %s: %s" % (exc.__class__.__name__, exc)
         try:
-            result["visibility"] = _restore_visibility(obj, view)
+            result["visibility"] = _restore_visibility(obj, view, saved_visibility)
         except Exception as exc:  # pragma: no cover - defensive
             result["error"] = "visibility: %s: %s" % (exc.__class__.__name__, exc)
     except Exception as exc:  # pragma: no cover - defensive
@@ -432,6 +513,7 @@ def restore_document_styles(
         summary["errors"].append("document objects unavailable: %s" % exc)
         return summary
     summary["objects_scanned"] = len(objects)
+    saved_visibility = _saved_headless_visibility(doc)
 
     applier = None
     opts = None
@@ -448,7 +530,8 @@ def restore_document_styles(
 
     marked_objects: List[Any] = []
     for obj in objects:
-        outcome = restore_object_style(obj, geometry_applier=applier, geometry_opts=opts)
+        outcome = restore_object_style(obj, geometry_applier=applier, geometry_opts=opts,
+                                       saved_visibility=saved_visibility.get(getattr(obj, "Name", "")))
         if not outcome["marked"]:
             continue
         summary["objects_marked"] += 1
@@ -480,7 +563,8 @@ def restore_document_styles(
             seen.add(key)
             try:
                 view = getattr(parent, "ViewObject", None)
-                if view is not None and _restore_visibility(parent, view):
+                if view is not None and _restore_visibility(parent, view,
+                        saved_visibility.get(getattr(parent, "Name", ""))):
                     summary["visibility_restored"] += 1
                 summary["groups_restored"] += 1
             except Exception as exc:  # pragma: no cover - defensive
@@ -488,6 +572,19 @@ def restore_document_styles(
                     "%s: group visibility: %s" % (getattr(parent, "Name", "?"), exc)
                 )
             pending.append(parent)
+
+    # Group visibility can cascade to children in some FreeCAD versions.
+    # Reapply each leaf's serialized state after parent groups are visible so
+    # hidden construction/support objects remain hidden.
+    for obj in marked_objects:
+        if _is_group(obj) or getattr(obj, "Name", "") not in saved_visibility:
+            continue
+        try:
+            view = getattr(obj, "ViewObject", None)
+            if view is not None and _restore_visibility(obj, view, saved_visibility[obj.Name]):
+                summary["visibility_restored"] += 1
+        except Exception as exc:
+            summary["errors"].append("%s: final visibility: %s" % (getattr(obj, "Name", "?"), exc))
 
     if summary["visibility_restored"] > 0:
         try:
@@ -541,6 +638,47 @@ def _console_log(message: str) -> None:
         FreeCAD.Console.PrintLog(message)
     except Exception:
         pass
+
+
+def restore_document_display_nodes(doc: Any) -> None:
+    """Rebuild explicit source/display transforms without reverting GUI styles."""
+    objects = getattr(doc, "Objects", ())
+    if any(getattr(obj, "PDFNonTextCompositeJSON", None) for obj in objects):
+        try:
+            from .PDFNonTextComposite import restore_document_displays
+        except ImportError:
+            from PDFNonTextComposite import restore_document_displays
+        restore_document_displays(doc)
+    if any(getattr(obj, "PDFDisplayPaintJSON", None) for obj in objects):
+        try:
+            from .PDFLatePaint import restore_document_displays
+        except ImportError:
+            from PDFLatePaint import restore_document_displays
+        restore_document_displays(doc)
+    if any(getattr(obj, "PDFTextLayoutJSON", None) for obj in objects):
+        try:
+            from .PDFTextLayout import restore_document_layouts
+        except ImportError:
+            from PDFTextLayout import restore_document_layouts
+        restore_document_layouts(doc)
+    if any(getattr(obj, "PDFImageOrderDisplayJSON", None) for obj in objects):
+        try:
+            from .PDFImagePaintOrder import restore_document_displays
+        except ImportError:
+            from PDFImagePaintOrder import restore_document_displays
+        restore_document_displays(doc)
+    if any(getattr(obj, "PDFRectOrderDisplayJSON", None) for obj in objects):
+        try:
+            from .PDFOpaqueRectOrder import restore_document_displays
+        except ImportError:
+            from PDFOpaqueRectOrder import restore_document_displays
+        restore_document_displays(doc)
+    if any(getattr(obj, "PDFPaperDisplayJSON", None) for obj in objects):
+        try:
+            from .PDFPaperDisplay import restore_document_paper
+        except ImportError:
+            from PDFPaperDisplay import restore_document_paper
+        restore_document_paper(doc)
 
 
 class PDFStyleRestoreObserver:
@@ -611,6 +749,10 @@ class PDFStyleRestoreObserver:
             needs_restore, reason = False, "gate_error: %s" % exc
         if not needs_restore:
             try:
+                restore_document_display_nodes(doc)
+            except Exception as exc:
+                self._log("PDF source display restore failed: %s\n" % exc)
+            try:
                 self._log(
                     "PDF Vector Importer: style restore skipped for %s (%s)\n"
                     % (str(getattr(doc, "Name", "") or "document"), reason)
@@ -620,6 +762,7 @@ class PDFStyleRestoreObserver:
             return
         try:
             self._restore(doc)
+            restore_document_display_nodes(doc)
         except Exception as exc:
             try:
                 self._log("PDF Vector Importer: style restore failed: %s\n" % exc)

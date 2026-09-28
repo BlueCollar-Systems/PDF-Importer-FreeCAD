@@ -551,7 +551,9 @@ class ImportPDFDialog(QtWidgets.QDialog):
 
         # Consolidated defaults per BCS-ARCH-001 parameter table.
         # Quality-tier dials are hardcoded — no UI exposure.
-        # Hatching is always "group" (least destructive).
+        # Preserve visible source hatching. The programmatic "group" option
+        # deliberately hides detected hatches; the dialog has no such control
+        # or saved preference and must not silently remove their visible paint.
         # Raster DPI is always 300. Strict text fidelity is always True.
         # Lineweight handling is always "preserve". Arc reconstruction
         # is always enabled in non-raster modes via the Auto cleanup level.
@@ -566,7 +568,7 @@ class ImportPDFDialog(QtWidgets.QDialog):
             import_text=import_text,
             text_mode=text_mode,
             strict_text_fidelity=True,
-            hatch_mode="group",
+            hatch_mode="import",
             group_by_color=True,
             assign_linewidth=True,
             map_dashes=(import_mode != "raster"),

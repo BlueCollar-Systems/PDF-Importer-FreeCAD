@@ -111,12 +111,24 @@ def test_invalid_native_face_is_not_silently_downgraded(native):
         build([rect(0, 0, 10, 10)])
 
 
-def test_unsupported_inventory_clip_is_not_downgraded_to_raster(monkeypatch):
-    from pdfcadcore.drawing_clips import UnsupportedClipFillError
+def test_unresolvable_inventory_clip_costs_one_fill_not_the_vector_inventory():
+    # This used to raise and abort the document. It must not become the other
+    # failure either: an emptied inventory that auto mode would deliver as raster.
+    from pdfcadcore.drawing_clips import clip_fill_issues
 
-    def fail(page):
-        raise UnsupportedClipFillError('Cannot preserve a partial clip')
+    ring = [('l', (0, 0), (20, 0)), ('l', (20, 0), (20, 10)), ('l', (20, 10), (0, 10)),
+            ('l', (0, 10), (0, 0)), ('re', (5, 2, 15, 8), 1)]
+    wedge = [('l', (0, 0), (20, 0)), ('l', (20, 0), (20, 10)), ('l', (20, 10), (0, 0))]
+    strokes = [{'type': 's', 'level': 0, 'seqno': 10 + n, 'rect': (40, n, 60, n + 1),
+                'items': [('l', (40, n), (60, n + 1))]} for n in range(6)]
+    rows = [{'type': 'clip', 'level': 0, 'scissor': (0, 0, 20, 10), 'even_odd': True, 'items': ring},
+            {'type': 'clip', 'level': 1, 'scissor': (0, 0, 20, 10), 'even_odd': True, 'items': wedge},
+            {'type': 'f', 'level': 2, 'seqno': 7, 'rect': (0, 0, 20, 10), 'fill': (0, 0, 0),
+             'fill_opacity': 1.0, 'even_odd': False, 'items': [('re', (0, 0, 20, 10), 1)]}] + strokes
+    page = SimpleNamespace(get_drawings=lambda extended: rows, get_images=lambda full: [1, 2])
 
-    monkeypatch.setattr(core, 'get_clip_aware_drawings', fail)
-    with pytest.raises(UnsupportedClipFillError, match='partial clip'):
-        core._page_visual_inventory(SimpleNamespace(), 'auto')
+    drawings, image_count = core._page_visual_inventory(page, 'auto')
+
+    assert drawings == strokes and image_count == 2
+    (issue,) = clip_fill_issues(drawings)
+    assert (issue['seqno'], issue['action'], issue['severity']) == (7, 'dropped-unsupported', 'warning')

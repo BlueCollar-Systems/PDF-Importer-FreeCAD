@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import ast
 import concurrent.futures
+import hashlib
 import importlib.util
 import inspect
 import math
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -93,6 +95,62 @@ def test_atomic_raster_publication_survives_concurrent_same_key_writers(tmp_path
     assert [path for path in tmp_path.iterdir() if path != destination] == []
 
 
+def test_raster_asset_dir_probes_writability_once_per_import(monkeypatch, tmp_path):
+    probes = []
+    real_ntf = tempfile.NamedTemporaryFile
+
+    def counting_ntf(*args, **kwargs):
+        probes.append(kwargs.get("dir") or (args[0] if args else None))
+        return real_ntf(*args, **kwargs)
+
+    monkeypatch.setattr(core.tempfile, "NamedTemporaryFile", counting_ntf)
+    monkeypatch.setattr(
+        core,
+        "FreeCAD",
+        SimpleNamespace(getUserAppDataDir=lambda: str(tmp_path / "appdata")),
+    )
+    core._reset_import_run_state(core.ImportOptions())
+    try:
+        first = core._raster_asset_dir()
+        second = core._raster_asset_dir()
+
+        assert first == second
+        assert first.is_dir()
+        assert len(probes) == 1
+    finally:
+        core._reset_import_run_state(core.ImportOptions())
+
+
+def test_save_pixmap_atomic_hashes_published_bytes_without_reencode(tmp_path):
+    destination = tmp_path / "span.png"
+    pixel_bytes = bytes((255, 0, 0, 0, 255, 0, 0, 0, 255))
+
+    class Pixmap:
+        width = 3
+        height = 1
+        n = 3
+        stride = 9
+        alpha = False
+        samples = pixel_bytes
+        colorspace = SimpleNamespace(n=3)
+
+        def save(self, _path):
+            raise AssertionError("samples path must not fall back to pix.save")
+
+    digest = core._save_pixmap_atomic(Pixmap(), destination)
+
+    assert destination.is_file()
+    assert destination.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+    assert digest == hashlib.sha256(destination.read_bytes()).hexdigest()
+    host = SimpleNamespace(
+        ImageFile=str(destination),
+        PDFRasterFile=str(destination),
+    )
+    evidence = core._raster_file_evidence(host, destination, source_sha256=digest)
+    assert evidence["raster_content_verified"] is True
+    assert evidence["source_asset_sha256"] == digest
+
+
 class _Vector:
     def __init__(self, x=0.0, y=0.0, z=0.0):
         self.x = float(x)
@@ -121,6 +179,9 @@ class _View:
         self.ShapeColor = (1.0, 1.0, 1.0)
         self.LineColor = (1.0, 1.0, 1.0)
         self.PointColor = (1.0, 1.0, 1.0)
+        # Draft Label defaults: a 1 mm "Dot" marker + leader on every anchor.
+        self.ArrowTypeStart = "Dot"
+        self.Line = True
 
 
 class _HostObject:
@@ -652,6 +713,12 @@ def test_native_item_delivery_rereads_live_text_transform_style_and_metadata(
     assert host.PDFTextColorRGB == "0.2,0.4,0.6"
     assert result["evidence"]["style_verification"] == "gui_view_and_app_metadata"
     assert result["evidence"]["view_style_verified"] is True
+    if attempted_type == "labels":
+        # points=[anchor, anchor] must not grow Draft's default Dot marker.
+        assert host.ViewObject.ArrowTypeStart == "None"
+        assert host.ViewObject.Line is False
+    else:
+        assert host.ViewObject.ArrowTypeStart == "Dot"
     assert core._host_anchor_xyz(host) == pytest.approx(
         result["evidence"]["expected_anchor_xyz"]
     )
@@ -671,9 +738,9 @@ def test_native_item_delivery_indexes_document_once_for_many_spans(monkeypatch):
     real_document_objects = core._document_objects
     scans = []
 
-    def counted_document_objects(doc):
+    def counted_document_objects(doc, *, required=False):
         scans.append(len(doc.Objects))
-        return real_document_objects(doc)
+        return real_document_objects(doc, required=required)
 
     monkeypatch.setattr(core, "_document_objects", counted_document_objects)
     opts = core.ImportOptions(
@@ -691,6 +758,158 @@ def test_native_item_delivery_indexes_document_once_for_many_spans(monkeypatch):
         result = core._deliver_text_item_native(
             item,
             "text",
+            opts,
+            text_group=group,
+            page_h=100.0,
+            scale=1.0,
+        )
+        created_ids.extend(result["created_entity_ids"])
+
+    assert len(created_ids) == 25
+    assert len(set(created_ids)) == 25
+    assert scans == [100]
+    assert all(document.getObject(entity_id) is not None for entity_id in created_ids)
+
+
+def test_raster_item_delivery_indexes_document_once_for_many_spans(monkeypatch, tmp_path):
+    document, group = _install_native_host(monkeypatch)
+    for index in range(100):
+        document.addObject("Part::Feature", "Existing_%03d" % index)
+
+    real_document_objects = core._document_objects
+    scans = []
+
+    def counted_document_objects(doc, *, required=False):
+        scans.append(len(doc.Objects))
+        return real_document_objects(doc, required=required)
+
+    monkeypatch.setattr(core, "_document_objects", counted_document_objects)
+    monkeypatch.setattr(core, "_raster_asset_dir", lambda: tmp_path)
+    opts = core.ImportOptions(
+        text_mode="raster",
+        import_text=True,
+        scale_to_mm=False,
+        user_scale=1.0,
+        raster_dpi=144,
+    )
+    opts._defer_page_recompute = True
+
+    class Pixmap:
+        width = 16
+        height = 24
+
+        def save(self, path):
+            Path(path).write_bytes(b"verified-raster-patch")
+
+    class Page:
+        rect = SimpleNamespace(x0=0.0, y0=0.0, x1=100.0, y1=100.0)
+
+        def get_pixmap(self, **_kwargs):
+            return Pixmap()
+
+    page = Page()
+    created_ids = []
+    for span_index in range(25):
+        item = _canonical_item("raster")
+        item["source_item_id"] = "p1:b0:l0:s%d" % span_index
+        item["span_index"] = span_index
+        result = core._deliver_text_item_raster(
+            item,
+            "raster",
+            opts,
+            page=page,
+            page_h=100.0,
+            scale=1.0,
+            fc_doc=document,
+            parent_group=group,
+        )
+        created_ids.extend(result["created_entity_ids"])
+
+    assert len(created_ids) == 25
+    assert len(set(created_ids)) == 25
+    assert scans == [100]
+    assert all(document.getObject(entity_id) is not None for entity_id in created_ids)
+
+
+def test_3d_text_item_delivery_indexes_document_once_for_many_spans(monkeypatch):
+    document, group = _install_native_host(monkeypatch)
+    for index in range(100):
+        document.addObject("Part::Feature", "Existing_%03d" % index)
+
+    real_document_objects = core._document_objects
+    scans = []
+
+    def counted_document_objects(doc, *, required=False):
+        scans.append(len(doc.Objects))
+        return real_document_objects(doc, required=required)
+
+    monkeypatch.setattr(core, "_document_objects", counted_document_objects)
+
+    def fake_compound(
+        doc,
+        *,
+        source_text,
+        font_path,
+        font_size_fc,
+        depth,
+        target_advance_fc,
+        placement,
+        text_group,
+        baseline_object_ids=None,
+        configure_host=None,
+    ):
+        host = doc.addObject("Part::Feature", "PDF_3D_Text")
+        host.TypeId = "Part::Feature"
+        host.Shape = SimpleNamespace(
+            isNull=lambda: False,
+            Solids=[object(), object()],
+            Volume=12.5,
+        )
+        host.Placement = placement
+        if callable(configure_host):
+            configure_host(host)
+        text_group.addObject(host)
+        return host, 1.0, float(target_advance_fc), float(target_advance_fc)
+
+    monkeypatch.setattr(core, "_create_verified_compound_text3d_entity", fake_compound)
+
+    def fake_font_resolution(font_name, _opts, **context):
+        identity = core._canonical_font_identity(font_name)
+        path = "C:/fonts/source.ttf"
+        return path, [
+            {
+                "source": "embedded_font",
+                "outcome": "found",
+                "font_identity": identity,
+                "path": path,
+                "sha256": "b" * 64,
+                "pdf_sha256": context["pdf_sha256"],
+                "page_number": context["page_number"],
+                "staging_complete": True,
+            }
+        ]
+
+    monkeypatch.setattr(
+        core,
+        "_resolve_shapestring_font_path_with_evidence",
+        fake_font_resolution,
+    )
+    opts = core.ImportOptions(
+        text_mode="3d_text",
+        import_text=True,
+        scale_to_mm=False,
+        user_scale=1.0,
+    )
+
+    created_ids = []
+    for span_index in range(25):
+        item = _canonical_item("3d_text")
+        item["font_identity"] = core._canonical_font_identity(item["span"]["font"])
+        item["source_item_id"] = "p1:b0:l0:s%d" % span_index
+        item["span_index"] = span_index
+        result = core._deliver_text_item_3d(
+            item,
+            "3d_text",
             opts,
             text_group=group,
             page_h=100.0,
@@ -1001,10 +1220,15 @@ def test_item_raster_delivery_is_persistent_verified_and_source_bound(
     assert result["evidence"]["raster_content_verified"] is True
     assert host.XSize == pytest.approx(item["bbox"][2] - item["bbox"][0])
     assert host.YSize == pytest.approx(item["bbox"][3] - item["bbox"][1])
+    bbox = item["bbox"]
+    assert host.Placement.Base.x == pytest.approx((bbox[0] + bbox[2]) / 2)
+    assert host.Placement.Base.y == pytest.approx(100 - (bbox[1] + bbox[3]) / 2)
+    assert host.Placement.Base.z == 0
+    assert host.ViewObject.DisplayMode == "No shading"
     assert document.recompute_calls == 0
 
 
-def test_text_raster_cache_renders_page_once_at_bounded_effective_dpi(
+def test_text_raster_cache_preserves_requested_dpi_above_page_cache_budget(
     monkeypatch,
 ):
     fitz = pytest.importorskip("fitz")
@@ -1029,11 +1253,16 @@ def test_text_raster_cache_renders_page_once_at_bounded_effective_dpi(
         opts=opts,
     )
 
-    assert 72 <= first_dpi < 300
+    assert first_dpi == 300
     assert second_dpi == first_dpi
     assert first.width > 0 and first.height > 0
     assert second.width > 0 and second.height > 0
-    assert opts._text_raster_page_cache["render_count"] == 1
+    assert "pixmap" not in opts._text_raster_page_cache
+    assert opts._text_raster_page_cache["render_count"] == 2
+    expected = page.get_pixmap(matrix=fitz.Matrix(300 / 72, 300 / 72),
+                               clip=fitz.Rect(15.0, 35.0, 80.0, 55.0), alpha=False)
+    assert (first.width, first.height, first.x, first.y) == (expected.width, expected.height, expected.x, expected.y)
+    assert first.samples == expected.samples
     pdf.close()
 
 
@@ -1127,6 +1356,52 @@ def test_raster_verifier_accepts_freecad_cache_rewrites_only_when_bytes_match(tm
     included_cache.write_bytes(b"wrong-raster")
     with pytest.raises(RuntimeError, match="does not match source"):
         core._raster_file_evidence(host, source)
+
+
+def test_raster_verifier_hashes_identical_resolved_paths_once(tmp_path, monkeypatch):
+    source = tmp_path / "shared-source.png"
+    source.write_bytes(b"one-source-bound-raster")
+    host = SimpleNamespace(
+        ImageFile=str(source),
+        PDFRasterFile=str(source),
+    )
+    hash_calls = []
+    real_path_sha256 = core._path_sha256
+
+    def counted_path_sha256(path):
+        hash_calls.append(str(Path(path)))
+        return real_path_sha256(path)
+
+    monkeypatch.setattr(core, "_path_sha256", counted_path_sha256)
+
+    evidence = core._raster_file_evidence(host, source)
+
+    assert evidence["raster_content_verified"] is True
+    assert hash_calls == [str(source)]
+
+
+def test_raster_verifier_reuses_precomputed_source_digest(tmp_path, monkeypatch):
+    source = tmp_path / "shared-source.png"
+    source.write_bytes(b"one-source-bound-raster")
+    host = SimpleNamespace(
+        ImageFile=str(source),
+        PDFRasterFile=str(source),
+    )
+    hash_calls = []
+
+    def counted_path_sha256(path):
+        hash_calls.append(str(Path(path)))
+        return "deadbeef"
+
+    monkeypatch.setattr(core, "_path_sha256", counted_path_sha256)
+
+    evidence = core._raster_file_evidence(
+        host, source, source_sha256="a" * 64
+    )
+
+    assert evidence["source_asset_sha256"] == "a" * 64
+    assert evidence["raster_content_verified"] is True
+    assert hash_calls == []
 
 
 def test_explicit_raster_is_requested_output_not_fallback():

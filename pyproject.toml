@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdf-vector-importer-fc"
-version = "4.0.92"
-description = "PDF vector importer workbench for FreeCAD — BlueCollar Systems"
+version = "4.0.108"
+description = "PDF vector importer workbench for FreeCAD — BlueCollar-Systems"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-  { name = "BlueCollar Systems" }
+  { name = "BlueCollar-Systems" }
 ]
 dependencies = [
   "PyMuPDF>=1.24,<2.0",
@@ -30,7 +30,8 @@ exclude = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-cache_dir = ".pytest_tmp/cache"
+pythonpath = ["."]
+cache_dir = "C:/TMP/pytest_cache/freecad"
 norecursedirs = [
   "dev_logs",
   "installer",

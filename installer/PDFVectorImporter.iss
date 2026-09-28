@@ -10,7 +10,7 @@
 AppId={{35D2F41F-0EA4-4C80-8480-7B6C2ADAC327}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-AppPublisher=BlueCollar Systems
+AppPublisher=BlueCollar-Systems
 AppPublisherURL=https://github.com/BlueCollar-Systems/PDF-Importer-FreeCAD
 ; Placeholder only — [Code] resolves the real Mod path at runtime.
 DefaultDirName={userappdata}\FreeCAD\v1-1\Mod\PDFVectorImporter

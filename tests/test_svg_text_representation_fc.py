@@ -18,6 +18,7 @@ for path in (REPO_ROOT, REPO_ROOT / "PDFVectorImporter" / "src"):
 
 from PDFVectorImporter.src import PDFSvgTextRenderer as renderer  # noqa: E402
 from PDFVectorImporter.src import PDFImporterCore as core  # noqa: E402
+from PDFVectorImporter.src import PDFGlyphFill as glyph_fill  # noqa: E402
 
 
 PRODUCTION_CREATE_PDF_SNAPSHOT = renderer._create_pdf_snapshot
@@ -429,6 +430,10 @@ class FakeGroup:
 
 
 def _install_renderer(monkeypatch):
+    # This suite isolates ownership/cleanup/assignment with token-only edge
+    # doubles. Real contour and native fill invariants have their own suite.
+    monkeypatch.setattr(glyph_fill, "placement_fill_rules",
+                        lambda _svg, gids, **_kwargs: [{"fill_rule": None, "clips": []} for _ in gids])
     monkeypatch.setattr(renderer, "FreeCAD", None)
     monkeypatch.setattr(renderer, "Part", FakePart)
     monkeypatch.setattr(renderer, "Vector", FakeVector)
@@ -525,17 +530,18 @@ def test_nonempty_unparseable_svg_placement_is_never_silently_dropped(monkeypatc
     assert exc_info.value.evidence["failed_placement_indices"] == [1]
 
 
-def test_empty_path_space_glyph_is_not_a_failed_visible_placement(monkeypatch):
+@pytest.mark.parametrize("empty_path", ["", "M 0 0 Z M 0 0", "m .5,-.5 z"])
+def test_empty_path_space_glyph_is_not_a_failed_visible_placement(monkeypatch, empty_path):
     _install_renderer(monkeypatch)
     monkeypatch.setattr(
         renderer,
         "_render_svg_with_pymupdf",
-        lambda *_args: SPACE_GLYPH_SVG,
+        lambda *_args: SPACE_GLYPH_SVG.replace('d=""', 'd="' + empty_path + '"'),
     )
     monkeypatch.setattr(
         renderer,
         "_svg_path_to_edges",
-        lambda path_d, *_args: [FakeEdge("ok")] if path_d.strip() else [],
+        lambda path_d, *_args: [FakeEdge("ok")] if not renderer._svg_path_is_move_only(path_d) else [],
     )
     doc = FakeDocument()
     group = FakeGroup()
@@ -1597,6 +1603,10 @@ def test_real_rotated_page_item_filters_never_cross_relabel(tmp_path, monkeypatc
 
     monkeypatch.setattr(renderer, "FreeCAD", FakeFreeCAD)
     monkeypatch.setattr(renderer, "Part", SmallGlyphPart)
+    # Token-only host double here tests source assignment after page rotation;
+    # filled contour construction is independently exercised in its own suite.
+    monkeypatch.setattr(glyph_fill, "placement_fill_rules",
+                        lambda _svg, gids, **_kwargs: [{"fill_rule": None, "clips": []} for _ in gids])
     monkeypatch.setattr(renderer, "Vector", FakeVector)
     monkeypatch.setattr(renderer, "find_pdftocairo", lambda: None)
     monkeypatch.setattr(
@@ -2191,3 +2201,7 @@ def test_inkless_threshold_is_the_edge_epsilon():
     above = renderer._SVG_EDGE_EPSILON_MM * 10.0
     assert renderer._svg_glyph_definition_draws_no_ink(f"M 0 0 L {below} 0") is True
     assert renderer._svg_glyph_definition_draws_no_ink(f"M 0 0 L {above} 0") is False
+
+@pytest.mark.parametrize("path", ["M 0 0 1 1", "M 0 0 L 1 1", "M 0 0 Q", "M NaN 0", "M 0", "M 0 0 C 1 2 3 4 5 6"])
+def test_empty_glyph_proof_does_not_hide_visible_or_malformed_paths(path):
+    assert not renderer._svg_path_is_move_only(path)

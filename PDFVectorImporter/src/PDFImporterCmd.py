@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # PDFImporterCmd.py — GUI command to import PDF with options dialog
-# BlueCollar Systems — BUILT. NOT BOUGHT.
+# BlueCollar-Systems — BUILT. NOT BOUGHT.
 #
 # BCS-ARCH-001 Rule 5 sweep: this dialog exposes only the user-facing
 # controls — Mode, Text rendering, Import text — plus legitimate workflow
@@ -189,7 +189,7 @@ class ImportPDFDialog(QtWidgets.QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Import PDF — BlueCollar Systems")
+        self.setWindowTitle("Import PDF — BlueCollar-Systems")
         self.setMinimumWidth(420)
         self._page_count = None
 
@@ -551,7 +551,9 @@ class ImportPDFDialog(QtWidgets.QDialog):
 
         # Consolidated defaults per BCS-ARCH-001 parameter table.
         # Quality-tier dials are hardcoded — no UI exposure.
-        # Hatching is always "group" (least destructive).
+        # Preserve visible source hatching. The programmatic "group" option
+        # deliberately hides detected hatches; the dialog has no such control
+        # or saved preference and must not silently remove their visible paint.
         # Raster DPI is always 300. Strict text fidelity is always True.
         # Lineweight handling is always "preserve". Arc reconstruction
         # is always enabled in non-raster modes via the Auto cleanup level.
@@ -566,7 +568,7 @@ class ImportPDFDialog(QtWidgets.QDialog):
             import_text=import_text,
             text_mode=text_mode,
             strict_text_fidelity=True,
-            hatch_mode="group",
+            hatch_mode="import",
             group_by_color=True,
             assign_linewidth=True,
             map_dashes=(import_mode != "raster"),

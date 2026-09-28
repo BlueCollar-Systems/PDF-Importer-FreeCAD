@@ -30,7 +30,8 @@ exclude = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-cache_dir = ".pytest_tmp/cache"
+pythonpath = ["."]
+cache_dir = "C:/TMP/pytest_cache/freecad"
 norecursedirs = [
   "dev_logs",
   "installer",

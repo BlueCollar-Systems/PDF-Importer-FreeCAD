@@ -196,17 +196,7 @@ PDFVectorImporter/
 |   |-- PDFImporterCmd.py       # FreeCAD command wrappers
 |   |-- PDFScaleTool.py         # Scale by Reference implementation
 |   |-- PDFHatchDetector.py     # Hatch region detection engine
-|   |-- PDFPrimitives.py        # Primitive geometry builders
 |   |-- PDFSvgTextRenderer.py   # SVG/text rendering pipeline
-|   |-- PDFPrimitiveExtractor.py
-|   |-- PDFRecognition.py       # Pattern and symbol recognition
-|   |-- PDFRegions.py           # Spatial region analysis
-|   |-- PDFValidation.py        # Import validation checks
-|   |-- PDFDimensionParser.py   # Dimension text extraction
-|   |-- PDFDocumentProfiler.py  # Document type classification
-|   |-- PDFGenericClassifier.py # Generic element classification
-|   |-- PDFGenericRecognizer.py # Generic pattern recognition
-|   |-- PDFGeometryCleanup.py   # Duplicate/overlap removal
 ```
 
 ### Headless (FreeCADCmd) saves keep their look

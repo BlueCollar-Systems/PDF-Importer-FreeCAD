@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import atexit
 import hashlib
+import json
 import os
 import math
 import re
@@ -1308,6 +1309,8 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
         )
 
     svg = cache.get("svg") if cache is not None else None
+    renderer_recovery = cache.get("renderer_recovery") if cache is not None else None
+    rendered_placements = None
     exe = None
     renderer_name = (
         str(cache.get("renderer_name") or "pymupdf")
@@ -1338,6 +1341,37 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 svg = _render_svg_with_pdftocairo(
                     exe, pdf_snapshot_path, page_num
                 )
+                # Cairo can keep painted glyphs in definitions reached through
+                # feImage/filter graphs. Ignoring uninstantiated definitions is
+                # intentional, but finding no placements cannot prove that the
+                # source lacks vector text. Retry the same representation from
+                # the same immutable PDF before creating any host entities.
+                if svg and not _svg_too_large(svg):
+                    rendered_placements = _parse_use_placements(svg)
+                    if not rendered_placements:
+                        if _pdf_file_signature(pdf_snapshot_path) != signature_before_render:
+                            source_binding_error(source_mutation_reason)
+                        renderer_recovery = {
+                            "from_renderer": "pdftocairo",
+                            "reason": "source_glyph_placements_unresolved",
+                            "to_renderer": "pymupdf",
+                            "representation_preserved": True,
+                        }
+                        renderer_name = "pymupdf"
+                        rendered_placements = None
+                        svg = _render_svg_with_pymupdf(pdf_snapshot_path, page_num)
+                        if not svg:
+                            raise TextRepresentationRenderError(
+                                "svg_renderer_recovery_failed",
+                                {
+                                    "requested_type": representation,
+                                    "renderer": renderer_name,
+                                    "renderer_recovery": dict(renderer_recovery),
+                                    "created_entity_ids": [],
+                                    "removed_entity_ids": [],
+                                    "cleanup_complete": True,
+                                },
+                            )
             else:
                 if FreeCAD:
                     FreeCAD.Console.PrintMessage(
@@ -1447,6 +1481,10 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
     if cache is not None:
         cache["svg"] = svg
         cache["renderer_name"] = renderer_name
+        if renderer_recovery is not None:
+            cache["renderer_recovery"] = dict(renderer_recovery)
+        if rendered_placements is not None:
+            cache["placements"] = rendered_placements
 
     # Parse page-wide SVG structures exactly once. Canonical item delivery
     # calls this function for every span, so reparsing the same XML payload
@@ -1515,8 +1553,15 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
 
     if not placements:
         raise TextRepresentationRenderError(
-            "svg_has_no_glyph_placements",
-            {"requested_type": representation, "renderer": renderer_name},
+            "svg_source_glyph_placements_unverified",
+            {
+                "requested_type": representation,
+                "renderer": renderer_name,
+                "renderer_recovery": renderer_recovery,
+                "created_entity_ids": [],
+                "removed_entity_ids": [],
+                "cleanup_complete": True,
+            },
         )
 
     # Build Part.Shape for each unique glyph
@@ -1540,6 +1585,28 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                     pass
         if cache is not None:
             cache["glyph_shapes"] = glyph_shapes
+
+    def glyph_affine(use_x, use_y, matrix):
+        if matrix and len(matrix) >= 6:
+            a, b, c, d, e, f = [float(v) for v in matrix[:6]]
+            e += float(use_x)
+            f += float(use_y)
+            tx = (e - vb_min_x) * x_unit_to_mm
+            ty = (vb_h + vb_min_y - f) * y_unit_to_mm if flip_y else (f - vb_min_y) * y_unit_to_mm
+            return (a, -c * x_unit_to_mm / y_unit_to_mm,
+                    -b * y_unit_to_mm / x_unit_to_mm, d, tx, ty)
+        tx = (float(use_x) - vb_min_x) * x_unit_to_mm
+        ty = ((vb_h + vb_min_y - float(use_y)) if flip_y else (float(use_y) - vb_min_y)) * y_unit_to_mm
+        return (1.0, 0.0, 0.0, 1.0, tx, ty)
+
+    def place_glyph_shape(shape, use_x, use_y, matrix):
+        a, b, c, d, tx, ty = glyph_affine(use_x, use_y, matrix)
+        if matrix and len(matrix) >= 6:
+            return _shape_affine_2d(shape, a, b, c, d, tx, ty)
+        try:
+            return shape.translated(Vector(tx, ty, 0.0))
+        except (AttributeError, RuntimeError, TypeError):
+            return None
 
     # Place all glyphs
     cached_placed = cache.get("placed_glyphs") if cache is not None else None
@@ -1565,31 +1632,7 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                     failed_placement_indices.append(placement_index)
                 continue
 
-            # SVG coords → FreeCAD coords
-            # Glyph use positions are in viewBox coordinates.
-            placed = None
-            if matrix and len(matrix) >= 6:
-                a, b, c, d, e, f = [float(v) for v in matrix[:6]]
-                e += float(use_x)
-                f += float(use_y)
-                tx = (e - vb_min_x) * x_unit_to_mm
-                ty = (vb_h + vb_min_y - f) * y_unit_to_mm if flip_y else (f - vb_min_y) * y_unit_to_mm
-
-                ratio_xy = (x_unit_to_mm / y_unit_to_mm) if abs(y_unit_to_mm) > 1e-12 else 1.0
-                ratio_yx = (y_unit_to_mm / x_unit_to_mm) if abs(x_unit_to_mm) > 1e-12 else 1.0
-                a11 = a
-                a12 = -c * ratio_xy
-                a21 = -b * ratio_yx
-                a22 = d
-                placed = _shape_affine_2d(shape, a11, a12, a21, a22, tx, ty)
-            else:
-                tx = (float(use_x) - vb_min_x) * x_unit_to_mm
-                ty = ((vb_h + vb_min_y - float(use_y)) * y_unit_to_mm) if flip_y else ((float(use_y) - vb_min_y) * y_unit_to_mm)
-                try:
-                    placed = shape.translated(Vector(tx, ty, 0.0))
-                except (AttributeError, RuntimeError, TypeError):
-                    placed = None
-
+            placed = place_glyph_shape(shape, use_x, use_y, matrix)
             try:
                 if placed is not None:
                     placed_glyphs.append((placement_index, gid, placed))
@@ -1921,6 +1964,19 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
     glyph_source_ids: List[str] = []
     geometry_shapes: List[object] = []
     creation_started = False
+    glyph_fill_proofs = []
+    if representation == "glyphs":
+        try:
+            from . import PDFGlyphFill as glyph_fill
+        except ImportError:
+            import PDFGlyphFill as glyph_fill
+        fill_rules = cache.get("glyph_fill_rules_v1") if cache is not None else None
+        if fill_rules is None:
+            fill_rules = glyph_fill.placement_fill_rules(
+                svg, [row[0] for row in placements], with_clips=True, defer_errors=True)
+            if cache is not None:
+                cache["glyph_fill_rules_v1"] = fill_rules
+        filled_prototypes = cache.setdefault("filled_glyph_prototypes_v1", {}) if cache is not None else {}
 
     def claim_new_object(obj, role: str) -> None:
         if obj is None:
@@ -1942,6 +1998,33 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 else f"p{int(page_num)}:g{glyph_index}"
             )
             if representation == "glyphs":
+                paint = fill_rules[glyph_index]
+                if paint.get("error"):
+                    raise ValueError("source glyph paint qualification failed for %s: %s" %
+                                     (glyph_source_id, paint["error"]))
+                rule = paint["fill_rule"]
+                fill_proof = None
+                if rule is not None:
+                    key = (_gid, rule)
+                    if key not in filled_prototypes:
+                        contours = []
+                        _svg_path_to_edges(glyph_defs[_gid], x_unit_to_mm, y_unit_to_mm, contours=contours)
+                        filled_prototypes[key] = glyph_fill.build_shape(contours, rule, Part, Vector)
+                    prototype, proof = filled_prototypes[key]
+                    _, use_x, use_y, matrix = placements[glyph_index]
+                    placed_shape = place_glyph_shape(prototype, use_x, use_y, matrix)
+                    a, b, c, d, tx, ty = glyph_affine(use_x, use_y, matrix)
+                    determinant = a * d - b * c
+                    fill_proof = dict(proof)
+                    fill_proof["contours"] = [[(a*x + b*y + tx, c*x + d*y + ty) for x, y in loop]
+                                              for loop in proof["contours"]]
+                    fill_proof["area"] = proof["area"] * abs(determinant)
+                    clip_quads = [[((x-vb_min_x)*x_unit_to_mm,
+                                   ((vb_h+vb_min_y-y) if flip_y else (y-vb_min_y))*y_unit_to_mm)
+                                  for x,y in quad] for quad in paint["clips"]]
+                    glyph_fill.verify_clip_containment(fill_proof["contours"], clip_quads)
+                    glyph_fill.verify_shape(placed_shape, fill_proof)
+                glyph_fill_proofs.append(fill_proof)
                 if not _shape_nonempty(placed_shape, require_edges=True):
                     raise RuntimeError("placed glyph shape is empty")
                 glyph_compound_shapes.append(placed_shape)
@@ -1955,6 +2038,8 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 raw_edge_count += placed_edge_count
 
         if representation == "glyphs":
+            if any(proof is None for proof in glyph_fill_proofs) and any(proof is not None for proof in glyph_fill_proofs):
+                raise RuntimeError("mixed filled and stroked glyphs require separate source paint ownership")
             if (
                 not glyph_compound_shapes
                 or glyph_edge_count <= 0
@@ -1983,6 +2068,9 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 or _shape_child_count(stored_shape) != len(glyph_source_ids)
             ):
                 raise RuntimeError("host glyph compound lost placed outlines")
+            for child, proof in zip(stored_shape.childShapes(), glyph_fill_proofs, strict=True):
+                if proof is not None:
+                    glyph_fill.verify_shape(child, proof)
             _annotate_text_entity(
                 obj,
                 glyph_compound_source_id,
@@ -1992,6 +2080,15 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
             add_property = getattr(obj, "addProperty", None)
             glyph_metadata = (
                 ("App::PropertyInteger", "PDFGlyphCount", len(glyph_source_ids)),
+                ("App::PropertyString", "PDFGlyphFillJSON", json.dumps({
+                    "schema": "source-svg-glyph-fill/1",
+                    "curve_geometry": "retained_svg_polygon_approximation",
+                    "glyphs": [{"source_id": source_id, "fill_rule": proof["fill_rule"],
+                                "face_count": len(proof["faces"]), "area": proof["area"],
+                                "contour_count": len(proof["contours"]), "edge_count": proof["edge_count"],
+                                "hole_count": sum(len(row["holes"]) for row in proof["faces"])}
+                               if proof is not None else {"source_id": source_id, "fill_rule": None}
+                               for source_id, proof in zip(glyph_source_ids, glyph_fill_proofs, strict=True)]}, sort_keys=True)),
                 (
                     "App::PropertyStringList",
                     "PDFGlyphSourceItemIds",
@@ -2227,6 +2324,9 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                     raise RuntimeError(
                         "stored glyph compound identity or outline count is invalid"
                     )
+                for child, proof in zip(refreshed_shape.childShapes(), glyph_fill_proofs, strict=True):
+                    if proof is not None:
+                        glyph_fill.verify_shape(child, proof)
 
         if item_filter is not None:
             attempt_evidence = {
@@ -2239,6 +2339,8 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 **item_filter_evidence,
                 "child_source_item_ids": list(child_source_ids),
             }
+            if renderer_recovery is not None:
+                attempt_evidence["renderer_recovery"] = dict(renderer_recovery)
             if representation == "glyphs":
                 attempt_evidence.update(
                     {
@@ -2319,6 +2421,7 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
         "entities": len(created_ids),
         "entity_type": representation,
         "renderer": renderer_name,
+        "renderer_recovery": renderer_recovery,
         "created_entity_ids": created_ids,
         "delivery_attempts": attempts,
         "source_item_id": item_filter["source_item_id"] if item_filter else None,
@@ -2868,13 +2971,17 @@ def _svg_glyph_definition_draws_no_ink(d: str) -> bool:
     )
 
 
-def _svg_path_to_edges(d: str, scale_x: float, scale_y: Optional[float] = None) -> List:
+def _svg_path_to_edges(d: str, scale_x: float, scale_y: Optional[float] = None, *, contours=None) -> List:
     """Parse SVG path d="" into Part edges.
 
     Glyph coordinates are in PDF points, Y-down.
     We flip Y and scale to mm for FreeCAD.
     """
     tokens = re.findall(r'[MLHVCSZQTAmlhvcszqta]|[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', d)
+    if contours is not None:
+        residue = re.sub(r'[MLHVCSZQTAmlhvcszqta]|[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?|[\s,]', '', d)
+        if residue:
+            raise ValueError("unknown source glyph path syntax")
     edges = []
     subpath_pts = []
     start_pt = None
@@ -2892,7 +2999,12 @@ def _svg_path_to_edges(d: str, scale_x: float, scale_y: Optional[float] = None) 
 
     def flush_subpath():
         nonlocal subpath_pts
-        if len(subpath_pts) >= 2:
+        if contours is not None and len(subpath_pts) >= 2:
+            points = [(float(p.x), float(p.y)) for p in subpath_pts]
+            if points[0] != points[-1]:
+                raise ValueError("source glyph contour is not closed")
+            contours.append(points)
+        elif len(subpath_pts) >= 2:
             for i in range(len(subpath_pts) - 1):
                 p1, p2 = subpath_pts[i], subpath_pts[i + 1]
                 if p1.distanceToPoint(p2) > 1e-4:
@@ -3127,7 +3239,7 @@ def _svg_path_to_edges(d: str, scale_x: float, scale_y: Optional[float] = None) 
             prev_cubic_cp2 = None
             prev_quad_cp = None
             if subpath_pts and start_pt:
-                if subpath_pts[-1].distanceToPoint(start_pt) > 1e-4:
+                if subpath_pts[-1].distanceToPoint(start_pt) > (0.0 if contours is not None else 1e-4):
                     subpath_pts.append(start_pt)
             flush_subpath()
             if start_pt:
@@ -3138,6 +3250,8 @@ def _svg_path_to_edges(d: str, scale_x: float, scale_y: Optional[float] = None) 
         if re.match(r'^[A-Za-z]$', tok):
             if cmd is not None:
                 run()
+                if contours is not None and nums:
+                    raise ValueError("incomplete source glyph path command")
             is_relative = tok.islower()
             cmd = tok.upper()
             nums = []
@@ -3145,6 +3259,8 @@ def _svg_path_to_edges(d: str, scale_x: float, scale_y: Optional[float] = None) 
             nums.append(float(tok))
     if cmd is not None:
         run()
+        if contours is not None and nums:
+            raise ValueError("incomplete source glyph path command")
     flush_subpath()
 
     return edges

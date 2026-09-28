@@ -40,7 +40,7 @@ def alpha_pdf():
 
 
 def _close(a, b, tol=1e-3):
-    return all(abs(x - y) <= tol for x, y in zip(a, b))
+    return all(abs(x - y) <= tol for x, y in zip(a, b, strict=True))
 
 
 def test_fill_alpha_is_composited_against_the_white_page(alpha_pdf):
@@ -123,7 +123,6 @@ def test_span_alpha_ignores_unpainted_render_modes():
 def test_freecad_host_importer_composites_the_same_way():
     # The FreeCAD host reads PyMuPDF directly (it does not call extract_page), so its
     # colour sites must apply the same compositing as pdfcadcore.
-    import importlib.util
     import pathlib
     src = pathlib.Path(__file__).resolve().parents[1] / "PDFVectorImporter" / "src" / "PDFImporterCore.py"
     text = src.read_text(encoding="utf-8")

@@ -29,6 +29,7 @@ from typing import Any, Callable, Iterator, List, Optional, Sequence, Tuple
 
 from .primitive_extractor import extract_page
 from .primitives import PageData
+from .stage_timing import StageTimer
 
 #: D7 soft budget: a page slower than this is flagged ``over_budget`` so the
 #: host can surface a "this document is heavy" hint or a page-range prompt.
@@ -75,6 +76,7 @@ def iter_pages(
     arc_fit_tol_mm: float = 0.05,
     min_arc_angle_deg: float = 5.0,
     arc_min_pts: int = 5,
+    stage_timing: Optional[StageTimer] = None,
 ) -> Iterator[Tuple[int, PageData]]:
     """Stream ``(page_number, PageData)`` tuples one page at a time.
 
@@ -94,32 +96,47 @@ def iter_pages(
     soft_budget_s:
         Per-page soft time budget; pages slower than this are flagged
         ``over_budget`` in the progress snapshot (D7 default 15 s).
+    stage_timing:
+        Optional :class:`pdfcadcore.stage_timing.StageTimer`. When supplied it
+        receives ``extract_ms`` (time spent in this generator turning the PDF
+        into ``PageData``) and ``host_build_ms`` (time the caller spent between
+        one yield and the next, i.e. building host objects from what it was
+        handed). The host needs no changes to be measured: a generator already
+        knows when it is running and when its consumer is. Omitting it changes
+        nothing about the pages yielded.
 
     Remaining keyword arguments are forwarded to
     :func:`pdfcadcore.primitive_extractor.extract_page`.
     """
     doc, owns_doc = _open_source(source)
+    timer = stage_timing if stage_timing is not None else StageTimer()
+    host_build_start: Optional[float] = None
     try:
         total = int(getattr(doc, "page_count", None) or len(doc))
         wanted = _normalize_pages(pages, total)
         total_elapsed = 0.0
 
         for idx, page_number in enumerate(wanted, start=1):
-            t0 = time.perf_counter()
-            page = doc.load_page(page_number - 1)
-            page_data = extract_page(
-                page,
-                page_num=page_number,
-                scale=scale,
-                flip_y=flip_y,
-                detect_arcs=detect_arcs,
-                arc_fit_tol_mm=arc_fit_tol_mm,
-                min_arc_angle_deg=min_arc_angle_deg,
-                arc_min_pts=arc_min_pts,
-            )
-            elapsed = time.perf_counter() - t0
-            total_elapsed += elapsed
+            if host_build_start is not None:
+                timer.add("host_build_ms", (time.perf_counter() - host_build_start) * 1000.0)
 
+            with timer.measure("extract_ms"):
+                page = doc.load_page(page_number - 1)
+                page_data = extract_page(
+                    page,
+                    page_num=page_number,
+                    scale=scale,
+                    flip_y=flip_y,
+                    detect_arcs=detect_arcs,
+                    arc_fit_tol_mm=arc_fit_tol_mm,
+                    min_arc_angle_deg=min_arc_angle_deg,
+                    arc_min_pts=arc_min_pts,
+                )
+            elapsed = timer.get("extract_ms") / 1000.0 - total_elapsed
+            total_elapsed = timer.get("extract_ms") / 1000.0
+
+            host_build_start = time.perf_counter()
+            timer.note_page()
             yield page_number, page_data
 
             if progress is not None:
@@ -136,5 +153,7 @@ def iter_pages(
                 if keep_going is False:
                     break
     finally:
+        if host_build_start is not None:
+            timer.add("host_build_ms", (time.perf_counter() - host_build_start) * 1000.0)
         if owns_doc:
             doc.close()

@@ -17,6 +17,16 @@ for path in (str(SRC_DIR), str(MOD_ROOT)):
 import PDFImporterCore as core  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _clear_font_kern_probe_cache(monkeypatch):
+    core._clear_font_kern_probe_cache()
+    # These host doubles use em-normalized outlines; real metric calibration
+    # has independent tests in test_text3d_em_scale_fc.py.
+    monkeypatch.setattr(core, "_text3d_source_em_scale", lambda *_args: 1.0)
+    yield
+    core._clear_font_kern_probe_cache()
+
+
 class FakeShape:
     def __init__(self, *, solid_count=2, volume=12.5, width=30.0):
         self.Solids = [object() for _ in range(solid_count)]
@@ -112,10 +122,15 @@ class BoundedGeometry:
         )
 
     def transformGeometry(self, matrix):
+        scale_x = float(matrix.A11)
+        scale_y = float(getattr(matrix, "A22", 1.0) or 1.0)
+        scale_z = float(getattr(matrix, "A33", 1.0) or 1.0)
         return BoundedGeometry(
-            self.BoundBox.XMin * float(matrix.A11),
-            self.BoundBox.XMax * float(matrix.A11),
+            self.BoundBox.XMin * scale_x,
+            self.BoundBox.XMax * scale_x,
             face_count=len(self.Faces),
+            solid_count=len(self.Solids),
+            volume=float(self.Volume) * abs(scale_x * scale_y * scale_z),
         )
 
     def extrude(self, _vector):
@@ -224,6 +239,7 @@ def test_compound_scales_pen_advance_without_stretching_inset_ink(monkeypatch):
         def __init__(self):
             self.A11 = 1.0
             self.A22 = 1.0
+            self.A33 = 1.0
 
     monkeypatch.setattr(core, "Part", BoundedPart)
     monkeypatch.setattr(core, "FreeCAD", SimpleNamespace(Matrix=FakeMatrix))
@@ -251,6 +267,67 @@ def test_compound_scales_pen_advance_without_stretching_inset_ink(monkeypatch):
     assert verified_advance == pytest.approx(15.0)
 
 
+def test_compound_reuses_baked_solid_only_for_identical_dimensions(monkeypatch):
+    extrude_calls = []
+    original_extrude = BoundedGeometry.extrude
+
+    def counting_extrude(self, vector):
+        extrude_calls.append(tuple(vector))
+        return original_extrude(self, vector)
+
+    class FakeMatrix:
+        def __init__(self):
+            self.A11 = 1.0
+            self.A22 = 1.0
+            self.A33 = 1.0
+
+    monkeypatch.setattr(BoundedGeometry, "extrude", counting_extrude)
+    monkeypatch.setattr(core, "Part", BoundedPart)
+    monkeypatch.setattr(core, "FreeCAD", SimpleNamespace(Matrix=FakeMatrix))
+    monkeypatch.setattr(core, "Vector", lambda x, y, z: (x, y, z))
+    monkeypatch.setattr(
+        core,
+        "_build_exact_text3d_outline_template",
+        lambda *_args: (BoundedGeometry(2.0, 6.0, face_count=1), 10.0, 1),
+    )
+
+    memo = core._Text3DOutlineMemo()
+    prior = core._ACTIVE_TEXT3D_OUTLINE_MEMO
+    core._ACTIVE_TEXT3D_OUTLINE_MEMO = memo
+    try:
+        first = core._build_exact_text3d_compound_shape(
+            source_text="A36",
+            font_path="C:/fonts/source.ttf",
+            font_size_fc=3.0,
+            depth=0.3,
+            target_advance_fc=15.0,
+        )
+        second = core._build_exact_text3d_compound_shape(
+            source_text="A36",
+            font_path="C:/fonts/source.ttf",
+            font_size_fc=3.0,
+            depth=0.3,
+            target_advance_fc=15.0,
+        )
+        third = core._build_exact_text3d_compound_shape(
+            source_text="A36",
+            font_path="C:/fonts/source.ttf",
+            font_size_fc=6.0,
+            depth=0.6,
+            target_advance_fc=30.0,
+        )
+    finally:
+        core._ACTIVE_TEXT3D_OUTLINE_MEMO = prior
+
+    assert extrude_calls == [(0.0, 0.0, 0.3), (0.0, 0.0, 0.6)]
+    assert memo.solid_hits == 1
+    assert memo.solid_misses == 2
+    assert first[0] is second[0]
+    assert first[0].BoundBox.XMin == pytest.approx(3.0)
+    assert second[0].BoundBox.XMin == pytest.approx(3.0)
+    assert third[0].BoundBox.XMin == pytest.approx(6.0)
+
+
 def test_compound_3d_text_is_one_verified_host_object_without_recompute(monkeypatch):
     document = FakeDocument()
     group = FakeGroup(document)
@@ -274,7 +351,7 @@ def test_compound_3d_text_is_one_verified_host_object_without_recompute(monkeypa
             placement=placement,
             text_group=group,
             configure_host=lambda obj: configured.append(obj),
-        )
+        )[:4]
     )
 
     assert document.Objects == [entity]
@@ -358,9 +435,24 @@ def test_text3d_outline_memo_returns_fresh_shapes_and_tracks_hits():
     assert calls == ["build", "build"]
     assert memo.hits == 1
     assert memo.misses == 2
-    assert first[0] is not second[0]
+    assert first[0] is second[0]
     assert first[1:] == second[1:] == (4.0, 3)
     assert third[1:] == (4.0, 3)
+
+
+def test_text3d_outline_memo_holds_a_dense_page_of_unique_strings():
+    memo = core._Text3DOutlineMemo()
+    unique_strings = 800
+
+    for index in range(unique_strings):
+        memo.get_or_build(
+            ("SPAN-%d" % index, "C:/fonts/source.ttf"),
+            lambda: (FakeShape(width=4.0), 4.0, 1),
+        )
+
+    assert memo.evictions == 0
+    assert memo.misses == unique_strings
+    assert memo.hits == 0
 
 
 def test_complete_nonspace_item_with_zero_exact_font_outlines_is_typed_and_private(
@@ -440,3 +532,390 @@ def test_malformed_or_failed_exact_font_api_is_never_closed_impossibility(
         core._build_exact_text3d_outline_template("AB", "C:/fonts/source.ttf")
 
     assert raised.value.__class__ is RuntimeError
+
+
+class ClosedWire:
+    def __init__(self, name="wire"):
+        self.name = name
+        self.Edges = [object()]
+        self.Wires = [self]
+        self.ShapeType = "Wire"
+
+    def isClosed(self):
+        return True
+
+
+class OpenWire:
+    def __init__(self):
+        self.Edges = [object()]
+        self.Wires = []
+        self.ShapeType = "Compound"
+
+    def isClosed(self):
+        return False
+
+
+def test_closed_text3d_wires_keep_already_closed_wires_without_reconnect(monkeypatch):
+    reconnect_calls = []
+
+    class TrackingPart:
+        class Compound:
+            def __init__(self, edges):
+                reconnect_calls.append(list(edges))
+
+            def connectEdgesToWires(self):
+                raise AssertionError("closed wires must not be reconnected")
+
+    monkeypatch.setattr(core, "Part", TrackingPart)
+    closed = ClosedWire()
+
+    result = core._closed_text3d_wires([closed])
+
+    assert result == [closed]
+    assert reconnect_calls == []
+
+
+def test_open_text3d_wires_still_reconnect(monkeypatch):
+    class Reconnected:
+        def __init__(self):
+            self.Wires = [ClosedWire("reconnected")]
+
+    class TrackingPart:
+        class Compound:
+            def __init__(self, edges):
+                self.edges = list(edges)
+
+            def connectEdgesToWires(self):
+                return Reconnected()
+
+    monkeypatch.setattr(core, "Part", TrackingPart)
+
+    result = core._closed_text3d_wires([OpenWire()])
+
+    assert len(result) == 1
+    assert result[0].name == "reconnected"
+
+
+def test_bake_does_not_wrap_an_already_solid_extrusion_in_compound(monkeypatch):
+    compound_calls = []
+
+    class TrackingPart(BoundedPart):
+        @staticmethod
+        def Compound(shapes):
+            compound_calls.append(list(shapes))
+            return BoundedPart.Compound(shapes)
+
+    class FakeMatrix:
+        def __init__(self):
+            self.A11 = 1.0
+            self.A22 = 1.0
+            self.A33 = 1.0
+
+    monkeypatch.setattr(core, "Part", TrackingPart)
+    monkeypatch.setattr(core, "FreeCAD", SimpleNamespace(Matrix=FakeMatrix))
+    monkeypatch.setattr(core, "Vector", lambda x, y, z: (x, y, z))
+    monkeypatch.setattr(
+        core,
+        "_build_exact_text3d_outline_template",
+        lambda *_args: (BoundedGeometry(2.0, 6.0, face_count=1), 10.0, 1),
+    )
+
+    compound, _horizontal, _native, verified = core._build_exact_text3d_compound_shape(
+        source_text="A",
+        font_path="C:/fonts/source.ttf",
+        font_size_fc=3.0,
+        depth=0.3,
+        target_advance_fc=15.0,
+    )
+
+    assert compound_calls == []
+    assert verified == pytest.approx(15.0)
+    assert compound.Volume > 0.0
+
+
+def test_kern_probe_loads_each_font_file_once(monkeypatch):
+    font_opens = []
+
+    class FakeFont:
+        def getBestCmap(self):
+            return {65: "A", 77: "M"}
+
+        def __contains__(self, table_name):
+            return table_name in {"cmap", "kern"}
+
+        def __getitem__(self, table_name):
+            return SimpleNamespace(kernTables=[SimpleNamespace(kernTable={})])
+
+        def close(self):
+            return None
+
+    def fake_ttfont(path, **_kwargs):
+        font_opens.append(path)
+        return FakeFont()
+
+    import fontTools.ttLib as ttlib
+
+    monkeypatch.setattr(ttlib, "TTFont", fake_ttfont)
+    core._clear_font_kern_probe_cache()
+    try:
+        first = core._text3d_zero_kern_probe_candidates("A", "C:/fonts/source.ttf")
+        second = core._text3d_zero_kern_probe_candidates("M", "C:/fonts/source.ttf")
+        third = core._text3d_zero_kern_probe_candidates("A", "C:/fonts/other.ttf")
+    finally:
+        core._clear_font_kern_probe_cache()
+
+    assert first == ["A", "M"]
+    assert second == ["M"]
+    assert third == ["A", "M"]
+    assert font_opens == ["C:/fonts/source.ttf", "C:/fonts/other.ttf"]
+
+
+def test_compound_host_skips_shape_volume_after_bake(monkeypatch):
+    document = FakeDocument()
+    group = FakeGroup(document)
+
+    class VolumeTrap:
+        def __init__(self):
+            self.Solids = [object(), object()]
+
+        def isNull(self):
+            return False
+
+        @property
+        def Volume(self):
+            raise AssertionError("host Shape.Volume must not be read after bake")
+
+    baked = VolumeTrap()
+    baked_volume = 12.5
+    monkeypatch.setattr(
+        core,
+        "_build_exact_text3d_compound_shape",
+        lambda **kwargs: (baked, 0.5, 60.0, 30.0, baked_volume),
+    )
+
+    entity, _hs, _na, _va, volume = core._create_verified_compound_text3d_entity(
+        document,
+        source_text="W12x30",
+        font_path="C:/fonts/source.ttf",
+        font_size_fc=2.5,
+        depth=0.3,
+        target_advance_fc=30.0,
+        placement=object(),
+        text_group=group,
+    )
+
+    assert entity.Shape is baked
+    assert volume == pytest.approx(12.5)
+
+
+def test_text3d_faces_skip_validate_when_bullseye_succeeds(monkeypatch):
+    makers = []
+
+    class BullseyeFace:
+        ShapeType = "Face"
+        Faces = []
+
+        def __init__(self):
+            self.Faces = [self]
+
+        def validate(self):
+            raise AssertionError("Face.validate is not required after extrusion proof")
+
+        def normalAt(self, _u, _v):
+            return SimpleNamespace(z=1.0)
+
+    class BullseyePart:
+        @staticmethod
+        def makeFace(_wires, maker):
+            makers.append(maker)
+            if maker != "Part::FaceMakerBullseye":
+                raise RuntimeError("maker %s should not run" % maker)
+            return BullseyeFace()
+
+        class Compound:
+            def __init__(self, _edges):
+                raise AssertionError("closed wires must not reconnect")
+
+    monkeypatch.setattr(core, "Part", BullseyePart)
+    faces = core._text3d_faces_for_outlines([ClosedWire()])
+
+    assert makers == ["Part::FaceMakerBullseye"]
+    assert len(faces) == 1
+
+
+def test_compound_host_skips_solid_count_after_bake(monkeypatch):
+    document = FakeDocument()
+    group = FakeGroup(document)
+
+    class SolidCountTrap:
+        def __init__(self):
+            self.Solids = [object(), object()]
+
+        def isNull(self):
+            return False
+
+        def countElement(self, kind):
+            raise AssertionError(
+                "host solid count must not be reread after bake (%s)" % kind
+            )
+
+        @property
+        def Volume(self):
+            raise AssertionError("host Shape.Volume must not be read after bake")
+
+    baked = SolidCountTrap()
+    monkeypatch.setattr(
+        core,
+        "_build_exact_text3d_compound_shape",
+        lambda **kwargs: (baked, 0.5, 60.0, 30.0, 12.5, 2),
+    )
+
+    entity, _hs, _na, _va, volume = core._create_verified_compound_text3d_entity(
+        document,
+        source_text="W12x30",
+        font_path="C:/fonts/source.ttf",
+        font_size_fc=2.5,
+        depth=0.3,
+        target_advance_fc=30.0,
+        placement=object(),
+        text_group=group,
+    )
+
+    assert entity.Shape is baked
+    assert volume == pytest.approx(12.5)
+
+
+def test_bake_reuses_cached_outline_ink_bounds(monkeypatch):
+    boundbox_reads = []
+
+    class FaceTemplate:
+        def __init__(self, *_args, **_kwargs):
+            self.Faces = [object()]
+            self.Solids = []
+            self.Volume = 0.0
+
+        def isNull(self):
+            return False
+
+        def copy(self):
+            return FaceTemplate()
+
+        @property
+        def BoundBox(self):
+            boundbox_reads.append("read")
+            return SimpleNamespace(
+                XMin=2.0,
+                XMax=6.0,
+                XLength=4.0,
+            )
+
+        def transformGeometry(self, matrix):
+            scale_x = float(matrix.A11)
+            return BoundedGeometry(
+                2.0 * scale_x,
+                6.0 * scale_x,
+                face_count=1,
+            )
+
+    class FakeMatrix:
+        def __init__(self):
+            self.A11 = 1.0
+            self.A22 = 1.0
+            self.A33 = 1.0
+
+    monkeypatch.setattr(core, "Part", BoundedPart)
+    monkeypatch.setattr(core, "FreeCAD", SimpleNamespace(Matrix=FakeMatrix))
+    monkeypatch.setattr(core, "Vector", lambda x, y, z: (x, y, z))
+    monkeypatch.setattr(
+        core,
+        "_build_exact_text3d_outline_template",
+        lambda *_args: (FaceTemplate(2.0, 6.0, face_count=1), 10.0, 1),
+    )
+
+    memo = core._Text3DOutlineMemo()
+    prior = core._ACTIVE_TEXT3D_OUTLINE_MEMO
+    core._ACTIVE_TEXT3D_OUTLINE_MEMO = memo
+    try:
+        core._build_exact_text3d_compound_shape(
+            source_text="A36",
+            font_path="C:/fonts/source.ttf",
+            font_size_fc=3.0,
+            depth=0.3,
+            target_advance_fc=15.0,
+        )
+        core._build_exact_text3d_compound_shape(
+            source_text="A36",
+            font_path="C:/fonts/source.ttf",
+            font_size_fc=3.0,
+            depth=0.3,
+            target_advance_fc=18.0,
+        )
+    finally:
+        core._ACTIVE_TEXT3D_OUTLINE_MEMO = prior
+
+    assert memo.hits == 1
+    assert memo.misses == 1
+    assert boundbox_reads == ["read"]
+
+
+def test_pen_advance_reuses_font_unit_scale_after_first_string(monkeypatch):
+    import fontTools.ttLib as ttlib
+
+    wire_calls = []
+    fixtures = {
+        "A": [[BoundedGeometry(0.5, 2.5)]],
+        "M": [[BoundedGeometry(2.0, 4.0)]],
+        "AM": [
+            [BoundedGeometry(0.5, 2.5)],
+            [BoundedGeometry(12.0, 14.0)],
+        ],
+        "AA": [
+            [BoundedGeometry(0.5, 2.5)],
+            [BoundedGeometry(10.5, 12.5)],
+        ],
+        "AAM": [
+            [BoundedGeometry(0.5, 2.5)],
+            [BoundedGeometry(10.5, 12.5)],
+            [BoundedGeometry(22.0, 24.0)],
+        ],
+    }
+
+    class FakePart(BoundedPart):
+        @staticmethod
+        def makeWireString(source_text, font_path, size, tracking):
+            wire_calls.append(source_text)
+            assert font_path == "C:/fonts/source.ttf"
+            assert (size, tracking) == (1.0, 0)
+            return fixtures[source_text]
+
+    class FakeFont:
+        def getBestCmap(self):
+            return {65: "A", 77: "M"}
+
+        def __contains__(self, table_name):
+            return table_name in {"cmap", "kern", "hmtx"}
+
+        def __getitem__(self, table_name):
+            if table_name == "kern":
+                return SimpleNamespace(kernTables=[SimpleNamespace(kernTable={})])
+            if table_name == "hmtx":
+                return SimpleNamespace(metrics={"A": (1000, 50), "M": (1200, 80)})
+            raise KeyError(table_name)
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(core, "Part", FakePart)
+    monkeypatch.setattr(ttlib, "TTFont", lambda *_args, **_kwargs: FakeFont())
+    core._clear_font_kern_probe_cache()
+    try:
+        first = core._measure_text3d_pen_advance("A", "C:/fonts/source.ttf")
+        calls_after_first = list(wire_calls)
+        second = core._measure_text3d_pen_advance("AA", "C:/fonts/source.ttf")
+    finally:
+        core._clear_font_kern_probe_cache()
+
+    assert first == pytest.approx(10.0)
+    assert second == pytest.approx(20.0)
+    assert calls_after_first == ["A", "AA"]
+    assert wire_calls == calls_after_first

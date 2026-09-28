@@ -23,7 +23,10 @@ from .import_report import ImportReport as ImportReport, build_import_report as 
 from .resolved_scale import resolve_page_scale as resolve_page_scale
 from .import_config import ImportConfig as ImportConfig, CLEANUP_PRESETS as CLEANUP_PRESETS
 from .primitive_extractor import extract_page as extract_page
-from .auto_mode import classify_page_content as classify_page_content
+from .auto_mode import (
+    classify_page_content as classify_page_content,
+    drawings_need_text_counts as drawings_need_text_counts,
+)
 from .hatch_detector import tag_hatch_primitives as tag_hatch_primitives
 from .geometry_cleanup import (
     cleanup_primitives as cleanup_primitives,
@@ -38,4 +41,8 @@ from .streaming import (
     iter_pages as iter_pages,
     PageProgress as PageProgress,
     DEFAULT_SOFT_BUDGET_S as DEFAULT_SOFT_BUDGET_S,
+)
+from .stage_timing import (
+    StageTimer as StageTimer,
+    SCHEMA as SCHEMA,
 )

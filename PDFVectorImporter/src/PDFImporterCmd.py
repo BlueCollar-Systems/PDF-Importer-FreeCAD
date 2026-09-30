@@ -656,14 +656,11 @@ class ImportPDFVectorCommand:
             else:
                 FreeCAD.Console.PrintMessage("PDF import complete.\n")
 
-            # Auto-switch to orthographic top view
+            # viewTop() then fitAll() leaves the navigation camera, which is
+            # often perspective, and frames the whole document. Repeat the
+            # sheet camera so the print stays face-on after the command returns.
             try:
-                import FreeCADGui
-                view = FreeCADGui.ActiveDocument.ActiveView
-                if view:
-                    view.setCameraType("Orthographic")
-                    view.viewTop()
-                    view.fitAll()
+                core._autofit_import_view(getattr(FreeCAD, "ActiveDocument", None))
             except (AttributeError, RuntimeError):
                 pass
 

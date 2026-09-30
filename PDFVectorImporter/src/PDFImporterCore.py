@@ -11224,6 +11224,42 @@ def _pdf_import_root_objects(fc_doc):
     return roots
 
 
+
+def _imported_sheet_bounds(fc_doc):
+    """XY span of imported page geometry. Z is not the sheet plane."""
+    if FreeCAD is None or fc_doc is None:
+        return None
+    try:
+        bb = FreeCAD.BoundBox()
+    except (AttributeError, RuntimeError):
+        return None
+    found = False
+    stack = list(_pdf_import_root_objects(fc_doc))
+    seen = set()
+    while stack:
+        obj = stack.pop()
+        name = getattr(obj, "Name", None) or id(obj)
+        if name in seen:
+            continue
+        seen.add(name)
+        shape = getattr(obj, "Shape", None)
+        try:
+            if shape is not None and not shape.isNull():
+                box = shape.BoundBox
+                if box.isValid():
+                    bb.add(box)
+                    found = True
+        except (AttributeError, RuntimeError):
+            pass
+        try:
+            stack.extend(list(getattr(obj, "OutList", []) or []))
+        except (AttributeError, RuntimeError):
+            pass
+    if not found:
+        return None
+    return (float(bb.XMin), float(bb.YMin), float(bb.XMax), float(bb.YMax))
+
+
 def _autofit_import_view(fc_doc) -> None:
     """Frame the viewport on imported PDF geometry, not unrelated document content."""
     try:
@@ -11270,11 +11306,10 @@ def _autofit_import_view(fc_doc) -> None:
                 pass
 
         try:
-            view.setCameraType("Orthographic")
-            view.viewTop()
-            view.fitAll()
-        except (AttributeError, RuntimeError):
-            pass
+            from PDFVectorImporter.sheet_camera import apply_straight_on_view
+        except ImportError:
+            from sheet_camera import apply_straight_on_view
+        apply_straight_on_view(view, _imported_sheet_bounds(fc_doc))
     finally:
         try:
             Gui.Selection.clearSelection()

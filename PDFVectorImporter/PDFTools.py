@@ -329,7 +329,7 @@ class InstallPyMuPDFCommand:
             subprocess.check_call(
                 [py, "-m", "pip", "install", "--upgrade",
                  "--only-binary", ":all:", "--user",
-                 "PyMuPDF>=1.24,<2.0", "fonttools>=4.50,<5.0"],
+                 "PyMuPDF>=1.28.2,<2.0", "fonttools>=4.50,<5.0"],
                 timeout=300, **_kw)
             site.addsitedir(target)
             try:
@@ -351,7 +351,7 @@ class InstallPyMuPDFCommand:
                     f"pip install PDF dependencies failed:\n{e}\n\n"
                     "Try running manually in a terminal:\n"
                     f'  "{py}" -m pip install --user '
-                    '"PyMuPDF>=1.24,<2.0" "fonttools>=4.50,<5.0"')
+                    '"PyMuPDF>=1.28.2,<2.0" "fonttools>=4.50,<5.0"')
         except (subprocess.SubprocessError, OSError, RuntimeError, ValueError) as e:
             _err(f"Installer error: {e}\n{traceback.format_exc()}")
 

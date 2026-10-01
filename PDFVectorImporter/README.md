@@ -176,7 +176,7 @@ Native wire outlines and general vector lineweights remain screen-dependent; Ras
 | Dependency | Required | Notes |
 |---|---|---|
 | **FreeCAD** | 0.21+ | Offline bundle supports embedded CPython 3.10 and 3.11; 1.1 installer smoke verified |
-| **PyMuPDF** | Yes | Version 1.28.0 bundled once in the shared stable-ABI tree |
+| **PyMuPDF** | Yes | Version 1.28.2 bundled once in the shared stable-ABI tree |
 | **fontTools** | Yes | Version 4.63.0 bundled separately for cp310 and cp311 to preserve embedded fonts and Unicode mappings |
 | **pdftocairo** | Optional | Preferred SVG renderer for text-as-geometry; bundled PyMuPDF is used when Poppler is absent |
 

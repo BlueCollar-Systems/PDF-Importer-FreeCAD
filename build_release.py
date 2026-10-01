@@ -157,7 +157,7 @@ PRIVATE_CONTENT_PATTERNS = (
 EXTERNAL_PRIVATE_DENYLIST_ENV = "BCS_PRIVATE_RELEASE_DENYLIST_B64"
 EXTERNAL_PRIVATE_DENYLIST_SCHEMA = "bcs.private-release-denylist/1.0"
 
-PYMUPDF_SPEC = "PyMuPDF==1.28.0"
+PYMUPDF_SPEC = "PyMuPDF==1.28.2"
 FONTTOOLS_SPEC = "fonttools==4.63.0"
 RUNTIME_DEPENDENCY_SPECS = (PYMUPDF_SPEC, FONTTOOLS_SPEC)
 COMMON_RUNTIME_DEPENDENCY_LOCK = REPO_ROOT / "requirements-release-common.lock"
@@ -166,7 +166,7 @@ RUNTIME_DEPENDENCY_LOCKS = {
     "cp311": REPO_ROOT / "requirements-release-cp311.lock",
 }
 EXPECTED_RUNTIME_WHEELS = {
-    "common": "pymupdf-1.28.0-cp310-abi3-win_amd64.whl",
+    "common": "pymupdf-1.28.2-cp310-abi3-win_amd64.whl",
     "cp310": "fonttools-4.63.0-cp310-cp310-win_amd64.whl",
     "cp311": "fonttools-4.63.0-cp311-cp311-win_amd64.whl",
 }
@@ -990,7 +990,7 @@ def _lib_has_runtime_dependencies(python_exe: Path, lib_dir: Path) -> bool:
         "or getattr(fitz, 'VersionBind', ''))\n"
         "font_version = version_tuple(getattr(fontTools, 'version', '') "
         "or getattr(fontTools, '__version__', ''))\n"
-        "if fitz_version != (1, 28, 0):\n"
+        "if fitz_version != (1, 28, 2):\n"
         "    raise SystemExit(4)\n"
         "if font_version != (4, 63, 0):\n"
         "    raise SystemExit(5)\n"
@@ -1031,19 +1031,32 @@ def _runtime_has_runtime_dependencies(
         "getattr(fitz, 'VersionBind', ''))\n"
         "font_version = str(getattr(fontTools, 'version', '') or "
         "getattr(fontTools, '__version__', ''))\n"
-        "if not fitz_version.startswith('1.28.0'):\n"
+        "if fitz_version != '1.28.2':\n"
         "    raise SystemExit(4)\n"
-        "if not font_version.startswith('4.63.0'):\n"
+        "if font_version != '4.63.0':\n"
         "    raise SystemExit(5)\n"
+        # Exercise disposal as well as construction: affected upstream versions
+        # exhausted None references only after repeated get_texttrace results.
+        # A successful stdout marker is insufficient; natural process exit is required.
+        "with fitz.open() as doc:\n"
+        "    page = doc.new_page()\n"
+        "    for row in range(10):\n"
+        "        page.insert_text((72, 72 + 20 * row), 'Release runtime span %d' % row)\n"
+        "    for _ in range(2048):\n"
+        "        spans = page.get_texttrace()\n"
+        "        if len(spans) != 10:\n"
+        "            raise SystemExit(6)\n"
+        "        del spans\n"
         "print('OK')\n"
     )
     try:
         proc = subprocess.run(
-            [str(python_exe), "-c", code],
+            [str(python_exe), "-I", "-B", "-c", code],
             capture_output=True,
             text=True,
+            timeout=60,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return False
     return proc.returncode == 0 and proc.stdout.strip() == "OK"
 

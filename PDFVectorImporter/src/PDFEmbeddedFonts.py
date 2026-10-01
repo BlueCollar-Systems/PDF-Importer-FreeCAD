@@ -517,6 +517,153 @@ def _atomic_content_addressed_write(cache_dir: Path, payload: bytes, extension: 
     return target
 
 
+def _source_item_font_identity(item):
+    """Only original source identity; requested display mode is not font truth."""
+    span = item["span"]
+    return {
+        "pdf_sha256": item["pdf_sha256"], "page_number": item["page_number"],
+        "source_item_id": item["source_item_id"], "text": item["text"],
+        "font": span["font"], "origin": tuple(item["origin"]),
+        "bbox": tuple(item["bbox"]), "line_direction": tuple(item["line_direction"]),
+        "indices": (item["block_index"], item["line_index"], item["span_index"]),
+    }
+
+
+def stage_bound_page_fonts(page, items, cache_dir):
+    """Stage the original character-bound program for each canonical item.
+
+    Page dictionaries can contain complementary subsets with the same family
+    name, and omit annotation appearance fonts. Never replace either case with
+    a last-wins family lookup. Missing original occurrence evidence stays an
+    item-scoped error; concrete nonembedded absence retains the established
+    independent exact-system-font route.
+    """
+    from pdfcadcore.embedded_fonts import EmbeddedFontCatalog
+    from pdfcadcore.primitive_extractor import _raw_text_with_source_quads
+    from pdfcadcore.glyph_code_recovery import recover_glyph_codes_in_place
+
+    raw = _raw_text_with_source_quads(page)
+    recover_glyph_codes_in_place(page, raw)
+    items = tuple(items)
+    if not items:
+        return {}
+    catalog = EmbeddedFontCatalog.from_page(page, items[0]["page_number"])
+    staged = {}
+    for item in items:
+        identity = _source_item_font_identity(item)
+        record = {"identity": identity, "legacy_allowed": False}
+        try:
+            bi, li, si = identity["indices"]
+            line = raw["blocks"][bi]["lines"][li]
+            span = line["spans"][si]
+            chars = tuple(span.get("chars", ()))
+            if (not chars or "".join(c["c"] for c in chars) != identity["text"]
+                    or span.get("font") != identity["font"]
+                    or tuple(span.get("origin", ())) != identity["origin"]
+                    or tuple(span.get("bbox", ())) != identity["bbox"]
+                    or tuple(line.get("dir", ())) != identity["line_direction"]):
+                raise ValueError("canonical item does not match the original character occurrence")
+            asset, failure = catalog.resolve_span(identity["font"], chars)
+            if asset is None:
+                if (failure.reason == "embedded_font_asset_build_failed"
+                        and failure.error_type == "ExactFontSourceImpossible"
+                        and failure.detail == "embedded font stream is empty"
+                        and failure.proof_category == "source_specific_impossibility"):
+                    record["legacy_allowed"] = True
+                else:
+                    raise ValueError(failure.reason)
+            elif not asset.source_binding_method:
+                # The old wrapper's unambiguous embedded inventory can retain
+                # its existing exact lookup; an ambiguous catalog has no asset.
+                record["legacy_allowed"] = True
+            else:
+                if (hashlib.sha256(asset.source_bytes).hexdigest() != asset.source_sha256
+                        or hashlib.sha256(asset.usable_bytes).hexdigest() != asset.usable_sha256):
+                    raise ValueError("original character font program hash mismatch")
+                path = _atomic_content_addressed_write(Path(cache_dir), asset.usable_bytes, asset.usable_format)
+                record.update(
+                    path=str(path), sha256=asset.usable_sha256,
+                    source_sha256=asset.source_sha256, source_origin=asset.source_origin,
+                    source_binding_method=asset.source_binding_method,
+                    source_program_candidates=asset.source_program_candidates,
+                    original_characters=tuple((c.get("source_font_character_codepoint"),
+                        tuple(c["origin"]), c["source_font_program_sha256"]) for c in chars),
+                )
+        except (AttributeError, IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            record["error"] = "%s: %s" % (type(exc).__name__, exc)
+        staged[item["source_item_id"]] = record
+    return staged
+
+
+def verify_bound_item_font(item, record):
+    """Reauthenticate staged bytes and original item before native creation."""
+    if not isinstance(record, dict) or record.get("identity") != _source_item_font_identity(item):
+        raise ValueError("original character font binding belongs to another source item")
+    if record.get("error"):
+        raise ValueError(record["error"])
+    if record.get("legacy_allowed") is True:
+        return None
+    if (record.get("source_binding_method") != "original_textpage_character_program_sha256"
+            or not record.get("original_characters")
+            or not all(c[2] == record.get("source_sha256") for c in record["original_characters"])):
+        raise ValueError("original character font binding is incomplete")
+    path = Path(record.get("path", ""))
+    if (not re.fullmatch(r"[0-9a-f]{64}", str(record.get("sha256", "")))
+            or not path.is_file()
+            or hashlib.sha256(path.read_bytes()).hexdigest() != record["sha256"]):
+        raise ValueError("original character font staging changed")
+    return str(path)
+
+
+def original_control_omission_records(page, items):
+    """Positive original-program evidence for invisible control occurrences.
+
+    This is not a native text representation. A record preserves the original
+    control semantics and placement while explaining why no entity is drawn.
+    An unbound or visible control receives no exemption from normal delivery.
+    """
+    from collections import defaultdict
+    from pdfcadcore.embedded_fonts import source_control_zero_ink_proof
+    from pdfcadcore.primitive_extractor import _extract_text
+
+    controls = [item for item in items if item["text"] and all(ord(c) < 32 for c in item["text"])]
+    if not controls:
+        return {}
+    original = _extract_text(page, float(page.rect.height), controls[0]["page_number"],
+                             False, 1.0, to_model=lambda x, y: (float(x), float(y)))
+    originals, canonical = defaultdict(list), defaultdict(list)
+    for item in original:
+        if item.text and all(ord(c) < 32 for c in item.text) and item.source_char_layout:
+            key = (item.text, item.font_name, tuple(item.source_char_layout[0].source_origin_pdf),
+                   tuple(item.source_bbox_pdf or ()))
+            originals[key].append(item)
+    for item in controls:
+        key = (item["text"], item["span"]["font"], tuple(item["origin"]), tuple(item["bbox"]))
+        canonical[key].append(item)
+    records = {}
+    for key, group in canonical.items():
+        candidates = originals.get(key, ())
+        if len(candidates) != len(group):
+            continue
+        proofs = [source_control_zero_ink_proof(candidate) for candidate in candidates]
+        # Coincident repeated occurrences are interchangeable only when their
+        # complete original program/placement/advance proofs are identical.
+        if not all(proofs) or any(proof != proofs[0] for proof in proofs[1:]):
+            continue
+        for item, proof in zip(group, proofs, strict=True):
+            records[item["source_item_id"]] = {
+                "schema": "bcs.freecad.source_zero_ink_control/1",
+                "pdf_sha256": item["pdf_sha256"], "page_number": item["page_number"],
+                "source_item_id": item["source_item_id"], "requested_type": item["requested_type"],
+                "source_text": item["text"], "origin_pdf": list(item["origin"]),
+                "bbox_pdf": list(item["bbox"]), "advance_units": "pdf_points",
+                "no_visible_ink": True, "outcome": "source_zero_ink_omitted",
+                "created_entity_ids": [], "final_type": None,
+                "original_control_zero_ink": proof,
+            }
+    return records
+
+
 def stage_page_fonts(
     pdf_doc,
     page,

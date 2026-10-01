@@ -540,7 +540,7 @@ def ensure_pymupdf(mod_dir: Optional[str]) -> dict:
                         "--disable-pip-version-check",
                         "--target",
                         str(lib_dir),
-                        "PyMuPDF>=1.24,<2.0",
+                        "PyMuPDF>=1.28.2,<2.0",
                     ],
                     timeout_s=600,
                 )
@@ -548,7 +548,7 @@ def ensure_pymupdf(mod_dir: Optional[str]) -> dict:
             except (subprocess.SubprocessError, OSError, ValueError, RuntimeError) as exc:
                 step_results.append(
                     {
-                        "cmd": [py, "-m", "pip", "install", "--target", str(lib_dir), "PyMuPDF>=1.24,<2.0"],
+                        "cmd": [py, "-m", "pip", "install", "--target", str(lib_dir), "PyMuPDF>=1.28.2,<2.0"],
                         "error": str(exc),
                     }
                 )

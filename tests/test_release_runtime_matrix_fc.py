@@ -132,7 +132,7 @@ def test_vendoring_builds_shared_and_exact_abi_trees_with_a_manifest(
         "platform": "win_amd64",
         "common": {
             "path": "common",
-            "wheel": "pymupdf-1.28.0-cp310-abi3-win_amd64.whl",
+            "wheel": "pymupdf-1.28.2-cp310-abi3-win_amd64.whl",
             "wheel_tag": "cp310-abi3-win_amd64",
         },
         "runtimes": {

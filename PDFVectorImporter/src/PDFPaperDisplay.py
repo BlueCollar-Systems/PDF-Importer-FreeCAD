@@ -78,6 +78,26 @@ class ViewProviderPaper:
         return None
 
 
+def placed_sheet_box(corners, origin=(0.0, 0.0)):
+    """Page rectangle in model space. Origin is the paper object's placement."""
+    xs = [float(point[0]) + float(origin[0]) for point in corners]
+    ys = [float(point[1]) + float(origin[1]) for point in corners]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def union_sheet_boxes(boxes):
+    """One view box around every placed sheet. Off-sheet strokes are not included."""
+    usable = [box for box in boxes if box and len(box) == 4]
+    if not usable:
+        return None
+    return (
+        min(box[0] for box in usable),
+        min(box[1] for box in usable),
+        max(box[2] for box in usable),
+        max(box[3] for box in usable),
+    )
+
+
 def restore_document_paper(doc):
     count = 0
     for obj in getattr(doc, "Objects", ()):

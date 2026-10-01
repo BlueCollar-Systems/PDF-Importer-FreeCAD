@@ -11578,6 +11578,62 @@ def _pdf_import_root_objects(fc_doc):
     return roots
 
 
+def _sheet_view_box(fc_doc):
+    """Union of placed PDF paper rectangles, in model millimeters."""
+    try:
+        from .PDFPaperDisplay import placed_sheet_box, union_sheet_boxes
+    except ImportError:
+        from PDFPaperDisplay import placed_sheet_box, union_sheet_boxes
+    boxes = []
+    for obj in _document_objects(fc_doc):
+        raw = getattr(obj, "PDFPaperDisplayJSON", None)
+        if not raw:
+            continue
+        try:
+            import json
+            corners = json.loads(raw).get("corners_mm") or ()
+            base = obj.Placement.Base
+            boxes.append(placed_sheet_box(corners, (base.x, base.y)))
+        except (AttributeError, TypeError, ValueError, KeyError):
+            continue
+    return union_sheet_boxes(boxes)
+
+
+def _fit_view_to_sheet(fc_doc, view, sheet) -> bool:
+    """Look straight at the sheet. A stroke past the crop must not set the zoom."""
+    frame = None
+    try:
+        import Part
+        x0, y0, x1, y1 = sheet
+        frame = fc_doc.addObject("Part::Feature", "PDF_SheetViewFrame")
+        frame.Shape = Part.makePolygon([
+            _v(x0, y0, 0.0), _v(x1, y0, 0.0), _v(x1, y1, 0.0),
+            _v(x0, y1, 0.0), _v(x0, y0, 0.0),
+        ])
+        import FreeCADGui as Gui
+        Gui.Selection.clearSelection()
+        Gui.Selection.addSelection(frame)
+        Gui.SendMsgToActiveView("ViewFit")
+        return True
+    except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
+        try:
+            view.fitAll()
+        except (AttributeError, RuntimeError):
+            return False
+        return True
+    finally:
+        if frame is not None:
+            try:
+                import FreeCADGui as Gui
+                Gui.Selection.clearSelection()
+            except (ImportError, AttributeError, RuntimeError):
+                pass
+            try:
+                fc_doc.removeObject(frame.Name)
+            except (AttributeError, RuntimeError):
+                pass
+
+
 def _fit_import_descendant_bounds(view, roots) -> bool:
     """Fit every visible imported child, including hosts with empty group bounds.
 
@@ -11694,7 +11750,9 @@ def _autofit_import_view(fc_doc) -> None:
             except (AttributeError, RuntimeError):
                 pass
 
-        if not selected_fit:
+        sheet = _sheet_view_box(fc_doc)
+        framed = bool(sheet) and _fit_view_to_sheet(fc_doc, view, sheet)
+        if not framed and not selected_fit:
             try:
                 view.fitAll()
             except (AttributeError, RuntimeError):

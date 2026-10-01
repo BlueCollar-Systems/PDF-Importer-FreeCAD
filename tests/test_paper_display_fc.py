@@ -25,6 +25,17 @@ def test_paper_creation_is_view_only_and_keeps_exact_page_bounds():
     assert json.loads(obj.PDFPaperDisplayJSON)['corners_mm']==[list(p) for p in corners]
 
 
+def test_view_box_is_the_placed_sheet_not_an_off_sheet_stroke():
+    first = paper.placed_sheet_box([(0, 0, 0), (216, 0, 0), (216, 279, 0), (0, 279, 0)])
+    second = paper.placed_sheet_box(
+        [(0, 0, 0), (216, 0, 0), (216, 279, 0), (0, 279, 0)],
+        origin=(0, -340),
+    )
+    box = paper.union_sheet_boxes([first, second])
+    assert box[0] == 0 and box[2] == 216
+    assert box[1] == -340 and box[3] == 279
+
+
 @pytest.mark.parametrize('corners,depth', [([(0,0,0)]*4,-1),
     ([(0,0,0),(1,0,1),(1,1,0),(0,1,0)],-1),
     ([(0,0,0),(1,0,0),(1,1,0),(0,1,0)],1)])

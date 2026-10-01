@@ -14,7 +14,7 @@ from typing import MutableSequence, Optional, Tuple
 RUNTIME_MANIFEST_SCHEMA = "bcs.freecad.runtime-matrix/1.0"
 SUPPORTED_RUNTIME_TAGS = {(3, 10): "cp310", (3, 11): "cp311"}
 EXPECTED_RUNTIME_WHEELS = {
-    "common": "pymupdf-1.28.0-cp310-abi3-win_amd64.whl",
+    "common": "pymupdf-1.28.2-cp310-abi3-win_amd64.whl",
     "cp310": "fonttools-4.63.0-cp310-cp310-win_amd64.whl",
     "cp311": "fonttools-4.63.0-cp311-cp311-win_amd64.whl",
 }
@@ -74,7 +74,7 @@ def _require_runtime_entry(path: Path, *, directory: bool) -> Path:
 
 def _require_loaded_module_provenance(runtime: "BundledRuntime") -> None:
     expected = (
-        ("pymupdf", runtime.dependency_paths[1], "1.28.0"),
+        ("pymupdf", runtime.dependency_paths[1], "1.28.2"),
         ("fontTools", runtime.dependency_paths[0], "4.63.0"),
     )
     for module_name, expected_root, expected_version in expected:

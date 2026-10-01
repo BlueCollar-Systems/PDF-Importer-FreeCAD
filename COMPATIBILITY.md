@@ -33,11 +33,18 @@ Embedded Python comes from the installed FreeCAD build. Release installs bundle 
 
 | Dependency | Release installer | Source checkout |
 |------------|-------------------|-----------------|
-| PyMuPDF 1.28.0 | ✅ Shared cp310-abi3 Windows wheel | Workbench **Install / Update PDF Dependencies** or system/user package |
+| PyMuPDF 1.28.2 | ✅ Shared cp310-abi3 Windows wheel | Workbench **Install / Update PDF Dependencies** or system/user package |
 | fontTools 4.63.0 | ✅ Exact cp310 and cp311 Windows wheels | Same fallback command |
 | Poppler / pdfcadcore | ✅ In workbench | Same |
 
 No system Python, pip, or OS packages required for release users.
+
+PyMuPDF 1.28.2 is the minimum supported source runtime. It fixes the repeated
+`Page.get_texttrace()` reference-ownership defect that can terminate Python 3.10
+and 3.11 during batch extraction or shutdown ([upstream #5042](https://github.com/pymupdf/PyMuPDF/issues/5042)).
+Restart FreeCAD after updating a loaded dependency; do not reuse the old native module.
+Release validation exercises repeated text-trace extraction in both bundled ABIs
+and requires each interpreter to exit normally.
 
 ## Legacy hardware notes
 
@@ -70,9 +77,9 @@ In FreeCAD GUI: select workbench **PDF Vector Importer** → verify toolbar **PD
 
 | FreeCAD | Python | PyMuPDF | Status |
 |---------|--------|---------|--------|
-| 1.1.x | 3.11 | 1.28.0 offline bundle | ✅ Verified (Windows installer smoke) |
-| 1.0.x | 3.11 | 1.28.0 offline bundle | ⚠️ Expected |
-| 0.21.x | 3.10 | 1.28.0 offline bundle | ⚠️ Expected |
+| 1.1.x | 3.11 | 1.28.2 offline bundle | ⚠️ Runtime update; native validation pending |
+| 1.0.x | 3.11 | 1.28.2 offline bundle | ⚠️ Expected |
+| 0.21.x | 3.10 | 1.28.2 offline bundle | ⚠️ Expected |
 | Any host using 3.12+ | 3.12+ | System/user install only | ⚠️ No bundled offline runtime |
 | 0.19–0.20 | 3.8–3.9 | legacy pin | ⚠️ Expected only after legacy branch testing |
 | 0.18 and earlier | | | ❌ Not supported |

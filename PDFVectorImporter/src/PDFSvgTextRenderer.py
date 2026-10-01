@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+from fractions import Fraction
 from typing import Dict, List, Optional, Tuple
 
 try:
@@ -50,6 +51,103 @@ def _svg_path_is_move_only(path_d: str) -> bool:
     number = r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
     move = rf"[Mm]\s*{number}(?:\s*,\s*|\s+|(?=[+-])){number}\s*[Zz]?\s*"
     return re.fullmatch(rf"(?:{move})+", path_d.strip()) is not None
+
+
+def _svg_filtered_glyph_sources(svg: str) -> list:
+    """Find painted filter inputs whose glyph uses are absent from body uses.
+
+    This requests a second renderer of the same immutable PDF; it never
+    expands a filter graph or certifies omitted paint as delivered.
+    """
+    root = ET.fromstring(svg)
+    ids = {}
+    for node in root.iter():
+        identity = node.get("id")
+        if identity:
+            if identity in ids:
+                raise ValueError("duplicate source SVG identity")
+            ids[identity] = node
+    found = []
+    stack = [root]
+    visited = set()
+    while stack:
+        node = stack.pop()
+        if id(node) in visited:
+            continue
+        visited.add(id(node))
+        if node.tag.rsplit("}", 1)[-1] in {"defs", "filter", "mask", "clipPath", "symbol"}:
+            continue
+        declarations = dict(part.split(":", 1) for part in node.get("style", "").split(";") if ":" in part)
+        declarations = {key.strip(): value.strip() for key, value in declarations.items()}
+        match = re.fullmatch(r"url\(#([^)]*)\)", declarations.get("filter", node.get("filter", "")).strip())
+        effect = ids.get(match.group(1)) if match else None
+        if effect is not None and effect.tag.rsplit("}", 1)[-1] == "filter":
+            for image in effect.iter():
+                if image.tag.rsplit("}", 1)[-1] != "feImage":
+                    continue
+                ref = image.get("href", image.get("{http://www.w3.org/1999/xlink}href", ""))
+                target = ids.get(ref[1:]) if ref.startswith("#") else None
+                if target is None:
+                    continue
+                # A painted filter may reference another compositing group
+                # whose own filter reaches the actual glyph definitions.
+                stack.append(target)
+                count = sum(
+                    child.tag.rsplit("}", 1)[-1] == "use"
+                    and child.get("href", child.get("{http://www.w3.org/1999/xlink}href", "")).startswith("#")
+                    and _glyph_reference_id(child.get("href", child.get("{http://www.w3.org/1999/xlink}href", ""))[1:])
+                    for child in target.iter()
+                )
+                if count:
+                    found.append({"filter_id": match.group(1), "source_id": ref[1:], "glyph_use_count": count})
+        if node.tag.rsplit("}", 1)[-1] == "use":
+            ref = node.get("href", node.get("{http://www.w3.org/1999/xlink}href", ""))
+            if ref.startswith("#") and ref[1:] in ids and not _glyph_reference_id(ref[1:]):
+                stack.append(ids[ref[1:]])
+        stack.extend(reversed(list(node)))
+    return found
+
+
+def _fully_clipped_glyph_proof(shape, paint, *, vb_min_x, vb_min_y, vb_h,
+                               x_unit_to_mm, y_unit_to_mm, flip_y):
+    """Prove complete fill-only native bounds strictly outside one source clip.
+
+    Fraction arithmetic prevents inward rounding of the clip bounds. Touching,
+    partial visibility, stroke paint and unproved clipping remain unchanged.
+    """
+    if not isinstance(paint, dict) or paint.get("error") or paint.get("fill_rule") not in ("nonzero", "evenodd"):
+        return None
+    bbox = _shape_host_bbox(shape)
+    if bbox is None:
+        return None
+    try:
+        values = (vb_min_x, vb_min_y, vb_h, x_unit_to_mm, y_unit_to_mm)
+        if any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
+            return None
+        vx, vy, height, sx, sy = map(Fraction, values)
+        if height <= 0 or sx <= 0 or sy <= 0 or type(flip_y) is not bool:
+            return None
+        box = tuple(Fraction(value) for value in bbox)
+        for clip_index, quad in enumerate(paint.get("clips", [])):
+            if len(quad) != 4 or any(len(point) != 2 for point in quad):
+                return None
+            if any(type(value) not in (int, float) or not math.isfinite(value) for point in quad for value in point):
+                return None
+            points = [(Fraction(x), Fraction(y)) for x, y in quad]
+            turns = [(points[(i+1)%4][0]-points[i][0])*(points[(i+2)%4][1]-points[(i+1)%4][1])
+                     - (points[(i+1)%4][1]-points[i][1])*(points[(i+2)%4][0]-points[(i+1)%4][0]) for i in range(4)]
+            if not (all(t > 0 for t in turns) or all(t < 0 for t in turns)):
+                return None
+            host = [((x-vx)*sx, ((height+vy-y) if flip_y else (y-vy))*sy) for x,y in points]
+            clip_box = (min(p[0] for p in host), min(p[1] for p in host), max(p[0] for p in host), max(p[1] for p in host))
+            if box[2] < clip_box[0] or box[0] > clip_box[2] or box[3] < clip_box[1] or box[1] > clip_box[3]:
+                return {"reason": "complete_fill_bounds_strictly_outside_active_source_clip",
+                        "host_glyph_bbox": list(bbox), "active_clip_index": clip_index,
+                        "source_clip_quad": [list(p) for p in quad],
+                        "exact_host_clip_bbox": [str(value) for value in clip_box]}
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return None
 
 
 def find_pdftocairo() -> Optional[str]:
@@ -1348,15 +1446,19 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 # the same immutable PDF before creating any host entities.
                 if svg and not _svg_too_large(svg):
                     rendered_placements = _parse_use_placements(svg)
-                    if not rendered_placements:
+                    filtered_sources = _svg_filtered_glyph_sources(svg)
+                    if not rendered_placements or filtered_sources:
                         if _pdf_file_signature(pdf_snapshot_path) != signature_before_render:
                             source_binding_error(source_mutation_reason)
                         renderer_recovery = {
                             "from_renderer": "pdftocairo",
-                            "reason": "source_glyph_placements_unresolved",
+                            "reason": ("source_glyph_filter_graph_unresolved" if filtered_sources
+                                       else "source_glyph_placements_unresolved"),
                             "to_renderer": "pymupdf",
                             "representation_preserved": True,
                         }
+                        if filtered_sources:
+                            renderer_recovery["filtered_glyph_sources"] = filtered_sources
                         renderer_name = "pymupdf"
                         rendered_placements = None
                         svg = _render_svg_with_pymupdf(pdf_snapshot_path, page_num)
@@ -1564,6 +1666,13 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
             },
         )
 
+    zero_extent_placement_evidence = cache.get("zero_extent_placement_evidence") if cache is not None else None
+    if zero_extent_placement_evidence is None:
+        zero_extent_placement_evidence = _svg_zero_extent_placement_proofs(
+            svg, placements, verified_pdf_sha256, page_num)
+        if cache is not None:
+            cache["zero_extent_placement_evidence"] = zero_extent_placement_evidence
+
     # Build Part.Shape for each unique glyph
     cached_shapes = cache.get("glyph_shapes") if cache is not None else None
     if cached_shapes is not None and not isinstance(cached_shapes, dict):
@@ -1609,15 +1718,34 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
             return None
 
     # Place all glyphs
+    # Resolve source clip ownership once, independently of item allocation.
+    # Unsupported paint cannot authorize an omission; its ordinary strict
+    # delivery validation remains responsible for rejecting it.
+    clip_paints = cache.get("glyph_fill_rules_v1") if cache is not None else None
+    if clip_paints is None:
+        try:
+            from . import PDFGlyphFill as clip_fill
+        except ImportError:
+            import PDFGlyphFill as clip_fill
+        try:
+            clip_paints = clip_fill.placement_fill_rules(
+                svg, [row[0] for row in placements], with_clips=True, defer_errors=True)
+        except (ValueError, TypeError, ET.ParseError):
+            clip_paints = None
+        if clip_paints is not None and cache is not None:
+            cache["glyph_fill_rules_v1"] = clip_paints
     cached_placed = cache.get("placed_glyphs") if cache is not None else None
     if cached_placed is not None:
         placed_glyphs = list(cached_placed)
         failed_placement_indices = list(cache.get("failed_placement_indices") or [])
         empty_placement_indices = list(cache.get("empty_placement_indices") or [])
+        clipped_placement_evidence = list(cache.get("clipped_placement_evidence") or [])
     else:
         placed_glyphs = []
         failed_placement_indices: List[int] = []
         empty_placement_indices: List[int] = []
+        clipped_placement_evidence = []
+        clip_svg_sha256 = hashlib.sha256(svg.encode("utf-8")).hexdigest()
 
         for placement_index, (gid, use_x, use_y, matrix) in enumerate(placements):
             shape = glyph_shapes.get(gid)
@@ -1635,6 +1763,16 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
             placed = place_glyph_shape(shape, use_x, use_y, matrix)
             try:
                 if placed is not None:
+                    clipped = _fully_clipped_glyph_proof(
+                        placed, clip_paints[placement_index] if clip_paints is not None else None,
+                        vb_min_x=vb_min_x, vb_min_y=vb_min_y, vb_h=vb_h,
+                        x_unit_to_mm=x_unit_to_mm, y_unit_to_mm=y_unit_to_mm, flip_y=flip_y)
+                    if clipped is not None:
+                        clipped_placement_evidence.append(dict(
+                            clipped, source_placement_index=placement_index, source_glyph_id=gid,
+                            pdf_sha256=verified_pdf_sha256, page_number=int(page_num),
+                            svg_sha256=clip_svg_sha256))
+                        continue
                     placed_glyphs.append((placement_index, gid, placed))
                 else:
                     failed_placement_indices.append(placement_index)
@@ -1644,6 +1782,7 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
             cache["placed_glyphs"] = list(placed_glyphs)
             cache["failed_placement_indices"] = list(failed_placement_indices)
             cache["empty_placement_indices"] = list(empty_placement_indices)
+            cache["clipped_placement_evidence"] = list(clipped_placement_evidence)
 
     if failed_placement_indices:
         raise TextRepresentationRenderError(
@@ -1659,6 +1798,8 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
                 "renderer": renderer_name,
                 "failed_placement_indices": failed_placement_indices,
                 "empty_placement_indices": empty_placement_indices,
+                "zero_extent_placement_evidence": list(zero_extent_placement_evidence),
+                "clipped_placement_evidence": list(clipped_placement_evidence),
                 "created_entity_ids": [],
                 "removed_entity_ids": [],
                 "cleanup_complete": True,
@@ -1879,6 +2020,10 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
             item_filter_evidence["empty_placement_indices"] = list(
                 empty_placement_indices
             )
+        if clipped_placement_evidence:
+            item_filter_evidence["clipped_placement_evidence"] = list(clipped_placement_evidence)
+        if zero_extent_placement_evidence:
+            item_filter_evidence["zero_extent_placement_evidence"] = list(zero_extent_placement_evidence)
         if not matched_glyphs:
             raster_source_placements = (
                 cache.get("raster_source_placements") if cache is not None else None
@@ -2422,6 +2567,8 @@ def render_text(pdf_path: str, page_num: int, page_h: float,
         "entity_type": representation,
         "renderer": renderer_name,
         "renderer_recovery": renderer_recovery,
+        "clipped_placement_evidence": list(clipped_placement_evidence),
+        "zero_extent_placement_evidence": list(zero_extent_placement_evidence),
         "created_entity_ids": created_ids,
         "delivery_attempts": attempts,
         "source_item_id": item_filter["source_item_id"] if item_filter else None,
@@ -2587,6 +2734,131 @@ def _glyph_reference_id(gid: str) -> bool:
     )
 
 
+def _svg_zero_extent_glyph_proofs(svg: str) -> Dict[str, dict]:
+    """Prove Cairo's empty masked-image glyph without accepting other images.
+
+    An absent path is not proof of absent ink. This recognizes only a unique
+    zero-size rectangle -> mask -> zero-size image chain, with no other paint,
+    styles, transforms or external resources. Decimal zero is checked lexically
+    so a tiny nonzero dimension cannot disappear through float underflow.
+    """
+    if "<?xml-stylesheet" in svg.lower():
+        return {}
+    try:
+        root = ET.fromstring(svg)
+    except (ET.ParseError, ValueError):
+        return {}
+    namespace = "{http://www.w3.org/2000/svg}"
+
+    def tag(element):
+        return element.tag.removeprefix(namespace) if isinstance(element.tag, str) else ""
+
+    def blank(element):
+        return not (element.text or "").strip() and all(not (child.tail or "").strip() for child in element)
+
+    def zero(value):
+        return isinstance(value, str) and len(value) <= 64 and re.fullmatch(
+            r"[+-]?(?:0+(?:\.0*)?|\.0+)(?:[eE][+-]?[0-9]+)?", value
+        ) is not None
+
+    elements = list(root.iter())
+    if tag(root) != "svg" or any(tag(element) == "style" for element in elements):
+        return {}
+    by_id = {}
+    parents = {child: parent for parent in elements for child in parent}
+    for element in elements:
+        identifier = element.get("id")
+        if identifier is not None:
+            if identifier in by_id:
+                return {}
+            by_id[identifier] = element
+
+    def in_plain_defs(element):
+        ancestor = parents.get(element)
+        while ancestor is not None and tag(ancestor) == "g" and not ancestor.attrib:
+            ancestor = parents.get(ancestor)
+        return ancestor is not None and tag(ancestor) == "defs" and not ancestor.attrib
+
+    proofs = {}
+    for identifier, glyph in by_id.items():
+        if not _glyph_reference_id(identifier) or tag(glyph) != "g" or set(glyph.attrib) != {"id"}:
+            continue
+        if not in_plain_defs(glyph) or not blank(glyph) or len(glyph) != 1:
+            continue
+        rectangle = glyph[0]
+        if (tag(rectangle) != "rect" or len(rectangle) or not blank(rectangle)
+                or set(rectangle.attrib) != {"x", "y", "width", "height", "mask"}
+                or not all(zero(rectangle.get(name)) for name in ("x", "y", "width", "height"))):
+            continue
+        reference = re.fullmatch(r"url\(#([A-Za-z_][A-Za-z0-9_.:-]*)\)", rectangle.get("mask", ""))
+        mask = by_id.get(reference.group(1)) if reference else None
+        if (mask is None or tag(mask) != "mask" or set(mask.attrib) != {"id"}
+                or not in_plain_defs(mask) or not blank(mask) or len(mask) != 1):
+            continue
+        use = mask[0]
+        href_keys = ({"href"}, {"{http://www.w3.org/1999/xlink}href"})
+        if tag(use) != "use" or set(use.attrib) not in href_keys or len(use) or not blank(use):
+            continue
+        href = next(iter(use.attrib.values()))
+        image = by_id.get(href[1:]) if href.startswith("#") else None
+        if (image is None or tag(image) != "image" or len(image) or not blank(image)
+                or not in_plain_defs(image) or set(image.attrib) != {"id", "x", "y", "width", "height"}
+                or not all(zero(image.get(name)) for name in ("x", "y", "width", "height"))):
+            continue
+        proofs[identifier] = {
+            "schema": "source-svg-zero-extent-glyph/1",
+            "proof_kind": "zero_rectangle_mask_and_zero_image",
+            "source_svg_sha256": hashlib.sha256(svg.encode("utf-8")).hexdigest(),
+            "source_glyph_id": identifier,
+            "source_mask_id": mask.get("id"),
+            "source_image_id": image.get("id"),
+            "definition_sha256": hashlib.sha256(ET.tostring(glyph, encoding="utf-8")).hexdigest(),
+            "mask_sha256": hashlib.sha256(ET.tostring(mask, encoding="utf-8")).hexdigest(),
+            "image_sha256": hashlib.sha256(ET.tostring(image, encoding="utf-8")).hexdigest(),
+            "native_entity_created": False,
+        }
+    return proofs
+
+
+def _svg_zero_extent_placement_proofs(svg, placements, pdf_sha256, page_num):
+    """Keep every proved empty SVG occurrence bound to its source page/position."""
+    proofs = _svg_zero_extent_glyph_proofs(svg)
+    if not proofs:
+        return []
+    if not isinstance(pdf_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", pdf_sha256) is None:
+        raise ValueError("zero-extent glyph source PDF binding is invalid")
+    if not isinstance(page_num, int) or isinstance(page_num, bool) or page_num < 1:
+        raise ValueError("zero-extent glyph source page binding is invalid")
+    if placements != _parse_use_placements(svg):
+        raise ValueError("zero-extent glyph source placement binding changed")
+    try:
+        from . import PDFGlyphFill as glyph_fill
+    except ImportError:
+        import PDFGlyphFill as glyph_fill
+    paints = glyph_fill.placement_fill_rules(
+        svg, [row[0] for row in placements], with_clips=True, defer_errors=True)
+    if len(paints) != len(placements):
+        raise ValueError("zero-extent glyph paint occurrence census is invalid")
+    result = []
+    for index, (identifier, x, y, matrix) in enumerate(placements):
+        if identifier not in proofs:
+            continue
+        paint = paints[index]
+        if (not isinstance(paint, dict) or paint.get("error")
+                or "fill_rule" not in paint or "clips" not in paint):
+            raise ValueError("zero-extent glyph source paint context is unproved")
+        coordinates = [x, y] + (list(matrix) if matrix is not None else [])
+        if ((matrix is not None and len(matrix) != 6)
+                or not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+                           for v in coordinates)):
+            raise ValueError("zero-extent glyph source placement is invalid")
+        result.append(dict(proofs[identifier], pdf_sha256=pdf_sha256, page_number=page_num,
+                           source_placement_index=index, source_svg_origin=[x, y],
+                           source_svg_matrix=list(matrix) if matrix is not None else None,
+                           source_paint_context=dict(paint)))
+    return result
+
+
 def _parse_all_glyph_defs(svg: str) -> Dict[str, str]:
     glyph_defs: Dict[str, str] = {}
     for gid, path_d in re.findall(
@@ -2615,6 +2887,8 @@ def _parse_all_glyph_defs(svg: str) -> Dict[str, str]:
         path_d = d_m.group(1)
         if _glyph_reference_id(gid):
             glyph_defs[gid] = path_d
+    for glyph_id in _svg_zero_extent_glyph_proofs(svg):
+        glyph_defs.setdefault(glyph_id, "")
     return glyph_defs
 
 

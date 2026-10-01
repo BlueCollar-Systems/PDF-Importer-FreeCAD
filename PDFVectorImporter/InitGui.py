@@ -221,7 +221,7 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
             subprocess.check_call(
                 [py, "-m", "pip", "install", "--upgrade",
                  "--only-binary", ":all:", "--user",
-                 "PyMuPDF>=1.24,<2.0", "fonttools>=4.50,<5.0"],
+                 "PyMuPDF>=1.28.2,<2.0", "fonttools>=4.50,<5.0"],
                 timeout=300, **kw)
             site.addsitedir(target)
 
@@ -249,7 +249,7 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
                 "Automatic install failed.\n\n"
                 "Try manually in a terminal:\n"
                 '  "' + py + '" -m pip install --user '
-                '"PyMuPDF>=1.24,<2.0" "fonttools>=4.50,<5.0"')
+                '"PyMuPDF>=1.28.2,<2.0" "fonttools>=4.50,<5.0"')
         except (subprocess.SubprocessError, OSError, RuntimeError, ValueError) as e:
             FreeCAD.Console.PrintError("Install error: " + str(e) + "\n")
 

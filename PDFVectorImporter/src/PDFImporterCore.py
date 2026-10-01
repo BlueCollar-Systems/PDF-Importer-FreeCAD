@@ -11578,41 +11578,6 @@ def _pdf_import_root_objects(fc_doc):
     return roots
 
 
-
-def _imported_sheet_bounds(fc_doc):
-    """XY span of imported page geometry. Z is not the sheet plane."""
-    if FreeCAD is None or fc_doc is None:
-        return None
-    try:
-        bb = FreeCAD.BoundBox()
-    except (AttributeError, RuntimeError):
-        return None
-    found = False
-    stack = list(_pdf_import_root_objects(fc_doc))
-    seen = set()
-    while stack:
-        obj = stack.pop()
-        name = getattr(obj, "Name", None) or id(obj)
-        if name in seen:
-            continue
-        seen.add(name)
-        shape = getattr(obj, "Shape", None)
-        try:
-            if shape is not None and not shape.isNull():
-                box = shape.BoundBox
-                if box.isValid():
-                    bb.add(box)
-                    found = True
-        except (AttributeError, RuntimeError):
-            pass
-        try:
-            stack.extend(list(getattr(obj, "OutList", []) or []))
-        except (AttributeError, RuntimeError):
-            pass
-    if not found:
-        return None
-    return (float(bb.XMin), float(bb.YMin), float(bb.XMax), float(bb.YMax))
-
 def _fit_import_descendant_bounds(view, roots) -> bool:
     """Fit every visible imported child, including hosts with empty group bounds.
 
@@ -11704,10 +11669,8 @@ def _autofit_import_view(fc_doc) -> None:
         # Fit in the final orientation. A later fitAll would replace the
         # selected-sheet bounds with unrelated objects elsewhere in the document.
         try:
-            # viewTop() restores the navigation camera. Orthographic has to
-            # follow it, or the sheet opens as a perspective orbit.
-            view.viewTop()
             view.setCameraType("Orthographic")
+            view.viewTop()
         except (AttributeError, RuntimeError):
             pass
         selected_fit = _fit_import_descendant_bounds(view, roots)
@@ -11731,19 +11694,11 @@ def _autofit_import_view(fc_doc) -> None:
             except (AttributeError, RuntimeError):
                 pass
 
-        if selected_fit:
-            # viewTop() puts the navigation camera back, often in perspective.
-            # The descendant fit already framed the sheet; lock the projection.
+        if not selected_fit:
             try:
-                view.setCameraType("Orthographic")
+                view.fitAll()
             except (AttributeError, RuntimeError):
                 pass
-        else:
-            try:
-                from PDFVectorImporter.sheet_camera import apply_straight_on_view
-            except ImportError:
-                from sheet_camera import apply_straight_on_view
-            apply_straight_on_view(view, _imported_sheet_bounds(fc_doc))
     finally:
         try:
             Gui.Selection.clearSelection()

@@ -658,12 +658,6 @@ class ImportPDFVectorCommand:
 
             # The core frames the complete batch in top orthographic view.
             # Do not replace that imported-sheet framing with a document fitAll.
-            # viewTop() restores the navigation camera, often perspective, so
-            # repeat the sheet camera after the command returns.
-            try:
-                core._autofit_import_view(getattr(FreeCAD, "ActiveDocument", None))
-            except (AttributeError, RuntimeError):
-                pass
 
         except (RuntimeError, ValueError, TypeError, OSError, AttributeError, ImportError) as e:
             import traceback

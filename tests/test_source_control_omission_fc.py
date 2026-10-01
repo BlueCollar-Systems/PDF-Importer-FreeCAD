@@ -12,6 +12,7 @@ for path in (ROOT / "PDFVectorImporter", ROOT / "PDFVectorImporter" / "src"):
     sys.path.insert(0, str(path))
 import PDFEmbeddedFonts as fonts  # noqa: E402
 import PDFImporterCore as core  # noqa: E402
+import PDFSvgTextRenderer as svg_renderer  # noqa: E402
 
 
 def control_pdf(path):
@@ -34,6 +35,85 @@ def render(path, monkeypatch, mode="text"):
             fc_doc=SimpleNamespace(Objects=[]), parent_group=group,
             opts=opts, pdf_sha256=core._pdf_file_sha256(str(path)))
     return result, opts, group
+
+
+def mixed_control_pdf(path):
+    with fitz.open() as pdf:
+        page = pdf.new_page(width=160, height=120)
+        page.insert_text((30, 20), "A", fontname="cour", fontsize=11)
+        page.insert_text((30, 50), "X", fontname="cour", fontsize=11)
+        pdf.update_stream(page.get_contents()[-1], b"BT /cour 11 Tf 30 70 Td <0a> Tj ET")
+        page.insert_text((30, 80), "B", fontname="cour", fontsize=11)
+        pdf.save(path)
+
+
+def capture_svg_manifest(path, monkeypatch, mode):
+    captured = {}
+
+    def deliver(item, attempted, state, **kwargs):
+        captured["manifest"] = kwargs["render_cache"]["source_item_manifest"]
+        return {"source_item_id": item["source_item_id"], "outcome": "verified",
+                "final_type": attempted, "created_entity_ids": ["test_" + item["source_item_id"]]}
+
+    monkeypatch.setattr(core, "_deliver_text_item_svg", deliver)
+    monkeypatch.setattr(core, "_run_text_item_fallback_ladder",
+                        lambda item, requested, deliverers, opts: deliverers[requested](item, requested, None))
+    result, opts, group = render(path, monkeypatch, mode)
+    return captured["manifest"], result, opts, group
+
+
+def assign_manifest(manifest, digest):
+    # Independent bounded ink boxes exercise the real global assignment and
+    # strict manifest validator; this test does not claim native shape delivery.
+    shapes = []
+    for index, entry in enumerate(manifest):
+        x0, y0, x1, y1 = entry["bbox"]
+        bounds = SimpleNamespace(XMin=x0 + 0.1, YMin=y0 + 0.1,
+                                 XMax=x1 - 0.1, YMax=y1 - 0.1)
+        shapes.append((index, "test_glyph", SimpleNamespace(BoundBox=bounds)))
+    return svg_renderer._build_global_placement_assignments(
+        shapes, manifest, page_num=1, pdf_sha256=digest,
+        page_rotation_matrix=(1.0, 0.0, 0.0, 1.0, 0.0, 0.0),
+        vb_min_x=0, vb_min_y=0, vb_w=160, vb_h=120,
+        page_w=160, page_h=120, x_unit_to_mm=1, y_unit_to_mm=1, flip_y=False)
+
+
+@pytest.mark.parametrize("mode", ["glyphs", "geometry"])
+def test_verified_middle_control_is_not_a_visible_svg_assignment_item(tmp_path, monkeypatch, mode):
+    path = tmp_path / "mixed.pdf"
+    mixed_control_pdf(path)
+    manifest, result, opts, group = capture_svg_manifest(path, monkeypatch, mode)
+    persisted = json.loads(group.PDFSourceZeroInkControlsJSON)
+    assert len(persisted) == 1 and persisted[0]["source_text"] == "\n"
+    control_id = persisted[0]["source_item_id"]
+    assert result["source_item_count"] == opts._report_extra["text_source_spans"] == 3
+    assert result["source_item_ids"][1] == control_id
+    assert [entry["source_item_id"] for entry in manifest] == [
+        result["source_item_ids"][0], result["source_item_ids"][2]]
+    assert [entry["text"] for entry in manifest] == ["A", "B"]
+    assert [entry["source_order"] for entry in manifest] == [0, 1]
+    assert persisted == opts._report_extra["source_zero_ink_controls"]
+    assert opts._verified_source_zero_ink_controls[control_id] == persisted[0]
+    assert persisted[0]["created_entity_ids"] == [] and persisted[0]["final_type"] is None
+    assignments, _, unmatched = assign_manifest(manifest, core._pdf_file_sha256(str(path)))
+    assert unmatched == []
+    assert assignments == {entry["source_item_id"]: [i] for i, entry in enumerate(manifest)}
+    assert result["host_entity_count"] == 2
+
+
+@pytest.mark.parametrize("mode", ["glyphs", "geometry"])
+def test_unproved_middle_control_remains_in_svg_manifest_and_fails_strict_validation(tmp_path, monkeypatch, mode):
+    path = tmp_path / "unproved.pdf"
+    mixed_control_pdf(path)
+    monkeypatch.setattr(fonts, "original_control_omission_records", lambda *args: {})
+    manifest, result, opts, group = capture_svg_manifest(path, monkeypatch, mode)
+    assert len(manifest) == result["source_item_count"] == 3
+    assert [entry["text"] for entry in manifest] == ["A", "\n", "B"]
+    assert [entry["source_order"] for entry in manifest] == [0, 1, 2]
+    assert "source_zero_ink_controls" not in opts._report_extra
+    assert "PDFSourceZeroInkControlsJSON" not in group.PropertiesList
+    with pytest.raises(ValueError, match="SVG source item manifest entry is invalid"):
+        assign_manifest(manifest, core._pdf_file_sha256(str(path)))
 
 
 @pytest.mark.parametrize("mode", ["text", "labels", "3d_text", "glyphs", "geometry", "raster"])

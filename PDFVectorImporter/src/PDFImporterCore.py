@@ -10338,7 +10338,14 @@ def _render_canonical_text_items(
                 "bbox": item["bbox"],
                 "text": item["text"],
             }
-            for source_order, item in enumerate(items)
+            # The assignment manifest describes visible SVG ink. Keep proven
+            # zero-ink controls in the canonical roster and persisted proof,
+            # but exclude them before numbering this visible-only manifest.
+            # Unproved controls remain subject to the strict assignment gate.
+            for source_order, item in enumerate(
+                item for item in items
+                if item["source_item_id"] not in control_omissions
+            )
         ]
     }
 

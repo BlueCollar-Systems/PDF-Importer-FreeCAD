@@ -500,9 +500,9 @@ See **[COMPATIBILITY.md](COMPATIBILITY.md)** for the full matrix. Summary:
 
 | FreeCAD Version | Python | PyMuPDF | Status |
 |----------------|--------|---------|--------|
-| 0.21.x | 3.10 | 1.28.0 bundled offline | ⚠️ Expected |
-| 1.0.x | 3.11 | 1.28.0 bundled offline | ⚠️ Expected |
-| 1.1.x | 3.11 | 1.28.0 bundled offline | ✅ Verified |
+| 0.21.x | 3.10 | 1.28.2 bundled offline | ⚠️ Expected |
+| 1.0.x | 3.11 | 1.28.2 bundled offline | ⚠️ Expected |
+| 1.1.x | 3.11 | 1.28.2 bundled offline | ⚠️ Runtime update; native validation pending |
 | Any host using 3.12+ | 3.12+ | System/user install only | ⚠️ No bundled offline runtime |
 | 0.19–0.20 | 3.8–3.9 | legacy pin | ⚠️ Expected only after legacy branch testing |
 | 0.18 and earlier | | | ❌ Not supported |
@@ -516,7 +516,7 @@ Evidence levels:
 
 - **FreeCAD** 0.21 or later
 - **Python** 3.10 or 3.11 for the bundled offline Windows runtime. Other source hosts may use compatible system/user packages.
-- **PyMuPDF** `1.28.0` in the release runtime’s shared `src/lib/common` tree. When Poppler/pdftocairo is absent, it also backs Glyphs/Geometry text rendering.
+- **PyMuPDF** `1.28.2` in the release runtime’s shared `src/lib/common` tree. When Poppler/pdftocairo is absent, it also backs Glyphs/Geometry text rendering.
 - **fontTools** `4.63.0` in the exact `src/lib/cp310` or `src/lib/cp311` tree selected from FreeCAD’s embedded Python ABI. The incompatible sibling tree is never added to `sys.path`.
 
 ## Known Limitations

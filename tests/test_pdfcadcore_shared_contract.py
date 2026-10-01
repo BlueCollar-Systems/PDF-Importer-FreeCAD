@@ -52,6 +52,14 @@ def test_text_truth_model_preserves_every_cross_host_field() -> None:
         "target_quad",
         "advance_width",
         "glyph_height",
+        "source_font_size_pdf",
+        "source_font_ascender",
+        "source_font_descender",
+        "source_writing_mode",
+        "source_font_program_sha256",
+        "source_font_binding_verified",
+        "source_font_character_codepoint",
+        "source_glyph_trace_codepoint",
     ]
     normalized_fields = {field.name for field in fields(primitives.NormalizedText)}
     assert {

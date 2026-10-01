@@ -8,7 +8,7 @@ preserve these notices and comply with the applicable terms.
 ## PyMuPDF / MuPDF
 
 - Project: PyMuPDF (bindings) over MuPDF (Artifex)
-- Bundled version: PyMuPDF 1.28.0 (shared stable-ABI payload at `PDFVectorImporter/src/lib/common/`)
+- Bundled version: PyMuPDF 1.28.2 (shared stable-ABI payload at `PDFVectorImporter/src/lib/common/`)
 - Upstream: https://github.com/pymupdf/PyMuPDF
 - License model: **AGPL-3.0-or-later OR Artifex commercial license**
   (verified in `PDFVectorImporter/src/lib/common/pymupdf-*.dist-info/METADATA`:

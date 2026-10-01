@@ -1374,6 +1374,27 @@ def _merge_text_entity_info(
     return merged
 
 
+def _complete_verified_control_coverage(opts, extra, source_ids, source_count):
+    """Recognize an entirely invisible roster without inventing text entities."""
+    records = extra.get("source_zero_ink_controls")
+    verified = getattr(opts, "_verified_source_zero_ink_controls", {})
+    if (not source_ids or source_count != len(source_ids)
+            or extra.get("text_source_spans") != source_count
+            or not isinstance(records, list) or len(records) != source_count
+            or not isinstance(verified, dict) or set(verified) != source_ids):
+        return False
+    by_id = {}
+    for record in records:
+        if not isinstance(record, dict):
+            return False
+        source_id = record.get("source_item_id")
+        if (not isinstance(source_id, str) or source_id in by_id
+                or source_id not in verified or record != verified[source_id]):
+            return False
+        by_id[source_id] = record
+    return set(by_id) == source_ids
+
+
 def write_import_report(
     *,
     pdf_path: str,
@@ -1804,6 +1825,7 @@ def write_import_report(
         pdf_engine_version=_pymupdf_version(),
         import_text=bool(opts.import_text),
         text_mode=str(opts.text_mode or "3d_text"),
+        text_source_spans=text_source_spans,
         text_fallback=text_fallback,
         peak_mb=sample_process_mb(),
         performance_phases=phases or None,
@@ -1823,7 +1845,28 @@ def write_import_report(
         extra=extra,
     )
 
-    if host_font_summary["note"] or text_degrade_note:
+    control_only_report = (
+        text_count == 0 and reported_source_roster_valid
+        and not text_degrade_warnings and not session_degraded_pages
+        and _complete_verified_control_coverage(
+            opts, extra, reported_source_item_ids, reported_source_item_count)
+        and all(record["pdf_sha256"] == report.input.get("sha256")
+                for record in extra["source_zero_ink_controls"])
+    )
+    if control_only_report:
+        # The canonical source count remains intact. Only the generic missing
+        # entity warning is inapplicable when every item has an unchanged,
+        # positively verified original-program no-ink receipt from this run.
+        diagnostics = report.extra.get("diagnostics", {})
+        diagnostics["signals"] = [signal for signal in diagnostics.get("signals", [])
+                                  if signal != "source_text_seen_but_no_text_entities_created"]
+        diagnostics["recommended_actions"] = [
+            action for action in diagnostics.get("recommended_actions", [])
+            if action != ("Treat missing delivered text entities as a failed import; inspect the "
+                          "item attempt history without changing the requested representation.")
+        ]
+
+    if host_font_summary["note"] or text_degrade_note or control_only_report:
         # The shared core overwrites extra["font_substitution_note"] from its
         # PDF audit inside build_import_report, so the host note is appended
         # here and the human summary is rebuilt to carry it.
@@ -2186,34 +2229,219 @@ def _polyline_run_is_smooth(verts: List["Vector"], max_turn_deg: float = 60.0) -
     return valid_turns >= 2
 
 
+def _source_line_cubic_commands(items):
+    """Read finite explicit source coordinates without rounding or changing them."""
+    if not isinstance(items, (list, tuple)) or not items:
+        return None
+    def point(value):
+        try:
+            if isinstance(value, (tuple, list)):
+                if len(value) != 2:
+                    return None
+                coordinates = value
+            else:
+                coordinates = (value.x, value.y)
+            if any(type(n) not in (int, float) or not math.isfinite(n)
+                   for n in coordinates):
+                return None
+            return tuple(coordinates)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+
+    commands = []
+    for item in items:
+        if not isinstance(item, (tuple, list)) or not item:
+            return None
+        if not isinstance(item[0], str):
+            return None
+        expected = {"l": 3, "c": 5}.get(item[0])
+        if expected is None or len(item) != expected:
+            return None
+        coordinates = tuple(point(p) for p in item[1:])
+        if any(p is None for p in coordinates):
+            return None
+        commands.append((item[0], coordinates))
+    return commands
+
+
+def _source_fill_without_retraced_bridge(path_group):
+    """Cancel an exact opposite fill bridge, including PDF's implicit closer.
+
+    A->B, a closed boundary B...B, B->A has that boundary's even-odd fill.
+    The final B->A may be an explicit command or PDF's implicit fill closure.
+    Original inner commands, paint, and source dictionary remain unchanged.
+    """
+    items = path_group.get("items", [])
+    if (path_group.get("type") != "f"
+            or path_group.get("even_odd") is not True
+            or path_group.get("fill") is None
+            or path_group.get("color") is not None
+            or path_group.get("stroke") is not None):
+        return items, None
+    commands = _source_line_cubic_commands(items)
+    if commands is None or len(commands) < 3:
+        return items, None
+
+    first, last = commands[0], commands[-1]
+    if first[0] != "l":
+        return items, None
+    a, b = first[1]
+    if a == b:
+        return items, None
+    explicit = last[0] == "l" and last[1] == (b, a)
+    stop = len(items) - 1 if explicit else len(items)
+    current = b
+    boundary = commands[1:stop]
+    visited = {b}
+    for index, (_kind, coordinates) in enumerate(boundary):
+        if coordinates[0] != current:
+            return items, None
+        current = coordinates[-1]
+        if index < len(boundary) - 1:
+            # A second loop must not be merged into the first native face.
+            if current in visited:
+                return items, None
+            visited.add(current)
+    if current != b:
+        return items, None
+
+    canonical = json.dumps(commands, separators=(",", ":"), allow_nan=False)
+    proof = {
+        "schema": "bcs.freecad.source-fill-boundary/1",
+        "policy": "cancel_exact_opposite_fill_bridge",
+        "source_paint_order": path_group.get("seqno"),
+        "fill_rule": "even_odd",
+        "source_commands_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "source_item_count": len(items),
+        "retained_item_range": [1, stop],
+        "retained_item_range_convention": "zero_based_half_open",
+        "cancelled_bridge": [list(a), list(b)],
+        "closure_origin": ("explicit_reverse_command" if explicit
+                           else "implicit_pdf_fill_closure"),
+    }
+    return items[1:stop], proof
+
+
+def _source_implicit_fill_boundary(path_group):
+    """Close one proved connected open PDF fill, without closing its stroke.
+
+    Only explicit line/cubic endpoints establish connectivity. Native vertex
+    ordering cannot authorize a connector, and separate loops are not merged.
+    Native validity still has to establish that the resulting face is usable.
+    """
+    items = path_group.get("items", [])
+    if (path_group.get("type") not in ("f", "fs")
+            or path_group.get("fill") is None
+            or path_group.get("closePath") not in (None, False)
+            or type(path_group.get("even_odd")) is not bool):
+        return items, None
+    commands = _source_line_cubic_commands(items)
+    if commands is None or len(commands) < 2:
+        return items, None
+    start = current = commands[0][1][0]
+    visited = {start}
+    for _kind, points in commands:
+        if points[0] != current or points[-1] in visited:
+            return items, None
+        current = points[-1]
+        visited.add(current)
+    canonical = json.dumps(commands, separators=(",", ":"), allow_nan=False)
+    proof = {
+        "schema": "bcs.freecad.source-fill-boundary/1",
+        "policy": "close_connected_pdf_fill",
+        "source_paint_order": path_group.get("seqno"),
+        "fill_rule": "even_odd" if path_group["even_odd"] else "nonzero",
+        "source_commands_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "source_item_count": len(items),
+        "retained_item_range": [0, len(items)],
+        "retained_item_range_convention": "zero_based_half_open",
+        "closure_origin": "implicit_pdf_fill_closure",
+        "fill_closing_segment": [list(current), list(start)],
+        "stroke_closure": "unchanged_open_source",
+    }
+    return list(items) + [("l", current, start)], proof
+
+
+class DrawingGeometryFailure(Exception):
+    """A requested source drawing could not become valid native geometry."""
+
+
+def _require_valid_drawing_shape(shape, context):
+    try:
+        valid = not shape.isNull() and shape.isValid()
+    except Exception as exc:
+        raise DrawingGeometryFailure("Native drawing %s validity could not be checked" % context) from exc
+    if valid is not True:
+        raise DrawingGeometryFailure("Native drawing %s is null or invalid" % context)
+    return shape
+
+
+def _source_fill_boundary_edges(items, page_h, opts, scale):
+    """Build every retained source line/cubic without length or curve fitting."""
+    edges = []
+    for item in items:
+        try:
+            points = [_to_fc(_xy(value), page_h, opts, scale) for value in item[1:]]
+            if item[0] == "l" and len(points) == 2:
+                edge = Part.LineSegment(*points).toShape()
+            elif item[0] == "c" and len(points) == 4:
+                curve = Part.BezierCurve()
+                curve.setPoles(points)
+                edge = curve.toShape()
+            else:
+                raise DrawingGeometryFailure("Source fill boundary has an unsupported command")
+        except (RuntimeError, ValueError, TypeError) as exc:
+            raise DrawingGeometryFailure("Source fill boundary construction failed") from exc
+        edges.append(_require_valid_drawing_shape(edge, "source fill edge"))
+    return edges
+
+
 def _make_shape_obj(edges: List, closed: bool, make_face: bool, fc_doc=None):
-    """Build Part::Feature from edges, optionally closing + making a Face."""
+    """Build a valid native wire/face; never substitute a wire for a failed fill."""
     if not edges:
         return None
     doc = fc_doc or FreeCAD.ActiveDocument
     try:
         wire = Part.Wire(edges)
         if closed and not wire.isClosed():
-            # Use wire vertexes (topologically safe) instead of edge vertexes
             if wire.Vertexes:
                 p0 = wire.Vertexes[0].Point
                 pN = wire.Vertexes[-1].Point
                 if _len2d(_v(p0.x, p0.y), _v(pN.x, pN.y)) > ZERO_TOL:
                     closer = Part.LineSegment(pN, p0).toShape()
                     wire = Part.Wire(edges + [closer])
-        if make_face and wire.isClosed():
-            try:
-                face = Part.Face(wire)
-                obj = doc.addObject("Part::Feature", "Face")
-                obj.Shape = face
-                return obj
-            except (RuntimeError, ValueError, TypeError):
-                pass
-        obj = doc.addObject("Part::Feature", "Wire")
-        obj.Shape = wire
-        return obj
-    except (RuntimeError, ValueError, TypeError):
-        return None
+        _require_valid_drawing_shape(wire, "wire")
+        if make_face:
+            if not wire.isClosed():
+                raise DrawingGeometryFailure("Native drawing fill has an open boundary")
+            shape = _require_valid_drawing_shape(Part.Face(wire), "face")
+            name = "Face"
+        else:
+            shape, name = wire, "Wire"
+    except (RuntimeError, ValueError, TypeError) as exc:
+        raise DrawingGeometryFailure("Native drawing construction failed") from exc
+    obj = doc.addObject("Part::Feature", name)
+    obj.Shape = shape
+    _require_valid_drawing_shape(obj.Shape, "stored " + name)
+    return obj
+
+
+def _attach_source_fill_boundary(obj, proof, page_num, page_h, opts, scale, pdf_path):
+    digest = str(getattr(opts, "_pdf_sha256", "") or "")
+    if not digest:
+        digest = _pdf_file_sha256(pdf_path)
+        opts._pdf_sha256 = digest
+    receipt = dict(proof, source_pdf_sha256=digest, source_page=int(page_num),
+                   source_page_height=float(page_h), coordinate_scale=float(scale),
+                   page_rotation_matrix=list(_page_matrix_values(opts)), flip_y=bool(opts.flip_y),
+                   boundary_representation="original_lines_and_cubic_bezier_controls")
+    if proof.get("policy") == "close_connected_pdf_fill":
+        receipt["boundary_representation"] = "original_lines_and_cubic_bezier_controls_plus_pdf_fill_closure"
+    obj.addProperty("App::PropertyString", "PDFSourceFillBoundaryJSON", "PDF Source")
+    obj.PDFSourceFillBoundaryJSON = json.dumps(receipt, sort_keys=True)
+    if json.loads(obj.PDFSourceFillBoundaryJSON) != receipt:
+        raise DrawingGeometryFailure("Source fill-boundary provenance was not retained")
+    return receipt
 
 
 def _normalize_model3d_mode(raw) -> str:
@@ -2485,6 +2713,20 @@ def _apply_style(
                 # Older view providers may expose only the original color.
                 # Keep their source-colored material rather than failing import.
                 pass
+            if stroke_rgb is None:
+                try:
+                    proof = json.loads(getattr(obj, "PDFSourceFillBoundaryJSON", "{}"))
+                    if proof.get("policy") == "close_connected_pdf_fill":
+                        # The PDF-implied fill closer is not a painted stroke.
+                        # Persisted provenance also applies this on GUI reopen.
+                        try:
+                            vo.DisplayMode = "Shaded"
+                            if vo.DisplayMode != "Shaded":
+                                raise DrawingGeometryFailure("Native implicit fill display was not retained")
+                        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                            raise DrawingGeometryFailure("Native implicit fill display could not be set") from exc
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    pass
         else:
             try:
                 _apply_planar_outline_display(obj, vo, stroke_rgb, fill_rgb)
@@ -4336,7 +4578,8 @@ def _iter_text_source_items(
                 source_text = source_span.get("text", "")
                 if not isinstance(source_text, str):
                     raise ValueError("text span content must be a string")
-                if not source_text or source_text.isspace():
+                is_control = bool(source_text) and all(ord(char) < 32 for char in source_text)
+                if not source_text or (source_text.isspace() and not is_control):
                     continue
 
                 source_font = source_span.get("font", "")
@@ -8195,6 +8438,8 @@ def _deliver_text_item_3d(
     page_h: float,
     scale: float,
     raw_source_dict=None,
+    source_page_quad=None,
+    source_font_binding=None,
 ) -> Dict[str, Any]:
     """Deliver and verify exactly one canonical 3D Text source item."""
     try:
@@ -8421,12 +8666,27 @@ def _deliver_text_item_3d(
     )
 
     try:
-        font_path, source_results = _resolve_shapestring_font_path_with_evidence(
-            font_identity["raw_name"],
-            opts,
-            pdf_sha256=pdf_sha256,
-            page_number=page_number,
-        )
+        font_path = None
+        if source_font_binding is not None:
+            from PDFEmbeddedFonts import verify_bound_item_font
+            font_path = verify_bound_item_font(bound_item, source_font_binding)
+        if font_path is not None:
+            source_results = [_font_source_result(
+                "embedded_font", "found", font_identity,
+                path=font_path, sha256=source_font_binding["sha256"],
+                pdf_sha256=pdf_sha256, page_number=page_number, staging_complete=True,
+                source_item_id=source_item_id,
+                source_program_sha256=source_font_binding["source_sha256"],
+                source_origin=source_font_binding["source_origin"],
+                source_binding_method=source_font_binding["source_binding_method"],
+                source_program_candidates=source_font_binding["source_program_candidates"],
+                original_characters=source_font_binding["original_characters"],
+            )]
+        else:
+            font_path, source_results = _resolve_shapestring_font_path_with_evidence(
+                font_identity["raw_name"], opts,
+                pdf_sha256=pdf_sha256, page_number=page_number,
+            )
         source_results = copy.deepcopy(source_results)
     except Exception as exc:
         terminal_failure(
@@ -8813,6 +9073,16 @@ def _deliver_text_item_3d(
         ):
             raise RuntimeError("compound 3D Text host evidence could not be verified")
 
+        page_clip = None
+        if source_page_quad is not None:
+            stage = "source_page_text_clip"
+            from PDFPageTextClip import clip_native_text_shape
+            page_clip = clip_native_text_shape(
+                compound_entity, source_page_quad, part=Part, vector=Vector)
+            if page_clip is not None:
+                shape = compound_entity.Shape
+                solid_count = _shape_solid_count(shape)
+                volume = float(shape.Volume) if not shape.isNull() else 0.0
         _remember_native_text_object(opts, compound_entity)
         return {
             "source_item_id": source_item_id,
@@ -8853,6 +9123,7 @@ def _deliver_text_item_3d(
                 "view_style_verified": style_verification
                 == "gui_view_and_app_metadata",
                 "source_character_layout": source_character_layout,
+                "source_page_clip": page_clip,
                 "advance_verification": ("original_source_character_origins_and_font_matrix"
                     if source_character_layout is not None else "whole_span_font_pen_advance"),
             },
@@ -8886,6 +9157,8 @@ def _deliver_text_item_3d(
             "font_path": font_path,
             "font_source": (font_source_result or {}).get("source"),
         }
+        if stage == "source_page_text_clip":
+            terminal_failure("source_page_text_clip_failed", compound_failure_evidence)
         if source_character_layout is not None:
             terminal_failure("positioned_3d_text_failed", compound_failure_evidence)
         if owned:
@@ -9084,6 +9357,12 @@ def _deliver_text_item_3d(
             > max(0.05, target_advance_fc * 0.03)
         ):
             raise RuntimeError("3D Text host evidence could not be verified")
+        if source_page_quad is not None:
+            stage = "source_page_text_clip"
+            from PDFPageTextClip import clip_native_text_shape
+            # Contained native ink needs no mutation. A crossing parametric
+            # extrusion must not be accepted through an unclipped legacy path.
+            clip_native_text_shape(extrusion, source_page_quad, part=Part, vector=Vector)
     except Text3DExactFontOutlinesUnavailable as exc:
         shapestring_zero_outline_evidence = dict(exc.evidence)
         if compound_zero_outline_evidence is None:
@@ -9674,6 +9953,7 @@ def _deliver_text_item_svg(
     fc_doc,
     parent_group,
     render_cache: Optional[Dict[str, Any]] = None,
+    source_page_quad=None,
 ) -> Dict[str, Any]:
     """Deliver one canonical item as verified SVG Glyphs or raw Geometry."""
     try:
@@ -10104,6 +10384,16 @@ def _deliver_text_item_svg(
                         from PDFStyleRestore import has_source_glyph_fill
                     if has_source_glyph_fill(host_obj):
                         _apply_text3d_display_style(host_obj)
+        if source_page_quad is not None:
+            from PDFPageTextClip import clip_native_text_shape
+            page_clips = []
+            for host_obj in delivered_objects:
+                proof = clip_native_text_shape(
+                    host_obj, source_page_quad, part=Part, vector=Vector)
+                if proof is not None:
+                    page_clips.append({"entity_id": _host_object_id(host_obj), **proof})
+            if page_clips:
+                attempt["evidence"]["source_page_clips"] = page_clips
     except Exception as exc:
         result_summary = {
             "exception": "%s: %s" % (exc.__class__.__name__, exc),
@@ -10121,15 +10411,16 @@ def _deliver_text_item_svg(
     return copy.deepcopy(attempt)
 
 
-def _bind_native_source_layout(item, delivered, raw_dict, *, opts, scale, doc, group):
+def _bind_native_source_layout(item, delivered, raw_dict, *, opts, scale, doc, group,
+                               source_page_quad=None):
     """Complete native delivery or roll back every object owned by the attempt."""
     created_ids = list(delivered["created_entity_ids"])
     owned = [obj for name in created_ids if (obj := doc.getObject(name)) is not None]
     try:
         try:
-            from .PDFTextLayout import build_source_affine_layout, persist_source_layout
+            from .PDFTextLayout import bind_source_page_clip, build_source_affine_layout, persist_source_layout
         except ImportError:
-            from PDFTextLayout import build_source_affine_layout, persist_source_layout
+            from PDFTextLayout import bind_source_page_clip, build_source_affine_layout, persist_source_layout
         evidence = delivered["evidence"]
         layout = build_source_affine_layout(item, raw_dict,
             scale=scale, font_size=evidence["font_size"], font_name=evidence["font_name"],
@@ -10137,7 +10428,8 @@ def _bind_native_source_layout(item, delivered, raw_dict, *, opts, scale, doc, g
             page_matrix=_page_matrix_values(opts))
         if len(owned) != len(created_ids):
             raise RuntimeError("Native source-layout object disappeared")
-        installed = [persist_source_layout(host, layout) for host in owned]
+        installed = [persist_source_layout(host, bind_source_page_clip(layout, host, source_page_quad)
+                     if source_page_quad is not None else layout) for host in owned]
         for host, proof in zip(owned, installed, strict=True):
             if getattr(host, "ViewObject", None) is not None and not proof.get("native_nodes_installed"):
                 raise RuntimeError("Native source-layout display was not installed")
@@ -10182,6 +10474,14 @@ def _render_canonical_text_items(
 ) -> Dict[str, Any]:
     """Deliver raw PDF spans through the finite item representation contract."""
     requested = _normalize_requested_text_type(str(opts.text_mode or ""))
+    source_page_quad = None
+    if fitz is not None and isinstance(page, fitz.Page):
+        source_page_rect = page.rect * page.derotation_matrix
+        source_page_quad = []
+        for point in (source_page_rect.tl, source_page_rect.tr,
+                      source_page_rect.br, source_page_rect.bl):
+            model_point = _to_fc((point.x, point.y), page_h, opts, scale)
+            source_page_quad.append((float(model_point.x), float(model_point.y)))
     source_dict = raw_tdict if raw_tdict is not None else _page_text_dict(page, opts)
     items = list(
         _iter_text_source_items(source_dict, int(page_num), pdf_sha256, requested)
@@ -10203,7 +10503,27 @@ def _render_canonical_text_items(
         run_report_extra.get("text_source_spans", 0) or 0
     ) + len(items)
 
+    control_omissions = {}
+    if any(item["text"] and all(ord(char) < 32 for char in item["text"]) for item in items):
+        from PDFEmbeddedFonts import original_control_omission_records
+        if _pdf_file_sha256(pdf_path) != pdf_sha256:
+            raise ValueError("original PDF changed before control-ink verification")
+        control_omissions = original_control_omission_records(page, items)
+        if control_omissions:
+            encoded = json.dumps(list(control_omissions.values()), sort_keys=True,
+                                 separators=(",", ":"), allow_nan=False)
+            property_name = "PDFSourceZeroInkControlsJSON"
+            if property_name not in parent_group.PropertiesList:
+                parent_group.addProperty("App::PropertyString", property_name, "PDF Source")
+            setattr(parent_group, property_name, encoded)
+            if getattr(parent_group, property_name) != encoded:
+                raise ValueError("host did not preserve original control-ink proof")
+            if _pdf_file_sha256(pdf_path) != pdf_sha256:
+                raise ValueError("original PDF changed during control-ink verification")
+            run_report_extra.setdefault("source_zero_ink_controls", []).extend(json.loads(encoded))
+
     font_stage_complete = False
+    bound_page_fonts = None
     svg_render_cache: Dict[str, Any] = {
         "source_snapshot_cache": getattr(
             opts, "_svg_source_snapshot_cache", {}
@@ -10217,7 +10537,14 @@ def _render_canonical_text_items(
                 "bbox": item["bbox"],
                 "text": item["text"],
             }
-            for source_order, item in enumerate(items)
+            # The assignment manifest describes visible SVG ink. Keep proven
+            # zero-ink controls in the canonical roster and persisted proof,
+            # but exclude them before numbering this visible-only manifest.
+            # Unproved controls remain subject to the strict assignment gate.
+            for source_order, item in enumerate(
+                item for item in items
+                if item["source_item_id"] not in control_omissions
+            )
         ]
     }
 
@@ -10252,7 +10579,7 @@ def _render_canonical_text_items(
         return read_source_character_geometry(page)
 
     def deliver_3d(item, attempted, state):
-        nonlocal font_stage_complete, source_character_dict, source_3d_character_dict
+        nonlocal font_stage_complete, source_character_dict, source_3d_character_dict, bound_page_fonts
         if source_3d_character_dict is None and fitz is not None and isinstance(page, fitz.Page):
             source_3d_character_dict = page_text_setup(
                 "source_character_geometry",
@@ -10276,6 +10603,12 @@ def _render_canonical_text_items(
                 ),
             )
             font_stage_complete = True
+        if bound_page_fonts is None and fitz is not None and isinstance(page, fitz.Page):
+            from PDFEmbeddedFonts import stage_bound_page_fonts
+            bound_page_fonts = page_text_setup(
+                "original_character_font_programs", item, attempted,
+                lambda: stage_bound_page_fonts(page, items, _shapestring_font_cache_dir()),
+            )
         source_arguments = ({"raw_source_dict": source_3d_character_dict}
                             if source_3d_character_dict is not None else {})
         return _deliver_text_item_3d(
@@ -10286,6 +10619,9 @@ def _render_canonical_text_items(
             page_h=page_h,
             scale=scale,
             **source_arguments,
+            source_page_quad=source_page_quad,
+            source_font_binding=(bound_page_fonts[item["source_item_id"]]
+                                 if bound_page_fonts is not None else None),
         )
 
     def deliver_native(item, attempted, state):
@@ -10301,7 +10637,8 @@ def _render_canonical_text_items(
         delivered = _deliver_text_item_native(item, attempted, state,
             text_group=parent_group, page_h=page_h, scale=scale)
         return _bind_native_source_layout(item, delivered, source_character_dict,
-            opts=opts, scale=scale, doc=fc_doc, group=parent_group)
+            opts=opts, scale=scale, doc=fc_doc, group=parent_group,
+            source_page_quad=source_page_quad)
 
     deliverers = {
         "text": deliver_native,
@@ -10318,6 +10655,7 @@ def _render_canonical_text_items(
             fc_doc=fc_doc,
             parent_group=parent_group,
             render_cache=svg_render_cache,
+            source_page_quad=source_page_quad,
         ),
         "geometry": lambda item, attempted, state: _deliver_text_item_svg(
             item,
@@ -10330,6 +10668,7 @@ def _render_canonical_text_items(
             fc_doc=fc_doc,
             parent_group=parent_group,
             render_cache=svg_render_cache,
+            source_page_quad=source_page_quad,
         ),
         "raster": lambda item, attempted, state: _deliver_text_item_raster(
             item,
@@ -10362,6 +10701,12 @@ def _render_canonical_text_items(
     drawing_units = int(profile.get("drawing_operations", 0) or 0)
     total_units = int(profile.get("total_units", 0) or 0)
     for item_index, item in enumerate(items):
+        if item["source_item_id"] in control_omissions:
+            # Preserve the complete roster without claiming a native object or
+            # a different text mode for a positively proven invisible control.
+            delivered_source_ids.append(item["source_item_id"])
+            text_characters_done += len(item["text"])
+            continue
         if getattr(opts, "progress_callback", None) and item_index % 25 == 0:
             _emit_progress(
                 opts,
@@ -10429,6 +10774,15 @@ def _render_canonical_text_items(
             total_units=total_units,
         )
 
+    if control_omissions:
+        if (parent_group.PDFSourceZeroInkControlsJSON != encoded
+                or _pdf_file_sha256(pdf_path) != pdf_sha256):
+            raise ValueError("original control-ink evidence changed during text delivery")
+        # Keep a separate immutable-by-report copy only after native metadata
+        # and the original PDF have both survived the complete page delivery.
+        verified_controls = dict(getattr(opts, "_verified_source_zero_ink_controls", {}) or {})
+        verified_controls.update({record["source_item_id"]: record for record in json.loads(encoded)})
+        opts._verified_source_zero_ink_controls = verified_controls
     unique_final_types = sorted(set(final_types))
     return {
         # "mixed" means two or more representations were delivered. A page on
@@ -11259,6 +11613,63 @@ def _imported_sheet_bounds(fc_doc):
         return None
     return (float(bb.XMin), float(bb.YMin), float(bb.XMax), float(bb.YMax))
 
+def _fit_import_descendant_bounds(view, roots) -> bool:
+    """Fit every visible imported child, including hosts with empty group bounds.
+
+    ViewSelection uses group view-provider bounds and can truncate a large
+    selection. A temporary eight-corner Coin node fits the complete union
+    without changing the document, visibility, or the operator's selection.
+    """
+    bounds = None
+    pending = list(roots)
+    seen = set()
+    while pending:
+        obj = pending.pop()
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        provider = getattr(obj, "ViewObject", None)
+        if provider is None or not getattr(provider, "Visibility", True):
+            continue
+        pending.extend(list(getattr(obj, "Group", ()) or ()))
+        try:
+            box = provider.getBoundingBox()
+            values = tuple(float(getattr(box, name)) for name in
+                           ("XMin", "YMin", "ZMin", "XMax", "YMax", "ZMax"))
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            continue
+        if not all(math.isfinite(value) for value in values):
+            continue
+        if any(values[index] > values[index + 3] for index in range(3)):
+            continue
+        if bounds is None:
+            bounds = values
+        else:
+            bounds = tuple(min(bounds[i], values[i]) for i in range(3)) + tuple(
+                max(bounds[i], values[i]) for i in range(3, 6)
+            )
+    if bounds is None or not any(bounds[i] < bounds[i + 3] for i in range(3)):
+        return False
+    try:
+        from pivy import coin
+
+        width, height = view.getSize()
+        if width <= 0 or height <= 0:
+            return False
+        corners = [(x, y, z) for x in (bounds[0], bounds[3])
+                   for y in (bounds[1], bounds[4]) for z in (bounds[2], bounds[5])]
+        coordinates = coin.SoCoordinate3()
+        coordinates.point.setValues(0, len(corners), corners)
+        points = coin.SoPointSet()
+        points.numPoints = len(corners)
+        node = coin.SoSeparator()
+        node.addChild(coordinates)
+        node.addChild(points)
+        view.getCameraNode().viewAll(node, coin.SbViewportRegion(width, height), 1.1)
+        return True
+    except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+
 
 def _autofit_import_view(fc_doc) -> None:
     """Frame the viewport on imported PDF geometry, not unrelated document content."""
@@ -11290,7 +11701,17 @@ def _autofit_import_view(fc_doc) -> None:
         prior_sel = []
 
     try:
-        if roots:
+        # Fit in the final orientation. A later fitAll would replace the
+        # selected-sheet bounds with unrelated objects elsewhere in the document.
+        try:
+            # viewTop() restores the navigation camera. Orthographic has to
+            # follow it, or the sheet opens as a perspective orbit.
+            view.viewTop()
+            view.setCameraType("Orthographic")
+        except (AttributeError, RuntimeError):
+            pass
+        selected_fit = _fit_import_descendant_bounds(view, roots)
+        if roots and not selected_fit:
             try:
                 Gui.Selection.clearSelection()
             except (AttributeError, RuntimeError):
@@ -11301,15 +11722,28 @@ def _autofit_import_view(fc_doc) -> None:
                 except (AttributeError, RuntimeError):
                     pass
             try:
-                Gui.SendMsgToActiveView("ViewSelection")
+                selected_names = {
+                    getattr(obj, "Name", "") for obj in Gui.Selection.getSelection()
+                }
+                if all(obj.Name in selected_names for obj in roots):
+                    Gui.SendMsgToActiveView("ViewSelection")
+                    selected_fit = True
             except (AttributeError, RuntimeError):
                 pass
 
-        try:
-            from PDFVectorImporter.sheet_camera import apply_straight_on_view
-        except ImportError:
-            from sheet_camera import apply_straight_on_view
-        apply_straight_on_view(view, _imported_sheet_bounds(fc_doc))
+        if selected_fit:
+            # viewTop() puts the navigation camera back, often in perspective.
+            # The descendant fit already framed the sheet; lock the projection.
+            try:
+                view.setCameraType("Orthographic")
+            except (AttributeError, RuntimeError):
+                pass
+        else:
+            try:
+                from PDFVectorImporter.sheet_camera import apply_straight_on_view
+            except ImportError:
+                from sheet_camera import apply_straight_on_view
+            apply_straight_on_view(view, _imported_sheet_bounds(fc_doc))
     finally:
         try:
             Gui.Selection.clearSelection()
@@ -12096,9 +12530,10 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             _batch_idx[parent_name] = idx
             stroke_rgb, fill_rgb, width, dashes = _batch_styles.get(key, (None, None, None, None))
             try:
-                compound = Part.makeCompound(shapes)
+                compound = _require_valid_drawing_shape(Part.makeCompound(shapes), "compound batch")
                 obj = fc_doc.addObject("Part::Feature", f"Batch_{idx}")
                 obj.Shape = compound
+                _require_valid_drawing_shape(obj.Shape, "stored compound batch")
                 _apply_style(obj, stroke_rgb, fill_rgb, width, dashes, opts)
                 parent.addObject(obj)
                 obj_count += 1
@@ -12109,6 +12544,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     try:
                         obj = fc_doc.addObject("Part::Feature", "Wire")
                         obj.Shape = shp
+                        _require_valid_drawing_shape(obj.Shape, "stored batch member")
                         _apply_style(obj, stroke_rgb, fill_rgb, width, dashes, opts)
                         parent.addObject(obj)
                         obj_count += 1
@@ -12119,10 +12555,12 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
     def _add_to_batch(shape, parent, stroke_rgb, fill_rgb, width, dashes):
         """Add a shape to the batch or create immediately if batching disabled."""
         nonlocal obj_count
+        _require_valid_drawing_shape(shape, "batch input")
         if not _batch_size or path_group.get("seqno") in image_order_strokes:
             # No batching — original behavior
             obj = fc_doc.addObject("Part::Feature", "Wire")
             obj.Shape = shape
+            _require_valid_drawing_shape(obj.Shape, "stored drawing stroke")
             _bind_image_order_stroke(obj, path_group.get("seqno"))
             _apply_style(obj, stroke_rgb, fill_rgb, width, dashes, opts)
             parent.addObject(obj)
@@ -12294,10 +12732,27 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     opts, page_num, [_host_clip_fill_issue(path_group, exc, superseded)])
             continue
 
+        # Cancel only a proved zero-area retraced fill bridge. Keep the source
+        # path dictionary intact and construct its retained boundary exactly.
+        source_fill_proof = None
+        source_open_stroke_edges = None
+        if ((opts.hatch_to_faces or (opts.make_faces and close_path))
+                and path_group.get("seqno") not in image_order_strokes):
+            items, source_fill_proof = _source_fill_without_retraced_bridge(path_group)
+            if source_fill_proof is None and opts.hatch_to_faces:
+                items, source_fill_proof = _source_implicit_fill_boundary(path_group)
+                if source_fill_proof is not None and path_group.get("type") == "fs":
+                    source_open_stroke_edges = _source_fill_boundary_edges(
+                        path_group["items"], page_h, opts, scale)
+        preserve_source_edges = bool(path_group.get("bcs_preserve_source_edges") or source_fill_proof)
+
         # Build edges per sub-path
         current_pt: Optional[Vector] = None
         sub_edges: List = []
         wires_edges: List[List] = []
+        if source_fill_proof is not None:
+            # Closure was proved in source space. Never invent a closing edge.
+            wires_edges.append((_source_fill_boundary_edges(items, page_h, opts, scale), close_path))
 
         def flush_sub(close_flag: bool, _wires=wires_edges):
             nonlocal sub_edges, current_pt
@@ -12306,7 +12761,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             sub_edges = []
             current_pt = None
 
-        for item in items:
+        for item in (() if source_fill_proof is not None else items):
             kind = item[0]
             data = item[1:]
 
@@ -12369,7 +12824,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     p2 = _to_fc((x2, y2), page_h, opts, scale)
                     p3 = _to_fc((x3, y3), page_h, opts, scale)
 
-                if path_group.get("bcs_preserve_source_edges"):
+                if preserve_source_edges:
                     # Outlines beside exact clip masks must retain their
                     # actual cubic boundary, rather than a fitted circle or
                     # tessellation that can expose slivers around the fill.
@@ -12483,7 +12938,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         # monster PDFs are almost certainly contour lines or map features, not
         # arcs from a CAD exporter.  The arc fitter still runs; it just skips
         # chains that are obviously not arc candidates.
-        if opts.detect_arcs and not path_group.get("bcs_preserve_source_edges"):
+        if opts.detect_arcs and not preserve_source_edges:
             processed = []
             for edges, is_closed in wires_edges:
                 if _is_heavy and len(edges) > 200:
@@ -12498,7 +12953,8 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
 
         # Create FreeCAD objects from collected edges
         for edges, is_closed in wires_edges:
-            want_face = ((opts.hatch_to_faces and fill is not None)
+            want_face = (source_fill_proof is not None
+                         or (opts.hatch_to_faces and fill is not None)
                          or (opts.make_faces and is_closed))
             if path_group.get("seqno") in image_order_strokes:
                 # Source-qualified later paint is a stroke; an invisible fs
@@ -12516,16 +12972,31 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                                 closer = Part.LineSegment(pN, p0).toShape()
                                 wire = Part.Wire(edges + [closer])
                     _add_to_batch(wire, parent, stroke_rgb, fill_rgb, width, dashes)
-                except (RuntimeError, ValueError, TypeError, AttributeError):
-                    pass
+                except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
+                    raise DrawingGeometryFailure("Native drawing stroke construction failed") from exc
             else:
                 # Faces and non-batchable shapes: create individually
-                obj = _make_shape_obj(edges, is_closed, make_face=want_face, fc_doc=fc_doc)
+                obj = _make_shape_obj(edges, False if source_fill_proof is not None else is_closed,
+                                      make_face=want_face, fc_doc=fc_doc)
                 if obj is not None:
+                    if source_fill_proof is not None:
+                        _attach_source_fill_boundary(obj, source_fill_proof, page_num, page_h,
+                                                     opts, scale, pdf_path)
                     _bind_image_order_stroke(obj, path_group.get("seqno"))
-                    _apply_style(obj, stroke_rgb, fill_rgb, width, dashes, opts)
+                    implicit_fill = (source_fill_proof is not None
+                                     and source_fill_proof["policy"] == "close_connected_pdf_fill")
+                    _apply_style(obj, None if implicit_fill else stroke_rgb, fill_rgb,
+                                 None if implicit_fill else width, None if implicit_fill else dashes, opts)
                     parent.addObject(obj)
                     obj_count += 1
+                    if source_open_stroke_edges is not None:
+                        stroke_obj = _make_shape_obj(source_open_stroke_edges, False, False, fc_doc)
+                        stroke_proof = dict(source_fill_proof, policy="retain_open_pdf_stroke")
+                        _attach_source_fill_boundary(stroke_obj, stroke_proof, page_num, page_h,
+                                                     opts, scale, pdf_path)
+                        _apply_style(stroke_obj, stroke_rgb, None, width, dashes, opts)
+                        parent.addObject(stroke_obj)
+                        obj_count += 1
                     try:
                         face_area = float(getattr(obj.Shape, "Area", 0.0) or 0.0)
                     except (AttributeError, TypeError, ValueError):
@@ -13887,6 +14358,15 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             fc_doc, baseline_object_ids, baseline_object_names
         )
         _restore_page_result_telemetry(opts, invocation_telemetry_snapshot)
+        if isinstance(failure, DrawingGeometryFailure):
+            opts.import_status = "failed"
+            try:
+                _write_terminal_representation_failure_report(
+                    pdf_path=pdf_path, opts=opts, total_pages=total_pages,
+                    pages_imported=len(previously_certified_pages),
+                    elapsed_ms=(time.perf_counter() - t_import_start) * 1000.0, failure=failure)
+            except (OSError, RuntimeError, TypeError, ValueError, ImportError) as report_error:
+                _err("Terminal geometry failure report could not be written: %s" % report_error)
         if not rollback["cleanup_complete"]:
             raise RuntimeError(
                 "Import failed and rollback was incomplete: %s" % rollback

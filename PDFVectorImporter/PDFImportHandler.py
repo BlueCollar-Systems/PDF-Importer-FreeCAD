@@ -151,13 +151,7 @@ def _import_with_dialog(filename):
             return
         FreeCAD.Console.PrintMessage("PDF import complete.\n")
 
-        # Fit view
-        try:
-            import FreeCADGui
-            if FreeCADGui.ActiveDocument and FreeCADGui.ActiveDocument.ActiveView:
-                FreeCADGui.ActiveDocument.ActiveView.fitAll()
-        except (ImportError, AttributeError, RuntimeError):
-            pass
+        # Keep the core's final top-orthographic fit to the imported sheets.
     except (RuntimeError, ValueError, TypeError, OSError, AttributeError, ImportError) as e:
         from pdfcadcore.fitz_loader import PdfOpenError
 

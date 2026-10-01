@@ -111,7 +111,7 @@ Setup builds from this repo resolve/remove Mod junctions before copying files an
 Release ZIPs and `FreeCAD-PDF-Importer-Setup_vX.Y.Z.exe` are built with a
 private ABI-selected runtime under:
 
-`…\Mod\PDFVectorImporter\src\lib\common` (PyMuPDF 1.28.0)
+`…\Mod\PDFVectorImporter\src\lib\common` (PyMuPDF 1.28.2)
 
 `…\Mod\PDFVectorImporter\src\lib\cp310` or `cp311` (fontTools 4.63.0)
 
@@ -125,7 +125,7 @@ commit-bound, so the release builder regenerates them from three hashed locks.
 Manual fallback install:
 
 ```powershell
-& "C:\Program Files\FreeCAD 1.1\bin\python.exe" -m pip install --user "PyMuPDF>=1.24,<2.0" "fonttools>=4.50,<5.0"
+& "C:\Program Files\FreeCAD 1.1\bin\python.exe" -m pip install --user "PyMuPDF>=1.28.2,<2.0" "fonttools>=4.50,<5.0"
 ```
 
 (Adjust `python.exe` for your FreeCAD version.)

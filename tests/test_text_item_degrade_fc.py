@@ -554,7 +554,7 @@ def test_a_sheet_with_no_degraded_item_stays_ready_and_additive_only(tmp_path):
 
 
 def test_report_shape_is_unchanged_apart_from_additive_keys(tmp_path):
-    """A sheet that never degrades must be byte-identical bar the new keys."""
+    """Source-count forwarding changes only its value and the delivery ledger."""
 
     def build(with_spans):
         opts = core.ImportOptions(text_mode="text", import_text=True)
@@ -575,8 +575,10 @@ def test_report_shape_is_unchanged_apart_from_additive_keys(tmp_path):
     without = build(False)
     with_spans = build(True)
     added = set(with_spans["extra"]) - set(without["extra"])
-    assert added == {"text_source_spans", "text_representation_delivery"}
-    for key in without["extra"]:
+    assert added == {"text_representation_delivery"}
+    assert without["extra"]["text_source_spans"] == 0
+    assert with_spans["extra"]["text_source_spans"] == 2
+    for key in set(without["extra"]) - {"text_source_spans"}:
         assert with_spans["extra"][key] == without["extra"][key]
     assert with_spans["result"] == without["result"]
 

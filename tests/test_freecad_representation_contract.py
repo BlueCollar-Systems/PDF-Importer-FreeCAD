@@ -738,7 +738,7 @@ def test_source_items_preserve_original_identity_and_transform():
                     {
                         "dir": (0, 1),
                         "spans": [
-                            {"text": "\t"},
+                            {**source_span, "text": "\t"},
                             source_span,
                         ],
                     },
@@ -751,8 +751,10 @@ def test_source_items_preserve_original_identity_and_transform():
         tdict, 2, "A" * 64, " 3D Text "
     ))
 
-    assert len(items) == 1
-    item = items[0]
+    assert len(items) == 2
+    assert items[0]["text"] == "\t"
+    assert items[0]["source_item_id"] == "p2:b1:l1:s0"
+    item = items[1]
     assert item["importer_identity"] == core.FREECAD_TEXT_IMPORTER_IDENTITY
     assert item["pdf_sha256"] == "a" * 64
     assert item["page_number"] == 2
@@ -1750,8 +1752,9 @@ def test_verified_item_3d_result_has_complete_ids_and_evidence(monkeypatch):
     assert set(normalized["support_entity_ids"]) == {support.Name, calibrated.Name}
 
 
+@pytest.mark.parametrize("clip_failure", [False, True])
 def test_verified_item_3d_prefers_one_exact_compound_with_editable_metadata(
-    monkeypatch,
+    monkeypatch, clip_failure,
 ):
     document, draft, group = _install_host(monkeypatch)
     item = _canonical_3d_item("TEXT")
@@ -1800,6 +1803,22 @@ def test_verified_item_3d_prefers_one_exact_compound_with_editable_metadata(
         core, "_create_verified_compound_text3d_entity", create_compound
     )
 
+    if clip_failure:
+        import PDFPageTextClip
+        def fail_clip(*_args, **_kwargs):
+            raise ValueError("native clip did not preserve ink")
+        monkeypatch.setattr(PDFPageTextClip, "clip_native_text_shape", fail_clip)
+        with pytest.raises(core.TextRepresentationFailure) as caught:
+            core._deliver_text_item_3d(
+                item, "3d_text", core.ImportOptions(text_mode="3d_text"),
+                text_group=group, page_h=100., scale=1.,
+                source_page_quad=[(0,0),(100,0),(100,100),(0,100)])
+        assert caught.value.attempt["reason"] == "source_page_text_clip_failed"
+        assert caught.value.attempt["cleanup_complete"]
+        assert document.Objects == []
+        assert draft.calls == []
+        return
+
     result = core._deliver_text_item_3d(
         item,
         "3d_text",
@@ -1825,3 +1844,25 @@ def test_verified_item_3d_prefers_one_exact_compound_with_editable_metadata(
     assert host.PDFFontFileSHA256 == resolution[1][0]["sha256"]
     assert draft.calls == []
     assert draft.label_calls == []
+
+
+def test_legacy_3d_crossing_page_is_not_accepted_without_a_persistent_clip(monkeypatch):
+    import PDFPageTextClip
+    document, draft, group = _install_host(monkeypatch)
+    item = _canonical_3d_item("TEXT")
+    monkeypatch.setattr(core, "_resolve_shapestring_font_path_with_evidence",
+                        lambda *_args, **_kwargs: _found_font_resolution(item))
+    checked = []
+    def reject_parametric(host, *_args, **_kwargs):
+        checked.append(host.TypeId)
+        raise ValueError("source page clipping requires a persistent exact text feature")
+    monkeypatch.setattr(PDFPageTextClip, "clip_native_text_shape", reject_parametric)
+    with pytest.raises(core.TextRepresentationFailure) as caught:
+        core._deliver_text_item_3d(
+            item, "3d_text", core.ImportOptions(text_mode="3d_text"),
+            text_group=group, page_h=100., scale=1.,
+            source_page_quad=[(0,0),(100,0),(100,100),(0,100)])
+    assert checked == ["Part::Extrusion"]
+    assert caught.value.attempt["outcome"] == "failed"
+    assert caught.value.attempt["cleanup_complete"]
+    assert document.Objects == []

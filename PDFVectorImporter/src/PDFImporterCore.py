@@ -1374,6 +1374,27 @@ def _merge_text_entity_info(
     return merged
 
 
+def _complete_verified_control_coverage(opts, extra, source_ids, source_count):
+    """Recognize an entirely invisible roster without inventing text entities."""
+    records = extra.get("source_zero_ink_controls")
+    verified = getattr(opts, "_verified_source_zero_ink_controls", {})
+    if (not source_ids or source_count != len(source_ids)
+            or extra.get("text_source_spans") != source_count
+            or not isinstance(records, list) or len(records) != source_count
+            or not isinstance(verified, dict) or set(verified) != source_ids):
+        return False
+    by_id = {}
+    for record in records:
+        if not isinstance(record, dict):
+            return False
+        source_id = record.get("source_item_id")
+        if (not isinstance(source_id, str) or source_id in by_id
+                or source_id not in verified or record != verified[source_id]):
+            return False
+        by_id[source_id] = record
+    return set(by_id) == source_ids
+
+
 def write_import_report(
     *,
     pdf_path: str,
@@ -1804,6 +1825,7 @@ def write_import_report(
         pdf_engine_version=_pymupdf_version(),
         import_text=bool(opts.import_text),
         text_mode=str(opts.text_mode or "3d_text"),
+        text_source_spans=text_source_spans,
         text_fallback=text_fallback,
         peak_mb=sample_process_mb(),
         performance_phases=phases or None,
@@ -1823,7 +1845,28 @@ def write_import_report(
         extra=extra,
     )
 
-    if host_font_summary["note"] or text_degrade_note:
+    control_only_report = (
+        text_count == 0 and reported_source_roster_valid
+        and not text_degrade_warnings and not session_degraded_pages
+        and _complete_verified_control_coverage(
+            opts, extra, reported_source_item_ids, reported_source_item_count)
+        and all(record["pdf_sha256"] == report.input.get("sha256")
+                for record in extra["source_zero_ink_controls"])
+    )
+    if control_only_report:
+        # The canonical source count remains intact. Only the generic missing
+        # entity warning is inapplicable when every item has an unchanged,
+        # positively verified original-program no-ink receipt from this run.
+        diagnostics = report.extra.get("diagnostics", {})
+        diagnostics["signals"] = [signal for signal in diagnostics.get("signals", [])
+                                  if signal != "source_text_seen_but_no_text_entities_created"]
+        diagnostics["recommended_actions"] = [
+            action for action in diagnostics.get("recommended_actions", [])
+            if action != ("Treat missing delivered text entities as a failed import; inspect the "
+                          "item attempt history without changing the requested representation.")
+        ]
+
+    if host_font_summary["note"] or text_degrade_note or control_only_report:
         # The shared core overwrites extra["font_substitution_note"] from its
         # PDF audit inside build_import_report, so the host note is appended
         # here and the human summary is rebuilt to carry it.
@@ -4336,7 +4379,8 @@ def _iter_text_source_items(
                 source_text = source_span.get("text", "")
                 if not isinstance(source_text, str):
                     raise ValueError("text span content must be a string")
-                if not source_text or source_text.isspace():
+                is_control = bool(source_text) and all(ord(char) < 32 for char in source_text)
+                if not source_text or (source_text.isspace() and not is_control):
                     continue
 
                 source_font = source_span.get("font", "")
@@ -8195,6 +8239,8 @@ def _deliver_text_item_3d(
     page_h: float,
     scale: float,
     raw_source_dict=None,
+    source_page_quad=None,
+    source_font_binding=None,
 ) -> Dict[str, Any]:
     """Deliver and verify exactly one canonical 3D Text source item."""
     try:
@@ -8421,12 +8467,27 @@ def _deliver_text_item_3d(
     )
 
     try:
-        font_path, source_results = _resolve_shapestring_font_path_with_evidence(
-            font_identity["raw_name"],
-            opts,
-            pdf_sha256=pdf_sha256,
-            page_number=page_number,
-        )
+        font_path = None
+        if source_font_binding is not None:
+            from PDFEmbeddedFonts import verify_bound_item_font
+            font_path = verify_bound_item_font(bound_item, source_font_binding)
+        if font_path is not None:
+            source_results = [_font_source_result(
+                "embedded_font", "found", font_identity,
+                path=font_path, sha256=source_font_binding["sha256"],
+                pdf_sha256=pdf_sha256, page_number=page_number, staging_complete=True,
+                source_item_id=source_item_id,
+                source_program_sha256=source_font_binding["source_sha256"],
+                source_origin=source_font_binding["source_origin"],
+                source_binding_method=source_font_binding["source_binding_method"],
+                source_program_candidates=source_font_binding["source_program_candidates"],
+                original_characters=source_font_binding["original_characters"],
+            )]
+        else:
+            font_path, source_results = _resolve_shapestring_font_path_with_evidence(
+                font_identity["raw_name"], opts,
+                pdf_sha256=pdf_sha256, page_number=page_number,
+            )
         source_results = copy.deepcopy(source_results)
     except Exception as exc:
         terminal_failure(
@@ -8813,6 +8874,16 @@ def _deliver_text_item_3d(
         ):
             raise RuntimeError("compound 3D Text host evidence could not be verified")
 
+        page_clip = None
+        if source_page_quad is not None:
+            stage = "source_page_text_clip"
+            from PDFPageTextClip import clip_native_text_shape
+            page_clip = clip_native_text_shape(
+                compound_entity, source_page_quad, part=Part, vector=Vector)
+            if page_clip is not None:
+                shape = compound_entity.Shape
+                solid_count = _shape_solid_count(shape)
+                volume = float(shape.Volume) if not shape.isNull() else 0.0
         _remember_native_text_object(opts, compound_entity)
         return {
             "source_item_id": source_item_id,
@@ -8853,6 +8924,7 @@ def _deliver_text_item_3d(
                 "view_style_verified": style_verification
                 == "gui_view_and_app_metadata",
                 "source_character_layout": source_character_layout,
+                "source_page_clip": page_clip,
                 "advance_verification": ("original_source_character_origins_and_font_matrix"
                     if source_character_layout is not None else "whole_span_font_pen_advance"),
             },
@@ -8886,6 +8958,8 @@ def _deliver_text_item_3d(
             "font_path": font_path,
             "font_source": (font_source_result or {}).get("source"),
         }
+        if stage == "source_page_text_clip":
+            terminal_failure("source_page_text_clip_failed", compound_failure_evidence)
         if source_character_layout is not None:
             terminal_failure("positioned_3d_text_failed", compound_failure_evidence)
         if owned:
@@ -9084,6 +9158,12 @@ def _deliver_text_item_3d(
             > max(0.05, target_advance_fc * 0.03)
         ):
             raise RuntimeError("3D Text host evidence could not be verified")
+        if source_page_quad is not None:
+            stage = "source_page_text_clip"
+            from PDFPageTextClip import clip_native_text_shape
+            # Contained native ink needs no mutation. A crossing parametric
+            # extrusion must not be accepted through an unclipped legacy path.
+            clip_native_text_shape(extrusion, source_page_quad, part=Part, vector=Vector)
     except Text3DExactFontOutlinesUnavailable as exc:
         shapestring_zero_outline_evidence = dict(exc.evidence)
         if compound_zero_outline_evidence is None:
@@ -9674,6 +9754,7 @@ def _deliver_text_item_svg(
     fc_doc,
     parent_group,
     render_cache: Optional[Dict[str, Any]] = None,
+    source_page_quad=None,
 ) -> Dict[str, Any]:
     """Deliver one canonical item as verified SVG Glyphs or raw Geometry."""
     try:
@@ -10104,6 +10185,16 @@ def _deliver_text_item_svg(
                         from PDFStyleRestore import has_source_glyph_fill
                     if has_source_glyph_fill(host_obj):
                         _apply_text3d_display_style(host_obj)
+        if source_page_quad is not None:
+            from PDFPageTextClip import clip_native_text_shape
+            page_clips = []
+            for host_obj in delivered_objects:
+                proof = clip_native_text_shape(
+                    host_obj, source_page_quad, part=Part, vector=Vector)
+                if proof is not None:
+                    page_clips.append({"entity_id": _host_object_id(host_obj), **proof})
+            if page_clips:
+                attempt["evidence"]["source_page_clips"] = page_clips
     except Exception as exc:
         result_summary = {
             "exception": "%s: %s" % (exc.__class__.__name__, exc),
@@ -10121,15 +10212,16 @@ def _deliver_text_item_svg(
     return copy.deepcopy(attempt)
 
 
-def _bind_native_source_layout(item, delivered, raw_dict, *, opts, scale, doc, group):
+def _bind_native_source_layout(item, delivered, raw_dict, *, opts, scale, doc, group,
+                               source_page_quad=None):
     """Complete native delivery or roll back every object owned by the attempt."""
     created_ids = list(delivered["created_entity_ids"])
     owned = [obj for name in created_ids if (obj := doc.getObject(name)) is not None]
     try:
         try:
-            from .PDFTextLayout import build_source_affine_layout, persist_source_layout
+            from .PDFTextLayout import bind_source_page_clip, build_source_affine_layout, persist_source_layout
         except ImportError:
-            from PDFTextLayout import build_source_affine_layout, persist_source_layout
+            from PDFTextLayout import bind_source_page_clip, build_source_affine_layout, persist_source_layout
         evidence = delivered["evidence"]
         layout = build_source_affine_layout(item, raw_dict,
             scale=scale, font_size=evidence["font_size"], font_name=evidence["font_name"],
@@ -10137,7 +10229,8 @@ def _bind_native_source_layout(item, delivered, raw_dict, *, opts, scale, doc, g
             page_matrix=_page_matrix_values(opts))
         if len(owned) != len(created_ids):
             raise RuntimeError("Native source-layout object disappeared")
-        installed = [persist_source_layout(host, layout) for host in owned]
+        installed = [persist_source_layout(host, bind_source_page_clip(layout, host, source_page_quad)
+                     if source_page_quad is not None else layout) for host in owned]
         for host, proof in zip(owned, installed, strict=True):
             if getattr(host, "ViewObject", None) is not None and not proof.get("native_nodes_installed"):
                 raise RuntimeError("Native source-layout display was not installed")
@@ -10182,6 +10275,14 @@ def _render_canonical_text_items(
 ) -> Dict[str, Any]:
     """Deliver raw PDF spans through the finite item representation contract."""
     requested = _normalize_requested_text_type(str(opts.text_mode or ""))
+    source_page_quad = None
+    if fitz is not None and isinstance(page, fitz.Page):
+        source_page_rect = page.rect * page.derotation_matrix
+        source_page_quad = []
+        for point in (source_page_rect.tl, source_page_rect.tr,
+                      source_page_rect.br, source_page_rect.bl):
+            model_point = _to_fc((point.x, point.y), page_h, opts, scale)
+            source_page_quad.append((float(model_point.x), float(model_point.y)))
     source_dict = raw_tdict if raw_tdict is not None else _page_text_dict(page, opts)
     items = list(
         _iter_text_source_items(source_dict, int(page_num), pdf_sha256, requested)
@@ -10203,7 +10304,27 @@ def _render_canonical_text_items(
         run_report_extra.get("text_source_spans", 0) or 0
     ) + len(items)
 
+    control_omissions = {}
+    if any(item["text"] and all(ord(char) < 32 for char in item["text"]) for item in items):
+        from PDFEmbeddedFonts import original_control_omission_records
+        if _pdf_file_sha256(pdf_path) != pdf_sha256:
+            raise ValueError("original PDF changed before control-ink verification")
+        control_omissions = original_control_omission_records(page, items)
+        if control_omissions:
+            encoded = json.dumps(list(control_omissions.values()), sort_keys=True,
+                                 separators=(",", ":"), allow_nan=False)
+            property_name = "PDFSourceZeroInkControlsJSON"
+            if property_name not in parent_group.PropertiesList:
+                parent_group.addProperty("App::PropertyString", property_name, "PDF Source")
+            setattr(parent_group, property_name, encoded)
+            if getattr(parent_group, property_name) != encoded:
+                raise ValueError("host did not preserve original control-ink proof")
+            if _pdf_file_sha256(pdf_path) != pdf_sha256:
+                raise ValueError("original PDF changed during control-ink verification")
+            run_report_extra.setdefault("source_zero_ink_controls", []).extend(json.loads(encoded))
+
     font_stage_complete = False
+    bound_page_fonts = None
     svg_render_cache: Dict[str, Any] = {
         "source_snapshot_cache": getattr(
             opts, "_svg_source_snapshot_cache", {}
@@ -10252,7 +10373,7 @@ def _render_canonical_text_items(
         return read_source_character_geometry(page)
 
     def deliver_3d(item, attempted, state):
-        nonlocal font_stage_complete, source_character_dict, source_3d_character_dict
+        nonlocal font_stage_complete, source_character_dict, source_3d_character_dict, bound_page_fonts
         if source_3d_character_dict is None and fitz is not None and isinstance(page, fitz.Page):
             source_3d_character_dict = page_text_setup(
                 "source_character_geometry",
@@ -10276,6 +10397,12 @@ def _render_canonical_text_items(
                 ),
             )
             font_stage_complete = True
+        if bound_page_fonts is None and fitz is not None and isinstance(page, fitz.Page):
+            from PDFEmbeddedFonts import stage_bound_page_fonts
+            bound_page_fonts = page_text_setup(
+                "original_character_font_programs", item, attempted,
+                lambda: stage_bound_page_fonts(page, items, _shapestring_font_cache_dir()),
+            )
         source_arguments = ({"raw_source_dict": source_3d_character_dict}
                             if source_3d_character_dict is not None else {})
         return _deliver_text_item_3d(
@@ -10286,6 +10413,9 @@ def _render_canonical_text_items(
             page_h=page_h,
             scale=scale,
             **source_arguments,
+            source_page_quad=source_page_quad,
+            source_font_binding=(bound_page_fonts[item["source_item_id"]]
+                                 if bound_page_fonts is not None else None),
         )
 
     def deliver_native(item, attempted, state):
@@ -10301,7 +10431,8 @@ def _render_canonical_text_items(
         delivered = _deliver_text_item_native(item, attempted, state,
             text_group=parent_group, page_h=page_h, scale=scale)
         return _bind_native_source_layout(item, delivered, source_character_dict,
-            opts=opts, scale=scale, doc=fc_doc, group=parent_group)
+            opts=opts, scale=scale, doc=fc_doc, group=parent_group,
+            source_page_quad=source_page_quad)
 
     deliverers = {
         "text": deliver_native,
@@ -10318,6 +10449,7 @@ def _render_canonical_text_items(
             fc_doc=fc_doc,
             parent_group=parent_group,
             render_cache=svg_render_cache,
+            source_page_quad=source_page_quad,
         ),
         "geometry": lambda item, attempted, state: _deliver_text_item_svg(
             item,
@@ -10330,6 +10462,7 @@ def _render_canonical_text_items(
             fc_doc=fc_doc,
             parent_group=parent_group,
             render_cache=svg_render_cache,
+            source_page_quad=source_page_quad,
         ),
         "raster": lambda item, attempted, state: _deliver_text_item_raster(
             item,
@@ -10362,6 +10495,12 @@ def _render_canonical_text_items(
     drawing_units = int(profile.get("drawing_operations", 0) or 0)
     total_units = int(profile.get("total_units", 0) or 0)
     for item_index, item in enumerate(items):
+        if item["source_item_id"] in control_omissions:
+            # Preserve the complete roster without claiming a native object or
+            # a different text mode for a positively proven invisible control.
+            delivered_source_ids.append(item["source_item_id"])
+            text_characters_done += len(item["text"])
+            continue
         if getattr(opts, "progress_callback", None) and item_index % 25 == 0:
             _emit_progress(
                 opts,
@@ -10429,6 +10568,15 @@ def _render_canonical_text_items(
             total_units=total_units,
         )
 
+    if control_omissions:
+        if (parent_group.PDFSourceZeroInkControlsJSON != encoded
+                or _pdf_file_sha256(pdf_path) != pdf_sha256):
+            raise ValueError("original control-ink evidence changed during text delivery")
+        # Keep a separate immutable-by-report copy only after native metadata
+        # and the original PDF have both survived the complete page delivery.
+        verified_controls = dict(getattr(opts, "_verified_source_zero_ink_controls", {}) or {})
+        verified_controls.update({record["source_item_id"]: record for record in json.loads(encoded)})
+        opts._verified_source_zero_ink_controls = verified_controls
     unique_final_types = sorted(set(final_types))
     return {
         # "mixed" means two or more representations were delivered. A page on
@@ -11224,6 +11372,64 @@ def _pdf_import_root_objects(fc_doc):
     return roots
 
 
+def _fit_import_descendant_bounds(view, roots) -> bool:
+    """Fit every visible imported child, including hosts with empty group bounds.
+
+    ViewSelection uses group view-provider bounds and can truncate a large
+    selection. A temporary eight-corner Coin node fits the complete union
+    without changing the document, visibility, or the operator's selection.
+    """
+    bounds = None
+    pending = list(roots)
+    seen = set()
+    while pending:
+        obj = pending.pop()
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        provider = getattr(obj, "ViewObject", None)
+        if provider is None or not getattr(provider, "Visibility", True):
+            continue
+        pending.extend(list(getattr(obj, "Group", ()) or ()))
+        try:
+            box = provider.getBoundingBox()
+            values = tuple(float(getattr(box, name)) for name in
+                           ("XMin", "YMin", "ZMin", "XMax", "YMax", "ZMax"))
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            continue
+        if not all(math.isfinite(value) for value in values):
+            continue
+        if any(values[index] > values[index + 3] for index in range(3)):
+            continue
+        if bounds is None:
+            bounds = values
+        else:
+            bounds = tuple(min(bounds[i], values[i]) for i in range(3)) + tuple(
+                max(bounds[i], values[i]) for i in range(3, 6)
+            )
+    if bounds is None or not any(bounds[i] < bounds[i + 3] for i in range(3)):
+        return False
+    try:
+        from pivy import coin
+
+        width, height = view.getSize()
+        if width <= 0 or height <= 0:
+            return False
+        corners = [(x, y, z) for x in (bounds[0], bounds[3])
+                   for y in (bounds[1], bounds[4]) for z in (bounds[2], bounds[5])]
+        coordinates = coin.SoCoordinate3()
+        coordinates.point.setValues(0, len(corners), corners)
+        points = coin.SoPointSet()
+        points.numPoints = len(corners)
+        node = coin.SoSeparator()
+        node.addChild(coordinates)
+        node.addChild(points)
+        view.getCameraNode().viewAll(node, coin.SbViewportRegion(width, height), 1.1)
+        return True
+    except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+
+
 def _autofit_import_view(fc_doc) -> None:
     """Frame the viewport on imported PDF geometry, not unrelated document content."""
     try:
@@ -11254,7 +11460,15 @@ def _autofit_import_view(fc_doc) -> None:
         prior_sel = []
 
     try:
-        if roots:
+        # Fit in the final orientation. A later fitAll would replace the
+        # selected-sheet bounds with unrelated objects elsewhere in the document.
+        try:
+            view.setCameraType("Orthographic")
+            view.viewTop()
+        except (AttributeError, RuntimeError):
+            pass
+        selected_fit = _fit_import_descendant_bounds(view, roots)
+        if roots and not selected_fit:
             try:
                 Gui.Selection.clearSelection()
             except (AttributeError, RuntimeError):
@@ -11265,16 +11479,20 @@ def _autofit_import_view(fc_doc) -> None:
                 except (AttributeError, RuntimeError):
                     pass
             try:
-                Gui.SendMsgToActiveView("ViewSelection")
+                selected_names = {
+                    getattr(obj, "Name", "") for obj in Gui.Selection.getSelection()
+                }
+                if all(obj.Name in selected_names for obj in roots):
+                    Gui.SendMsgToActiveView("ViewSelection")
+                    selected_fit = True
             except (AttributeError, RuntimeError):
                 pass
 
-        try:
-            view.setCameraType("Orthographic")
-            view.viewTop()
-            view.fitAll()
-        except (AttributeError, RuntimeError):
-            pass
+        if not selected_fit:
+            try:
+                view.fitAll()
+            except (AttributeError, RuntimeError):
+                pass
     finally:
         try:
             Gui.Selection.clearSelection()

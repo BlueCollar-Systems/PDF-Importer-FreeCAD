@@ -163,6 +163,119 @@ def test_original_rectangular_clip_needs_all_contour_points_inside():
         fill.verify_clip_containment([rectangle(1.9, 2.1, 3.9, 3.9)], clips)
 
 
+@pytest.mark.parametrize("path", [
+    "M0 0H10V10H0Z",
+    "M0 0L10 0L10 10L0 10Z M0 0",
+    "M0,0 10,0 10,10 0,10Z M200 300",
+    "M0 0V10H10V0Z M-2 -3",
+    "M0 0L10 0L10 10L0 10L0 0Z",
+    "M0 0L0 0L10 0L10 10L0 10Z",
+])
+def test_cairo_rectangle_serializations_preserve_transformed_clip(path):
+    value = svg(
+        '<g clip-path="url(#c)"><use href="#glyph-1"/></g>',
+        '<clipPath id="c"><path d="' + path
+        + '" transform="matrix(-2,1,1,3,20,30)"/></clipPath>',
+    )
+    clips = fill.placement_fill_rules(value, ["glyph-1"], with_clips=True)[0]["clips"]
+    transform = lambda x, y: (-2*x + y + 20, x + 3*y + 30)
+    assert set(clips[0]) == {transform(x, y) for x, y in rectangle(0, 0, 10, 10)}
+    # Concave outer boundary, a counter, and a disconnected dot remain inside
+    # the original convex clip; containment does not alter their geometry.
+    contours = [
+        [(1, 1), (8, 1), (8, 8), (5, 8), (5, 5), (1, 5), (1, 1)],
+        rectangle(2, 2, 3, 3, True), rectangle(1, 7, 3, 9),
+    ]
+    placed = [[transform(x, y) for x, y in loop] for loop in contours]
+    before = [list(loop) for loop in placed]
+    fill.verify_clip_containment(placed, clips)
+    assert placed == before
+    with pytest.raises(ValueError, match="cross"):
+        fill.verify_clip_containment(
+            [[transform(x, y) for x, y in rectangle(9, 1, 11, 2)]], clips
+        )
+
+
+@pytest.mark.parametrize("path", [
+    "M0 0L10 0L9 10L0 10Z",  # trapezoid cannot become its bounding box
+    "M0 0L10 10L0 10L10 0Z",  # crossing rectangle corners
+    "M0 0L10 0L10 10L5 5L0 10Z",  # concave region
+    "M0 0H10V10H0Z M2 2H8V8H2Z",  # second filled region or counter
+    "M0 0H10V10H0Z M2 2L8 2",  # not a move-only tail
+    "M0 0H10V10H0Z M2 2L2 2",  # even a zero-length drawn tail stays unsupported
+    "M0 0H10V10H0Z M2 2L8 2L8 8",  # implicitly closed fill remains unsupported
+    "M0 0H10V10H0", "M0 0H10V10H0Z M", "M0 0H10V10H0Z L",
+    "M0 0H10V10H0Z Z", "M0 0C2 0 8 0 10 0L10 10L0 10Z",
+    "m0 0h10v10h-10z", "M0 0H1e309V10H0Z", "M0 0HnanV10H0Z",
+    "M0 0H10V0H0Z", "M0 0", "M0 0Z", "L0 0L10 0L10 10L0 10Z",
+])
+def test_clip_serialization_extension_cannot_drop_nonrectangle_ink(path):
+    value = svg(
+        '<g clip-path="url(#c)"><use href="#glyph-1"/></g>',
+        '<clipPath id="c"><path d="' + path + '"/></clipPath>',
+    )
+    with pytest.raises(ValueError):
+        fill.placement_fill_rules(value, ["glyph-1"], with_clips=True)
+    deferred = fill.placement_fill_rules(
+        value, ["glyph-1"], with_clips=True, defer_errors=True
+    )
+    assert deferred[0]["error"]
+
+
+@pytest.mark.parametrize("rule", ["nonzero", "evenodd"])
+@pytest.mark.parametrize("pieces", [
+    "M0 0H10V4H0Z M0 4V10H10V4Z M0 4",  # opposite orientations
+    "M0 0H4V10H0Z M4 0H10V5H4Z M4 5H10V10H4Z",
+])
+def test_exact_disjoint_rectangle_tiling_keeps_the_entire_clip(rule, pieces):
+    value = svg(
+        '<g clip-path="url(#c)"><use href="#glyph-1"/></g>',
+        '<clipPath id="c"><path clip-rule="' + rule + '" d="' + pieces + '"/></clipPath>',
+    )
+    paint = fill.placement_fill_rules(value, ["glyph-1"], with_clips=True)[0]
+    assert paint["clips"] == [[(0, 0), (10, 0), (10, 10), (0, 10)]]
+    # The source glyph crosses internal tiling seams, but never the real clip.
+    contours = [rectangle(1, 1, 9, 9), rectangle(2, 2, 8, 8, True)]
+    fill.verify_clip_containment(contours, paint["clips"])
+    with pytest.raises(ValueError, match="cross"):
+        fill.verify_clip_containment([rectangle(1, 1, 11, 9)], paint["clips"])
+
+
+@pytest.mark.parametrize("path", [
+    "M0 0H1V2H0Z M1.000000000000000000000001 0H2V2H1.000000000000000000000001Z",
+    "M0 0H1V2H0Z M0.999999999999999999999999 0H2V2H0.999999999999999999999999Z",
+    "M0 0H1V1H0Z M1 1H2V2H1Z",  # corner contact leaves missing area
+    "M0 0H10V2H0Z M0 8H10V10H0Z M0 2H2V8H0Z M8 2H10V8H8Z",  # hole
+    "M0 0H10V10H0Z M0 0V10H10V0Z",  # cancelling winding or evenodd overlap
+    "M0 0H1e-400V1H0Z",  # exact positive width collapses in native floats
+    "M0 0H1e-999999999V1H0Z",  # bounded numeric work
+])
+@pytest.mark.parametrize("rule", ["nonzero", "evenodd"])
+def test_rectangle_union_never_approximates_gaps_overlaps_holes_or_rounding(path, rule):
+    assert float("1.000000000000000000000001") == float("0.999999999999999999999999")
+    value = svg(
+        '<g clip-path="url(#c)"><use href="#glyph-1"/></g>',
+        '<clipPath id="c"><path clip-rule="' + rule + '" d="' + path + '"/></clipPath>',
+    )
+    with pytest.raises(ValueError):
+        fill.placement_fill_rules(value, ["glyph-1"], with_clips=True)
+
+
+@pytest.mark.parametrize("matrix", [
+    "1,0,0,1,1e20,1e20",  # finite translation collapses distinct corners
+    "1e308,0,0,1e308,0,0",  # transformed coordinates overflow
+    "1,2,2,4,0,0",  # singular
+    "1,0,0,1,nan,0",
+])
+def test_rectangle_clip_transform_must_remain_finite_and_convex(matrix):
+    value = svg(
+        '<g clip-path="url(#c)"><use href="#glyph-1"/></g>',
+        '<clipPath id="c"><path d="M0 0H10V10H0Z" transform="matrix(' + matrix + ')"/></clipPath>',
+    )
+    with pytest.raises(ValueError):
+        fill.placement_fill_rules(value, ["glyph-1"], with_clips=True)
+
+
 @pytest.mark.parametrize(
     "location",
     [
@@ -561,6 +674,46 @@ def test_glyphs_then_geometry_keep_distinct_cached_native_topology(monkeypatch):
     assert (
         len(cache["filled_glyph_prototypes_v1"][("glyph-O", "nonzero")][0].Faces) == 1
     )
+
+
+@pytest.mark.parametrize("clip_right,verified", [(22, True), (15, False)])
+@pytest.mark.parametrize("tiled", [False, True])
+def test_cairo_rectangle_clip_keeps_requested_filled_glyphs_or_rejects_crossing(
+    monkeypatch, clip_right, verified, tiled
+):
+    existing, module = install_topology_renderer(monkeypatch)
+    clip = (
+        f"M8 18L{clip_right} 18L{clip_right} 25L8 25Z "
+        f"M8 25L{clip_right} 25L{clip_right} 32L8 32Z M8 25"
+        if tiled else f"M8 18L{clip_right} 18L{clip_right} 32L8 32Z M8 18"
+    )
+    source = (
+        '<svg width="100" height="100" viewBox="0 0 100 100"><defs>'
+        '<path id="glyph-O" d="M0 0H10V10H0Z M2 2V8H8V2Z"/>'
+        '<clipPath id="c"><path d="' + clip + '"/></clipPath></defs>'
+        '<g clip-path="url(#c)"><use href="#glyph-O" x="10" y="20"/></g></svg>'
+    )
+    monkeypatch.setattr(module, "_render_svg_with_pymupdf", lambda *_: source)
+    doc, group = existing.FakeDocument(), existing.FakeGroup()
+    kwargs = dict(page_w=100, fc_doc=doc, parent_group=group,
+                  source_item=existing._source_item(bbox=(8.0, 18.0, 22.0, 32.0)),
+                  representation="glyphs", requested_representation="glyphs")
+    if not verified:
+        with pytest.raises(module.TextRepresentationRenderError) as error:
+            module.render_text("fixture.pdf", 1, 100, 1, **kwargs)
+        assert "filled glyph would cross its original source clip" in error.value.evidence["exception"]
+        assert group.objects == []
+        return
+    result = module.render_text("fixture.pdf", 1, 100, 1, **kwargs)
+    assert result["outcome"] == "verified"
+    assert result["entity_type"] == "glyphs"
+    assert result["delivery_attempts"][0]["requested_type"] == "glyphs"
+    assert result["delivery_attempts"][0]["final_type"] == "glyphs"
+    assert len(group.objects) == 1
+    obj = group.objects[0]
+    assert len(obj.Shape.Faces) == 1 and len(obj.Shape.Faces[0].Wires) == 2
+    assert obj.Shape.Area == 64
+    assert json.loads(obj.PDFGlyphFillJSON)["glyphs"][0]["hole_count"] == 1
 
 
 @pytest.mark.parametrize("effect", ['opacity=".5"', 'clip-path="url(#curved)"'])

@@ -82,6 +82,16 @@ class TextCharLayout:
     target_quad: Tuple[Tuple[float, float], ...]
     advance_width: float
     glyph_height: float
+    # Original PDF font metrics from the same MuPDF text-page occurrence.
+    # Font-file metrics and RAWDICT's normalized box metrics are not equivalent.
+    source_font_size_pdf: Optional[float] = None
+    source_font_ascender: Optional[float] = None
+    source_font_descender: Optional[float] = None
+    source_writing_mode: Optional[int] = None
+    source_font_program_sha256: str = ""
+    source_font_binding_verified: bool = False
+    source_font_character_codepoint: Optional[int] = None
+    source_glyph_trace_codepoint: Optional[int] = None
 
 
 @dataclass

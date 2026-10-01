@@ -2504,7 +2504,7 @@ def test_symbolic_cmap_repair_falls_back_to_mac_roman_only_without_pdf_encoding(
 
 
 _SYMBOLIC_HOST_PROBE = r"""
-import json, os, sys, traceback
+import hashlib, json, os, sys, traceback
 out_path, report_path, pdf_path = sys.argv[-3], sys.argv[-2], sys.argv[-1]
 result = {"ok": False}
 try:
@@ -2540,6 +2540,29 @@ try:
     result["object_types"] = sorted(
         str(getattr(obj, "TypeId", "")) for obj in doc.Objects
     ) if doc is not None else []
+    result["selected_font_usage"] = []
+    for obj in doc.Objects if doc is not None else []:
+        selected_path = str(getattr(obj, "PDFFontFile", "") or "")
+        if not selected_path:
+            continue
+        selected_font = TTFont(selected_path, lazy=False)
+        selected_cmap = selected_font.getBestCmap() or {}
+        contours = {}
+        for char in "GRID":
+            coordinates, endpoints, flags = selected_font["glyf"][selected_cmap[ord(char)]].getCoordinates(selected_font["glyf"])
+            contours[char] = hashlib.sha256(json.dumps(
+                [list(coordinates), list(endpoints), list(flags)], separators=(",", ":")
+            ).encode("utf-8")).hexdigest()
+        with open(selected_path, "rb") as font_handle:
+            actual_sha256 = hashlib.sha256(font_handle.read()).hexdigest()
+        result["selected_font_usage"].append({
+            "sha256": actual_sha256,
+            "persisted_sha256": str(obj.PDFFontFileSHA256),
+            "source_text": str(obj.PDFSourceText),
+            "glyph_ids": {char: selected_font.getGlyphID(selected_cmap[ord(char)]) for char in "GRID"},
+            "contour_sha256": contours,
+        })
+        selected_font.close()
     result["ok"] = True
 except Exception:
     result["error"] = traceback.format_exc()
@@ -2555,7 +2578,7 @@ def test_gdi_symbolic_truetype_subset_delivers_native_3d_text_in_freecad(tmp_pat
     freecadcmd = _find_freecadcmd()
     if not freecadcmd:
         pytest.skip("FreeCADCmd.exe not found - native 3D Text delivery not exercised")
-    _fitz, pdf_path, _font_bytes = _symbolic_fixture(tmp_path)
+    _fitz, pdf_path, font_bytes = _symbolic_fixture(tmp_path)
 
     probe_path = tmp_path / "symbolic_probe.py"
     probe_path.write_text(_SYMBOLIC_HOST_PROBE % {"repo": str(REPO_ROOT)}, encoding="utf-8")
@@ -2603,4 +2626,26 @@ def test_gdi_symbolic_truetype_subset_delivers_native_3d_text_in_freecad(tmp_pat
     assert font_source["source"] == "embedded_font"
     assert font_source["outcome"] == "found"
     assert font_source["font_identity"]["normalized_key"] == "arialsubset"
-    assert font_source["sha256"] == result["staged_record"]["sha256"]
+    # The item-bound route can repair its cmap differently from the older
+    # page-family cache. Verify the actual native object's selected program,
+    # and every selected outline against the original symbolic program.
+    assert font_source["source_binding_method"] == "original_textpage_character_program_sha256"
+    assert font_source["source_program_sha256"] == hashlib.sha256(font_bytes).hexdigest()
+    assert len(font_source["original_characters"]) == len(_SYMBOLIC_FIXTURE_TEXT)
+    assert all(row[2] == font_source["source_program_sha256"] for row in font_source["original_characters"])
+    assert len(result["selected_font_usage"]) == 1
+    usage = result["selected_font_usage"][0]
+    assert usage["sha256"] == usage["persisted_sha256"] == font_source["sha256"]
+    assert usage["source_text"] == _SYMBOLIC_FIXTURE_TEXT
+    assert sorted(usage["glyph_ids"]) == sorted("GRID")
+    assert all(glyph_id > 0 for glyph_id in usage["glyph_ids"].values())
+    original_font = TTFont(io.BytesIO(font_bytes), lazy=False)
+    symbol = next(table for table in original_font["cmap"].tables
+                  if (table.platformID, table.platEncID) == (3, 0))
+    for code, char in _SYMBOLIC_FIXTURE_CODES.items():
+        coordinates, endpoints, flags = original_font["glyf"][symbol.cmap[0xF000 + code]].getCoordinates(original_font["glyf"])
+        expected = hashlib.sha256(json.dumps(
+            [list(coordinates), list(endpoints), list(flags)], separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+        assert usage["contour_sha256"][char] == expected
+    original_font.close()

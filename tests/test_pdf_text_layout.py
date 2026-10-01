@@ -127,7 +127,9 @@ class Transform:
 COIN = SimpleNamespace(SoSeparator=Group, SoTransform=Transform,
     SoScale=lambda: SimpleNamespace(scaleFactor=Field()), SoFont=Font,
     SoTranslation=lambda: SimpleNamespace(translation=Field()), SoAsciiText=Text,
-    SoMatrixTransform=lambda: SimpleNamespace(matrix=Field()), SbMatrix=lambda *values: values)
+    SoMatrixTransform=lambda: SimpleNamespace(matrix=Field()), SbMatrix=lambda *values: values,
+    SoClipPlane=lambda: SimpleNamespace(plane=Field(), on=Field()),
+    SbVec3f=lambda *values: values, SbPlane=lambda normal, distance: (normal, distance))
 
 
 def _object(*, label=False, affine=False):
@@ -326,3 +328,58 @@ def test_observer_does_not_dereference_unattached_or_destroyed_view():
     gui.slotBeforeChangeObject(Unattached(), "Visibility")
     gui.slotChangedObject(Unattached(), "Visibility")
     layout._AppObserver().slotChangedObject(Destroyed(), "Visibility")
+
+
+@pytest.mark.parametrize("label", [False, True])
+@pytest.mark.parametrize("angle", [0., 35., 90., 270.])
+def test_source_page_planes_clip_actual_display_in_original_editable_frame(label, angle):
+    obj = _object(label=label, affine=True)
+    half = math.radians(angle)*.5
+    obj.Placement.Rotation.Q = (0., 0., math.sin(half), math.cos(half))
+    source = _affine_payload()
+    page = [(0.,0.),(40.,0.),(40.,60.),(0.,60.)]
+    clipped = layout.bind_source_page_clip(source, obj, page)
+    assert "source_page_clip" not in source
+    setattr(obj, layout.PROPERTY, json.dumps(clipped))
+    original_text = list(obj.Text)
+    result = layout.restore_object_layout(obj, coin_module=COIN)
+    state = obj.ViewObject.Proxy._bcs_source_layout
+    assert result["source_page_clip_planes"] == 4
+    assert obj.Text == original_text
+    assert state["group"].children[1:5] == state["clip_planes"]
+    assert state["group"].children[5] is state["scale"]
+    inverse = (0.,0.,-math.sin(half),math.cos(half))
+    for point, inside in [((20.,30.,0.), True), ((-1.,30.,0.), False),
+                          ((41.,30.,0.), False), ((20.,-1.,0.), False),
+                          ((20.,61.,0.), False)]:
+        local = layout._rotate(inverse, (point[0]-20., point[1]-30., point[2]))
+        kept = all(sum(a*b for a,b in zip(node.plane.value[0],local,strict=True))
+                   >= node.plane.value[1] for node in state["clip_planes"])
+        assert kept is inside
+    before = [node.plane.value for node in state["clip_planes"]]
+    _change_view(obj, "FontSize", 12.)
+    assert [node.plane.value for node in state["clip_planes"]] == before
+    prop = "CustomText" if label else "Text"
+    _change_data(obj, prop, ["user edit"])
+    assert not state["active"]
+    _change_data(obj, prop, original_text)
+    assert state["active"]
+    fresh = _object(label=label, affine=True)
+    setattr(fresh, layout.PROPERTY, getattr(obj, layout.PROPERTY))
+    layout.restore_object_layout(fresh, coin_module=COIN)
+    assert [node.plane.value for node in fresh.ViewObject.Proxy._bcs_source_layout["clip_planes"]] == before
+
+
+@pytest.mark.parametrize("fault", ["normal", "nan", "partial", "schema"])
+def test_invalid_page_clip_planes_fail_before_scene_change(fault):
+    obj = _object()
+    payload = layout.bind_source_page_clip(_payload(), obj, [(0,0),(40,0),(40,60),(0,60)])
+    clip = payload["source_page_clip"]
+    if fault == "normal": clip["local_planes"][0][0] = 5.
+    if fault == "nan": clip["local_planes"][0][3] = float("nan")
+    if fault == "partial": clip["local_planes"].pop()
+    if fault == "schema": clip["schema"] = "unknown"
+    setattr(obj, layout.PROPERTY, json.dumps(payload))
+    with pytest.raises(ValueError):
+        layout.restore_object_layout(obj, coin_module=COIN)
+    assert obj.ViewObject.Proxy.node_wld.findChild(obj.ViewObject.Proxy.text_wld) >= 0

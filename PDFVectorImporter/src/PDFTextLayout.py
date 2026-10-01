@@ -16,6 +16,7 @@ import re
 PROPERTY = "PDFTextLayoutJSON"
 SCHEMA = "bcs.freecad.source_text_layout/1"
 AFFINE_SCHEMA = "mupdf_character_font_matrix/1"
+PAGE_CLIP_SCHEMA = "bcs.freecad.source_page_text_planes/1"
 _observers = None
 
 
@@ -132,6 +133,19 @@ def _validate(payload):
     affine = payload.get("source_affine")
     if affine is not None and affine != AFFINE_SCHEMA:
         raise ValueError("unsupported source text affine geometry")
+    clip = payload.get("source_page_clip")
+    if clip is not None:
+        if not isinstance(clip, dict) or clip.get("schema") != PAGE_CLIP_SCHEMA:
+            raise ValueError("unsupported source page text clipping")
+        bounds = _finite(clip.get("source_page_bounds"), 4)
+        planes = clip.get("local_planes")
+        if (bounds[0] >= bounds[2] or bounds[1] >= bounds[3]
+                or not isinstance(planes, list) or len(planes) != 4):
+            raise ValueError("source page text clipping is incomplete")
+        for plane in planes:
+            nx, ny, nz, _distance = _finite(plane, 4)
+            if not math.isclose(math.sqrt(nx*nx+ny*ny+nz*nz), 1., abs_tol=1e-10):
+                raise ValueError("source page text clip normal is invalid")
     if (not isinstance(text, str) or not text or not isinstance(chars, list)
             or len(chars) != len(text) or not payload.get("font_name")):
         raise ValueError("source text layout is incomplete")
@@ -192,6 +206,33 @@ def _quat_product(a, b):
 def _rotate(q, v):
     inv = (-q[0], -q[1], -q[2], q[3])
     return _quat_product(_quat_product(q, (*v, 0.)), inv)[:3]
+
+
+def bind_source_page_clip(payload, obj, page_quad):
+    """Bind the source page's four planes to the original editable text frame.
+
+    The planes precede font/character transforms, so actual displayed glyphs
+    are clipped without guessing their ink from character metric boxes.
+    User movement carries the original crop with the same object.
+    """
+    from PDFPageTextClip import _page_bounds
+
+    bounds = _page_bounds(page_quad)
+    placement = obj.Placement
+    base = _finite((placement.Base.x, placement.Base.y, placement.Base.z), 3)
+    q = _finite(tuple(placement.Rotation.Q), 4)
+    if not math.isclose(sum(value*value for value in q), 1., abs_tol=1e-10):
+        raise ValueError("source text placement rotation is invalid")
+    inverse = (-q[0], -q[1], -q[2], q[3])
+    planes = []
+    for normal, distance in (((1., 0., 0.), bounds[0]), ((0., 1., 0.), bounds[1]),
+                             ((-1., 0., 0.), -bounds[2]), ((0., -1., 0.), -bounds[3])):
+        planes.append([*_rotate(inverse, normal),
+                       distance-sum(a*b for a, b in zip(normal, base, strict=True))])
+    result = dict(payload, source_page_clip={"schema": PAGE_CLIP_SCHEMA,
+                  "source_page_bounds": list(bounds), "local_planes": planes})
+    _validate(result)
+    return result
 
 
 def _label_correction(obj, proxy, node):
@@ -325,7 +366,8 @@ def restore_object_layout(obj, *, coin_module=None):
             raise ValueError("source layout changed after native nodes were bound")
         _refresh(obj, state)
         return {"persisted": True, "native_nodes_installed": state["active"],
-                "character_count": len(payload["characters"])}
+                "character_count": len(payload["characters"]),
+                "source_page_clip_planes": len(state["clip_planes"])}
     if coin_module is None:
         from pivy import coin as coin_module
         _ensure_observers()
@@ -337,7 +379,15 @@ def restore_object_layout(obj, *, coin_module=None):
     if parent is None or parent.findChild(stock) < 0:
         raise RuntimeError("native Draft text node is not in its expected parent")
     group, correction, scaling = coin.SoSeparator(), coin.SoTransform(), coin.SoScale()
-    group.addChild(correction); group.addChild(scaling)
+    group.addChild(correction)
+    clip_nodes = []
+    for nx, ny, nz, distance in payload.get("source_page_clip", {}).get("local_planes", ()):
+        clip = coin.SoClipPlane()
+        clip.plane.setValue(coin.SbPlane(coin.SbVec3f(nx, ny, nz), distance))
+        clip.on.setValue(True)
+        group.addChild(clip)
+        clip_nodes.append(clip)
+    group.addChild(scaling)
     font = coin.SoFont()
     font.name.connectFrom(proxy.font.name)
     font.size.setValue(payload["font_size"])
@@ -362,11 +412,11 @@ def restore_object_layout(obj, *, coin_module=None):
         nodes.append((translation, text))
     state = {"digest": digest, "payload": payload, "parent": parent, "stock": stock,
              "group": group, "scale": scaling, "correction": correction,
-             "nodes": nodes, "affines": affines, "active": False}
+             "nodes": nodes, "affines": affines, "clip_planes": clip_nodes, "active": False}
     proxy._bcs_source_layout = state
     _refresh(obj, state)
     return {"persisted": True, "native_nodes_installed": state["active"],
-            "character_count": len(nodes)}
+            "character_count": len(nodes), "source_page_clip_planes": len(clip_nodes)}
 
 
 def restore_document_layouts(doc):

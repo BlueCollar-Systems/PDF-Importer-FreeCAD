@@ -2229,34 +2229,219 @@ def _polyline_run_is_smooth(verts: List["Vector"], max_turn_deg: float = 60.0) -
     return valid_turns >= 2
 
 
+def _source_line_cubic_commands(items):
+    """Read finite explicit source coordinates without rounding or changing them."""
+    if not isinstance(items, (list, tuple)) or not items:
+        return None
+    def point(value):
+        try:
+            if isinstance(value, (tuple, list)):
+                if len(value) != 2:
+                    return None
+                coordinates = value
+            else:
+                coordinates = (value.x, value.y)
+            if any(type(n) not in (int, float) or not math.isfinite(n)
+                   for n in coordinates):
+                return None
+            return tuple(coordinates)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+
+    commands = []
+    for item in items:
+        if not isinstance(item, (tuple, list)) or not item:
+            return None
+        if not isinstance(item[0], str):
+            return None
+        expected = {"l": 3, "c": 5}.get(item[0])
+        if expected is None or len(item) != expected:
+            return None
+        coordinates = tuple(point(p) for p in item[1:])
+        if any(p is None for p in coordinates):
+            return None
+        commands.append((item[0], coordinates))
+    return commands
+
+
+def _source_fill_without_retraced_bridge(path_group):
+    """Cancel an exact opposite fill bridge, including PDF's implicit closer.
+
+    A->B, a closed boundary B...B, B->A has that boundary's even-odd fill.
+    The final B->A may be an explicit command or PDF's implicit fill closure.
+    Original inner commands, paint, and source dictionary remain unchanged.
+    """
+    items = path_group.get("items", [])
+    if (path_group.get("type") != "f"
+            or path_group.get("even_odd") is not True
+            or path_group.get("fill") is None
+            or path_group.get("color") is not None
+            or path_group.get("stroke") is not None):
+        return items, None
+    commands = _source_line_cubic_commands(items)
+    if commands is None or len(commands) < 3:
+        return items, None
+
+    first, last = commands[0], commands[-1]
+    if first[0] != "l":
+        return items, None
+    a, b = first[1]
+    if a == b:
+        return items, None
+    explicit = last[0] == "l" and last[1] == (b, a)
+    stop = len(items) - 1 if explicit else len(items)
+    current = b
+    boundary = commands[1:stop]
+    visited = {b}
+    for index, (_kind, coordinates) in enumerate(boundary):
+        if coordinates[0] != current:
+            return items, None
+        current = coordinates[-1]
+        if index < len(boundary) - 1:
+            # A second loop must not be merged into the first native face.
+            if current in visited:
+                return items, None
+            visited.add(current)
+    if current != b:
+        return items, None
+
+    canonical = json.dumps(commands, separators=(",", ":"), allow_nan=False)
+    proof = {
+        "schema": "bcs.freecad.source-fill-boundary/1",
+        "policy": "cancel_exact_opposite_fill_bridge",
+        "source_paint_order": path_group.get("seqno"),
+        "fill_rule": "even_odd",
+        "source_commands_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "source_item_count": len(items),
+        "retained_item_range": [1, stop],
+        "retained_item_range_convention": "zero_based_half_open",
+        "cancelled_bridge": [list(a), list(b)],
+        "closure_origin": ("explicit_reverse_command" if explicit
+                           else "implicit_pdf_fill_closure"),
+    }
+    return items[1:stop], proof
+
+
+def _source_implicit_fill_boundary(path_group):
+    """Close one proved connected open PDF fill, without closing its stroke.
+
+    Only explicit line/cubic endpoints establish connectivity. Native vertex
+    ordering cannot authorize a connector, and separate loops are not merged.
+    Native validity still has to establish that the resulting face is usable.
+    """
+    items = path_group.get("items", [])
+    if (path_group.get("type") not in ("f", "fs")
+            or path_group.get("fill") is None
+            or path_group.get("closePath") not in (None, False)
+            or type(path_group.get("even_odd")) is not bool):
+        return items, None
+    commands = _source_line_cubic_commands(items)
+    if commands is None or len(commands) < 2:
+        return items, None
+    start = current = commands[0][1][0]
+    visited = {start}
+    for _kind, points in commands:
+        if points[0] != current or points[-1] in visited:
+            return items, None
+        current = points[-1]
+        visited.add(current)
+    canonical = json.dumps(commands, separators=(",", ":"), allow_nan=False)
+    proof = {
+        "schema": "bcs.freecad.source-fill-boundary/1",
+        "policy": "close_connected_pdf_fill",
+        "source_paint_order": path_group.get("seqno"),
+        "fill_rule": "even_odd" if path_group["even_odd"] else "nonzero",
+        "source_commands_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "source_item_count": len(items),
+        "retained_item_range": [0, len(items)],
+        "retained_item_range_convention": "zero_based_half_open",
+        "closure_origin": "implicit_pdf_fill_closure",
+        "fill_closing_segment": [list(current), list(start)],
+        "stroke_closure": "unchanged_open_source",
+    }
+    return list(items) + [("l", current, start)], proof
+
+
+class DrawingGeometryFailure(Exception):
+    """A requested source drawing could not become valid native geometry."""
+
+
+def _require_valid_drawing_shape(shape, context):
+    try:
+        valid = not shape.isNull() and shape.isValid()
+    except Exception as exc:
+        raise DrawingGeometryFailure("Native drawing %s validity could not be checked" % context) from exc
+    if valid is not True:
+        raise DrawingGeometryFailure("Native drawing %s is null or invalid" % context)
+    return shape
+
+
+def _source_fill_boundary_edges(items, page_h, opts, scale):
+    """Build every retained source line/cubic without length or curve fitting."""
+    edges = []
+    for item in items:
+        try:
+            points = [_to_fc(_xy(value), page_h, opts, scale) for value in item[1:]]
+            if item[0] == "l" and len(points) == 2:
+                edge = Part.LineSegment(*points).toShape()
+            elif item[0] == "c" and len(points) == 4:
+                curve = Part.BezierCurve()
+                curve.setPoles(points)
+                edge = curve.toShape()
+            else:
+                raise DrawingGeometryFailure("Source fill boundary has an unsupported command")
+        except (RuntimeError, ValueError, TypeError) as exc:
+            raise DrawingGeometryFailure("Source fill boundary construction failed") from exc
+        edges.append(_require_valid_drawing_shape(edge, "source fill edge"))
+    return edges
+
+
 def _make_shape_obj(edges: List, closed: bool, make_face: bool, fc_doc=None):
-    """Build Part::Feature from edges, optionally closing + making a Face."""
+    """Build a valid native wire/face; never substitute a wire for a failed fill."""
     if not edges:
         return None
     doc = fc_doc or FreeCAD.ActiveDocument
     try:
         wire = Part.Wire(edges)
         if closed and not wire.isClosed():
-            # Use wire vertexes (topologically safe) instead of edge vertexes
             if wire.Vertexes:
                 p0 = wire.Vertexes[0].Point
                 pN = wire.Vertexes[-1].Point
                 if _len2d(_v(p0.x, p0.y), _v(pN.x, pN.y)) > ZERO_TOL:
                     closer = Part.LineSegment(pN, p0).toShape()
                     wire = Part.Wire(edges + [closer])
-        if make_face and wire.isClosed():
-            try:
-                face = Part.Face(wire)
-                obj = doc.addObject("Part::Feature", "Face")
-                obj.Shape = face
-                return obj
-            except (RuntimeError, ValueError, TypeError):
-                pass
-        obj = doc.addObject("Part::Feature", "Wire")
-        obj.Shape = wire
-        return obj
-    except (RuntimeError, ValueError, TypeError):
-        return None
+        _require_valid_drawing_shape(wire, "wire")
+        if make_face:
+            if not wire.isClosed():
+                raise DrawingGeometryFailure("Native drawing fill has an open boundary")
+            shape = _require_valid_drawing_shape(Part.Face(wire), "face")
+            name = "Face"
+        else:
+            shape, name = wire, "Wire"
+    except (RuntimeError, ValueError, TypeError) as exc:
+        raise DrawingGeometryFailure("Native drawing construction failed") from exc
+    obj = doc.addObject("Part::Feature", name)
+    obj.Shape = shape
+    _require_valid_drawing_shape(obj.Shape, "stored " + name)
+    return obj
+
+
+def _attach_source_fill_boundary(obj, proof, page_num, page_h, opts, scale, pdf_path):
+    digest = str(getattr(opts, "_pdf_sha256", "") or "")
+    if not digest:
+        digest = _pdf_file_sha256(pdf_path)
+        opts._pdf_sha256 = digest
+    receipt = dict(proof, source_pdf_sha256=digest, source_page=int(page_num),
+                   source_page_height=float(page_h), coordinate_scale=float(scale),
+                   page_rotation_matrix=list(_page_matrix_values(opts)), flip_y=bool(opts.flip_y),
+                   boundary_representation="original_lines_and_cubic_bezier_controls")
+    if proof.get("policy") == "close_connected_pdf_fill":
+        receipt["boundary_representation"] = "original_lines_and_cubic_bezier_controls_plus_pdf_fill_closure"
+    obj.addProperty("App::PropertyString", "PDFSourceFillBoundaryJSON", "PDF Source")
+    obj.PDFSourceFillBoundaryJSON = json.dumps(receipt, sort_keys=True)
+    if json.loads(obj.PDFSourceFillBoundaryJSON) != receipt:
+        raise DrawingGeometryFailure("Source fill-boundary provenance was not retained")
+    return receipt
 
 
 def _normalize_model3d_mode(raw) -> str:
@@ -2528,6 +2713,20 @@ def _apply_style(
                 # Older view providers may expose only the original color.
                 # Keep their source-colored material rather than failing import.
                 pass
+            if stroke_rgb is None:
+                try:
+                    proof = json.loads(getattr(obj, "PDFSourceFillBoundaryJSON", "{}"))
+                    if proof.get("policy") == "close_connected_pdf_fill":
+                        # The PDF-implied fill closer is not a painted stroke.
+                        # Persisted provenance also applies this on GUI reopen.
+                        try:
+                            vo.DisplayMode = "Shaded"
+                            if vo.DisplayMode != "Shaded":
+                                raise DrawingGeometryFailure("Native implicit fill display was not retained")
+                        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                            raise DrawingGeometryFailure("Native implicit fill display could not be set") from exc
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    pass
         else:
             try:
                 _apply_planar_outline_display(obj, vo, stroke_rgb, fill_rgb)
@@ -12286,9 +12485,10 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             _batch_idx[parent_name] = idx
             stroke_rgb, fill_rgb, width, dashes = _batch_styles.get(key, (None, None, None, None))
             try:
-                compound = Part.makeCompound(shapes)
+                compound = _require_valid_drawing_shape(Part.makeCompound(shapes), "compound batch")
                 obj = fc_doc.addObject("Part::Feature", f"Batch_{idx}")
                 obj.Shape = compound
+                _require_valid_drawing_shape(obj.Shape, "stored compound batch")
                 _apply_style(obj, stroke_rgb, fill_rgb, width, dashes, opts)
                 parent.addObject(obj)
                 obj_count += 1
@@ -12299,6 +12499,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     try:
                         obj = fc_doc.addObject("Part::Feature", "Wire")
                         obj.Shape = shp
+                        _require_valid_drawing_shape(obj.Shape, "stored batch member")
                         _apply_style(obj, stroke_rgb, fill_rgb, width, dashes, opts)
                         parent.addObject(obj)
                         obj_count += 1
@@ -12309,10 +12510,12 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
     def _add_to_batch(shape, parent, stroke_rgb, fill_rgb, width, dashes):
         """Add a shape to the batch or create immediately if batching disabled."""
         nonlocal obj_count
+        _require_valid_drawing_shape(shape, "batch input")
         if not _batch_size or path_group.get("seqno") in image_order_strokes:
             # No batching — original behavior
             obj = fc_doc.addObject("Part::Feature", "Wire")
             obj.Shape = shape
+            _require_valid_drawing_shape(obj.Shape, "stored drawing stroke")
             _bind_image_order_stroke(obj, path_group.get("seqno"))
             _apply_style(obj, stroke_rgb, fill_rgb, width, dashes, opts)
             parent.addObject(obj)
@@ -12484,10 +12687,27 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     opts, page_num, [_host_clip_fill_issue(path_group, exc, superseded)])
             continue
 
+        # Cancel only a proved zero-area retraced fill bridge. Keep the source
+        # path dictionary intact and construct its retained boundary exactly.
+        source_fill_proof = None
+        source_open_stroke_edges = None
+        if ((opts.hatch_to_faces or (opts.make_faces and close_path))
+                and path_group.get("seqno") not in image_order_strokes):
+            items, source_fill_proof = _source_fill_without_retraced_bridge(path_group)
+            if source_fill_proof is None and opts.hatch_to_faces:
+                items, source_fill_proof = _source_implicit_fill_boundary(path_group)
+                if source_fill_proof is not None and path_group.get("type") == "fs":
+                    source_open_stroke_edges = _source_fill_boundary_edges(
+                        path_group["items"], page_h, opts, scale)
+        preserve_source_edges = bool(path_group.get("bcs_preserve_source_edges") or source_fill_proof)
+
         # Build edges per sub-path
         current_pt: Optional[Vector] = None
         sub_edges: List = []
         wires_edges: List[List] = []
+        if source_fill_proof is not None:
+            # Closure was proved in source space. Never invent a closing edge.
+            wires_edges.append((_source_fill_boundary_edges(items, page_h, opts, scale), close_path))
 
         def flush_sub(close_flag: bool, _wires=wires_edges):
             nonlocal sub_edges, current_pt
@@ -12496,7 +12716,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             sub_edges = []
             current_pt = None
 
-        for item in items:
+        for item in (() if source_fill_proof is not None else items):
             kind = item[0]
             data = item[1:]
 
@@ -12559,7 +12779,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     p2 = _to_fc((x2, y2), page_h, opts, scale)
                     p3 = _to_fc((x3, y3), page_h, opts, scale)
 
-                if path_group.get("bcs_preserve_source_edges"):
+                if preserve_source_edges:
                     # Outlines beside exact clip masks must retain their
                     # actual cubic boundary, rather than a fitted circle or
                     # tessellation that can expose slivers around the fill.
@@ -12673,7 +12893,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         # monster PDFs are almost certainly contour lines or map features, not
         # arcs from a CAD exporter.  The arc fitter still runs; it just skips
         # chains that are obviously not arc candidates.
-        if opts.detect_arcs and not path_group.get("bcs_preserve_source_edges"):
+        if opts.detect_arcs and not preserve_source_edges:
             processed = []
             for edges, is_closed in wires_edges:
                 if _is_heavy and len(edges) > 200:
@@ -12688,7 +12908,8 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
 
         # Create FreeCAD objects from collected edges
         for edges, is_closed in wires_edges:
-            want_face = ((opts.hatch_to_faces and fill is not None)
+            want_face = (source_fill_proof is not None
+                         or (opts.hatch_to_faces and fill is not None)
                          or (opts.make_faces and is_closed))
             if path_group.get("seqno") in image_order_strokes:
                 # Source-qualified later paint is a stroke; an invisible fs
@@ -12706,16 +12927,31 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                                 closer = Part.LineSegment(pN, p0).toShape()
                                 wire = Part.Wire(edges + [closer])
                     _add_to_batch(wire, parent, stroke_rgb, fill_rgb, width, dashes)
-                except (RuntimeError, ValueError, TypeError, AttributeError):
-                    pass
+                except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
+                    raise DrawingGeometryFailure("Native drawing stroke construction failed") from exc
             else:
                 # Faces and non-batchable shapes: create individually
-                obj = _make_shape_obj(edges, is_closed, make_face=want_face, fc_doc=fc_doc)
+                obj = _make_shape_obj(edges, False if source_fill_proof is not None else is_closed,
+                                      make_face=want_face, fc_doc=fc_doc)
                 if obj is not None:
+                    if source_fill_proof is not None:
+                        _attach_source_fill_boundary(obj, source_fill_proof, page_num, page_h,
+                                                     opts, scale, pdf_path)
                     _bind_image_order_stroke(obj, path_group.get("seqno"))
-                    _apply_style(obj, stroke_rgb, fill_rgb, width, dashes, opts)
+                    implicit_fill = (source_fill_proof is not None
+                                     and source_fill_proof["policy"] == "close_connected_pdf_fill")
+                    _apply_style(obj, None if implicit_fill else stroke_rgb, fill_rgb,
+                                 None if implicit_fill else width, None if implicit_fill else dashes, opts)
                     parent.addObject(obj)
                     obj_count += 1
+                    if source_open_stroke_edges is not None:
+                        stroke_obj = _make_shape_obj(source_open_stroke_edges, False, False, fc_doc)
+                        stroke_proof = dict(source_fill_proof, policy="retain_open_pdf_stroke")
+                        _attach_source_fill_boundary(stroke_obj, stroke_proof, page_num, page_h,
+                                                     opts, scale, pdf_path)
+                        _apply_style(stroke_obj, stroke_rgb, None, width, dashes, opts)
+                        parent.addObject(stroke_obj)
+                        obj_count += 1
                     try:
                         face_area = float(getattr(obj.Shape, "Area", 0.0) or 0.0)
                     except (AttributeError, TypeError, ValueError):
@@ -14077,6 +14313,15 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             fc_doc, baseline_object_ids, baseline_object_names
         )
         _restore_page_result_telemetry(opts, invocation_telemetry_snapshot)
+        if isinstance(failure, DrawingGeometryFailure):
+            opts.import_status = "failed"
+            try:
+                _write_terminal_representation_failure_report(
+                    pdf_path=pdf_path, opts=opts, total_pages=total_pages,
+                    pages_imported=len(previously_certified_pages),
+                    elapsed_ms=(time.perf_counter() - t_import_start) * 1000.0, failure=failure)
+            except (OSError, RuntimeError, TypeError, ValueError, ImportError) as report_error:
+                _err("Terminal geometry failure report could not be written: %s" % report_error)
         if not rollback["cleanup_complete"]:
             raise RuntimeError(
                 "Import failed and rollback was incomplete: %s" % rollback

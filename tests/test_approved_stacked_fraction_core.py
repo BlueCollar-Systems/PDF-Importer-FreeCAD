@@ -26,7 +26,7 @@ from pdfcadcore import primitive_extractor  # noqa: E402
 # codes are not proven is left byte for byte as MuPDF delivered it, so no
 # fraction predicate, layout rule or source-character proof changed here.
 REVIEWED_COMBINED_SUCCESSOR_SHA256 = (
-    "85d7159f6fd294846528b872fef5f375af4d8a0ec0e44ff949dc34ae8e74a1f9"
+    "0064571305a21d5a73dee1849929d26632ade4b43971cd837bbf83b1e604b884"
 )
 
 

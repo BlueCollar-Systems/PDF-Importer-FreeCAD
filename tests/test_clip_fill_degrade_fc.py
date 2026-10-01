@@ -40,6 +40,25 @@ class Wire:
         a, b = self.edges[0][1][0], self.edges[-1][1][-1]
         return (a.x, a.y) == (b.x, b.y)
 
+    def isNull(self):
+        return not self.edges
+
+    def isValid(self):
+        return bool(self.edges) and all(
+            (left[1][-1].x, left[1][-1].y) == (right[1][0].x, right[1][0].y)
+            for left, right in zip(self.edges, self.edges[1:], strict=False))
+
+
+class Compound(tuple):
+    def __new__(cls, shapes):
+        return tuple.__new__(cls, ("compound", list(shapes)))
+
+    def isNull(self):
+        return not self[1]
+
+    def isValid(self):
+        return bool(self[1]) and all(shape.isValid() for shape in self[1])
+
 
 class HostObject:
     def __init__(self, name, type_id):
@@ -151,7 +170,7 @@ def host(monkeypatch):
 
     monkeypatch.setattr(core, "Part", SimpleNamespace(
         LineSegment=lambda a, b: SimpleNamespace(toShape=lambda: ("l", [a, b])),
-        Wire=Wire, makeFace=make_face, makeCompound=lambda shapes: ("compound", list(shapes)),
+        Wire=Wire, makeFace=make_face, makeCompound=Compound,
     ))
     monkeypatch.setattr(core, "_to_fc", lambda point, page_h, opts, scale: Vector(point[0], page_h - point[1]))
     monkeypatch.setattr(core, "_apply_style", lambda *_args, **_kwargs: None)

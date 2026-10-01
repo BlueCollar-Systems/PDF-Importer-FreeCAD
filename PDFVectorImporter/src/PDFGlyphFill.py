@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import re
 import xml.etree.ElementTree as ET
+from fractions import Fraction
 
 
 def _cross(a, b, c):
@@ -309,6 +310,105 @@ def build_shape(contours, fill_rule, part, vector):
     return shape, proof
 
 
+def _rectangle_clip_points(path_data):
+    """Read one rectangle or an exact rectangular tiling, plus move-only tails.
+
+    A move with no drawing segments contributes no clip area. Every drawn
+    subpath must be a closed rectangle. Disjoint interiors and exact area prove
+    that multiple rectangles cover their entire bounding rectangle; this is
+    not a bounding-box approximation of a more complicated clipping region.
+    """
+    token_re = re.compile(r"[MLHVZ]|[-+]?(?:\d*\.\d+|\d+\.?\d*)(?:[eE][-+]?\d+)?")
+    tokens, end = [], 0
+    for match in token_re.finditer(path_data):
+        if path_data[end:match.start()].strip(" \t\r\n,"):
+            raise ValueError("nonrectangular source glyph clip is unsupported")
+        tokens.append(match.group())
+        end = match.end()
+    if path_data[end:].strip(" \t\r\n,") or not tokens or len(tokens) > 128:
+        raise ValueError("unsupported source glyph clip path")
+    loops, current, command, index, drawn = [], None, None, 0, False
+    while index < len(tokens):
+        if tokens[index] in ("M", "L", "H", "V", "Z"):
+            command = tokens[index]
+            index += 1
+            if command == "Z":
+                if current is None or len(current) < 4:
+                    raise ValueError("invalid source glyph rectangle clip")
+                loops.append(current)
+                current, command, drawn = None, None, False
+                continue
+        count = 2 if command in ("M", "L") else 1
+        if command is None or index + count > len(tokens):
+            raise ValueError("incomplete source glyph clip path")
+        try:
+            raw = tokens[index:index + count]
+            if any(len(value) > 128 or (
+                "e" in value.lower() and abs(int(value.lower().split("e")[1])) > 400
+            ) for value in raw):
+                raise ValueError("source glyph clip numeric limit exceeded")
+            if not all(math.isfinite(float(value)) for value in raw):
+                raise ValueError("nonfinite source glyph clip coordinate")
+            values = [Fraction(value) for value in raw]
+        except (ValueError, OverflowError) as exc:
+            raise ValueError("incomplete source glyph clip path") from exc
+        index += count
+        if command == "M":
+            if current is not None and drawn:
+                raise ValueError("open source glyph clip is unsupported")
+            current, command, drawn = [tuple(values)], "L", False
+        else:
+            if current is None:
+                raise ValueError("source glyph clip must start with a move")
+            drawn = True
+            previous = current[-1]
+            point = (values[0], previous[1]) if command == "H" else (
+                (previous[0], values[0]) if command == "V" else tuple(values)
+            )
+            if point != previous:
+                current.append(point)
+    if current is not None and drawn:
+        raise ValueError("open source glyph clip is unsupported")
+    if not loops:
+        raise ValueError("source glyph clip must contain one rectangle")
+    rectangles = []
+    for points in loops:
+        if points[-1] == points[0]:
+            points = points[:-1]
+        xs, ys = {p[0] for p in points}, {p[1] for p in points}
+        if (
+            len(points) != 4 or len(xs) != 2 or len(ys) != 2
+            or set(points) != {(x, y) for x in xs for y in ys}
+            or any((a[0] == b[0]) == (a[1] == b[1])
+                   for a, b in zip(points, points[1:] + points[:1], strict=True))
+        ):
+            raise ValueError("nonrectangular source glyph clip is unsupported")
+        rectangles.append((min(xs), min(ys), max(xs), max(ys)))
+    for index, first in enumerate(rectangles):
+        for second in rectangles[index + 1:]:
+            if (
+                max(first[0], second[0]) < min(first[2], second[2])
+                and max(first[1], second[1]) < min(first[3], second[3])
+            ):
+                raise ValueError("overlapping source glyph clip rectangles are unsupported")
+    x0 = min(row[0] for row in rectangles)
+    y0 = min(row[1] for row in rectangles)
+    x1 = max(row[2] for row in rectangles)
+    y1 = max(row[3] for row in rectangles)
+    area = sum((row[2] - row[0]) * (row[3] - row[1]) for row in rectangles)
+    if area != (x1 - x0) * (y1 - y0):
+        raise ValueError("source glyph clip rectangles do not cover one rectangle")
+    # Preserve the existing single-path ordering. Only a proved subdivision
+    # needs a reconstructed outer boundary; no source segment is snapped.
+    points = loops[0] if len(loops) == 1 else [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+    if points[-1] == points[0]:
+        points = points[:-1]
+    result = [(float(x), float(y)) for x, y in points]
+    if len(set(result)) != 4:
+        raise ValueError("source glyph clip cannot retain its rectangle coordinates")
+    return result
+
+
 def placement_fill_rules(
     svg, expected_glyph_ids, *, with_clips=False, defer_errors=False
 ):
@@ -342,26 +442,9 @@ def placement_fill_rules(
             "clip-rule", "nonzero"
         ) not in ("nonzero", "evenodd"):
             raise ValueError("unsupported source glyph clip properties")
-        number = r"([-+]?(?:\d*\.\d+|\d+\.?\d*)(?:[eE][-+]?\d+)?)"
-        rectangle = re.fullmatch(
-            r"\s*M\s*"
-            + number
-            + r"[ ,]+"
-            + number
-            + r"\s*H\s*"
-            + number
-            + r"\s*V\s*"
-            + number
-            + r"\s*H\s*"
-            + number
-            + r"\s*Z\s*",
-            path.get("d", ""),
-        )
-        if local(path) != "path" or not rectangle:
+        if local(path) != "path":
             raise ValueError("nonrectangular source glyph clip is unsupported")
-        x0, y0, x1, y1, last_x = map(float, rectangle.groups())
-        if last_x != x0 or x0 == x1 or y0 == y1:
-            raise ValueError("invalid source glyph rectangle clip")
+        points = _rectangle_clip_points(path.get("d", ""))
         transform = path.get("transform", "matrix(1,0,0,1,0,0)")
         matrix_match = re.fullmatch(r"matrix\(([^)]*)\)", transform.strip())
         values = (
@@ -371,14 +454,21 @@ def placement_fill_rules(
             raise ValueError("unsupported source glyph clip transform")
         a, b, c, d, e, f = map(float, values)
         if (
-            not all(map(math.isfinite, (x0, y0, x1, y1, a, b, c, d, e, f)))
+            not all(map(math.isfinite, (a, b, c, d, e, f)))
             or a * d - b * c == 0
         ):
             raise ValueError("invalid source glyph clip matrix")
-        return [
+        quad = [
             (a * x + c * y + e, b * x + d * y + f)
-            for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
+            for x, y in points
         ]
+        turns = [_cross(quad[i], quad[(i + 1) % 4], quad[(i + 2) % 4]) for i in range(4)]
+        if not all(math.isfinite(value) for point in quad for value in point) or not (
+            all(math.isfinite(value) and value > 0 for value in turns)
+            or all(math.isfinite(value) and value < 0 for value in turns)
+        ):
+            raise ValueError("source glyph clip transform lost its convex rectangle")
+        return quad
 
     def local(node):
         return node.tag.rsplit("}", 1)[-1]

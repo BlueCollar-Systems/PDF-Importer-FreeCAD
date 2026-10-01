@@ -18,6 +18,7 @@ def test_dependency_contract_test_uses_only_python_310_stdlib():
 def test_fonttools_is_declared_for_python_and_freecad_addon_manager():
     pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert re.search(r'(?mi)^\s*"fonttools>=4\.50,<5\.0",\s*$', pyproject)
+    assert '"PyMuPDF>=1.28.2,<2.0"' in pyproject
 
     root = ET.parse(REPO_ROOT / "PDFVectorImporter" / "package.xml").getroot()
     namespace = {"fc": "https://wiki.freecad.org/Package_Metadata"}
@@ -50,7 +51,7 @@ def test_release_builder_verifies_and_vendors_both_runtime_dependencies():
     spec.loader.exec_module(module)
 
     assert module.RUNTIME_DEPENDENCY_SPECS == (
-        "PyMuPDF==1.28.0",
+        "PyMuPDF==1.28.2",
         "fonttools==4.63.0",
     )
     common_lock = (REPO_ROOT / "requirements-release-common.lock").read_text(
@@ -62,8 +63,8 @@ def test_release_builder_verifies_and_vendors_both_runtime_dependencies():
     cp311_lock = (REPO_ROOT / "requirements-release-cp311.lock").read_text(
         encoding="utf-8"
     )
-    assert "PyMuPDF==1.28.0" in common_lock
-    assert "sha256:e01e90fd86abfeb37ceb921eddb951f988a11d45ff6ce6b7664f2039849068ec" in common_lock
+    assert "PyMuPDF==1.28.2" in common_lock
+    assert "sha256:ebd244918798502d7b4504c90410d1711a4d7675a32584ca30f1bab419ecbffe" in common_lock
     assert "fonttools==4.63.0" in cp310_lock
     assert "sha256:0c18358a155d75034911c5ee397a5b44cd19dd325dbb8b35fb60bf421d6a72ac" in cp310_lock
     assert "fonttools==4.63.0" in cp311_lock
@@ -90,6 +91,13 @@ def test_both_interactive_setup_paths_install_and_verify_fonttools():
     assert '"fonttools>=4.50,<5.0"' in init_source
     assert "import fontTools" in tools_source
     assert '"fonttools>=4.50,<5.0"' in tools_source
+    assert '"PyMuPDF>=1.28.2,<2.0"' in init_source
+    assert '"PyMuPDF>=1.28.2,<2.0"' in tools_source
+    harness_source = (
+        REPO_ROOT / "PDFVectorImporter" / "adapters" / "freecad_harness.py"
+    ).read_text(encoding="utf-8")
+    assert '"PyMuPDF>=1.28.2,<2.0"' in harness_source
+    assert '"PyMuPDF>=1.24,<2.0"' not in harness_source
 
 
 def test_installation_docs_name_the_complete_runtime_and_current_menu_command():

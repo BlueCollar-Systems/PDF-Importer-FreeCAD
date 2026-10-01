@@ -656,16 +656,8 @@ class ImportPDFVectorCommand:
             else:
                 FreeCAD.Console.PrintMessage("PDF import complete.\n")
 
-            # Auto-switch to orthographic top view
-            try:
-                import FreeCADGui
-                view = FreeCADGui.ActiveDocument.ActiveView
-                if view:
-                    view.setCameraType("Orthographic")
-                    view.viewTop()
-                    view.fitAll()
-            except (AttributeError, RuntimeError):
-                pass
+            # The core frames the complete batch in top orthographic view.
+            # Do not replace that imported-sheet framing with a document fitAll.
 
         except (RuntimeError, ValueError, TypeError, OSError, AttributeError, ImportError) as e:
             import traceback

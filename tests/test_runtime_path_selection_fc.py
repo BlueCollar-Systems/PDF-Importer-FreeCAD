@@ -20,8 +20,8 @@ def _write_runtime_layout(addon_root: Path) -> None:
                 "platform": "win_amd64",
                 "common": {
                     "path": "common",
-                    "dependencies": {"PyMuPDF": "1.28.0"},
-                    "wheel": "pymupdf-1.28.0-cp310-abi3-win_amd64.whl",
+                    "dependencies": {"PyMuPDF": "1.28.2"},
+                    "wheel": "pymupdf-1.28.2-cp310-abi3-win_amd64.whl",
                     "wheel_tag": "cp310-abi3-win_amd64",
                 },
                 "runtimes": {
@@ -292,7 +292,7 @@ def test_unsupported_host_does_not_inspect_a_corrupt_windows_bundle(
 
 @pytest.mark.parametrize(
     ("module_name", "version_attribute", "version"),
-    [("pymupdf", "__version__", "1.28.0"), ("fontTools", "__version__", "4.63.0")],
+    [("pymupdf", "__version__", "1.28.2"), ("fontTools", "__version__", "4.63.0")],
 )
 def test_activation_rejects_preloaded_dependency_from_wrong_origin(
     monkeypatch: pytest.MonkeyPatch,
@@ -331,7 +331,12 @@ def test_activation_rejects_preloaded_dependency_from_wrong_origin(
 
 @pytest.mark.parametrize(
     ("module_name", "runtime_dir", "loaded_version"),
-    [("pymupdf", "common", "1.27.0"), ("fontTools", "cp310", "4.62.0")],
+    [
+        ("pymupdf", "common", "1.27.0"),
+        ("pymupdf", "common", "1.28.0"),
+        ("pymupdf", "common", "1.28.1"),
+        ("fontTools", "cp310", "4.62.0"),
+    ],
 )
 def test_activation_rejects_preloaded_dependency_with_wrong_version(
     monkeypatch: pytest.MonkeyPatch,
@@ -377,7 +382,7 @@ def test_activation_rejects_preloaded_dependency_with_wrong_version(
 
 @pytest.mark.parametrize(
     ("module_name", "runtime_dir", "loaded_version"),
-    [("pymupdf", "common", "1.28.0"), ("fontTools", "cp310", "4.63.0")],
+    [("pymupdf", "common", "1.28.2"), ("fontTools", "cp310", "4.63.0")],
 )
 def test_activation_accepts_preloaded_dependency_from_selected_exact_runtime(
     monkeypatch: pytest.MonkeyPatch,

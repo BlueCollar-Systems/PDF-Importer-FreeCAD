@@ -11599,39 +11599,61 @@ def _sheet_view_box(fc_doc):
     return union_sheet_boxes(boxes)
 
 
-def _fit_view_to_sheet(fc_doc, view, sheet) -> bool:
-    """Look straight at the sheet. A stroke past the crop must not set the zoom."""
-    frame = None
+# A print is read edge to edge, so the sheet gets a small margin, not the
+# bounding-sphere slack Coin's viewAll applies on its own.
+_SHEET_VIEW_MARGIN = 1.05
+
+
+def _fit_view_to_sheet(view, sheet) -> bool:
+    """Look straight at the sheet box. A stroke past the crop must not set the zoom.
+
+    The camera is placed from the sheet rectangle itself. "ViewFit" fits the
+    whole document, so an off-sheet stroke or an unrelated object would set the
+    zoom again; a temporary document object would also touch the document and
+    the operator's selection. Neither is used here.
+    """
     try:
-        import Part
-        x0, y0, x1, y1 = sheet
-        frame = fc_doc.addObject("Part::Feature", "PDF_SheetViewFrame")
-        frame.Shape = Part.makePolygon([
-            _v(x0, y0, 0.0), _v(x1, y0, 0.0), _v(x1, y1, 0.0),
-            _v(x0, y1, 0.0), _v(x0, y0, 0.0),
-        ])
-        import FreeCADGui as Gui
-        Gui.Selection.clearSelection()
-        Gui.Selection.addSelection(frame)
-        Gui.SendMsgToActiveView("ViewFit")
-        return True
-    except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
-        try:
-            view.fitAll()
-        except (AttributeError, RuntimeError):
+        x0, y0, x1, y1 = (float(value) for value in sheet)
+    except (TypeError, ValueError):
+        return False
+    if not all(math.isfinite(value) for value in (x0, y0, x1, y1)):
+        return False
+    if x1 <= x0 or y1 <= y0:
+        return False
+    try:
+        from pivy import coin
+
+        width, height = view.getSize()
+        if width <= 0 or height <= 0:
             return False
-        return True
-    finally:
-        if frame is not None:
-            try:
-                import FreeCADGui as Gui
-                Gui.Selection.clearSelection()
-            except (ImportError, AttributeError, RuntimeError):
-                pass
-            try:
-                fc_doc.removeObject(frame.Name)
-            except (AttributeError, RuntimeError):
-                pass
+        camera = view.getCameraNode()
+        corners = [(x, y, 0.0) for x in (x0, x1) for y in (y0, y1)]
+        coordinates = coin.SoCoordinate3()
+        coordinates.point.setValues(0, len(corners), corners)
+        points = coin.SoPointSet()
+        points.numPoints = len(corners)
+        node = coin.SoSeparator()
+        node.addChild(coordinates)
+        node.addChild(points)
+        # Position, focal distance and clip planes for the sheet corners.
+        camera.viewAll(node, coin.SbViewportRegion(width, height), 1.0)
+    except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+    # viewAll fits the corners' bounding sphere. Set the orthographic height
+    # from the rectangle so the sheet fills the window in either orientation.
+    # Coin widens a view volume by 1/aspect when the window is taller than wide.
+    aspect = float(width) / float(height)
+    span_x, span_y = x1 - x0, y1 - y0
+    if aspect >= 1.0:
+        tight = max(span_y, span_x / aspect)
+    else:
+        tight = max(span_x, span_y * aspect)
+    try:
+        camera.height.setValue(tight * _SHEET_VIEW_MARGIN)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        # A perspective camera has no height; the corner fit above stands.
+        pass
+    return True
 
 
 def _fit_import_descendant_bounds(view, roots) -> bool:
@@ -11721,6 +11743,17 @@ def _autofit_import_view(fc_doc) -> None:
     except (AttributeError, RuntimeError):
         prior_sel = []
 
+    # An animated turn to the top view would still be running when the fit is
+    # computed, and would finish by moving the camera again. Turn it off for
+    # the duration of the framing and put the operator's setting back.
+    animated = False
+    try:
+        animated = bool(view.isAnimationEnabled())
+        if animated:
+            view.setAnimationEnabled(False)
+    except (AttributeError, RuntimeError, TypeError):
+        animated = False
+
     try:
         # Fit in the final orientation. A later fitAll would replace the
         # selected-sheet bounds with unrelated objects elsewhere in the document.
@@ -11751,7 +11784,7 @@ def _autofit_import_view(fc_doc) -> None:
                 pass
 
         sheet = _sheet_view_box(fc_doc)
-        framed = bool(sheet) and _fit_view_to_sheet(fc_doc, view, sheet)
+        framed = bool(sheet) and _fit_view_to_sheet(view, sheet)
         if not framed and not selected_fit:
             try:
                 view.fitAll()
@@ -11767,6 +11800,11 @@ def _autofit_import_view(fc_doc) -> None:
                     pass
         except (AttributeError, RuntimeError):
             pass
+        if animated:
+            try:
+                view.setAnimationEnabled(True)
+            except (AttributeError, RuntimeError, TypeError):
+                pass
 
 
 # ──────────────────────────────────────────────────────────────────────

@@ -11714,12 +11714,105 @@ def _fit_import_descendant_bounds(view, roots) -> bool:
         return False
 
 
+# FreeCAD sends its own "ViewFit" (fit the whole document) to the view when an
+# Open, Import or drop command returns and the AutoFitToView preference is on,
+# which is the default. That runs after the importer has framed the sheet, so
+# the framing is applied again once the command is back in the event loop.
+_VIEW_REFRAME_DELAYS_MS = (0, 250, 1000)
+_VIEW_REFRAME_MODAL_RETRY_MS = 250
+_VIEW_REFRAME_MODAL_RETRIES = 2400
+_view_reframe_token = 0
+
+
+def _qt_modules():
+    """Qt bindings of the running host, or (None, None) outside the GUI."""
+    for package in ("PySide6", "PySide2", "PySide"):
+        try:
+            module = __import__(package, fromlist=["QtCore", "QtWidgets"])
+            return module.QtCore, module.QtWidgets
+        except (ImportError, AttributeError):
+            continue
+    return None, None
+
+
+def _schedule_import_view_reframe(fc_doc) -> bool:
+    """Frame the sheets again after the host's own post-import fit.
+
+    A step waits while a modal dialog (import summary, warnings) is open: the
+    import command has not returned yet and the host's fit has not run. A newer
+    import supersedes pending steps, and nothing happens once the document is
+    closed or no longer the active one.
+    """
+    global _view_reframe_token
+    QtCore, QtWidgets = _qt_modules()
+    name = getattr(fc_doc, "Name", "") or ""
+    if QtCore is None or not name:
+        return False
+    _view_reframe_token += 1
+    token = _view_reframe_token
+
+    def _document():
+        try:
+            import FreeCADGui as Gui
+
+            active = Gui.ActiveDocument
+            if active is None or getattr(active.Document, "Name", None) != name:
+                return None
+            return active.Document
+        except (ImportError, AttributeError, RuntimeError):
+            return None
+
+    def _modal_open() -> bool:
+        try:
+            return QtWidgets.QApplication.activeModalWidget() is not None
+        except (AttributeError, RuntimeError):
+            return False
+
+    def _step(index, retries_left):
+        if token != _view_reframe_token:
+            return
+        if _modal_open():
+            if retries_left > 0:
+                _arm(_VIEW_REFRAME_MODAL_RETRY_MS, index, retries_left - 1)
+            return
+        doc = _document()
+        if doc is None:
+            return
+        _frame_import_view(doc)
+        if index + 1 < len(_VIEW_REFRAME_DELAYS_MS):
+            _arm(
+                _VIEW_REFRAME_DELAYS_MS[index + 1] - _VIEW_REFRAME_DELAYS_MS[index],
+                index + 1,
+                _VIEW_REFRAME_MODAL_RETRIES,
+            )
+
+    def _arm(delay_ms, index, retries_left) -> bool:
+        try:
+            QtCore.QTimer.singleShot(
+                int(delay_ms), lambda: _step(index, retries_left)
+            )
+        except (AttributeError, RuntimeError, TypeError):
+            return False
+        return True
+
+    return _arm(_VIEW_REFRAME_DELAYS_MS[0], 0, _VIEW_REFRAME_MODAL_RETRIES)
+
+
 def _autofit_import_view(fc_doc) -> None:
-    """Frame the viewport on imported PDF geometry, not unrelated document content."""
+    """Frame the imported sheets now and again after the host's own fit."""
+    if _frame_import_view(fc_doc):
+        _schedule_import_view_reframe(fc_doc)
+
+
+def _frame_import_view(fc_doc) -> bool:
+    """Frame the viewport on imported PDF sheets, not unrelated document content.
+
+    Returns True when a view was there to frame.
+    """
     try:
         import FreeCADGui as Gui
     except ImportError:
-        return
+        return False
 
     try:
         Gui.updateGui()
@@ -11734,7 +11827,7 @@ def _autofit_import_view(fc_doc) -> None:
     except (AttributeError, RuntimeError):
         view = None
     if view is None:
-        return
+        return False
 
     roots = _pdf_import_root_objects(fc_doc)
     prior_sel = []
@@ -11805,6 +11898,7 @@ def _autofit_import_view(fc_doc) -> None:
                 view.setAnimationEnabled(True)
             except (AttributeError, RuntimeError, TypeError):
                 pass
+    return True
 
 
 # ──────────────────────────────────────────────────────────────────────

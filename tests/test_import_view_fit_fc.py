@@ -303,3 +303,112 @@ def test_view_animation_is_off_while_the_view_is_framed_and_restored_after(monke
     else:
         assert not [event for event in events if event[0] == "animation"]
     assert state["enabled"] is enabled
+
+
+def _qt(monkeypatch, modal=None):
+    """Fake Qt: timers are recorded and fired by the test."""
+    timers = []
+    state = {"modal": modal}
+    qt_core = SimpleNamespace(QTimer=SimpleNamespace(
+        singleShot=lambda delay, callback: timers.append((delay, callback))))
+    qt_widgets = SimpleNamespace(QApplication=SimpleNamespace(
+        activeModalWidget=lambda: state["modal"]))
+    monkeypatch.setitem(sys.modules, "PySide6",
+                        SimpleNamespace(QtCore=qt_core, QtWidgets=qt_widgets))
+    return timers, state
+
+
+def _named_doc(name, objects):
+    doc = SimpleNamespace(Name=name, Objects=objects)
+    sys.modules["FreeCADGui"].ActiveDocument.Document = doc
+    return doc
+
+
+FRAMED = [("camera", "Orthographic"), ("top",)]
+
+
+def test_sheets_are_framed_again_after_the_host_fit_all(monkeypatch):
+    # FreeCAD sends its own "ViewFit" when the import command returns. The
+    # framing is applied again from the event loop so it is the last camera move.
+    events, selection, old_selection = _host(monkeypatch)
+    timers, _state = _qt(monkeypatch)
+    pages = [_page("PDF_Page_1")]
+    doc = _named_doc("Sheet", pages)
+    first = FRAMED + [("ViewSelection", tuple(pages))]
+
+    core._autofit_import_view(doc)
+    assert events == first
+    assert [delay for delay, _callback in timers] == [0]
+
+    # The host's fit-all arrives here, then the event loop runs the timer.
+    events.append(("ViewFit", ("host",)))
+    timers.pop(0)[1]()
+    assert events == first + [("ViewFit", ("host",))] + first
+    assert [delay for delay, _callback in timers] == [250]
+    timers.pop(0)[1]()
+    assert [delay for delay, _callback in timers] == [750]
+    timers.pop(0)[1]()
+    assert timers == []
+    assert events == first + [("ViewFit", ("host",))] + first * 3
+    assert selection == [old_selection]
+
+
+def test_reframe_waits_while_a_dialog_of_the_import_is_still_open(monkeypatch):
+    events, _selection, _old = _host(monkeypatch)
+    timers, state = _qt(monkeypatch, modal=object())
+    pages = [_page("PDF_Page_1")]
+    doc = _named_doc("Sheet", pages)
+    core._autofit_import_view(doc)
+    before = list(events)
+
+    # The import summary is still on screen: the command has not returned.
+    timers.pop(0)[1]()
+    assert events == before
+    assert [delay for delay, _callback in timers] == [250]
+    state["modal"] = None
+    timers.pop(0)[1]()
+    assert events == before + FRAMED + [("ViewSelection", tuple(pages))]
+
+
+def test_a_newer_import_supersedes_pending_reframes(monkeypatch):
+    events, _selection, _old = _host(monkeypatch)
+    timers, _state = _qt(monkeypatch)
+    doc = _named_doc("Sheet", [_page("PDF_Page_1")])
+    core._autofit_import_view(doc)
+    stale = timers.pop(0)[1]
+    core._autofit_import_view(doc)
+    count = len(events)
+    stale()
+    assert len(events) == count
+    assert len(timers) == 1
+
+
+@pytest.mark.parametrize("change", ["closed", "other_document"])
+def test_reframe_leaves_another_document_alone(monkeypatch, change):
+    events, _selection, _old = _host(monkeypatch)
+    timers, _state = _qt(monkeypatch)
+    doc = _named_doc("Sheet", [_page("PDF_Page_1")])
+    core._autofit_import_view(doc)
+    count = len(events)
+    gui = sys.modules["FreeCADGui"]
+    if change == "closed":
+        gui.ActiveDocument = None
+    else:
+        gui.ActiveDocument.Document = SimpleNamespace(Name="Other", Objects=[])
+    timers.pop(0)[1]()
+    assert len(events) == count
+    assert timers == []
+
+
+def test_no_reframe_is_scheduled_without_a_view_or_without_qt(monkeypatch):
+    _host(monkeypatch)
+    timers, _state = _qt(monkeypatch)
+    sys.modules["FreeCADGui"].ActiveDocument = None
+    core._autofit_import_view(SimpleNamespace(Name="Sheet", Objects=[]))
+    assert timers == []
+
+    _host(monkeypatch)
+    for package in ("PySide6", "PySide2", "PySide"):
+        monkeypatch.setitem(sys.modules, package, None)
+    doc = _named_doc("Sheet", [_page("PDF_Page_1")])
+    core._autofit_import_view(doc)  # must not raise

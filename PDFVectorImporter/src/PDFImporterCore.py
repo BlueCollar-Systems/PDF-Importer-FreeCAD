@@ -284,6 +284,150 @@ def _rect_area(obj) -> Optional[float]:
         return None
 
 
+# A path is left out as a page background only when its FILL paints the page.
+# Its bounding box alone says nothing: a border, a corner-to-corner diagonal
+# and a thin frame all have sheet-sized bounds and almost no ink.
+PAGE_BACKGROUND_FILL_RATIO = 0.95
+PAGE_FILL_CONTOUR_LIMIT = 64
+_PAGE_FILL_CURVE_STEPS = 8
+
+
+def _fill_outlines(items):
+    """Subpath outlines of a path as point lists in PDF points.
+
+    Returns None for a command this reader does not know: the caller then
+    cannot measure the fill.
+    """
+    outlines = []
+    current: List[Tuple[float, float]] = []
+
+    def flush():
+        nonlocal current
+        if len(current) >= 3:
+            outlines.append(current)
+        current = []
+
+    def begin(point):
+        if current and (abs(current[-1][0] - point[0]) > 1e-6
+                        or abs(current[-1][1] - point[1]) > 1e-6):
+            flush()
+        if not current:
+            current.append(point)
+
+    try:
+        for item in items:
+            kind = item[0]
+            if kind == "l" and len(item) == 3:
+                begin(_xy(item[1]))
+                current.append(_xy(item[2]))
+            elif kind == "c" and len(item) == 5:
+                (x0, y0), (x1, y1), (x2, y2), (x3, y3) = (_xy(value) for value in item[1:])
+                begin((x0, y0))
+                for step in range(1, _PAGE_FILL_CURVE_STEPS + 1):
+                    t = step / float(_PAGE_FILL_CURVE_STEPS)
+                    u = 1.0 - t
+                    current.append((
+                        u * u * u * x0 + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x3,
+                        u * u * u * y0 + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y3,
+                    ))
+            elif kind == "re" and len(item) >= 2:
+                flush()
+                x, y, w, h = _rect_coords(item[1])
+                corners = [(x, y + h), (x + w, y + h), (x + w, y), (x, y)]
+                # PyMuPDF: 1 is anti-clockwise on the page, -1 clockwise.
+                if len(item) > 2 and item[2] == -1:
+                    corners.reverse()
+                outlines.append(corners)
+            elif kind == "qu" and len(item) == 2:
+                flush()
+                quad = item[1]
+                outlines.append([_xy(quad.ul), _xy(quad.ll), _xy(quad.lr), _xy(quad.ur)])
+            else:
+                return None
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None
+    flush()
+    if not all(math.isfinite(value) for outline in outlines for point in outline for value in point):
+        return None
+    return outlines
+
+
+def _outline_area(outline) -> float:
+    """Signed area of a closed outline (shoelace)."""
+    total = 0.0
+    for index, (x0, y0) in enumerate(outline):
+        x1, y1 = outline[(index + 1) % len(outline)]
+        total += x0 * y1 - x1 * y0
+    return total / 2.0
+
+
+def _point_in_outline(point, outline) -> bool:
+    x, y = point
+    inside = False
+    for index, (x0, y0) in enumerate(outline):
+        x1, y1 = outline[(index + 1) % len(outline)]
+        if (y0 > y) != (y1 > y) and x < x0 + (y - y0) * (x1 - x0) / (y1 - y0):
+            inside = not inside
+    return inside
+
+
+def _page_sized_fill_kind(path_group, page_area: float) -> str:
+    """What the fill of a path with sheet-sized bounds paints.
+
+    "background"  the fill covers the page edge to edge, or cannot be measured:
+                  it is left out, as a page background always was.
+    "parts"       separate pieces (the bars of a frame, a diagonal band): each
+                  piece is an ordinary fill.
+    "holes"       a frame or a plate with openings: one fill whose inner
+                  outlines are holes.
+    """
+    outlines = _fill_outlines(path_group.get("items") or ())
+    if not outlines:
+        return "background"
+    limit = float(page_area) * PAGE_BACKGROUND_FILL_RATIO
+    areas = [_outline_area(outline) for outline in outlines]
+    if len(outlines) > PAGE_FILL_CONTOUR_LIMIT:
+        # Too many pieces to sort into inside and outside; together they
+        # either can cover the page or cannot.
+        return "background" if sum(abs(area) for area in areas) > limit else "parts"
+
+    boxes = [(min(p[0] for p in outline), min(p[1] for p in outline),
+              max(p[0] for p in outline), max(p[1] for p in outline)) for outline in outlines]
+    even_odd = bool(path_group.get("even_odd", False))
+    painted = 0.0
+    has_hole = False
+    alternates = True
+    for index, outline in enumerate(outlines):
+        probe = ((outline[0][0] + outline[1][0]) / 2.0, (outline[0][1] + outline[1][1]) / 2.0)
+        box = boxes[index]
+        around = [
+            other for other in range(len(outlines))
+            if other != index and abs(areas[other]) > abs(areas[index])
+            and boxes[other][0] <= box[0] and boxes[other][1] <= box[1]
+            and boxes[other][2] >= box[2] and boxes[other][3] >= box[3]
+            and _point_in_outline(probe, outlines[other])
+        ]
+        if even_odd:
+            outside = len(around) % 2 == 1
+            inside = not outside
+        else:
+            winding = sum(1 if areas[other] > 0 else -1 for other in around)
+            outside = winding != 0
+            inside = winding + (1 if areas[index] > 0 else -1) != 0
+        painted += (int(inside) - int(outside)) * abs(areas[index])
+        if outside and not inside:
+            has_hole = True
+        if inside != (len(around) % 2 == 0) or outside == inside:
+            alternates = False
+    if painted > limit:
+        return "background"
+    if not has_hole:
+        return "parts"
+    # A face with holes is built by nesting depth; that is this fill only when
+    # every outline switches between painted and unpainted.
+    return "holes" if alternates else "background"
+
+
 def _vector_group_stats(drawings: List[dict], page_area: Optional[float] = None) -> Dict[str, float]:
     """Profile coarse vector composition for auto-mode heuristics."""
     total = len(drawings)
@@ -12796,17 +12940,59 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         # ── Skip page-sized background fills ──
         # Some PDFs include a full-page rectangle as a background fill.
         # These add no useful geometry and obscure the actual drawing content.
+        # Only a fill can be such a background, and only when it paints the
+        # page: a stroked border, a corner-to-corner line and a thin frame
+        # have sheet-sized bounds too and are drawing content.
         grp_rect = path_group.get("rect")
-        if grp_rect and _is_rect(grp_rect):
+        # A compound clip fill is a shaped mask (a frame, a ring) whose
+        # bounds are its clip's: sheet-sized bounds are not sheet-sized ink.
+        if (fill is not None and grp_rect and _is_rect(grp_rect)
+                and not path_group.get("bcs_compound_clip_fill")):
             grp_area = abs(grp_rect.width * grp_rect.height)
             # page_w / page_h are float(page.rect.width/height) read once per
             # page above; reading page.rect here built two PyMuPDF Rects per
             # path group (1.1 million on a 550k-path sheet, 15 s).
             page_area = page_w * page_h
-            # A compound clip fill is a shaped mask (a frame, a ring) whose
-            # bounds are its clip's: sheet-sized bounds are not sheet-sized ink.
-            if grp_area > page_area * 0.95 and not path_group.get("bcs_compound_clip_fill"):
-                continue
+            if grp_area > page_area * PAGE_BACKGROUND_FILL_RATIO:
+                fill_kind = _page_sized_fill_kind(path_group, page_area)
+                if fill_kind == "holes":
+                    # One fill with openings. Independent faces per outline
+                    # would paint the openings and cover the sheet.
+                    obj = None
+                    try:
+                        shape = _compound_clip_fill_shape(
+                            dict(path_group, even_odd=True,
+                                 bcs_clip_fill_group_id="sheet-frame:%s" % path_group.get("seqno")),
+                            page_h, opts, scale)
+                        obj = fc_doc.addObject("Part::Feature", "Face")
+                        obj.Shape = shape
+                        _apply_style(obj, None, fill_rgb, width, dashes, opts)
+                        _parent_for(stroke_rgb or fill_rgb, layer_name).addObject(obj)
+                        obj_count += 1
+                    except ImportCancelled:
+                        raise
+                    except Exception as exc:
+                        # This one fill is left out, never drawn without its openings.
+                        if obj is not None:
+                            try:
+                                fc_doc.removeObject(obj.Name)
+                            except Exception:
+                                pass
+                        try:
+                            detail = "%s: %s" % (type(exc).__name__, exc)
+                        except Exception:
+                            detail = type(exc).__name__
+                        _warn("Page %s: a sheet-sized fill with openings (drawing order %s) "
+                              "could not be built and was left out: %s"
+                              % (page_num, path_group.get("seqno"), detail))
+                if fill_kind != "parts":
+                    if stroke is None:
+                        continue
+                    # The outline is drawing content; the fill is not delivered twice
+                    # (holes) or not at all (background).
+                    path_group = dict(path_group, fill=None, type="s")
+                    fill = None
+                    fill_rgb = None
 
         parent = _parent_for(stroke_rgb or fill_rgb, layer_name)
 

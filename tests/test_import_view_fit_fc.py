@@ -156,3 +156,150 @@ def test_unset_or_nonfinite_descendant_bounds_do_not_claim_a_fit():
     roots = [_view_bounds((1e38, 1e38, 1e38, -1e38, -1e38, -1e38)),
              _view_bounds((0, 0, 0, float("inf"), 10, 0))]
     assert core._fit_import_descendant_bounds(view, roots) is False
+
+
+def _paper(corners, origin=(0.0, 0.0)):
+    import json
+
+    return SimpleNamespace(
+        Name="PDF_Paper",
+        PDFPaperDisplayJSON=json.dumps({"corners_mm": corners}),
+        Placement=SimpleNamespace(Base=SimpleNamespace(x=origin[0], y=origin[1])),
+        isDerivedFrom=lambda kind: False,
+    )
+
+
+def _sheet_host(monkeypatch, size):
+    """A view whose camera records the corner fit and the orthographic height."""
+    events, selection, old_selection = _host(monkeypatch)
+    fitted = []
+
+    class Coordinate:
+        def __init__(self):
+            self.values = []
+            self.point = SimpleNamespace(setValues=self.set_values)
+
+        def set_values(self, start, count, values):
+            assert start == 0 and count == len(values)
+            self.values = list(values)
+
+    class Node:
+        def __init__(self):
+            self.children = []
+
+        def addChild(self, node):
+            self.children.append(node)
+
+    coin = SimpleNamespace(SoCoordinate3=Coordinate, SoPointSet=SimpleNamespace,
+                           SoSeparator=Node, SbViewportRegion=lambda w, h: (w, h))
+    monkeypatch.setitem(sys.modules, "pivy", SimpleNamespace(coin=coin))
+    heights = []
+    camera = SimpleNamespace(
+        viewAll=lambda node, viewport, slack: fitted.append((node, viewport, slack)),
+        height=SimpleNamespace(setValue=heights.append),
+    )
+    view = sys.modules["FreeCADGui"].ActiveDocument.ActiveView
+    view.getSize = lambda: size
+    view.getCameraNode = lambda: camera
+    return events, selection, old_selection, fitted, heights
+
+
+@pytest.mark.parametrize("size,expected_height", [
+    # Letter portrait sheet, 215.9 x 279.4 mm.
+    ((1600, 900), 279.4 * 1.05),            # wide window: the sheet height decides
+    ((600, 1200), 215.9 * 1.05),            # tall window: Coin widens by 1/aspect
+    ((900, 1000), 279.4 * 0.9 * 1.05),      # slightly tall window: the sheet height decides
+])
+def test_sheet_fit_places_the_camera_on_the_paper_without_a_document_fit(
+        monkeypatch, size, expected_height):
+    events, selection, old_selection, fitted, heights = _sheet_host(monkeypatch, size)
+    corners = [(0, 0, 0), (215.9, 0, 0), (215.9, 279.4, 0), (0, 279.4, 0)]
+    page = _page("PDF_Page_1")
+    # An off-sheet stroke and an unrelated object far away must not set the zoom.
+    stray = _view_bounds((-900.0, 100.0, 0.0, 215.9, 100.0, 0.0))
+    stray.Name = "PDF_Stray"
+    stray.isDerivedFrom = lambda kind: False
+    unrelated = _view_bounds((1e6, 1e6, 0, 1e6 + 1, 1e6 + 1, 1))
+    unrelated.Name = "ExistingRemoteBuilding"
+    unrelated.isDerivedFrom = lambda kind: False
+
+    def no_new_objects(*_args, **_kwargs):
+        raise AssertionError("the view fit must not add a document object")
+
+    doc = SimpleNamespace(Objects=[page, _paper(corners), stray, unrelated],
+                          addObject=no_new_objects, removeObject=no_new_objects)
+    core._autofit_import_view(doc)
+
+    # The fit-all message is never sent: it would frame the stray stroke and
+    # the unrelated object. The operator's selection is back as it was.
+    assert not [event for event in events if event[0] in ("ViewFit", "all")]
+    assert selection == [old_selection]
+    node, viewport, slack = fitted[-1]
+    assert viewport == size and slack == 1.0
+    assert set(node.children[0].values) == {
+        (x, y, 0.0) for x in (0.0, 215.9) for y in (0.0, 279.4)
+    }
+    assert node.children[1].numPoints == 4
+    assert heights[-1] == pytest.approx(expected_height)
+
+
+def test_sheet_fit_covers_every_placed_sheet_of_a_batch(monkeypatch):
+    events, _selection, _old, fitted, heights = _sheet_host(monkeypatch, (1600, 900))
+    letter = [(0, 0, 0), (215.9, 0, 0), (215.9, 279.4, 0), (0, 279.4, 0)]
+    tabloid = [(0, 0, 0), (431.8, 0, 0), (431.8, 279.4, 0), (0, 279.4, 0)]
+    doc = SimpleNamespace(Objects=[
+        _page("PDF_Page_1"), _paper(letter), _page("PDF_Page_2"), _paper(tabloid, origin=(0.0, -335.28)),
+    ])
+    core._autofit_import_view(doc)
+    node, _viewport, _slack = fitted[-1]
+    assert set(node.children[0].values) == {
+        (x, y, 0.0) for x in (0.0, 431.8) for y in (-335.28, 279.4)
+    }
+    # Both sheets, edge to edge: the stack is taller than the window is wide.
+    assert heights[-1] == pytest.approx((279.4 + 335.28) * 1.05)
+    assert not [event for event in events if event[0] == "ViewFit"]
+
+
+def test_sheet_fit_reports_failure_instead_of_fitting_the_document(monkeypatch):
+    # No Coin bindings: nothing may fall back to a whole-document fit when the
+    # imported pages were already fitted by selection.
+    events, selection, old_selection = _host(monkeypatch)
+    monkeypatch.setitem(sys.modules, "pivy", None)
+    corners = [(0, 0, 0), (215.9, 0, 0), (215.9, 279.4, 0), (0, 279.4, 0)]
+    pages = [_page("PDF_Page_1")]
+    core._autofit_import_view(SimpleNamespace(Objects=pages + [_paper(corners)]))
+    assert events == [
+        ("camera", "Orthographic"), ("top",), ("ViewSelection", tuple(pages)),
+    ]
+    assert selection == [old_selection]
+
+
+@pytest.mark.parametrize("sheet", [
+    None, (), (0, 0, 0), (0, 0, 0, 10), (10, 0, 0, 10), (0, 0, float("nan"), 10),
+    (0, 0, float("inf"), 10), ("a", 0, 1, 1),
+])
+def test_sheet_fit_rejects_a_box_that_is_not_a_rectangle(sheet):
+    assert core._fit_view_to_sheet(SimpleNamespace(), sheet) is False
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_view_animation_is_off_while_the_view_is_framed_and_restored_after(monkeypatch, enabled):
+    events, _selection, _old = _host(monkeypatch)
+    view = sys.modules["FreeCADGui"].ActiveDocument.ActiveView
+    state = {"enabled": enabled}
+    view.isAnimationEnabled = lambda: state["enabled"]
+
+    def set_enabled(value):
+        state["enabled"] = bool(value)
+        events.append(("animation", bool(value)))
+
+    view.setAnimationEnabled = set_enabled
+    core._autofit_import_view(SimpleNamespace(Objects=[_page("PDF_Page_1")]))
+    if enabled:
+        # Off before the turn to the top view, back on after the last fit.
+        assert events[0] == ("animation", False)
+        assert events[1:3] == [("camera", "Orthographic"), ("top",)]
+        assert events[-1] == ("animation", True)
+    else:
+        assert not [event for event in events if event[0] == "animation"]
+    assert state["enabled"] is enabled

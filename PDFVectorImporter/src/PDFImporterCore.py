@@ -11758,27 +11758,119 @@ def _apply_sheet_straight_on(view, sheet) -> bool:
         return False
 
 
+_VIEW_REFRAME_DELAYS_MS = (0, 250, 1000)
+_VIEW_REFRAME_MODAL_RETRY_MS = 250
+_VIEW_REFRAME_MODAL_RETRIES = 2400
+_view_reframe_token = 0
+
+
+def _cancel_import_view_reframe() -> None:
+    """Invalidate callbacks before another import can process GUI events."""
+    global _view_reframe_token
+    _view_reframe_token += 1
+
+
+def _qt_modules():
+    """Qt bindings of the running host, or (None, None) outside the GUI."""
+    for package in ("PySide6", "PySide2", "PySide"):
+        try:
+            module = __import__(package, fromlist=["QtCore", "QtWidgets"])
+            return module.QtCore, module.QtWidgets
+        except (ImportError, AttributeError):
+            continue
+    return None, None
+
+
+def _schedule_import_view_reframe(fc_doc) -> bool:
+    """Reapply the sheet frame after Open/Import/drop's own final ViewFit.
+
+    Import-summary modal dialogs run an event loop before the host command
+    returns. Wait for those dialogs, then make the bounded settling passes.
+    Callbacks belong to this exact document and view, never a reused name.
+    """
+    QtCore, QtWidgets = _qt_modules()
+    try:
+        import FreeCADGui as Gui
+
+        active = Gui.ActiveDocument
+        if (QtCore is None or not getattr(fc_doc, "Name", "")
+                or active is None or active.Document is not fc_doc):
+            return False
+        view = active.ActiveView
+        if view is None:
+            return False
+    except (ImportError, AttributeError, RuntimeError, ReferenceError):
+        return False
+    token = _view_reframe_token
+
+    def _still_active():
+        try:
+            active = Gui.ActiveDocument
+            return (active is not None and active.Document is fc_doc
+                    and active.ActiveView is view)
+        except (AttributeError, RuntimeError, ReferenceError):
+            return False
+
+    def _step(index, retries_left):
+        if token != _view_reframe_token or not _still_active():
+            return
+        try:
+            modal_open = QtWidgets.QApplication.activeModalWidget() is not None
+        except (AttributeError, RuntimeError):
+            return
+        if modal_open:
+            if retries_left > 0:
+                _arm(_VIEW_REFRAME_MODAL_RETRY_MS, index, retries_left - 1)
+            return
+        # Do not yield to another event loop between the ownership check and
+        # using the view. The immediate path has already refreshed the GUI.
+        _frame_import_view(fc_doc, update_gui=False)
+        if index + 1 < len(_VIEW_REFRAME_DELAYS_MS):
+            _arm(_VIEW_REFRAME_DELAYS_MS[index + 1] - _VIEW_REFRAME_DELAYS_MS[index],
+                 index + 1, _VIEW_REFRAME_MODAL_RETRIES)
+
+    def _arm(delay_ms, index, retries_left):
+        try:
+            QtCore.QTimer.singleShot(int(delay_ms), lambda: _step(index, retries_left))
+        except (AttributeError, RuntimeError, TypeError):
+            return False
+        return True
+
+    return _arm(_VIEW_REFRAME_DELAYS_MS[0], 0, _VIEW_REFRAME_MODAL_RETRIES)
+
+
 def _autofit_import_view(fc_doc) -> None:
-    """Frame the viewport on imported PDF geometry, not unrelated document content."""
+    """Frame the imported sheets now and again after the host's own fit."""
+    _cancel_import_view_reframe()
+    token = _view_reframe_token
+    if _frame_import_view(fc_doc) and token == _view_reframe_token:
+        _schedule_import_view_reframe(fc_doc)
+
+
+def _frame_import_view(fc_doc, *, update_gui=True) -> bool:
+    """Frame imported PDF geometry; return whether an active view existed."""
     try:
         import FreeCADGui as Gui
     except ImportError:
-        return
+        return False
 
-    try:
-        Gui.updateGui()
-    except (AttributeError, RuntimeError):
-        pass
+    if update_gui:
+        try:
+            Gui.updateGui()
+        except (AttributeError, RuntimeError):
+            pass
 
     view = None
     try:
         adoc = Gui.ActiveDocument
         if adoc:
+            if getattr(adoc, "Document", fc_doc) is not fc_doc:
+                return False
             view = adoc.ActiveView
     except (AttributeError, RuntimeError):
         view = None
     if view is None:
-        return
+        return False
 
     roots = _pdf_import_root_objects(fc_doc)
     prior_sel = []
@@ -11854,6 +11946,7 @@ def _autofit_import_view(fc_doc) -> None:
                 view.setAnimationEnabled(True)
             except (AttributeError, RuntimeError, TypeError):
                 pass
+    return True
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -11968,6 +12061,7 @@ def import_pdf_page(pdf_path: str, page_num: int = 1,
                     opts: Optional[ImportOptions] = None,
                     autofit: bool = True):
     """Import a single PDF page into the active FreeCAD document."""
+    _cancel_import_view_reframe()
     if opts is None:
         opts = ImportOptions(ignore_images=not IMAGE_WB)
     _reset_import_run_state(opts)
@@ -12748,21 +12842,8 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         if stroke is None and fill is None:
             continue
 
-        # ── Skip page-sized background fills ──
-        # Some PDFs include a full-page rectangle as a background fill.
-        # These add no useful geometry and obscure the actual drawing content.
-        grp_rect = path_group.get("rect")
-        if grp_rect and _is_rect(grp_rect):
-            grp_area = abs(grp_rect.width * grp_rect.height)
-            # page_w / page_h are float(page.rect.width/height) read once per
-            # page above; reading page.rect here built two PyMuPDF Rects per
-            # path group (1.1 million on a 550k-path sheet, 15 s).
-            page_area = page_w * page_h
-            # A compound clip fill is a shaped mask (a frame, a ring) whose
-            # bounds are its clip's: sheet-sized bounds are not sheet-sized ink.
-            if grp_area > page_area * 0.95 and not path_group.get("bcs_compound_clip_fill"):
-                continue
-
+        # Bounds cannot distinguish background paint from a border, diagonal,
+        # or large filled feature. Preserve every visible source drawing here.
         parent = _parent_for(stroke_rgb or fill_rgb, layer_name)
 
         if opts.assign_linewidth:
@@ -14054,6 +14135,7 @@ def find_resumable_import_session(
 @_memoized_wirestrings
 def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     """Import one or more pages from a PDF file."""
+    _cancel_import_view_reframe()
     if opts is None:
         opts = ImportOptions(ignore_images=not IMAGE_WB)
     fc_doc = _ensure_doc()

@@ -305,17 +305,109 @@ def test_view_animation_is_off_while_the_view_is_framed_and_restored_after(monke
     assert state["enabled"] is enabled
 
 
-def _qt(monkeypatch, modal=None):
-    """Fake Qt: timers are recorded and fired by the test."""
-    timers = []
-    state = {"modal": modal}
-    qt_core = SimpleNamespace(QTimer=SimpleNamespace(
-        singleShot=lambda delay, callback: timers.append((delay, callback))))
-    qt_widgets = SimpleNamespace(QApplication=SimpleNamespace(
-        activeModalWidget=lambda: state["modal"]))
-    monkeypatch.setitem(sys.modules, "PySide6",
-                        SimpleNamespace(QtCore=qt_core, QtWidgets=qt_widgets))
-    return timers, state
+
+
+def test_framing_by_the_sheet_leaves_the_selection_untouched(monkeypatch):
+    # The camera is placed from the sheet corners. Clearing and re-adding the
+    # selection would fire selection events and turn a selected face into a
+    # selected object.
+    events, _selection, _old, _fitted, heights = _sheet_host(monkeypatch, (1600, 900))
+    gui = sys.modules["FreeCADGui"]
+
+    def untouched(*_args):
+        raise AssertionError("the selection must not be read or changed")
+
+    gui.Selection = SimpleNamespace(getSelection=untouched, clearSelection=untouched,
+                                    addSelection=untouched)
+    corners = [(0, 0, 0), (215.9, 0, 0), (215.9, 279.4, 0), (0, 279.4, 0)]
+    page = _view_bounds((0, 0, 0, 215.9, 279.4, 0))
+    page.Name = "PDF_Page_1"
+    page.isDerivedFrom = lambda kind: kind == "App::DocumentObjectGroup"
+    core._autofit_import_view(SimpleNamespace(Objects=[page, _paper(corners)]))
+    assert heights[-1] == pytest.approx(279.4 * 1.05)
+    assert events == [("camera", "Orthographic"), ("top",)]
+
+
+def _scan(page, centre, size):
+    """A page delivered as one image: the plane is drawn centred on its placement."""
+    return SimpleNamespace(
+        Name="Page_%d_raster" % page, TypeId="Image::ImagePlane", PDFSourceItemId="p%d:page" % page,
+        XSize=size[0], YSize=size[1],
+        Placement=SimpleNamespace(Base=SimpleNamespace(x=centre[0], y=centre[1])),
+        isDerivedFrom=lambda kind: False,
+    )
+
+
+def test_a_scanned_page_is_a_sheet_and_is_framed_edge_to_edge(monkeypatch):
+    # A scan has no paper object; its full-page image is the sheet.
+    events, _selection, _old, fitted, heights = _sheet_host(monkeypatch, (1600, 900))
+    scan = _scan(1, (107.07, 140.76), (214.14, 281.52))
+    core._autofit_import_view(SimpleNamespace(Objects=[_page("PDF_Page_1"), scan]))
+    node, _viewport, slack = fitted[-1]
+    assert slack == 1.0
+    assert {tuple(round(value, 6) for value in corner) for corner in node.children[0].values} == {
+        (x, y, 0.0) for x in (0.0, 214.14) for y in (0.0, 281.52)
+    }
+    assert heights[-1] == pytest.approx(281.52 * 1.05)
+    assert not [event for event in events if event[0] in ("ViewFit", "all")]
+
+
+@pytest.mark.parametrize("scan_page", [1, 3])
+def test_a_scan_at_either_end_of_a_batch_is_inside_the_framed_box(scan_page):
+    letter = [(0, 0, 0), (215.9, 0, 0), (215.9, 279.4, 0), (0, 279.4, 0)]
+    offsets = {1: 0.0, 2: -335.28, 3: -670.56}
+    objects = []
+    for number in (1, 2, 3):
+        objects.append(_page("PDF_Page_%d" % number))
+        if number == scan_page:
+            objects.append(_scan(number, (107.07, offsets[number] + 140.76), (214.14, 281.52)))
+        else:
+            objects.append(_paper(letter, origin=(0.0, offsets[number])))
+    box = core._sheet_view_box(SimpleNamespace(Objects=objects))
+    assert box[0] == pytest.approx(0.0) and box[2] == pytest.approx(215.9)
+    assert box[1] == pytest.approx(-670.56)
+    assert box[3] == pytest.approx(281.52 if scan_page == 1 else 279.4)
+
+
+@pytest.mark.parametrize("change", [
+    {"TypeId": "Part::Feature"},                 # not an image
+    {"PDFSourceItemId": "p1:image:3"},           # an embedded picture, not the page
+    {"PDFSourceItemId": ""},
+    {"XSize": 0.0},
+    {"YSize": float("nan")},
+    {"Placement": None},
+])
+def test_only_a_full_page_image_counts_as_a_sheet(change):
+    plane = _scan(1, (107.07, 140.76), (214.14, 281.52))
+    for name, value in change.items():
+        setattr(plane, name, value)
+    assert core._sheet_view_box(SimpleNamespace(Objects=[plane])) is None
+
+
+# ── FreeCAD's own fit after File > Open, File > Import and a drop ─────────
+
+class _Loop:
+    """Fake Qt: single-shot timers fired by the test, and the event-loop depth."""
+
+    def __init__(self, monkeypatch, level=1):
+        self.timers = []
+        self.level = level
+        self.modal = None
+        thread = SimpleNamespace(loopLevel=lambda: self.level)
+        qt_core = SimpleNamespace(
+            QTimer=SimpleNamespace(singleShot=lambda delay, callback: self.timers.append((delay, callback))),
+            QThread=SimpleNamespace(currentThread=lambda: thread),
+        )
+        qt_widgets = SimpleNamespace(QApplication=SimpleNamespace(activeModalWidget=lambda: self.modal))
+        monkeypatch.setitem(sys.modules, "PySide6",
+                            SimpleNamespace(QtCore=qt_core, QtWidgets=qt_widgets))
+        monkeypatch.setattr(core, "_host_import_commands", [])
+        monkeypatch.setattr(core, "_pending_view_reframes", {})
+
+    def fire(self):
+        delay, callback = self.timers.pop(0)
+        callback()
+        return delay
 
 
 def _named_doc(name, objects):
@@ -327,88 +419,302 @@ def _named_doc(name, objects):
 FRAMED = [("camera", "Orthographic"), ("top",)]
 
 
-def test_sheets_are_framed_again_after_the_host_fit_all(monkeypatch):
-    # FreeCAD sends its own "ViewFit" when the import command returns. The
-    # framing is applied again from the event loop so it is the last camera move.
+def test_sheets_are_framed_again_when_the_host_command_is_back_in_its_event_loop(monkeypatch):
+    # FreeCAD sends "ViewFit" (fit the whole document) when Open, Import or a
+    # drop returns. With view animation on that fit runs in an event loop of
+    # its own. The sheet framing is applied once that loop is gone.
     events, selection, old_selection = _host(monkeypatch)
-    timers, _state = _qt(monkeypatch)
+    loop = _Loop(monkeypatch, level=1)
     pages = [_page("PDF_Page_1")]
     doc = _named_doc("Sheet", pages)
-    first = FRAMED + [("ViewSelection", tuple(pages))]
+    once = FRAMED + [("ViewSelection", tuple(pages))]
 
-    core._autofit_import_view(doc)
-    assert events == first
-    assert [delay for delay, _callback in timers] == [0]
+    with core.host_import_command():
+        core._autofit_import_view(doc)
+        assert events == once
+        assert loop.timers == []                    # nothing is scheduled inside the command
+    assert [delay for delay, _callback in loop.timers] == [0]
 
-    # The host's fit-all arrives here, then the event loop runs the timer.
+    # The host's animated fit: its event loop is one level deeper.
+    loop.level = 2
     events.append(("ViewFit", ("host",)))
-    timers.pop(0)[1]()
-    assert events == first + [("ViewFit", ("host",))] + first
-    assert [delay for delay, _callback in timers] == [250]
-    timers.pop(0)[1]()
-    assert [delay for delay, _callback in timers] == [750]
-    timers.pop(0)[1]()
-    assert timers == []
-    assert events == first + [("ViewFit", ("host",))] + first * 3
+    assert loop.fire() == 0
+    assert loop.fire() == core._VIEW_REFRAME_POLL_MS
+    assert events == once + [("ViewFit", ("host",))]     # still waiting
+    # Back in the loop the command was started from.
+    loop.level = 1
+    loop.fire()
+    assert events == once + [("ViewFit", ("host",))] + once
+    assert loop.timers == []                        # framed once, then nothing more
     assert selection == [old_selection]
 
 
-def test_reframe_waits_while_a_dialog_of_the_import_is_still_open(monkeypatch):
+def test_no_reframe_without_a_host_command(monkeypatch):
+    # The toolbar command and scripts are not followed by a host fit.
+    _host(monkeypatch)
+    loop = _Loop(monkeypatch)
+    core._autofit_import_view(_named_doc("Sheet", [_page("PDF_Page_1")]))
+    assert loop.timers == []
+
+
+@pytest.mark.parametrize("busy", ["dialog", "animation"])
+def test_reframe_waits_for_an_open_dialog_and_a_running_view_animation(monkeypatch, busy):
     events, _selection, _old = _host(monkeypatch)
-    timers, state = _qt(monkeypatch, modal=object())
+    loop = _Loop(monkeypatch)
+    doc = _named_doc("Sheet", [_page("PDF_Page_1")])
+    view = sys.modules["FreeCADGui"].ActiveDocument.ActiveView
+    animating = {"on": busy == "animation"}
+    view.isAnimating = lambda: animating["on"]
+    if busy == "dialog":
+        loop.modal = object()
+    with core.host_import_command():
+        core._autofit_import_view(doc)
+    count = len(events)
+    loop.fire()
+    assert len(events) == count and len(loop.timers) == 1
+    loop.modal = None
+    animating["on"] = False
+    loop.fire()
+    assert len(events) > count and loop.timers == []
+
+
+def test_without_a_known_loop_depth_the_camera_has_to_hold_still(monkeypatch):
+    events, _selection, _old = _host(monkeypatch)
+    loop = _Loop(monkeypatch)
+    sys.modules["PySide6"].QtCore.QThread = None        # no loopLevel on this host
+    doc = _named_doc("Sheet", [_page("PDF_Page_1")])
+    camera = {"height": 293.37}
+    view = sys.modules["FreeCADGui"].ActiveDocument.ActiveView
+    vector = SimpleNamespace(getValue=lambda: (0.0, 0.0, 1.0))
+    rotation = SimpleNamespace(getValue=lambda: (0.0, 0.0, 0.0, 1.0))
+    view.getCameraNode = lambda: SimpleNamespace(
+        position=SimpleNamespace(getValue=lambda: vector),
+        orientation=SimpleNamespace(getValue=lambda: rotation),
+        height=SimpleNamespace(getValue=lambda: camera["height"]),
+    )
+    with core.host_import_command():
+        core._autofit_import_view(doc)
+    count = len(events)
+    for height in (293.37, 5000.0, 20000.0, 50010.78):   # the host's fit, step by step
+        camera["height"] = height
+        loop.fire()
+        assert len(events) == count and len(loop.timers) == 1
+    loop.fire()                                          # unchanged since the last look
+    assert len(events) > count and loop.timers == []
+
+
+def test_a_second_import_leaves_one_check_running_and_frames_once(monkeypatch):
+    events, _selection, _old = _host(monkeypatch)
+    loop = _Loop(monkeypatch)
     pages = [_page("PDF_Page_1")]
     doc = _named_doc("Sheet", pages)
-    core._autofit_import_view(doc)
-    before = list(events)
-
-    # The import summary is still on screen: the command has not returned.
-    timers.pop(0)[1]()
-    assert events == before
-    assert [delay for delay, _callback in timers] == [250]
-    state["modal"] = None
-    timers.pop(0)[1]()
-    assert events == before + FRAMED + [("ViewSelection", tuple(pages))]
-
-
-def test_a_newer_import_supersedes_pending_reframes(monkeypatch):
-    events, _selection, _old = _host(monkeypatch)
-    timers, _state = _qt(monkeypatch)
-    doc = _named_doc("Sheet", [_page("PDF_Page_1")])
-    core._autofit_import_view(doc)
-    stale = timers.pop(0)[1]
-    core._autofit_import_view(doc)
+    once = FRAMED + [("ViewSelection", tuple(pages))]
+    with core.host_import_command():
+        core._autofit_import_view(doc)
+    with core.host_import_command():
+        core._autofit_import_view(doc)
     count = len(events)
-    stale()
-    assert len(events) == count
-    assert len(timers) == 1
+    assert len(loop.timers) == 2
+    loop.fire()                                          # the older check has been replaced
+    assert len(events) == count and len(loop.timers) == 1
+    loop.fire()
+    assert events[count:] == once and loop.timers == []
+
+
+def test_the_check_waits_while_the_command_imports_its_next_file(monkeypatch):
+    # File > Open with several files: FreeCAD opens them one after the other
+    # and fits after each. Nothing is framed in between.
+    events, _selection, _old = _host(monkeypatch)
+    loop = _Loop(monkeypatch)
+    doc = _named_doc("Sheet", [_page("PDF_Page_1")])
+    with core.host_import_command():
+        core._autofit_import_view(doc)
+    count = len(events)
+    with core.host_import_command():
+        loop.fire()                                      # an event pump inside the next import
+        assert len(events) == count and len(loop.timers) == 1
+    loop.fire()
+    assert len(events) > count and loop.timers == []
+
+
+def test_every_file_of_one_command_is_framed_in_its_own_view(monkeypatch):
+    _host(monkeypatch)
+    loop = _Loop(monkeypatch)
+    gui = sys.modules["FreeCADGui"]
+    framed = []
+    documents = {}
+
+    def gui_document(name):
+        view = SimpleNamespace(
+            setCameraType=lambda value, name=name: framed.append((name, value)),
+            viewTop=lambda: None, fitAll=lambda: None,
+        )
+        doc = SimpleNamespace(Name=name, Objects=[])
+        documents[name] = SimpleNamespace(Document=doc, ActiveView=view)
+        return doc
+
+    first, second, third = (gui_document(name) for name in ("First", "Second", "Third"))
+    gui.getDocument = lambda name: documents[name]
+    for doc in (first, second, third):
+        gui.ActiveDocument = documents[doc.Name]
+        with core.host_import_command():
+            core._autofit_import_view(doc)
+    assert framed == [("First", "Orthographic"), ("Second", "Orthographic"), ("Third", "Orthographic")]
+    del documents["Second"]                              # closed before the command returned
+    del framed[:]
+    while loop.timers:
+        loop.fire()
+    # The last document is the active one; the first is framed in its own view all the same.
+    assert framed == [("First", "Orthographic"), ("Third", "Orthographic")]
+    assert core._pending_view_reframes == {}
 
 
 @pytest.mark.parametrize("change", ["closed", "other_document"])
 def test_reframe_leaves_another_document_alone(monkeypatch, change):
     events, _selection, _old = _host(monkeypatch)
-    timers, _state = _qt(monkeypatch)
+    loop = _Loop(monkeypatch)
     doc = _named_doc("Sheet", [_page("PDF_Page_1")])
-    core._autofit_import_view(doc)
+    with core.host_import_command():
+        core._autofit_import_view(doc)
     count = len(events)
     gui = sys.modules["FreeCADGui"]
     if change == "closed":
         gui.ActiveDocument = None
     else:
         gui.ActiveDocument.Document = SimpleNamespace(Name="Other", Objects=[])
-    timers.pop(0)[1]()
+    loop.fire()
     assert len(events) == count
-    assert timers == []
+    assert loop.timers == []
 
 
-def test_no_reframe_is_scheduled_without_a_view_or_without_qt(monkeypatch):
+def test_reframe_gives_up_after_its_last_check(monkeypatch):
     _host(monkeypatch)
-    timers, _state = _qt(monkeypatch)
+    loop = _Loop(monkeypatch)
+    monkeypatch.setattr(core, "_VIEW_REFRAME_MAX_POLLS", 3)
+    doc = _named_doc("Sheet", [_page("PDF_Page_1")])
+    with core.host_import_command():
+        core._autofit_import_view(doc)
+    loop.level = 2                                       # never returns to the base loop
+    fired = 0
+    while loop.timers:
+        loop.fire()
+        fired += 1
+    assert fired == 3
+
+
+def test_a_failed_or_cancelled_host_import_schedules_nothing(monkeypatch):
+    _host(monkeypatch)
+    loop = _Loop(monkeypatch)
+    with pytest.raises(RuntimeError):
+        with core.host_import_command():
+            raise RuntimeError("import failed before any view was framed")
+    with core.host_import_command():
+        pass
+    assert loop.timers == []
+    assert core._host_import_commands == []
+
+
+def test_nothing_is_scheduled_without_a_view_or_without_qt(monkeypatch):
+    _host(monkeypatch)
+    loop = _Loop(monkeypatch)
     sys.modules["FreeCADGui"].ActiveDocument = None
-    core._autofit_import_view(SimpleNamespace(Name="Sheet", Objects=[]))
-    assert timers == []
+    with core.host_import_command():
+        core._autofit_import_view(SimpleNamespace(Name="Sheet", Objects=[]))
+    assert loop.timers == []
 
     _host(monkeypatch)
     for package in ("PySide6", "PySide2", "PySide"):
         monkeypatch.setitem(sys.modules, package, None)
     doc = _named_doc("Sheet", [_page("PDF_Page_1")])
-    core._autofit_import_view(doc)  # must not raise
+    with core.host_import_command():
+        core._autofit_import_view(doc)                   # must not raise
+
+
+def test_no_view_preference_is_read_or_written():
+    # The host's automatic fit is a user preference. It stays as stored: the
+    # framing code and the handler never open the parameter store.
+    import ast
+    import inspect
+
+    for function in (core._HostImportCommand, core._reframe_after_host_fit, core._autofit_import_view,
+                     core._frame_import_view, core._fit_view_to_sheet, core._event_loop_level):
+        text = inspect.getsource(function)
+        assert not [word for word in ("ParamGet", "SetBool", "RemBool", "GetBool") if word in text]
+    handler = (REPO / "PDFVectorImporter" / "PDFImportHandler.py").read_text(encoding="utf-8")
+    names = {node.attr for node in ast.walk(ast.parse(handler)) if isinstance(node, ast.Attribute)}
+    assert not names & {"ParamGet", "SetBool", "RemBool", "GetBool"}
+
+
+def _load_handler(monkeypatch, gui_up=True):
+    """PDFImportHandler with a fake FreeCAD, bound to this test's core module."""
+    import importlib.util
+
+    freecad = SimpleNamespace(
+        GuiUp=gui_up,
+        getUserAppDataDir=lambda: str(REPO / "no-such-profile"),
+        getResourceDir=lambda: str(REPO / "no-such-resources"),
+        Console=SimpleNamespace(PrintMessage=lambda _t: None, PrintError=lambda _t: None,
+                                PrintWarning=lambda _t: None),
+        newDocument=lambda name: SimpleNamespace(Name=name),
+        setActiveDocument=lambda _name: None,
+        getDocument=lambda name: SimpleNamespace(Name=name),
+    )
+    monkeypatch.setitem(sys.modules, "FreeCAD", freecad)
+    package = SimpleNamespace(src=SimpleNamespace(PDFImporterCore=core))
+    monkeypatch.setitem(sys.modules, "PDFVectorImporter", package)
+    monkeypatch.setitem(sys.modules, "PDFVectorImporter.src", package.src)
+    monkeypatch.setitem(sys.modules, "PDFVectorImporter.src.PDFImporterCore", core)
+    spec = importlib.util.spec_from_file_location(
+        "PDFImportHandler_under_test", REPO / "PDFVectorImporter" / "PDFImportHandler.py")
+    handler = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(handler)
+    monkeypatch.setattr(handler, "_check_fitz", lambda: True)
+    return handler
+
+
+@pytest.mark.parametrize("entry", ["open", "insert"])
+def test_the_host_entry_points_run_the_import_inside_the_command_scope(monkeypatch, entry):
+    _host(monkeypatch)
+    loop = _Loop(monkeypatch)
+    handler = _load_handler(monkeypatch)
+    doc = _named_doc("Sheet", [_page("PDF_Page_1")])
+    seen = []
+
+    def fake_import(filename):
+        seen.append((filename, len(core._host_import_commands)))
+        core._autofit_import_view(doc)
+        assert loop.timers == []
+
+    monkeypatch.setattr(handler, "_import_with_dialog", fake_import)
+    if entry == "open":
+        handler.open("D042.pdf")
+    else:
+        handler.insert("D042.pdf", "Sheet")
+    assert seen == [("D042.pdf", 1)]
+    assert core._host_import_commands == []
+    assert [delay for delay, _callback in loop.timers] == [0]     # armed as the handler returns
+
+
+def test_the_scope_closes_when_the_import_raises(monkeypatch):
+    _host(monkeypatch)
+    loop = _Loop(monkeypatch)
+    handler = _load_handler(monkeypatch)
+
+    def failing(_filename):
+        raise KeyError("unexpected")
+
+    monkeypatch.setattr(handler, "_import_with_dialog", failing)
+    with pytest.raises(KeyError):
+        handler.open("D042.pdf")
+    assert core._host_import_commands == [] and loop.timers == []
+
+
+def test_the_handler_works_with_a_core_that_has_no_command_scope(monkeypatch):
+    _host(monkeypatch)
+    _Loop(monkeypatch)
+    handler = _load_handler(monkeypatch)
+    monkeypatch.delattr(core, "host_import_command")
+    called = []
+    monkeypatch.setattr(handler, "_import_with_dialog", called.append)
+    handler.open("D042.pdf")
+    assert called == ["D042.pdf"]

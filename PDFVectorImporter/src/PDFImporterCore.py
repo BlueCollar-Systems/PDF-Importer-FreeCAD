@@ -11722,8 +11722,32 @@ def _pdf_import_root_objects(fc_doc):
     return roots
 
 
+_FULL_PAGE_RASTER_ITEM = re.compile(r"^p\d+:page$")
+
+
+def _full_page_raster_box(obj):
+    """Rectangle of a page delivered as one image. A scan has no paper object:
+    its image plane is the sheet. The plane is drawn centred on its placement.
+    """
+    try:
+        if str(getattr(obj, "TypeId", "")) != "Image::ImagePlane":
+            return None
+        if not _FULL_PAGE_RASTER_ITEM.match(str(getattr(obj, "PDFSourceItemId", "") or "")):
+            return None
+        base = obj.Placement.Base
+        half_w, half_h = float(obj.XSize) / 2.0, float(obj.YSize) / 2.0
+        box = (float(base.x) - half_w, float(base.y) - half_h,
+               float(base.x) + half_w, float(base.y) + half_h)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in box) or half_w <= 0.0 or half_h <= 0.0:
+        return None
+    return box
+
+
 def _sheet_view_box(fc_doc):
-    """Union of placed PDF paper rectangles, in model millimeters."""
+    """Union of the placed sheets, in model millimeters: every PDF paper
+    rectangle and every page delivered as a full-page image."""
     try:
         from .PDFPaperDisplay import placed_sheet_box, union_sheet_boxes
     except ImportError:
@@ -11732,6 +11756,9 @@ def _sheet_view_box(fc_doc):
     for obj in _document_objects(fc_doc):
         raw = getattr(obj, "PDFPaperDisplayJSON", None)
         if not raw:
+            scan = _full_page_raster_box(obj)
+            if scan is not None:
+                boxes.append(scan)
             continue
         try:
             import json
@@ -11860,12 +11887,15 @@ def _fit_import_descendant_bounds(view, roots) -> bool:
 
 # FreeCAD sends its own "ViewFit" (fit the whole document) to the view when an
 # Open, Import or drop command returns and the AutoFitToView preference is on,
-# which is the default. That runs after the importer has framed the sheet, so
-# the framing is applied again once the command is back in the event loop.
-_VIEW_REFRAME_DELAYS_MS = (0, 250, 1000)
-_VIEW_REFRAME_MODAL_RETRY_MS = 250
-_VIEW_REFRAME_MODAL_RETRIES = 2400
-_view_reframe_token = 0
+# which is the default. That fit comes after the importer has framed the sheet,
+# and with view animation on it runs in an event loop of its own. The sheet is
+# therefore framed once more when that command is back in the event loop it was
+# started from: detected, not timed. No preference is read or changed.
+_VIEW_REFRAME_POLL_MS = 30
+_VIEW_REFRAME_MAX_POLLS = 4000
+_host_import_commands: List[Any] = []
+_pending_view_reframes: Dict[str, Any] = {}   # document name -> event-loop depth of its command
+_view_reframe_watch = 0
 
 
 def _qt_modules():
@@ -11879,106 +11909,217 @@ def _qt_modules():
     return None, None
 
 
-def _schedule_import_view_reframe(fc_doc) -> bool:
-    """Frame the sheets again after the host's own post-import fit.
+def _event_loop_level():
+    """How many Qt event loops are running inside each other, or None."""
+    QtCore, _widgets = _qt_modules()
+    try:
+        return int(QtCore.QThread.currentThread().loopLevel())
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
 
-    A step waits while a modal dialog (import summary, warnings) is open: the
-    import command has not returned yet and the host's fit has not run. A newer
-    import supersedes pending steps, and nothing happens once the document is
-    closed or no longer the active one.
+
+class _HostImportCommand:
+    """One import started by FreeCAD itself: File > Open, File > Import, a drop.
+
+    FreeCAD fits the whole document when such a command returns. The documents
+    framed inside the command are framed again after that fit.
     """
-    global _view_reframe_token
-    QtCore, QtWidgets = _qt_modules()
-    name = getattr(fc_doc, "Name", "") or ""
-    if QtCore is None or not name:
-        return False
-    _view_reframe_token += 1
-    token = _view_reframe_token
 
-    def _document():
+    def __init__(self):
+        self.documents: List[str] = []
+        self.base_level = None
+
+    def __enter__(self):
+        self.base_level = _event_loop_level()
+        _host_import_commands.append(self)
+        return self
+
+    def __exit__(self, *_exc_info):
+        try:
+            if self in _host_import_commands:
+                _host_import_commands.remove(self)
+            for name in self.documents:
+                _reframe_after_host_fit(name, self.base_level)
+        except Exception:
+            # The view is a convenience; it never fails an import.
+            pass
+        return False
+
+
+def host_import_command():
+    """Scope for PDFImportHandler.open / insert: frame the sheets after FreeCAD's fit."""
+    return _HostImportCommand()
+
+
+def _gui_document(Gui, name):
+    """The GUI document called ``name``, or None once it is closed."""
+    try:
+        return Gui.getDocument(name)
+    except Exception:
+        pass
+    try:
+        active = Gui.ActiveDocument
+        if active is not None and getattr(active.Document, "Name", None) == name:
+            return active
+    except (AttributeError, RuntimeError):
+        pass
+    return None
+
+
+def _view_camera_state(view):
+    """Position, orientation and height of the view camera, or None."""
+    try:
+        camera = view.getCameraNode()
+        values = list(camera.position.getValue().getValue())
+        values += list(camera.orientation.getValue().getValue())
+        height = getattr(camera, "height", None)
+        if height is not None:
+            values.append(height.getValue())
+        return tuple(round(float(value), 6) for value in values)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _reframe_after_host_fit(doc_name: str, base_level) -> bool:
+    """Frame the sheets of ``doc_name`` once the host's own fit has finished.
+
+    The host command is finished when the event loop is back at the depth the
+    command was started from, no dialog is open and no view animation is
+    running. Where the host cannot tell the depth, the camera has to hold still
+    from one check to the next instead: the host's animated fit moves it at
+    every step. Several files opened by one command are each framed in their
+    own view; a document closed in the meantime is skipped.
+    """
+    global _view_reframe_watch
+    QtCore, QtWidgets = _qt_modules()
+    if QtCore is None or not doc_name:
+        return False
+    _pending_view_reframes.pop(doc_name, None)
+    _pending_view_reframes[doc_name] = base_level
+    _view_reframe_watch += 1
+    watch = _view_reframe_watch
+    state = {"polls": 0, "camera": None, "seen": False}
+
+    def _busy(view) -> bool:
+        try:
+            if QtWidgets.QApplication.activeModalWidget() is not None:
+                return True
+        except (AttributeError, RuntimeError):
+            pass
+        try:
+            if view is not None and view.isAnimating():
+                return True
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        return False
+
+    def _check():
+        if watch != _view_reframe_watch or not _pending_view_reframes:
+            return
+        if _host_import_commands:
+            # The command is importing its next file; its fit is still to come.
+            _arm(_VIEW_REFRAME_POLL_MS)
+            return
         try:
             import FreeCADGui as Gui
-
-            active = Gui.ActiveDocument
-            if active is None or getattr(active.Document, "Name", None) != name:
-                return None
-            return active.Document
-        except (ImportError, AttributeError, RuntimeError):
-            return None
-
-    def _modal_open() -> bool:
+        except ImportError:
+            _pending_view_reframes.clear()
+            return
+        views = {}
+        for name in list(_pending_view_reframes):
+            gui_doc = _gui_document(Gui, name)
+            if gui_doc is None:
+                del _pending_view_reframes[name]      # closed
+            else:
+                views[name] = gui_doc
+        if not views:
+            return
+        state["polls"] += 1
         try:
-            return QtWidgets.QApplication.activeModalWidget() is not None
+            view = views[list(views)[-1]].ActiveView
         except (AttributeError, RuntimeError):
-            return False
+            view = None
+        level = _event_loop_level()
+        depths = [_pending_view_reframes[name] for name in views]
+        if level is not None and all(depth is not None for depth in depths):
+            ready = level <= min(depths) and not _busy(view)
+        else:
+            camera = _view_camera_state(view)
+            ready = state["seen"] and camera == state["camera"] and not _busy(view)
+            state["camera"], state["seen"] = camera, True
+        if ready:
+            _pending_view_reframes.clear()
+            for gui_doc in views.values():
+                try:
+                    _frame_import_view(gui_doc.Document, settle=False)
+                except (AttributeError, RuntimeError):
+                    continue
+        elif state["polls"] < _VIEW_REFRAME_MAX_POLLS:
+            _arm(_VIEW_REFRAME_POLL_MS)
+        else:
+            _pending_view_reframes.clear()
 
-    def _step(index, retries_left):
-        if token != _view_reframe_token:
-            return
-        if _modal_open():
-            if retries_left > 0:
-                _arm(_VIEW_REFRAME_MODAL_RETRY_MS, index, retries_left - 1)
-            return
-        doc = _document()
-        if doc is None:
-            return
-        _frame_import_view(doc)
-        if index + 1 < len(_VIEW_REFRAME_DELAYS_MS):
-            _arm(
-                _VIEW_REFRAME_DELAYS_MS[index + 1] - _VIEW_REFRAME_DELAYS_MS[index],
-                index + 1,
-                _VIEW_REFRAME_MODAL_RETRIES,
-            )
-
-    def _arm(delay_ms, index, retries_left) -> bool:
+    def _arm(delay_ms) -> bool:
         try:
-            QtCore.QTimer.singleShot(
-                int(delay_ms), lambda: _step(index, retries_left)
-            )
+            QtCore.QTimer.singleShot(int(delay_ms), _check)
         except (AttributeError, RuntimeError, TypeError):
+            _pending_view_reframes.clear()
             return False
         return True
 
-    return _arm(_VIEW_REFRAME_DELAYS_MS[0], 0, _VIEW_REFRAME_MODAL_RETRIES)
+    return _arm(0)
 
 
 def _autofit_import_view(fc_doc) -> None:
-    """Frame the imported sheets now and again after the host's own fit."""
-    if _frame_import_view(fc_doc):
-        _schedule_import_view_reframe(fc_doc)
+    """Frame the imported sheets; inside a host command, again after its fit."""
+    if not _frame_import_view(fc_doc):
+        return
+    if _host_import_commands:
+        name = getattr(fc_doc, "Name", "") or ""
+        if name and name not in _host_import_commands[-1].documents:
+            _host_import_commands[-1].documents.append(name)
 
 
-def _frame_import_view(fc_doc) -> bool:
+def _frame_import_view(fc_doc, settle: bool = True) -> bool:
     """Frame the viewport on imported PDF sheets, not unrelated document content.
 
-    Returns True when a view was there to frame.
+    Returns True when a view was there to frame. The operator's selection is
+    touched only by the selection fallback, and put back afterwards.
     """
     try:
         import FreeCADGui as Gui
     except ImportError:
         return False
 
-    try:
-        Gui.updateGui()
-    except (AttributeError, RuntimeError):
-        pass
+    if settle:
+        try:
+            Gui.updateGui()
+        except (AttributeError, RuntimeError):
+            pass
 
+    # The view of the document the import went into; that is the active
+    # document during an import.
     view = None
     try:
-        adoc = Gui.ActiveDocument
+        adoc = _gui_document(Gui, getattr(fc_doc, "Name", None)) or Gui.ActiveDocument
         if adoc:
             view = adoc.ActiveView
     except (AttributeError, RuntimeError):
         view = None
     if view is None:
         return False
+    # "ViewSelection" goes to the active view. It is this document's view
+    # during an import; after a command that opened several files it may not be.
+    in_active_view = True
+    try:
+        active = Gui.ActiveDocument
+        in_active_view = active is None or adoc is active or (
+            getattr(active.Document, "Name", None) == getattr(adoc.Document, "Name", None))
+    except (AttributeError, RuntimeError):
+        in_active_view = True
 
     roots = _pdf_import_root_objects(fc_doc)
-    prior_sel = []
-    try:
-        prior_sel = list(Gui.Selection.getSelection())
-    except (AttributeError, RuntimeError):
-        prior_sel = []
+    prior_sel = None
 
     # An animated turn to the top view would still be running when the fit is
     # computed, and would finish by moving the camera again. Turn it off for
@@ -12000,7 +12141,11 @@ def _frame_import_view(fc_doc) -> bool:
         except (AttributeError, RuntimeError):
             pass
         selected_fit = _fit_import_descendant_bounds(view, roots)
-        if roots and not selected_fit:
+        if roots and not selected_fit and in_active_view:
+            try:
+                prior_sel = list(Gui.Selection.getSelection())
+            except (AttributeError, RuntimeError):
+                prior_sel = []
             try:
                 Gui.Selection.clearSelection()
             except (AttributeError, RuntimeError):
@@ -12028,15 +12173,16 @@ def _frame_import_view(fc_doc) -> bool:
             except (AttributeError, RuntimeError):
                 pass
     finally:
-        try:
-            Gui.Selection.clearSelection()
-            for obj in prior_sel:
-                try:
-                    Gui.Selection.addSelection(obj)
-                except (AttributeError, RuntimeError):
-                    pass
-        except (AttributeError, RuntimeError):
-            pass
+        if prior_sel is not None:
+            try:
+                Gui.Selection.clearSelection()
+                for obj in prior_sel:
+                    try:
+                        Gui.Selection.addSelection(obj)
+                    except (AttributeError, RuntimeError):
+                        pass
+            except (AttributeError, RuntimeError):
+                pass
         if animated:
             try:
                 view.setAnimationEnabled(True)

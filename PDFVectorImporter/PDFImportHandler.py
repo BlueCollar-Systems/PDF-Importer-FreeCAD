@@ -96,10 +96,39 @@ def _check_fitz():
     return False
 
 
+class _NoScope:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc_info):
+        return False
+
+
+def _host_import_command():
+    """The core's scope for an import FreeCAD started itself.
+
+    When open() or insert() returns, FreeCAD fits the whole document
+    (preference View/AutoFitToView, on by default). The core frames the
+    imported sheets again after that fit; it needs to know where this
+    command begins and ends.
+    """
+    try:
+        import PDFVectorImporter.src.PDFImporterCore as core
+    except ImportError:
+        try:
+            import PDFImporterCore as core
+        except ImportError:
+            return _NoScope()
+    scope = getattr(core, "host_import_command", None)
+    return scope() if callable(scope) else _NoScope()
+
+
 def _do_import(filename):
     """Run the import — show dialog if GUI is up, otherwise use defaults."""
     if FreeCAD.GuiUp:
-        _import_with_dialog(filename)
+        # Last statement of open() / insert(): the scope ends as they return.
+        with _host_import_command():
+            _import_with_dialog(filename)
     else:
         _import_headless(filename)
 
@@ -151,7 +180,9 @@ def _import_with_dialog(filename):
             return
         FreeCAD.Console.PrintMessage("PDF import complete.\n")
 
-        # Keep the core's final top-orthographic fit to the imported sheets.
+        # The core has framed the imported sheets. FreeCAD fits the whole
+        # document after this function returns; the core frames the sheets
+        # again once that fit is over (see _host_import_command).
     except (RuntimeError, ValueError, TypeError, OSError, AttributeError, ImportError) as e:
         from pdfcadcore.fitz_loader import PdfOpenError
 

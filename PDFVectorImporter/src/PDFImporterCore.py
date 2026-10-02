@@ -11714,6 +11714,50 @@ def _fit_import_descendant_bounds(view, roots) -> bool:
         return False
 
 
+def _camera_accepts_straight_on(view) -> bool:
+    """True when this view can take the sheet camera helper's direct placement.
+
+    The helper looks top-down and then sets orthographic. Call-order tests, and
+    any host whose camera node cannot hold a position and a height, stay on the
+    orthographic-then-top path instead of being rewritten.
+    """
+    try:
+        camera = view.getCameraNode()
+        aspect = float(camera.aspectRatio.getValue())
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+    if not math.isfinite(aspect):
+        return False
+    try:
+        setters = (
+            camera.position.setValue,
+            camera.height.setValue,
+            camera.focalDistance.setValue,
+            camera.nearDistance.setValue,
+            camera.farDistance.setValue,
+        )
+    except AttributeError:
+        return False
+    return all(callable(setter) for setter in setters)
+
+
+def _apply_sheet_straight_on(view, sheet) -> bool:
+    """Frame a known paper box with the straight-on helper. False leaves the old path."""
+    if not sheet or not _camera_accepts_straight_on(view):
+        return False
+    try:
+        try:
+            from PDFVectorImporter.sheet_camera import apply_straight_on_view
+        except ImportError:
+            from sheet_camera import apply_straight_on_view
+    except ImportError:
+        return False
+    try:
+        return bool(apply_straight_on_view(view, sheet))
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+
+
 def _autofit_import_view(fc_doc) -> None:
     """Frame the viewport on imported PDF geometry, not unrelated document content."""
     try:
@@ -11757,39 +11801,44 @@ def _autofit_import_view(fc_doc) -> None:
     try:
         # Fit in the final orientation. A later fitAll would replace the
         # selected-sheet bounds with unrelated objects elsewhere in the document.
-        try:
-            view.setCameraType("Orthographic")
-            view.viewTop()
-        except (AttributeError, RuntimeError):
-            pass
-        selected_fit = _fit_import_descendant_bounds(view, roots)
-        if roots and not selected_fit:
+        sheet = _sheet_view_box(fc_doc)
+        # A capable camera uses the straight-on helper: viewTop, then
+        # orthographic, then a height taken from the paper. Doing that on
+        # every view would reverse the call order the selection-fit tests
+        # lock, and would fitAll when the camera node cannot hold a pose.
+        if not _apply_sheet_straight_on(view, sheet):
             try:
-                Gui.Selection.clearSelection()
+                view.setCameraType("Orthographic")
+                view.viewTop()
             except (AttributeError, RuntimeError):
                 pass
-            for obj in roots:
+            selected_fit = _fit_import_descendant_bounds(view, roots)
+            if roots and not selected_fit:
                 try:
-                    Gui.Selection.addSelection(obj)
+                    Gui.Selection.clearSelection()
                 except (AttributeError, RuntimeError):
                     pass
-            try:
-                selected_names = {
-                    getattr(obj, "Name", "") for obj in Gui.Selection.getSelection()
-                }
-                if all(obj.Name in selected_names for obj in roots):
-                    Gui.SendMsgToActiveView("ViewSelection")
-                    selected_fit = True
-            except (AttributeError, RuntimeError):
-                pass
+                for obj in roots:
+                    try:
+                        Gui.Selection.addSelection(obj)
+                    except (AttributeError, RuntimeError):
+                        pass
+                try:
+                    selected_names = {
+                        getattr(obj, "Name", "") for obj in Gui.Selection.getSelection()
+                    }
+                    if all(obj.Name in selected_names for obj in roots):
+                        Gui.SendMsgToActiveView("ViewSelection")
+                        selected_fit = True
+                except (AttributeError, RuntimeError):
+                    pass
 
-        sheet = _sheet_view_box(fc_doc)
-        framed = bool(sheet) and _fit_view_to_sheet(view, sheet)
-        if not framed and not selected_fit:
-            try:
-                view.fitAll()
-            except (AttributeError, RuntimeError):
-                pass
+            framed = bool(sheet) and _fit_view_to_sheet(view, sheet)
+            if not framed and not selected_fit:
+                try:
+                    view.fitAll()
+                except (AttributeError, RuntimeError):
+                    pass
     finally:
         try:
             Gui.Selection.clearSelection()

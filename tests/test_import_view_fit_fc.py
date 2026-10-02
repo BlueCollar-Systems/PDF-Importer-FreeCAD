@@ -303,3 +303,66 @@ def test_view_animation_is_off_while_the_view_is_framed_and_restored_after(monke
     else:
         assert not [event for event in events if event[0] == "animation"]
     assert state["enabled"] is enabled
+
+
+class _Pose:
+    def __init__(self, value=None):
+        self.value = value
+
+    def getValue(self):
+        return self.value
+
+    def setValue(self, *args):
+        self.value = args[0] if len(args) == 1 else args
+
+
+class _StraightCamera:
+    def __init__(self, aspect):
+        self.aspectRatio = _Pose(aspect)
+        self.position = _Pose(None)
+        self.height = _Pose(None)
+        self.focalDistance = _Pose(None)
+        self.nearDistance = _Pose(None)
+        self.farDistance = _Pose(None)
+
+
+def test_capable_camera_uses_the_straight_on_helper(monkeypatch):
+    """The GUI calls the sheet helper when the camera can hold a pose.
+
+    viewTop() restores the navigation camera, so orthographic has to come
+    after it. Hosts that cannot take that pose keep the older order.
+    """
+    import PDFVectorImporter.sheet_camera as sheet_camera
+
+    events, selection, old_selection = _host(monkeypatch)
+    view = sys.modules["FreeCADGui"].ActiveDocument.ActiveView
+    camera = _StraightCamera(aspect=1.6)
+    view.getCameraNode = lambda: camera
+    corners = [(0, 0, 0), (431.8, 0, 0), (431.8, 279.4, 0), (0, 279.4, 0)]
+    stray = SimpleNamespace(Name="PDF_Stray", isDerivedFrom=lambda kind: False)
+    doc = SimpleNamespace(Objects=[_page("PDF_Page_1"), _paper(corners), stray])
+
+    core._autofit_import_view(doc)
+
+    assert events[:2] == [("top",), ("camera", "Orthographic")]
+    assert "all" not in [event[0] for event in events]
+    assert "ViewFit" not in [event[0] for event in events]
+    assert "ViewSelection" not in [event[0] for event in events]
+    assert selection == [old_selection]
+    _cx, _cy, _z, height = sheet_camera.orthographic_sheet_frame(
+        0, 0, 431.8, 279.4, aspect=1.6,
+    )
+    pos = camera.position.value
+    assert abs(pos[0] - 215.9) < 1.0
+    assert abs(pos[1] - 139.7) < 1.0
+    assert pos[2] > 0.0
+    assert camera.height.value == pytest.approx(height)
+
+
+def test_sheet_without_a_pose_camera_keeps_orthographic_then_top(monkeypatch):
+    """Call-order contract: a camera the helper cannot pose is not reordered."""
+    events, _selection, _old = _host(monkeypatch)
+    corners = [(0, 0, 0), (215.9, 0, 0), (215.9, 279.4, 0), (0, 279.4, 0)]
+    doc = SimpleNamespace(Objects=[_page("PDF_Page_1"), _paper(corners)])
+    core._autofit_import_view(doc)
+    assert events[:2] == [("camera", "Orthographic"), ("top",)]

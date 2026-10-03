@@ -454,7 +454,7 @@ def test_page_geometry_failure_cleans_prior_owned_objects_and_is_not_READY(monke
 
 
 def test_original_clipped_helper_is_byte_and_AST_unchanged():
-    baseline=ROOT.parent/'freecad-session-viewprovider-v1/PDFVectorImporter/src/PDFImporterCore.py'
+    baseline=ROOT/'tests/fixtures/original_compound_clip_fill_shape.py.txt'
     import ast
     def get(p):
         source=p.read_text(encoding='utf-8-sig');node=next(n for n in ast.parse(source).body if isinstance(n,ast.FunctionDef) and n.name=='_compound_clip_fill_shape')

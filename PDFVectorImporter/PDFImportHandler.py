@@ -58,7 +58,7 @@ def insert(filename, docname):
 
     try:
         doc = FreeCAD.getDocument(docname)
-    except (RuntimeError, TypeError, ValueError):
+    except (NameError, RuntimeError, TypeError, ValueError):
         doc = None
 
     if doc is None:

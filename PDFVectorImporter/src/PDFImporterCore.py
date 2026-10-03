@@ -14044,6 +14044,32 @@ def _remove_post_baseline_document_objects(
     }
 
 
+def _rollback_import_transaction(
+    fc_doc,
+    baseline_object_ids: set,
+    baseline_object_names: set,
+) -> Dict[str, Any]:
+    """Attempt transaction abort, then always remove owned post-baseline objects."""
+    abort_failure = None
+    try:
+        fc_doc.abortTransaction()
+    except Exception as exc:
+        abort_failure = {
+            "type": exc.__class__.__name__,
+            "message": str(exc),
+        }
+    rollback = _remove_post_baseline_document_objects(
+        fc_doc, baseline_object_ids, baseline_object_names
+    )
+    if abort_failure is not None:
+        # Object absence cannot prove that a failed transaction abort restored
+        # document state. Keep the actual removal result separately and stop.
+        rollback["owned_object_cleanup_complete"] = rollback["cleanup_complete"]
+        rollback["transaction_abort_failure"] = abort_failure
+        rollback["cleanup_complete"] = False
+    return rollback
+
+
 def estimate_import_work(pdf_path: str, opts: Optional[ImportOptions] = None) -> Dict[str, Any]:
     """Inspect selected pages and return transparent, content-derived work units."""
     from PDFImportSession import build_work_plan
@@ -14538,10 +14564,42 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             active_page_baseline_names,
         )
         if not cleanup["cleanup_complete"]:
-            fc_doc.abortTransaction()
-            rollback = _remove_post_baseline_document_objects(
+            rollback = _rollback_import_transaction(
                 fc_doc, baseline_object_ids, baseline_object_names
             )
+            _restore_page_result_telemetry(opts, invocation_telemetry_snapshot)
+            opts.import_status = "failed"
+            rolled_back_pages = list(evaluated_pages)
+            report_extra = dict(getattr(opts, "_report_extra", {}) or {})
+            report_extra["cancel_cleanup"] = cleanup
+            report_extra["rollback"] = rollback
+            report_extra["representation_contract_scope"] = _representation_contract_scope(
+                valid_pages, previously_certified_pages, evaluated_pages, [],
+                previously_certified_pages, rolled_back_pages=rolled_back_pages,
+                previously_degraded_pages=resumed_degraded_pages,
+            )
+            report_extra["page_failure"] = {
+                "schema": "bcs.freecad.page_failure/1",
+                "requested_pages": list(valid_pages),
+                "last_evaluated_page": evaluated_pages[-1] if evaluated_pages else None,
+                "phase": "cancellation_cleanup",
+                "type": cancel.__class__.__name__,
+                "message": str(cancel),
+                "rollback_cleanup_complete": rollback["cleanup_complete"],
+            }
+            opts._report_extra = report_extra
+            opts.phase_timings_ms["pages_import_ms"] = (
+                time.perf_counter() - t_phase
+            ) * 1000.0
+            try:
+                _write_terminal_representation_failure_report(
+                    pdf_path=pdf_path, opts=opts, total_pages=total_pages,
+                    pages_imported=len(previously_certified_pages),
+                    elapsed_ms=(time.perf_counter() - t_import_start) * 1000.0,
+                    failure=cancel,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError, ImportError) as report_error:
+                _err("Terminal import failure report could not be written: %s" % report_error)
             raise RuntimeError(
                 "Cancellation could not remove the incomplete active page: "
                 f"cleanup={cleanup}, rollback={rollback}"
@@ -14565,15 +14623,27 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         ) * 1000.0
         cancelled = True
     except TextRepresentationFailure as failure:
-        fc_doc.abortTransaction()
-        rollback = _remove_post_baseline_document_objects(
+        rollback = _rollback_import_transaction(
             fc_doc, baseline_object_ids, baseline_object_names
         )
         _restore_page_result_telemetry(opts, invocation_telemetry_snapshot)
+        opts.import_status = "failed"
+        if not rollback["cleanup_complete"]:
+            failure.attempt["cleanup_complete"] = False
+            failure.attempt["rollback"] = rollback
         _append_text_item_attempt(opts, dict(getattr(failure, "attempt", {}) or {}))
         rolled_back_pages = list(evaluated_pages)
         report_extra = dict(getattr(opts, "_report_extra", {}) or {})
         report_extra["rollback"] = rollback
+        report_extra["page_failure"] = {
+            "schema": "bcs.freecad.page_failure/1",
+            "requested_pages": list(valid_pages),
+            "last_evaluated_page": evaluated_pages[-1] if evaluated_pages else None,
+            "phase": "text_representation",
+            "type": failure.__class__.__name__,
+            "message": str(failure),
+            "rollback_cleanup_complete": rollback["cleanup_complete"],
+        }
         report_extra["representation_contract_scope"] = (
             _representation_contract_scope(
                 valid_pages,
@@ -14605,13 +14675,9 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             )
         except (OSError, RuntimeError, TypeError, ValueError, ImportError) as report_error:
             _err(f"Terminal import failure report could not be written: {report_error}")
-        if not rollback["cleanup_complete"]:
-            failure.attempt["cleanup_complete"] = False
-            failure.attempt["rollback"] = rollback
         raise
     except Exception as failure:
-        fc_doc.abortTransaction()
-        rollback = _remove_post_baseline_document_objects(
+        rollback = _rollback_import_transaction(
             fc_doc, baseline_object_ids, baseline_object_names
         )
         _restore_page_result_telemetry(opts, invocation_telemetry_snapshot)

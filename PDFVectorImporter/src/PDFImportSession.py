@@ -32,6 +32,7 @@ NON_CONTENT_FIELDS = {
     "text_mode_fallbacks",
     "text_delivered_counts",
     "text_delivery_attempts",
+    "text3d_outline_cache_stats",
     "resolved_scale",
     "scale_hints",
     "phase_timings_ms",

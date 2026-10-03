@@ -203,6 +203,51 @@ def test_session_round_trip_and_exact_match_survive_host_property_persistence():
     assert session.remaining_pages(state) == [4]
 
 
+@pytest.mark.parametrize("hits", [0, 7])
+def test_cancelled_session_can_resume_after_terminal_outline_cache_statistics(hits):
+    document = FakeDocument()
+    options = Options(pages=[1, 2, 3])
+
+    def identity():
+        return session.build_identity(
+            source_sha256="a" * 64,
+            source_name="drawing.pdf",
+            opts=options,
+            importer_version="4.0.110",
+            requested_pages=options.pages,
+        )
+
+    original = identity()
+    host = session.create_session_object(document, original)
+    page = document.addObject("App::DocumentObjectGroup", "PDF_Page_1")
+    session.update_session_object(
+        host, status="cancelled", completed_pages=[1], page_groups={1: page.Name}
+    )
+    # The terminal report publishes these counters onto the same Options object
+    # that the next resume lookup receives. They describe prior work only.
+    options.text3d_outline_cache_stats = {
+        "hits": hits, "misses": 2, "evictions": 1, "solid_hits": 3, "solid_misses": 4
+    }
+    reopened = FakeDocument()
+    reopened.Objects.extend([host, page])
+    candidate = identity()
+    assert candidate == original
+    assert session.find_matching_session(reopened, candidate) is host
+    state = session.read_session_object(host)
+    assert state["completed_pages"] == [1]
+    assert session.remaining_pages(state) == [2, 3]
+
+    # Actual content and requested-page changes still prevent a match.
+    options.user_scale = 2.0
+    assert session.find_matching_session(reopened, identity()) is None
+    options.user_scale = 1.0
+    options.text_mode = "none"
+    assert session.find_matching_session(reopened, identity()) is None
+    options.text_mode = "3d_text"
+    options.pages = [1, 2]
+    assert session.find_matching_session(reopened, identity()) is None
+
+
 @pytest.mark.parametrize(
     "changed",
     [

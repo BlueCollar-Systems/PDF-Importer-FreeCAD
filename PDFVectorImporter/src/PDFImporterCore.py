@@ -12998,7 +12998,10 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 if source_fill_proof is not None and path_group.get("type") == "fs":
                     source_open_stroke_edges = _source_fill_boundary_edges(
                         path_group["items"], page_h, opts, scale)
-        preserve_source_edges = bool(path_group.get("bcs_preserve_source_edges") or source_fill_proof)
+        source_quad_stroke = (fill is None and stroke is not None
+                              and any(item[0] == "qu" for item in items))
+        preserve_source_edges = bool(path_group.get("bcs_preserve_source_edges") or source_fill_proof
+                                     or any(item[0] == "qu" for item in items))
 
         # Build edges per sub-path
         current_pt: Optional[Vector] = None
@@ -13165,6 +13168,21 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     prev = q
                 current_pt = p3
 
+            elif kind == "qu":  # source quadrilateral, including optimized strokes
+                flush_sub(False)
+                try:
+                    if len(data) != 1:
+                        raise ValueError("Quadrilateral must have four source corners")
+                    quad = data[0]
+                    points = [_to_fc(_finite_source_tuple(point, 2, "drawing.quad"), page_h, opts, scale)
+                              for point in (quad.ul, quad.ur, quad.lr, quad.ll)]
+                    edges = [_edge_line(a, b) for a, b in zip(points, points[1:] + points[:1], strict=True)]
+                    if any(edge is None for edge in edges):
+                        raise ValueError("Quadrilateral source edge was not built")
+                except (RuntimeError, AttributeError, TypeError, ValueError) as exc:
+                    raise DrawingGeometryFailure("Native source quadrilateral construction failed") from exc
+                wires_edges.append((edges, True))
+
             elif kind == "re":  # rectangle
                 flush_sub(False)
                 x, y, w, h = _parse_rect(data)
@@ -13210,7 +13228,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             want_face = (source_fill_proof is not None
                          or (opts.hatch_to_faces and fill is not None)
                          or (opts.make_faces and is_closed))
-            if compound_fill_delivered:
+            if compound_fill_delivered or source_quad_stroke:
                 want_face = False
             if path_group.get("seqno") in image_order_strokes:
                 # Source-qualified later paint is a stroke; an invisible fs

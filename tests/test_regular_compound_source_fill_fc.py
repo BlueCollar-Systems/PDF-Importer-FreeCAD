@@ -151,8 +151,17 @@ def reference_cells(contours,even_odd):
     return result
 
 
-def test_frozen_existing_ring_exact_source_and_hole():
-    pdf=ROOT.parent/'new-folder-investigation/freecad-current-host-inputs-v14/import_existing_ring.pdf'
+def test_frozen_existing_ring_exact_source_and_hole(tmp_path):
+    pdf = tmp_path / 'original compound ring.pdf'
+    with core.fitz.open() as document:
+        page = document.new_page(width=600, height=400)
+        page.draw_rect(page.rect, color=None, fill=(1, 1, 1))
+        path = page.new_shape()
+        path.draw_rect(page.rect)
+        path.draw_rect(core.fitz.Rect(290, 190, 310, 210))
+        path.finish(color=None, fill=(0, 1, 0), even_odd=True)
+        path.commit()
+        document.save(pdf)
     with core.fitz.open(pdf) as doc:
         rows=doc[0].get_drawings()
     row=rows[1];before=copy.deepcopy(row)

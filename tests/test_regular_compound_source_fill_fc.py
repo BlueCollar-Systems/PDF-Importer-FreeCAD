@@ -3,6 +3,7 @@ import copy
 from fractions import Fraction
 import itertools
 import json
+import math
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -43,20 +44,37 @@ def winding(points, x, y):
 
 
 class Line:
-    pass
+    def __init__(self, points):
+        a, b = points
+        self.Location = a
+        delta = tuple(y-x for x,y in zip(coords(a),coords(b),strict=True))
+        length = math.sqrt(sum(v*v for v in delta))
+        self.Direction = SimpleNamespace(**dict(zip(('x','y','z'),(v/length for v in delta),strict=True)))
+    def isPeriodic(self):return False
 
 
 class BezierCurve:
+    Degree = 3
     def setPoles(self, points):self.points=points
     def getPoles(self):return self.points
+    def getWeights(self):return [1.,1.,1.,1.]
+    def isRational(self):return False
+    def isPeriodic(self):return False
     def toShape(self):return Edge('c',self.points,self)
 
 
 class Edge:
     def __init__(self,kind,points,curve=None):
         self.kind,self.points=kind,points
-        self.Curve=curve or Line()
+        self.Curve=curve or Line(points)
         self.Vertexes=[SimpleNamespace(Point=p) for p in (points[0],points[-1])]
+        self.ShapeType,self.Orientation='Edge','Forward'
+        matrix=[1.,0.,0.,0.,0.,1.,0.,0.,0.,0.,1.,0.,0.,0.,0.,1.]
+        self.Placement=SimpleNamespace(toMatrix=lambda:SimpleNamespace(A=matrix))
+        # A positive sentinel for the pure cubic fixture; never native length
+        # proof. Line lengths and trims follow the native line API exactly.
+        self.Length=math.dist(coords(points[0]),coords(points[-1])) if kind=='l' else 1.
+        self.FirstParameter,self.LastParameter=0.,self.Length if kind=='l' else 1.
     def isSame(self,other):return self is other
     def isNull(self):return False
     def isValid(self):return True

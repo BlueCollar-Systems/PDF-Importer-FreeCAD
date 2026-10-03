@@ -272,14 +272,82 @@ def _edge_matches(edge, command, points):
             raise SourceFillError("Native fill cubic differs from original transformed controls")
 
 
+def _boundary_numbers(values, size):
+    values = tuple(values)
+    if (len(values) != size
+            or any(isinstance(v, bool) or not isinstance(v, Real) for v in values)):
+        raise SourceFillError("Invalid native fill boundary numeric data")
+    result = tuple(float(v) for v in values)
+    if not all(math.isfinite(v) for v in result):
+        raise SourceFillError("Nonfinite native fill boundary numeric data")
+    return result
+
+
+def _boundary_point(point):
+    return _boundary_numbers((getattr(point, axis) for axis in ("x", "y", "z")), 3)
+
+
+def _boundary_geometry(edge):
+    """Read exact original geometry, never a topology ID or approximation.
+
+    MakeWire may copy an edge while joining its vertices. A TShape identity
+    check therefore cannot establish source geometry conservation. Compare
+    the complete supported curve, its original trim and placement instead.
+    Edge orientation and vertex enumeration can reverse without changing
+    that underlying parameterized geometry, just as isSame ignores orientation.
+    """
+    try:
+        if (edge.ShapeType != "Edge" or edge.isNull() is not False
+                or edge.isValid() is not True
+                or edge.Orientation not in ("Forward", "Reversed")):
+            raise SourceFillError("Invalid native fill boundary edge")
+        placement = _boundary_numbers(edge.Placement.toMatrix().A, 16)
+        first, last, length = _boundary_numbers(
+            (edge.FirstParameter, edge.LastParameter, edge.Length), 3)
+        if first >= last or length <= 0:
+            raise SourceFillError("Invalid native fill boundary parameter interval or length")
+        endpoints = tuple(_boundary_point(v.Point) for v in edge.Vertexes)
+        if len(endpoints) != 2 or endpoints[0] == endpoints[1]:
+            raise SourceFillError("Invalid native fill boundary endpoints")
+        curve = edge.Curve
+        kind = curve.__class__.__name__
+        if curve.isPeriodic() is not False:
+            raise SourceFillError("Periodic native fill boundary is unsupported")
+        if kind == "Line":
+            location, direction = _boundary_point(curve.Location), _boundary_point(curve.Direction)
+            if not any(direction):
+                raise SourceFillError("Invalid native fill line direction")
+            controls = (location, direction)
+        elif kind == "BezierCurve":
+            if (type(curve.Degree) is not int or curve.Degree != 3
+                    or curve.isRational() is not False or (first, last) != (0.0, 1.0)):
+                raise SourceFillError("Native fill cubic degree, rationality or full trim changed")
+            poles = tuple(_boundary_point(p) for p in curve.getPoles())
+            weights = _boundary_numbers(curve.getWeights(), 4)
+            if len(poles) != 4 or weights != (1.0, 1.0, 1.0, 1.0):
+                raise SourceFillError("Native fill cubic controls or weights changed")
+            controls = (poles, weights)
+        else:
+            raise SourceFillError("Unsupported native fill boundary curve %r" % kind)
+        return kind, controls, (first, last), placement, tuple(sorted(endpoints)), length
+    except (RuntimeError, TypeError, ValueError, AttributeError, OverflowError) as exc:
+        if isinstance(exc, SourceFillError):
+            raise
+        raise SourceFillError("Native fill boundary geometry could not be verified") from exc
+
+
 def _edge_bijection(source, observed):
     if len(source) != len(observed):
         raise SourceFillError("Native fill boundary edge count changed")
+    originals = [_boundary_geometry(edge) for edge in source]
+    if len(set(originals)) != len(originals):
+        raise SourceFillError("Native fill boundary original geometry is ambiguous")
     used = set()
     for edge in observed:
-        matches = [i for i, original in enumerate(source) if edge.isSame(original)]
+        geometry = _boundary_geometry(edge)
+        matches = [i for i, original in enumerate(originals) if geometry == original]
         if len(matches) != 1 or matches[0] in used:
-            raise SourceFillError("Native fill boundary source-edge bijection failed")
+            raise SourceFillError("Native fill boundary source-edge geometry bijection failed")
         used.add(matches[0])
 
 

@@ -5899,7 +5899,7 @@ def _write_terminal_representation_failure_report(
     total_pages: int,
     pages_imported: int,
     elapsed_ms: float,
-    failure: TextRepresentationFailure,
+    failure: BaseException,
 ) -> str:
     """Persist the exact failed attempt after the document transaction aborts."""
     report_extra = dict(getattr(opts, "_report_extra", {}) or {})
@@ -14615,15 +14615,32 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             fc_doc, baseline_object_ids, baseline_object_names
         )
         _restore_page_result_telemetry(opts, invocation_telemetry_snapshot)
-        if isinstance(failure, DrawingGeometryFailure):
-            opts.import_status = "failed"
-            try:
-                _write_terminal_representation_failure_report(
-                    pdf_path=pdf_path, opts=opts, total_pages=total_pages,
-                    pages_imported=len(previously_certified_pages),
-                    elapsed_ms=(time.perf_counter() - t_import_start) * 1000.0, failure=failure)
-            except (OSError, RuntimeError, TypeError, ValueError, ImportError) as report_error:
-                _err("Terminal geometry failure report could not be written: %s" % report_error)
+        opts.import_status = "failed"
+        rolled_back_pages = list(evaluated_pages)
+        report_extra = dict(getattr(opts, "_report_extra", {}) or {})
+        report_extra["rollback"] = rollback
+        report_extra["representation_contract_scope"] = _representation_contract_scope(
+            valid_pages, previously_certified_pages, evaluated_pages, [],
+            previously_certified_pages, rolled_back_pages=rolled_back_pages,
+            previously_degraded_pages=resumed_degraded_pages,
+        )
+        report_extra["page_failure"] = {
+            "schema": "bcs.freecad.page_failure/1",
+            "requested_pages": list(valid_pages),
+            "last_evaluated_page": evaluated_pages[-1] if evaluated_pages else None,
+            "phase": "import_transaction",
+            "type": failure.__class__.__name__,
+            "message": str(failure),
+            "rollback_cleanup_complete": rollback["cleanup_complete"],
+        }
+        opts._report_extra = report_extra
+        try:
+            _write_terminal_representation_failure_report(
+                pdf_path=pdf_path, opts=opts, total_pages=total_pages,
+                pages_imported=len(previously_certified_pages),
+                elapsed_ms=(time.perf_counter() - t_import_start) * 1000.0, failure=failure)
+        except (OSError, RuntimeError, TypeError, ValueError, ImportError) as report_error:
+            _err("Terminal import failure report could not be written: %s" % report_error)
         if not rollback["cleanup_complete"]:
             raise RuntimeError(
                 "Import failed and rollback was incomplete: %s" % rollback

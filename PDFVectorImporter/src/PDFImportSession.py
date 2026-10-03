@@ -162,6 +162,11 @@ def _validate_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
 def create_session_object(document: Any, identity: Mapping[str, Any]) -> Any:
     exact = _validate_identity(identity)
     host = document.addObject("App::FeaturePython", "PDF_Import_Session")
+    # Initialize FreeCAD's default view provider before saving the session.
+    # An uninitialized provider changes DisplayMode on native document reopen.
+    view = getattr(host, "ViewObject", None)
+    if view is not None:
+        view.Proxy = 0
     try:
         host.Label = f"PDF Import — {exact['source_name']}"
     except (AttributeError, RuntimeError):

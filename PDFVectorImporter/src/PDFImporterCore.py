@@ -12913,11 +12913,84 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     opts, page_num, [_host_clip_fill_issue(path_group, exc, superseded)])
             continue
 
+        # Ordinary compound fills are one source paint, even without a clip.
+        # Filling each contour independently would erase even-odd counters and
+        # misinterpret nonzero winding. Keep original fs stroke paint separate.
+        compound_fill_delivered = False
+        if ((opts.hatch_to_faces or opts.make_faces) and fill is not None
+                and path_group.get("seqno") not in image_order_strokes):
+            try:
+                from .PDFSourceFill import SourceFillError, source_contours, build_compound_fill
+            except ImportError:
+                from PDFSourceFill import SourceFillError, source_contours, build_compound_fill
+            try:
+                contours = source_contours(path_group, _parse_rect)
+                if contours is not None and len(contours) > 1:
+                    compound_checks = 0
+                    def check_compound_cancel(paint_index=pg_idx, drawing_count=n_drawings):
+                        nonlocal compound_checks
+                        compound_checks += 1
+                        if compound_checks == 1 or compound_checks % 32 == 0:
+                            _progress_update(
+                                10 + int(69 * paint_index / max(drawing_count, 1)),
+                                "Processing compound source fill...", "geometry")
+                        if _progress_check_cancel():
+                            raise ImportCancelled("Compound source fill cancelled")
+
+                    shape, fill_receipt = build_compound_fill(
+                        contours, path_group["even_odd"], Part,
+                        lambda point: _to_fc(point, page_h, opts, scale),
+                        scale, check_compound_cancel,
+                    )
+                    fill_receipt.update(
+                        source_pdf_sha256=source_sha, source_page=int(page_num),
+                        source_paint_order=path_group.get("seqno"),
+                        source_fill_rgb=list(fill), delivered_fill_rgb=list(fill_rgb),
+                        coordinate_scale=float(scale), source_page_height=float(page_h),
+                        page_rotation_matrix=list(_page_matrix_values(opts)), flip_y=bool(opts.flip_y),
+                    )
+                    fill_receipt["created_entity_ids"] = []
+                    if shape is not None:
+                        obj = fc_doc.addObject("Part::Feature", "SourceCompoundFill")
+                        obj.Shape = shape
+                        _require_valid_drawing_shape(obj.Shape, "stored source compound fill")
+                        _apply_style(obj, None, fill_rgb, None, None, opts)
+                        parent.addObject(obj)
+                        fill_receipt["created_entity_ids"] = [obj.Name]
+                        obj.addProperty("App::PropertyString", "PDFSourceCompoundFillJSON", "PDF Source")
+                        obj.PDFSourceCompoundFillJSON = json.dumps(fill_receipt, sort_keys=True)
+                        if json.loads(obj.PDFSourceCompoundFillJSON) != fill_receipt:
+                            raise DrawingGeometryFailure("Compound fill provenance was not retained")
+                        obj_count += 1
+                        if _model3d_should_extrude(
+                                opts, is_closed=True, fill=fill,
+                                face_area=float(shape.Area), page_area=page_area_units):
+                            solid = fc_doc.addObject("Part::Feature", "PDF_3D_Solid")
+                            solid.Shape = shape.copy()
+                            if not _extrude_model3d_obj(solid, opts):
+                                raise DrawingGeometryFailure("Compound source fill extrusion failed")
+                            _apply_style(solid, None, fill_rgb, None, None, opts)
+                            parent.addObject(solid)
+                            obj_count += 1
+                            opts._model3d_solids = int(getattr(opts, "_model3d_solids", 0) or 0) + 1
+                    report_extra = dict(getattr(opts, "_report_extra", {}) or {})
+                    report_extra.setdefault("source_compound_fill_delivery", []).append(fill_receipt)
+                    opts._report_extra = report_extra
+                    compound_fill_delivered = True
+                    if path_group.get("type") == "f":
+                        continue
+                    # Original source edges below retain stroke width, dashes,
+                    # closure and paint. A compound fs fill is never repeated.
+                    fill_rgb = None
+            except SourceFillError as exc:
+                raise DrawingGeometryFailure("Compound source fill delivery failed: %s" % exc) from exc
+
         # Cancel only a proved zero-area retraced fill bridge. Keep the source
         # path dictionary intact and construct its retained boundary exactly.
         source_fill_proof = None
         source_open_stroke_edges = None
-        if ((opts.hatch_to_faces or (opts.make_faces and close_path))
+        if (not compound_fill_delivered
+                and (opts.hatch_to_faces or (opts.make_faces and close_path))
                 and path_group.get("seqno") not in image_order_strokes):
             items, source_fill_proof = _source_fill_without_retraced_bridge(path_group)
             if source_fill_proof is None and opts.hatch_to_faces:
@@ -13137,6 +13210,8 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             want_face = (source_fill_proof is not None
                          or (opts.hatch_to_faces and fill is not None)
                          or (opts.make_faces and is_closed))
+            if compound_fill_delivered:
+                want_face = False
             if path_group.get("seqno") in image_order_strokes:
                 # Source-qualified later paint is a stroke; an invisible fs
                 # fill must not acquire an opaque native face above the image.
@@ -13182,7 +13257,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                         face_area = float(getattr(obj.Shape, "Area", 0.0) or 0.0)
                     except (AttributeError, TypeError, ValueError):
                         face_area = 0.0
-                    if _model3d_should_extrude(
+                    if not compound_fill_delivered and _model3d_should_extrude(
                         opts,
                         is_closed=is_closed,
                         fill=fill,

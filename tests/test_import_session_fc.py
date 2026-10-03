@@ -204,7 +204,8 @@ def test_session_round_trip_and_exact_match_survive_host_property_persistence():
 
 
 @pytest.mark.parametrize("hits", [0, 7])
-def test_cancelled_session_can_resume_after_terminal_outline_cache_statistics(hits):
+@pytest.mark.parametrize("wire_hits", [0, 9])
+def test_cancelled_session_can_resume_after_terminal_outline_cache_statistics(hits, wire_hits):
     document = FakeDocument()
     options = Options(pages=[1, 2, 3])
 
@@ -228,6 +229,7 @@ def test_cancelled_session_can_resume_after_terminal_outline_cache_statistics(hi
     options.text3d_outline_cache_stats = {
         "hits": hits, "misses": 2, "evictions": 1, "solid_hits": 3, "solid_misses": 4
     }
+    options.wirestring_cache_stats = {"hits": wire_hits, "misses": 5}
     reopened = FakeDocument()
     reopened.Objects.extend([host, page])
     candidate = identity()

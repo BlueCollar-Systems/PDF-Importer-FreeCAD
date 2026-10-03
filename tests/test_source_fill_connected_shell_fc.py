@@ -162,14 +162,15 @@ def test_recombined_components_cannot_silently_lose_a_face():
 
 
 @pytest.mark.parametrize("at", [1, 2, 4, 8, 12, 15, 16])
-def test_cancellation_remains_exact_and_never_publishes_native_objects(at):
-    error = KeyboardInterrupt("cancelled at owned geometry boundary")
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, page_fixture.core.ImportCancelled])
+def test_cancellation_remains_exact_and_never_publishes_native_objects(at, error_type):
+    error = error_type("cancelled at owned geometry boundary")
     calls = []
     def cancel():
         calls.append(None)
         if len(calls) == at:
             raise error
-    with pytest.raises(KeyboardInterrupt) as caught:
+    with pytest.raises(error_type) as caught:
         fill._shell_connected_paint_faces(Shape(winding_cells()), Kernel(), cancel)
     assert caught.value is error
 
@@ -203,3 +204,32 @@ def test_shell_refusal_rolls_back_page_and_persists_failed_nonready_report(monke
     result = json.loads(report.read_text())
     assert result["extra"]["result_status"] == "failed"
     assert result["extra"]["import_contract_ready"]["ready"] is False
+
+
+def test_actual_shell_callback_cancel_escapes_composition_and_rolls_back_as_cancelled(monkeypatch, tmp_path):
+    contours = [page_fixture.rectangle(10, 10, 20, 20),
+                page_fixture.rectangle(15, 15, 10, 10)]
+    page_fixture.page_host(monkeypatch, contours)
+    error = page_fixture.core.ImportCancelled("operator cancelled shell assembly")
+    original = fill._shell_connected_paint_faces
+    def cancel(*args):
+        raise error
+    monkeypatch.setattr(fill, "_shell_connected_paint_faces", cancel)
+    opts = page_fixture.fixture.options(hatch_to_faces=True, compound_batch_size=0, scale_to_mm=False)
+    document = page_fixture.fixture.Document()
+    monkeypatch.setattr(page_fixture.core, "_recompute_page_if_needed", lambda *args: None)
+    with pytest.raises(page_fixture.core.ImportCancelled) as caught:
+        page_fixture.run_page_wrapper(monkeypatch, tmp_path, contours, opts, document)
+    assert caught.value is error and opts.import_status == "cancelled"
+    assert not document.Objects and not opts._report_extra.get("source_compound_fill_delivery")
+    monkeypatch.setattr(fill, "_shell_connected_paint_faces", original)
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, AttributeError, TypeError, ValueError])
+def test_native_topology_getter_fault_remains_typed_separately_from_cancel(error_type):
+    error = error_type("native topology reader failed")
+    def reader():
+        raise error
+    with pytest.raises(fill.SourceFillError) as caught:
+        fill._native_paint_read(reader)
+    assert caught.value.__cause__ is error

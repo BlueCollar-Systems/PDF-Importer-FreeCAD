@@ -246,6 +246,16 @@ def _native_same(left, right):
         raise SourceFillError("Native source fill shape identity could not be verified") from exc
 
 
+def _native_paint_read(reader):
+    """Wrap native getters independently of the caller's cancellation callback."""
+    try:
+        return reader()
+    except (RuntimeError, AttributeError, TypeError, ValueError) as exc:
+        if isinstance(exc, SourceFillError):
+            raise
+        raise SourceFillError("Native source fill paint topology could not be read") from exc
+
+
 def _native_shape_bijection(originals, observed, context):
     """Require the same placed native shapes, without sewing or tolerance."""
     if len(originals) != len(observed):
@@ -268,7 +278,7 @@ def _shell_connected_paint_faces(painted, part, cancel):
     geometrically nearby boundaries do not establish that relationship.
     makeShell must retain each original face and every edge of that face.
     """
-    faces = list(painted.Faces)
+    faces = _native_paint_read(lambda: list(painted.Faces))
     if len(faces) < 2:
         return painted
     _native_shape_bijection(faces, faces, "paint faces")
@@ -276,11 +286,12 @@ def _shell_connected_paint_faces(painted, part, cancel):
     adjacent = [set() for _ in faces]
     for face_index, face in enumerate(faces):
         cancel()
-        if face.isValid() is not True:
+        if _native_paint_read(lambda face=face: face.isValid()) is not True:
             raise SourceFillError("Invalid native source fill paint face")
-        for edge in face.Edges:
+        for edge in _native_paint_read(lambda face=face: list(face.Edges)):
             cancel()
-            if edge.isNull() is not False or edge.isValid() is not True:
+            if (_native_paint_read(lambda edge=edge: edge.isNull()) is not False
+                    or _native_paint_read(lambda edge=edge: edge.isValid()) is not True):
                 raise SourceFillError("Invalid native source fill paint edge")
             matches = [group for group in edge_groups
                        if _native_same(edge, group[0])]
@@ -314,9 +325,9 @@ def _shell_connected_paint_faces(painted, part, cancel):
     if all(len(component) == 1 for component in components):
         return painted
     shells = []
-    try:
-        for component in components:
-            cancel()
+    for component in components:
+        cancel()
+        try:
             if len(component) == 1:
                 shells.append(component[0])
                 continue
@@ -330,6 +341,11 @@ def _shell_connected_paint_faces(painted, part, cancel):
                 _native_shape_bijection(list(original.Edges), list(actual.Edges), "shell face edges")
             _require_area(_area(shell), sum(_area(face) for face in component), "connected paint shell")
             shells.append(shell)
+        except (RuntimeError, AttributeError, TypeError, ValueError) as exc:
+            if isinstance(exc, SourceFillError):
+                raise
+            raise SourceFillError("Native source fill connected shell construction failed") from exc
+    try:
         assembled = shells[0] if len(shells) == 1 else part.makeCompound(shells)
         assembled = _region(assembled, "connected paint components")
         if assembled is None:
@@ -544,8 +560,8 @@ def build_compound_fill(contours, even_odd, part, transform, scale, cancel=lambd
     expected_area = sum(_area(region) for region, _ in cells)
     _require_area(_area(painted), expected_area, "final disjoint painted union")
     if painted is not None:
+        painted = _shell_connected_paint_faces(painted, part, cancel)
         try:
-            painted = _shell_connected_paint_faces(painted, part, cancel)
             painted = _region(painted.removeSplitter(), "final planar paint")
             _require_area(_area(painted), expected_area, "removeSplitter")
         except (RuntimeError, AttributeError, TypeError) as exc:

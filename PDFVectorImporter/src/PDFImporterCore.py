@@ -5899,7 +5899,7 @@ def _write_terminal_representation_failure_report(
     total_pages: int,
     pages_imported: int,
     elapsed_ms: float,
-    failure: TextRepresentationFailure,
+    failure: BaseException,
 ) -> str:
     """Persist the exact failed attempt after the document transaction aborts."""
     report_extra = dict(getattr(opts, "_report_extra", {}) or {})
@@ -11758,27 +11758,119 @@ def _apply_sheet_straight_on(view, sheet) -> bool:
         return False
 
 
+_VIEW_REFRAME_DELAYS_MS = (0, 250, 1000)
+_VIEW_REFRAME_MODAL_RETRY_MS = 250
+_VIEW_REFRAME_MODAL_RETRIES = 2400
+_view_reframe_token = 0
+
+
+def _cancel_import_view_reframe() -> None:
+    """Invalidate callbacks before another import can process GUI events."""
+    global _view_reframe_token
+    _view_reframe_token += 1
+
+
+def _qt_modules():
+    """Qt bindings of the running host, or (None, None) outside the GUI."""
+    for package in ("PySide6", "PySide2", "PySide"):
+        try:
+            module = __import__(package, fromlist=["QtCore", "QtWidgets"])
+            return module.QtCore, module.QtWidgets
+        except (ImportError, AttributeError):
+            continue
+    return None, None
+
+
+def _schedule_import_view_reframe(fc_doc) -> bool:
+    """Reapply the sheet frame after Open/Import/drop's own final ViewFit.
+
+    Import-summary modal dialogs run an event loop before the host command
+    returns. Wait for those dialogs, then make the bounded settling passes.
+    Callbacks belong to this exact document and view, never a reused name.
+    """
+    QtCore, QtWidgets = _qt_modules()
+    try:
+        import FreeCADGui as Gui
+
+        active = Gui.ActiveDocument
+        if (QtCore is None or not getattr(fc_doc, "Name", "")
+                or active is None or active.Document is not fc_doc):
+            return False
+        view = active.ActiveView
+        if view is None:
+            return False
+    except (ImportError, AttributeError, RuntimeError, ReferenceError):
+        return False
+    token = _view_reframe_token
+
+    def _still_active():
+        try:
+            active = Gui.ActiveDocument
+            return (active is not None and active.Document is fc_doc
+                    and active.ActiveView is view)
+        except (AttributeError, RuntimeError, ReferenceError):
+            return False
+
+    def _step(index, retries_left):
+        if token != _view_reframe_token or not _still_active():
+            return
+        try:
+            modal_open = QtWidgets.QApplication.activeModalWidget() is not None
+        except (AttributeError, RuntimeError):
+            return
+        if modal_open:
+            if retries_left > 0:
+                _arm(_VIEW_REFRAME_MODAL_RETRY_MS, index, retries_left - 1)
+            return
+        # Do not yield to another event loop between the ownership check and
+        # using the view. The immediate path has already refreshed the GUI.
+        _frame_import_view(fc_doc, update_gui=False)
+        if index + 1 < len(_VIEW_REFRAME_DELAYS_MS):
+            _arm(_VIEW_REFRAME_DELAYS_MS[index + 1] - _VIEW_REFRAME_DELAYS_MS[index],
+                 index + 1, _VIEW_REFRAME_MODAL_RETRIES)
+
+    def _arm(delay_ms, index, retries_left):
+        try:
+            QtCore.QTimer.singleShot(int(delay_ms), lambda: _step(index, retries_left))
+        except (AttributeError, RuntimeError, TypeError):
+            return False
+        return True
+
+    return _arm(_VIEW_REFRAME_DELAYS_MS[0], 0, _VIEW_REFRAME_MODAL_RETRIES)
+
+
 def _autofit_import_view(fc_doc) -> None:
-    """Frame the viewport on imported PDF geometry, not unrelated document content."""
+    """Frame the imported sheets now and again after the host's own fit."""
+    _cancel_import_view_reframe()
+    token = _view_reframe_token
+    if _frame_import_view(fc_doc) and token == _view_reframe_token:
+        _schedule_import_view_reframe(fc_doc)
+
+
+def _frame_import_view(fc_doc, *, update_gui=True) -> bool:
+    """Frame imported PDF geometry; return whether an active view existed."""
     try:
         import FreeCADGui as Gui
     except ImportError:
-        return
+        return False
 
-    try:
-        Gui.updateGui()
-    except (AttributeError, RuntimeError):
-        pass
+    if update_gui:
+        try:
+            Gui.updateGui()
+        except (AttributeError, RuntimeError):
+            pass
 
     view = None
     try:
         adoc = Gui.ActiveDocument
         if adoc:
+            if getattr(adoc, "Document", fc_doc) is not fc_doc:
+                return False
             view = adoc.ActiveView
     except (AttributeError, RuntimeError):
         view = None
     if view is None:
-        return
+        return False
 
     roots = _pdf_import_root_objects(fc_doc)
     prior_sel = []
@@ -11854,6 +11946,7 @@ def _autofit_import_view(fc_doc) -> None:
                 view.setAnimationEnabled(True)
             except (AttributeError, RuntimeError, TypeError):
                 pass
+    return True
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -11968,6 +12061,7 @@ def import_pdf_page(pdf_path: str, page_num: int = 1,
                     opts: Optional[ImportOptions] = None,
                     autofit: bool = True):
     """Import a single PDF page into the active FreeCAD document."""
+    _cancel_import_view_reframe()
     if opts is None:
         opts = ImportOptions(ignore_images=not IMAGE_WB)
     _reset_import_run_state(opts)
@@ -12748,21 +12842,8 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         if stroke is None and fill is None:
             continue
 
-        # ── Skip page-sized background fills ──
-        # Some PDFs include a full-page rectangle as a background fill.
-        # These add no useful geometry and obscure the actual drawing content.
-        grp_rect = path_group.get("rect")
-        if grp_rect and _is_rect(grp_rect):
-            grp_area = abs(grp_rect.width * grp_rect.height)
-            # page_w / page_h are float(page.rect.width/height) read once per
-            # page above; reading page.rect here built two PyMuPDF Rects per
-            # path group (1.1 million on a 550k-path sheet, 15 s).
-            page_area = page_w * page_h
-            # A compound clip fill is a shaped mask (a frame, a ring) whose
-            # bounds are its clip's: sheet-sized bounds are not sheet-sized ink.
-            if grp_area > page_area * 0.95 and not path_group.get("bcs_compound_clip_fill"):
-                continue
-
+        # Bounds cannot distinguish background paint from a border, diagonal,
+        # or large filled feature. Preserve every visible source drawing here.
         parent = _parent_for(stroke_rgb or fill_rgb, layer_name)
 
         if opts.assign_linewidth:
@@ -12832,11 +12913,84 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     opts, page_num, [_host_clip_fill_issue(path_group, exc, superseded)])
             continue
 
+        # Ordinary compound fills are one source paint, even without a clip.
+        # Filling each contour independently would erase even-odd counters and
+        # misinterpret nonzero winding. Keep original fs stroke paint separate.
+        compound_fill_delivered = False
+        if ((opts.hatch_to_faces or opts.make_faces) and fill is not None
+                and path_group.get("seqno") not in image_order_strokes):
+            try:
+                from .PDFSourceFill import SourceFillError, source_contours, build_compound_fill
+            except ImportError:
+                from PDFSourceFill import SourceFillError, source_contours, build_compound_fill
+            try:
+                contours = source_contours(path_group, _parse_rect)
+                if contours is not None and len(contours) > 1:
+                    compound_checks = 0
+                    def check_compound_cancel(paint_index=pg_idx, drawing_count=n_drawings):
+                        nonlocal compound_checks
+                        compound_checks += 1
+                        if compound_checks == 1 or compound_checks % 32 == 0:
+                            _progress_update(
+                                10 + int(69 * paint_index / max(drawing_count, 1)),
+                                "Processing compound source fill...", "geometry")
+                        if _progress_check_cancel():
+                            raise ImportCancelled("Compound source fill cancelled")
+
+                    shape, fill_receipt = build_compound_fill(
+                        contours, path_group["even_odd"], Part,
+                        lambda point: _to_fc(point, page_h, opts, scale),
+                        scale, check_compound_cancel,
+                    )
+                    fill_receipt.update(
+                        source_pdf_sha256=source_sha, source_page=int(page_num),
+                        source_paint_order=path_group.get("seqno"),
+                        source_fill_rgb=list(fill), delivered_fill_rgb=list(fill_rgb),
+                        coordinate_scale=float(scale), source_page_height=float(page_h),
+                        page_rotation_matrix=list(_page_matrix_values(opts)), flip_y=bool(opts.flip_y),
+                    )
+                    fill_receipt["created_entity_ids"] = []
+                    if shape is not None:
+                        obj = fc_doc.addObject("Part::Feature", "SourceCompoundFill")
+                        obj.Shape = shape
+                        _require_valid_drawing_shape(obj.Shape, "stored source compound fill")
+                        _apply_style(obj, None, fill_rgb, None, None, opts)
+                        parent.addObject(obj)
+                        fill_receipt["created_entity_ids"] = [obj.Name]
+                        obj.addProperty("App::PropertyString", "PDFSourceCompoundFillJSON", "PDF Source")
+                        obj.PDFSourceCompoundFillJSON = json.dumps(fill_receipt, sort_keys=True)
+                        if json.loads(obj.PDFSourceCompoundFillJSON) != fill_receipt:
+                            raise DrawingGeometryFailure("Compound fill provenance was not retained")
+                        obj_count += 1
+                        if _model3d_should_extrude(
+                                opts, is_closed=True, fill=fill,
+                                face_area=float(shape.Area), page_area=page_area_units):
+                            solid = fc_doc.addObject("Part::Feature", "PDF_3D_Solid")
+                            solid.Shape = shape.copy()
+                            if not _extrude_model3d_obj(solid, opts):
+                                raise DrawingGeometryFailure("Compound source fill extrusion failed")
+                            _apply_style(solid, None, fill_rgb, None, None, opts)
+                            parent.addObject(solid)
+                            obj_count += 1
+                            opts._model3d_solids = int(getattr(opts, "_model3d_solids", 0) or 0) + 1
+                    report_extra = dict(getattr(opts, "_report_extra", {}) or {})
+                    report_extra.setdefault("source_compound_fill_delivery", []).append(fill_receipt)
+                    opts._report_extra = report_extra
+                    compound_fill_delivered = True
+                    if path_group.get("type") == "f":
+                        continue
+                    # Original source edges below retain stroke width, dashes,
+                    # closure and paint. A compound fs fill is never repeated.
+                    fill_rgb = None
+            except SourceFillError as exc:
+                raise DrawingGeometryFailure("Compound source fill delivery failed: %s" % exc) from exc
+
         # Cancel only a proved zero-area retraced fill bridge. Keep the source
         # path dictionary intact and construct its retained boundary exactly.
         source_fill_proof = None
         source_open_stroke_edges = None
-        if ((opts.hatch_to_faces or (opts.make_faces and close_path))
+        if (not compound_fill_delivered
+                and (opts.hatch_to_faces or (opts.make_faces and close_path))
                 and path_group.get("seqno") not in image_order_strokes):
             items, source_fill_proof = _source_fill_without_retraced_bridge(path_group)
             if source_fill_proof is None and opts.hatch_to_faces:
@@ -12844,7 +12998,10 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 if source_fill_proof is not None and path_group.get("type") == "fs":
                     source_open_stroke_edges = _source_fill_boundary_edges(
                         path_group["items"], page_h, opts, scale)
-        preserve_source_edges = bool(path_group.get("bcs_preserve_source_edges") or source_fill_proof)
+        source_quad_stroke = (fill is None and stroke is not None
+                              and any(item[0] == "qu" for item in items))
+        preserve_source_edges = bool(path_group.get("bcs_preserve_source_edges") or source_fill_proof
+                                     or any(item[0] == "qu" for item in items))
 
         # Build edges per sub-path
         current_pt: Optional[Vector] = None
@@ -13011,6 +13168,21 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     prev = q
                 current_pt = p3
 
+            elif kind == "qu":  # source quadrilateral, including optimized strokes
+                flush_sub(False)
+                try:
+                    if len(data) != 1:
+                        raise ValueError("Quadrilateral must have four source corners")
+                    quad = data[0]
+                    points = [_to_fc(_finite_source_tuple(point, 2, "drawing.quad"), page_h, opts, scale)
+                              for point in (quad.ul, quad.ur, quad.lr, quad.ll)]
+                    edges = [_edge_line(a, b) for a, b in zip(points, points[1:] + points[:1], strict=True)]
+                    if any(edge is None for edge in edges):
+                        raise ValueError("Quadrilateral source edge was not built")
+                except (RuntimeError, AttributeError, TypeError, ValueError) as exc:
+                    raise DrawingGeometryFailure("Native source quadrilateral construction failed") from exc
+                wires_edges.append((edges, True))
+
             elif kind == "re":  # rectangle
                 flush_sub(False)
                 x, y, w, h = _parse_rect(data)
@@ -13056,6 +13228,8 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             want_face = (source_fill_proof is not None
                          or (opts.hatch_to_faces and fill is not None)
                          or (opts.make_faces and is_closed))
+            if compound_fill_delivered or source_quad_stroke:
+                want_face = False
             if path_group.get("seqno") in image_order_strokes:
                 # Source-qualified later paint is a stroke; an invisible fs
                 # fill must not acquire an opaque native face above the image.
@@ -13101,7 +13275,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                         face_area = float(getattr(obj.Shape, "Area", 0.0) or 0.0)
                     except (AttributeError, TypeError, ValueError):
                         face_area = 0.0
-                    if _model3d_should_extrude(
+                    if not compound_fill_delivered and _model3d_should_extrude(
                         opts,
                         is_closed=is_closed,
                         fill=fill,
@@ -13888,6 +14062,32 @@ def _remove_post_baseline_document_objects(
     }
 
 
+def _rollback_import_transaction(
+    fc_doc,
+    baseline_object_ids: set,
+    baseline_object_names: set,
+) -> Dict[str, Any]:
+    """Attempt transaction abort, then always remove owned post-baseline objects."""
+    abort_failure = None
+    try:
+        fc_doc.abortTransaction()
+    except Exception as exc:
+        abort_failure = {
+            "type": exc.__class__.__name__,
+            "message": str(exc),
+        }
+    rollback = _remove_post_baseline_document_objects(
+        fc_doc, baseline_object_ids, baseline_object_names
+    )
+    if abort_failure is not None:
+        # Object absence cannot prove that a failed transaction abort restored
+        # document state. Keep the actual removal result separately and stop.
+        rollback["owned_object_cleanup_complete"] = rollback["cleanup_complete"]
+        rollback["transaction_abort_failure"] = abort_failure
+        rollback["cleanup_complete"] = False
+    return rollback
+
+
 def estimate_import_work(pdf_path: str, opts: Optional[ImportOptions] = None) -> Dict[str, Any]:
     """Inspect selected pages and return transparent, content-derived work units."""
     from PDFImportSession import build_work_plan
@@ -14054,6 +14254,7 @@ def find_resumable_import_session(
 @_memoized_wirestrings
 def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     """Import one or more pages from a PDF file."""
+    _cancel_import_view_reframe()
     if opts is None:
         opts = ImportOptions(ignore_images=not IMAGE_WB)
     fc_doc = _ensure_doc()
@@ -14381,10 +14582,42 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             active_page_baseline_names,
         )
         if not cleanup["cleanup_complete"]:
-            fc_doc.abortTransaction()
-            rollback = _remove_post_baseline_document_objects(
+            rollback = _rollback_import_transaction(
                 fc_doc, baseline_object_ids, baseline_object_names
             )
+            _restore_page_result_telemetry(opts, invocation_telemetry_snapshot)
+            opts.import_status = "failed"
+            rolled_back_pages = list(evaluated_pages)
+            report_extra = dict(getattr(opts, "_report_extra", {}) or {})
+            report_extra["cancel_cleanup"] = cleanup
+            report_extra["rollback"] = rollback
+            report_extra["representation_contract_scope"] = _representation_contract_scope(
+                valid_pages, previously_certified_pages, evaluated_pages, [],
+                previously_certified_pages, rolled_back_pages=rolled_back_pages,
+                previously_degraded_pages=resumed_degraded_pages,
+            )
+            report_extra["page_failure"] = {
+                "schema": "bcs.freecad.page_failure/1",
+                "requested_pages": list(valid_pages),
+                "last_evaluated_page": evaluated_pages[-1] if evaluated_pages else None,
+                "phase": "cancellation_cleanup",
+                "type": cancel.__class__.__name__,
+                "message": str(cancel),
+                "rollback_cleanup_complete": rollback["cleanup_complete"],
+            }
+            opts._report_extra = report_extra
+            opts.phase_timings_ms["pages_import_ms"] = (
+                time.perf_counter() - t_phase
+            ) * 1000.0
+            try:
+                _write_terminal_representation_failure_report(
+                    pdf_path=pdf_path, opts=opts, total_pages=total_pages,
+                    pages_imported=len(previously_certified_pages),
+                    elapsed_ms=(time.perf_counter() - t_import_start) * 1000.0,
+                    failure=cancel,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError, ImportError) as report_error:
+                _err("Terminal import failure report could not be written: %s" % report_error)
             raise RuntimeError(
                 "Cancellation could not remove the incomplete active page: "
                 f"cleanup={cleanup}, rollback={rollback}"
@@ -14408,15 +14641,27 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         ) * 1000.0
         cancelled = True
     except TextRepresentationFailure as failure:
-        fc_doc.abortTransaction()
-        rollback = _remove_post_baseline_document_objects(
+        rollback = _rollback_import_transaction(
             fc_doc, baseline_object_ids, baseline_object_names
         )
         _restore_page_result_telemetry(opts, invocation_telemetry_snapshot)
+        opts.import_status = "failed"
+        if not rollback["cleanup_complete"]:
+            failure.attempt["cleanup_complete"] = False
+            failure.attempt["rollback"] = rollback
         _append_text_item_attempt(opts, dict(getattr(failure, "attempt", {}) or {}))
         rolled_back_pages = list(evaluated_pages)
         report_extra = dict(getattr(opts, "_report_extra", {}) or {})
         report_extra["rollback"] = rollback
+        report_extra["page_failure"] = {
+            "schema": "bcs.freecad.page_failure/1",
+            "requested_pages": list(valid_pages),
+            "last_evaluated_page": evaluated_pages[-1] if evaluated_pages else None,
+            "phase": "text_representation",
+            "type": failure.__class__.__name__,
+            "message": str(failure),
+            "rollback_cleanup_complete": rollback["cleanup_complete"],
+        }
         report_extra["representation_contract_scope"] = (
             _representation_contract_scope(
                 valid_pages,
@@ -14448,25 +14693,38 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             )
         except (OSError, RuntimeError, TypeError, ValueError, ImportError) as report_error:
             _err(f"Terminal import failure report could not be written: {report_error}")
-        if not rollback["cleanup_complete"]:
-            failure.attempt["cleanup_complete"] = False
-            failure.attempt["rollback"] = rollback
         raise
     except Exception as failure:
-        fc_doc.abortTransaction()
-        rollback = _remove_post_baseline_document_objects(
+        rollback = _rollback_import_transaction(
             fc_doc, baseline_object_ids, baseline_object_names
         )
         _restore_page_result_telemetry(opts, invocation_telemetry_snapshot)
-        if isinstance(failure, DrawingGeometryFailure):
-            opts.import_status = "failed"
-            try:
-                _write_terminal_representation_failure_report(
-                    pdf_path=pdf_path, opts=opts, total_pages=total_pages,
-                    pages_imported=len(previously_certified_pages),
-                    elapsed_ms=(time.perf_counter() - t_import_start) * 1000.0, failure=failure)
-            except (OSError, RuntimeError, TypeError, ValueError, ImportError) as report_error:
-                _err("Terminal geometry failure report could not be written: %s" % report_error)
+        opts.import_status = "failed"
+        rolled_back_pages = list(evaluated_pages)
+        report_extra = dict(getattr(opts, "_report_extra", {}) or {})
+        report_extra["rollback"] = rollback
+        report_extra["representation_contract_scope"] = _representation_contract_scope(
+            valid_pages, previously_certified_pages, evaluated_pages, [],
+            previously_certified_pages, rolled_back_pages=rolled_back_pages,
+            previously_degraded_pages=resumed_degraded_pages,
+        )
+        report_extra["page_failure"] = {
+            "schema": "bcs.freecad.page_failure/1",
+            "requested_pages": list(valid_pages),
+            "last_evaluated_page": evaluated_pages[-1] if evaluated_pages else None,
+            "phase": "import_transaction",
+            "type": failure.__class__.__name__,
+            "message": str(failure),
+            "rollback_cleanup_complete": rollback["cleanup_complete"],
+        }
+        opts._report_extra = report_extra
+        try:
+            _write_terminal_representation_failure_report(
+                pdf_path=pdf_path, opts=opts, total_pages=total_pages,
+                pages_imported=len(previously_certified_pages),
+                elapsed_ms=(time.perf_counter() - t_import_start) * 1000.0, failure=failure)
+        except (OSError, RuntimeError, TypeError, ValueError, ImportError) as report_error:
+            _err("Terminal import failure report could not be written: %s" % report_error)
         if not rollback["cleanup_complete"]:
             raise RuntimeError(
                 "Import failed and rollback was incomplete: %s" % rollback

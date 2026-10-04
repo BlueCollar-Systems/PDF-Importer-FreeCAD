@@ -52,6 +52,108 @@ class FakeDocument:
         return next((obj for obj in self.Objects if obj.Name == name), None)
 
 
+def test_gui_session_initializes_native_default_provider_before_properties():
+    document = FakeDocument()
+    original_add = document.addObject
+    events = []
+
+    class NativeView:
+        def __init__(self):
+            self._proxy = None
+            self.DisplayMode = None
+
+        @property
+        def Proxy(self):
+            return self._proxy
+
+        @Proxy.setter
+        def Proxy(self, value):
+            events.append("initialize_view")
+            self._proxy = value
+            self.DisplayMode = ""
+
+    def add_with_view(kind, name):
+        host = original_add(kind, name)
+        host.ViewObject = NativeView()
+        original_property = host.addProperty
+
+        def add_property(*args):
+            assert host.ViewObject.DisplayMode == ""
+            events.append("property")
+            original_property(*args)
+
+        host.addProperty = add_property
+        return host
+
+    document.addObject = add_with_view
+    identity = session.build_identity(
+        source_sha256="a" * 64,
+        source_name="drawing.pdf",
+        opts=Options(pages=[1, 2]),
+        importer_version="4.0.80",
+        requested_pages=[1, 2],
+    )
+    host = session.create_session_object(document, identity)
+    assert host.ViewObject.Proxy == 0
+    assert events[0] == "initialize_view"
+    assert session.read_session_object(host)["source_sha256"] == "a" * 64
+    assert session.remaining_pages(session.read_session_object(host)) == [1, 2]
+
+
+def test_headless_session_with_no_view_provider_keeps_resume_identity():
+    document = FakeDocument()
+    original_add = document.addObject
+
+    def add_without_view(kind, name):
+        host = original_add(kind, name)
+        host.ViewObject = None
+        return host
+
+    document.addObject = add_without_view
+    identity = session.build_identity(
+        source_sha256="a" * 64,
+        source_name="drawing.pdf",
+        opts=Options(pages=[1]),
+        importer_version="4.0.80",
+        requested_pages=[1],
+    )
+    host = session.create_session_object(document, identity)
+    assert host.ViewObject is None
+    assert session.find_matching_session(document, identity) is host
+
+
+def test_native_view_initialization_failure_is_not_certified():
+    document = FakeDocument()
+    original_add = document.addObject
+
+    class RefusingView:
+        @property
+        def Proxy(self):
+            return None
+
+        @Proxy.setter
+        def Proxy(self, _value):
+            raise RuntimeError("native view initialization failed")
+
+    def add_refusing_view(kind, name):
+        host = original_add(kind, name)
+        host.ViewObject = RefusingView()
+        return host
+
+    document.addObject = add_refusing_view
+    identity = session.build_identity(
+        source_sha256="a" * 64,
+        source_name="drawing.pdf",
+        opts=Options(pages=[1]),
+        importer_version="4.0.80",
+        requested_pages=[1],
+    )
+    with pytest.raises(RuntimeError, match="native view initialization failed"):
+        session.create_session_object(document, identity)
+    assert not document.Objects[0].properties
+    assert not hasattr(document.Objects[0], "PDFImportStatus")
+
+
 def test_option_identity_is_canonical_and_excludes_runtime_fields():
     first = Options(pages=[3, 1], progress_callback=lambda _event: True)
     second = Options(
@@ -99,6 +201,53 @@ def test_session_round_trip_and_exact_match_survive_host_property_persistence():
     assert state["completed_pages"] == [1, 2]
     assert state["page_groups"] == {"1": page_one.Name, "2": page_two.Name}
     assert session.remaining_pages(state) == [4]
+
+
+@pytest.mark.parametrize("hits", [0, 7])
+@pytest.mark.parametrize("wire_hits", [0, 9])
+def test_cancelled_session_can_resume_after_terminal_outline_cache_statistics(hits, wire_hits):
+    document = FakeDocument()
+    options = Options(pages=[1, 2, 3])
+
+    def identity():
+        return session.build_identity(
+            source_sha256="a" * 64,
+            source_name="drawing.pdf",
+            opts=options,
+            importer_version="4.0.110",
+            requested_pages=options.pages,
+        )
+
+    original = identity()
+    host = session.create_session_object(document, original)
+    page = document.addObject("App::DocumentObjectGroup", "PDF_Page_1")
+    session.update_session_object(
+        host, status="cancelled", completed_pages=[1], page_groups={1: page.Name}
+    )
+    # The terminal report publishes these counters onto the same Options object
+    # that the next resume lookup receives. They describe prior work only.
+    options.text3d_outline_cache_stats = {
+        "hits": hits, "misses": 2, "evictions": 1, "solid_hits": 3, "solid_misses": 4
+    }
+    options.wirestring_cache_stats = {"hits": wire_hits, "misses": 5}
+    reopened = FakeDocument()
+    reopened.Objects.extend([host, page])
+    candidate = identity()
+    assert candidate == original
+    assert session.find_matching_session(reopened, candidate) is host
+    state = session.read_session_object(host)
+    assert state["completed_pages"] == [1]
+    assert session.remaining_pages(state) == [2, 3]
+
+    # Actual content and requested-page changes still prevent a match.
+    options.user_scale = 2.0
+    assert session.find_matching_session(reopened, identity()) is None
+    options.user_scale = 1.0
+    options.text_mode = "none"
+    assert session.find_matching_session(reopened, identity()) is None
+    options.text_mode = "3d_text"
+    options.pages = [1, 2]
+    assert session.find_matching_session(reopened, identity()) is None
 
 
 @pytest.mark.parametrize(

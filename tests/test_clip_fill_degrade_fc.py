@@ -315,7 +315,7 @@ def test_a_mask_that_fails_after_its_object_exists_leaves_nothing_half_built(hos
     assert issue["stage"] == "host-build" and issue["detail"].startswith("ValueError: view provider")
 
 
-def test_a_frame_whose_bounds_are_the_sheet_is_built_and_a_plain_background_is_still_skipped(host):
+def test_sheet_sized_paint_and_a_clipped_frame_are_both_preserved(host):
     sheet = (0, 0, 200, 100)
     frame = {"type": "clip", "level": 0, "scissor": core.fitz.Rect(sheet), "even_odd": True, "items": [
         ("re", core.fitz.Rect(sheet), 1), ("re", core.fitz.Rect(20, 20, 180, 80), 1)]}
@@ -323,9 +323,47 @@ def test_a_frame_whose_bounds_are_the_sheet_is_built_and_a_plain_background_is_s
     # The mask's bounds are its clip's, the whole sheet; its ink is a 20 pt band.
     (mask,) = document.named("ClippedFill")
     assert mask.PDFClipFillGroupId == "clip-fill:1"
-    (batch,) = document.named("Batch")                      # the stroke; the sheet-sized background is not drawn
-    assert len(batch.Shape[1]) == 1
+    # The source's sheet-sized fill is paint too, not an inferred background.
+    assert sorted(len(batch.Shape[1]) for batch in document.named("Batch")) == [1, 1]
     assert "clip_fill_delivery" not in opts._report_extra   # covered exactly and built: nothing to report
+
+
+@pytest.mark.parametrize("bounds", [(0, 0, 200, 100), (1, 1, 199, 99), (-5, -5, 205, 105)])
+@pytest.mark.parametrize("rectangle", [False, True])
+def test_large_stroke_bounds_do_not_remove_diagonals_or_sheet_borders(host, bounds, rectangle):
+    rect = core.fitz.Rect(bounds)
+    items = [("re", rect, 1)] if rectangle else [("l", rect.top_left, rect.bottom_right)]
+    row = {"type": "s", "seqno": 0, "rect": rect, "color": (0, 0, 0), "width": 1.0,
+           "items": items}
+    document, _opts, _group = import_page([row])
+    (batch,) = document.named("Batch")
+    (wire,) = batch.Shape[1]
+    points = [(point.x, point.y) for _kind, ends in wire.edges for point in ends]
+    x0, y0, x1, y1 = bounds
+    assert points[0] == (x0, 100 - y0)
+    assert (x1, 100 - y1) in points
+    assert len(wire.edges) == (4 if rectangle else 1)
+
+
+@pytest.mark.parametrize("color", [(1, 1, 1), (0.2, 0.4, 0.6)])
+@pytest.mark.parametrize("triangle", [False, True])
+def test_large_visible_fill_is_delivered_as_a_valid_face(host, monkeypatch, color, triangle):
+    # A triangle's bbox fills the page although its actual ink covers half of it.
+    row = fill(0, (0, 0, 200, 100), level=0)
+    row["fill"] = color
+    if triangle:
+        a, b, c = (core.fitz.Point(*point) for point in [(0, 0), (200, 100), (0, 100)])
+        row["items"] = [("l", a, b), ("l", b, c), ("l", c, a)]
+    row["closePath"] = True
+    monkeypatch.setattr(core.Part, "Face", lambda wire: wire, raising=False)
+    styles = []
+    monkeypatch.setattr(core, "_apply_style", lambda obj, stroke, fill, *args, **kwargs:
+                        styles.append((obj, stroke, fill)))
+    document, _opts, _group = import_page([row], options(hatch_to_faces=True))
+    (face,) = document.named("Face")
+    assert face.Shape.isClosed() and face.Shape.isValid()
+    assert len(face.Shape.edges) == (3 if triangle else 4)
+    assert any(obj is face and actual_fill == color for obj, _stroke, actual_fill in styles)
 
 
 def test_a_fill_the_core_delivered_and_this_host_then_dropped_is_counted_once(host, monkeypatch, tmp_path):

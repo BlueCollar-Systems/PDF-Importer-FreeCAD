@@ -189,7 +189,7 @@ def test_actual_atomic_report_io_refusal_preserves_original_exception_and_previo
         monkeypatch, tmp_path, kind, True, "once" if kind == "cancel" else "none")
     previous = b'{"previous_accepted_report":"preserve exact bytes"}\n'
     report.write_bytes(previous)
-    real_replace = atomic_io.os.replace
+    real_replace = atomic_io.Path.replace
     refused_writes = []
 
     def refuse_replace(source, destination):
@@ -200,7 +200,7 @@ def test_actual_atomic_report_io_refusal_preserves_original_exception_and_previo
             raise OSError("CONTROLLED_ATOMIC_REPORT_REPLACE_REFUSAL")
         return real_replace(source, destination)
 
-    monkeypatch.setattr(atomic_io.os, "replace", refuse_replace)
+    monkeypatch.setattr(atomic_io.Path, "replace", refuse_replace)
     with pytest.raises(RuntimeError) as caught:
         core.import_pdf(str(pdf), options)
     failure = observed["original_failure"]

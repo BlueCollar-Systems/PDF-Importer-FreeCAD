@@ -69,7 +69,18 @@ def apply_straight_on_view(view, bounds: Optional[Sequence[float]]) -> bool:
         except (AttributeError, RuntimeError, TypeError, ValueError):
             cam = None
             aspect = 1.0
-        if aspect != 1.0:
+        # FreeCAD leaves SoOrthographicCamera.aspectRatio at 1.0 even when the
+        # viewer window is wide. Prefer the live viewport size when present.
+        try:
+            size = view.getSize()
+            if size is not None and len(size) >= 2:
+                vw = float(size[0])
+                vh = float(size[1])
+                if vw > 0.0 and vh > 0.0:
+                    aspect = vw / vh
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+            pass
+        if abs(aspect - 1.0) > 1.0e-6:
             frame = orthographic_sheet_frame(
                 float(bounds[0]), float(bounds[1]), float(bounds[2]), float(bounds[3]),
                 aspect=aspect,

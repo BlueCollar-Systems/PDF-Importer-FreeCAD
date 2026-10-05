@@ -72,3 +72,21 @@ def test_missing_camera_node_still_finishes_orthographic():
     assert view.calls[0] == "viewTop"
     assert view.calls[-1] == "Orthographic"
     assert "fitAll" in view.calls
+
+
+def test_getSize_overrides_a_stuck_aspectRatio_of_one():
+    """FreeCAD reports aspectRatio 1.0; the live viewport still shapes the frame."""
+
+    class Sized(_View):
+        def getSize(self):
+            return (1600, 900)
+
+    view = Sized(aspect=1.0)
+    assert apply_straight_on_view(view, (0.0, 0.0, 431.8, 279.4)) is True
+    # 17x11 sheet in a 16:9 window: height must cover the sheet height, not
+    # the width/1.0 overshoot that made landscape sheets look tiny.
+    assert view.camera.height.value >= 279.4 * 1.05 - 1e-6
+    assert view.camera.height.value < 431.8 * 1.05  # would be true if aspect stayed 1.0 and width dominated wrongly for portrait; for landscape width/aspect wins when aspect is correct
+    # With aspect 1600/900, ortho_h = max(279.4, 431.8/(1600/900)) * 1.05 = max(279.4, 243.0) * 1.05
+    expected = max(279.4, 431.8 / (1600 / 900)) * 1.05
+    assert abs(view.camera.height.value - expected) < 1e-6

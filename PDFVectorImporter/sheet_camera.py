@@ -40,6 +40,30 @@ def orthographic_sheet_frame(
     return center_x, center_y, eye_z, ortho_h
 
 
+def viewport_aspect(view, camera) -> float:
+    """Width/height of the window.
+
+    FreeCAD's orthographic camera keeps ``aspectRatio`` at 1.0 and applies
+    the viewport while drawing. Using that default frames a wide sheet as
+    if the window were square, so the page opens short of the view.
+    """
+    try:
+        size = view.getSize()
+        width = float(size[0])
+        height = float(size[1])
+        if width > 0.0 and height > 0.0:
+            return width / height
+    except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+        pass
+    try:
+        aspect = float(camera.aspectRatio.getValue())
+        if aspect > 0.0:
+            return aspect
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+    return 1.0
+
+
 def apply_straight_on_view(view, bounds: Optional[Sequence[float]]) -> bool:
     """Look straight down on the sheet, orthographic, zoomed to the page."""
     if view is None:
@@ -65,22 +89,11 @@ def apply_straight_on_view(view, bounds: Optional[Sequence[float]]) -> bool:
     if frame is not None:
         try:
             cam = view.getCameraNode()
-            aspect = float(cam.aspectRatio.getValue())
+            aspect = viewport_aspect(view, cam)
         except (AttributeError, RuntimeError, TypeError, ValueError):
             cam = None
             aspect = 1.0
-        # FreeCAD leaves SoOrthographicCamera.aspectRatio at 1.0 even when the
-        # viewer window is wide. Prefer the live viewport size when present.
-        try:
-            size = view.getSize()
-            if size is not None and len(size) >= 2:
-                vw = float(size[0])
-                vh = float(size[1])
-                if vw > 0.0 and vh > 0.0:
-                    aspect = vw / vh
-        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
-            pass
-        if abs(aspect - 1.0) > 1.0e-6:
+        if aspect != 1.0:
             frame = orthographic_sheet_frame(
                 float(bounds[0]), float(bounds[1]), float(bounds[2]), float(bounds[3]),
                 aspect=aspect,

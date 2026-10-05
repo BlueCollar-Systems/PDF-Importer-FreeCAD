@@ -62,6 +62,18 @@ def test_view_top_then_orthographic_and_no_fit_all_when_the_sheet_is_known():
     assert pos[2] > 0.0
 
 
+def test_window_size_frames_a_wide_sheet_when_the_camera_aspect_stays_square():
+    view = _View(aspect=1.0)
+    def window_size():
+        return (1600, 900)
+    view.getSize = window_size
+    assert apply_straight_on_view(view, (0.0, 0.0, 431.8, 279.4)) is True
+    _cx, _cy, _z, wide = orthographic_sheet_frame(0.0, 0.0, 431.8, 279.4, aspect=1600.0 / 900.0)
+    _cx, _cy, _z, square = orthographic_sheet_frame(0.0, 0.0, 431.8, 279.4, aspect=1.0)
+    assert abs(view.camera.height.value - wide) < 0.01
+    assert view.camera.height.value < square
+
+
 def test_missing_camera_node_still_finishes_orthographic():
     class Bare(_View):
         def getCameraNode(self):
@@ -73,7 +85,6 @@ def test_missing_camera_node_still_finishes_orthographic():
     assert view.calls[-1] == "Orthographic"
     assert "fitAll" in view.calls
 
-
 def test_getSize_overrides_a_stuck_aspectRatio_of_one():
     """FreeCAD reports aspectRatio 1.0; the live viewport still shapes the frame."""
 
@@ -83,10 +94,6 @@ def test_getSize_overrides_a_stuck_aspectRatio_of_one():
 
     view = Sized(aspect=1.0)
     assert apply_straight_on_view(view, (0.0, 0.0, 431.8, 279.4)) is True
-    # 17x11 sheet in a 16:9 window: height must cover the sheet height, not
-    # the width/1.0 overshoot that made landscape sheets look tiny.
-    assert view.camera.height.value >= 279.4 * 1.05 - 1e-6
-    assert view.camera.height.value < 431.8 * 1.05  # would be true if aspect stayed 1.0 and width dominated wrongly for portrait; for landscape width/aspect wins when aspect is correct
-    # With aspect 1600/900, ortho_h = max(279.4, 431.8/(1600/900)) * 1.05 = max(279.4, 243.0) * 1.05
+    # 17x11 sheet in a 16:9 window: ortho height = max(279.4, 431.8 / (16/9)) * 1.05
     expected = max(279.4, 431.8 / (1600 / 900)) * 1.05
     assert abs(view.camera.height.value - expected) < 1e-6

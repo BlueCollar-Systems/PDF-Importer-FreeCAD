@@ -62,6 +62,18 @@ def test_view_top_then_orthographic_and_no_fit_all_when_the_sheet_is_known():
     assert pos[2] > 0.0
 
 
+def test_window_size_frames_a_wide_sheet_when_the_camera_aspect_stays_square():
+    view = _View(aspect=1.0)
+    def window_size():
+        return (1600, 900)
+    view.getSize = window_size
+    assert apply_straight_on_view(view, (0.0, 0.0, 431.8, 279.4)) is True
+    _cx, _cy, _z, wide = orthographic_sheet_frame(0.0, 0.0, 431.8, 279.4, aspect=1600.0 / 900.0)
+    _cx, _cy, _z, square = orthographic_sheet_frame(0.0, 0.0, 431.8, 279.4, aspect=1.0)
+    assert abs(view.camera.height.value - wide) < 0.01
+    assert view.camera.height.value < square
+
+
 def test_missing_camera_node_still_finishes_orthographic():
     class Bare(_View):
         def getCameraNode(self):

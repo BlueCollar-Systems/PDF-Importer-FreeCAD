@@ -84,3 +84,16 @@ def test_missing_camera_node_still_finishes_orthographic():
     assert view.calls[0] == "viewTop"
     assert view.calls[-1] == "Orthographic"
     assert "fitAll" in view.calls
+
+def test_getSize_overrides_a_stuck_aspectRatio_of_one():
+    """FreeCAD reports aspectRatio 1.0; the live viewport still shapes the frame."""
+
+    class Sized(_View):
+        def getSize(self):
+            return (1600, 900)
+
+    view = Sized(aspect=1.0)
+    assert apply_straight_on_view(view, (0.0, 0.0, 431.8, 279.4)) is True
+    # 17x11 sheet in a 16:9 window: ortho height = max(279.4, 431.8 / (16/9)) * 1.05
+    expected = max(279.4, 431.8 / (1600 / 900)) * 1.05
+    assert abs(view.camera.height.value - expected) < 1e-6

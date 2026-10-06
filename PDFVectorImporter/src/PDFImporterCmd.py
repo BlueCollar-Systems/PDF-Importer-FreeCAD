@@ -26,6 +26,8 @@ except ModuleNotFoundError as exc:
 
 activate_bundled_runtime_if_available(_addon_root)
 
+from PDFVectorImporter.pdfcadcore.fitz_loader import PdfOpenError, safe_open
+
 try:
     import pymupdf as fitz  # PyMuPDF >= 1.24 preferred name
 except ImportError:
@@ -196,6 +198,7 @@ class ImportPDFDialog(QtWidgets.QDialog):
         # ── File row ──
         self.file_edit = QtWidgets.QLineEdit()
         self.file_edit.setPlaceholderText("Choose a PDF file…")
+        self.file_edit.textChanged.connect(self._on_file_changed)
         browse_btn = QtWidgets.QPushButton("Browse…")
         browse_btn.clicked.connect(self._browse)
         file_row = QtWidgets.QHBoxLayout()
@@ -358,14 +361,22 @@ class ImportPDFDialog(QtWidgets.QDialog):
             except (AttributeError, RuntimeError, ValueError):
                 pass
             self.file_edit.setText(path)
-            if fitz:
-                try:
-                    with fitz.open(path) as doc:
-                        self._page_count = doc.page_count
-                    self.page_edit.setPlaceholderText(
-                        f"1-{self._page_count}  (PDF has {self._page_count} pages)")
-                except (RuntimeError, OSError, ValueError):
-                    pass
+            try:
+                self._refresh_page_count(path)
+            except (PdfOpenError, ImportError, RuntimeError, OSError, ValueError) as exc:
+                QtWidgets.QMessageBox.warning(self, "PDF Import", str(exc))
+
+    def _on_file_changed(self, _text):
+        """Page metadata belongs to the selected PDF, never the previous file."""
+        self._page_count = None
+        self.page_edit.setPlaceholderText("All pages")
+
+    def _refresh_page_count(self, path):
+        self._page_count = None
+        with safe_open(path) as document:
+            self._page_count = document.page_count
+        self.page_edit.setPlaceholderText(
+            f"1-{self._page_count}  (PDF has {self._page_count} pages)")
 
     _PARAM_PATH = "User parameter:BaseApp/Preferences/Mod/PDFVectorImporter"
 
@@ -454,6 +465,14 @@ class ImportPDFDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(
                 self, "Missing File", "Please select a valid PDF file.")
             return
+        # Reopen the currently selected path once before validation. Typing a
+        # path, replacing a file, and choosing another PDF after drag/drop must
+        # all use this document's page count.
+        try:
+            self._refresh_page_count(path)
+        except (PdfOpenError, ImportError, RuntimeError, OSError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(self, "PDF Import", str(exc))
+            return
         try:
             self._parse_pages()
         except ValueError as e:
@@ -469,7 +488,8 @@ class ImportPDFDialog(QtWidgets.QDialog):
         if not text or text in ("all", "*"):
             if self._page_count:
                 return list(range(1, self._page_count + 1))
-            return [1]
+            # An empty selection tells the core to resolve every page.
+            return []
 
         pages = set()
         bad_parts = []
@@ -488,6 +508,11 @@ class ImportPDFDialog(QtWidgets.QDialog):
                     bad_parts.append(part)
                     continue
                 start, end = sorted((a, b))
+                if self._page_count and end > self._page_count:
+                    raise ValueError(
+                        f"Page range out of range for this PDF: {part}. "
+                        f"This file has {self._page_count} page(s)."
+                    )
                 for p in range(start, end + 1):
                     pages.add(p)
             elif part.isdigit():

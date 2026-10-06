@@ -144,6 +144,8 @@ def _import_with_dialog(filename):
     if exec_fn is None or exec_fn() != QtWidgets.QDialog.Accepted:
         return
 
+    # The user can choose a different PDF in the prefilled dialog.
+    filename = dlg.file_edit.text().strip()
     opts = dlg.build_options()
     try:
         completed = run_interactive_import(core, filename, opts)

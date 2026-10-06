@@ -1,5 +1,6 @@
 """Exercise the registered handler against the host's document lookup results."""
 import importlib.util
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -81,3 +82,36 @@ def test_dependency_failure_never_creates_or_imports(handler):
     host.getDocument.assert_not_called()
     host.newDocument.assert_not_called()
     module._do_import.assert_not_called()
+
+
+def test_dialog_imports_the_pdf_selected_after_drag_and_drop(handler, monkeypatch):
+    module, host = handler
+    host.Console = SimpleNamespace(PrintMessage=Mock(), PrintError=Mock(), PrintWarning=Mock())
+    file_field = SimpleNamespace(value="")
+    file_field.setText = lambda value: setattr(file_field, "value", value)
+    file_field.text = lambda: file_field.value
+    options = SimpleNamespace()
+    dialog = SimpleNamespace(
+        file_edit=file_field,
+        page_edit=SimpleNamespace(setPlaceholderText=Mock()),
+        build_options=Mock(return_value=options),
+    )
+
+    def accept_selected_pdf():
+        file_field.value = "  chosen.pdf  "
+        return 1
+
+    dialog.exec = accept_selected_pdf
+    importer = Mock(return_value=True)
+    monkeypatch.setitem(sys.modules, "PDFImporterCmd", SimpleNamespace(
+        ImportPDFDialog=lambda: dialog,
+        run_interactive_import=importer,
+    ))
+    monkeypatch.setitem(sys.modules, "PySide6", SimpleNamespace(
+        QtWidgets=SimpleNamespace(QDialog=SimpleNamespace(Accepted=1))
+    ))
+
+    module._import_with_dialog("dropped.pdf")
+
+    importer.assert_called_once()
+    assert importer.call_args.args[1:] == ("chosen.pdf", options)

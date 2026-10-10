@@ -17,7 +17,7 @@ class Options:
 def identity(root):
     return session.build_identity(source_sha256="a" * 64, source_name="drawing.pdf",
         opts=Options([1, 2]), importer_version="4.0.111", requested_pages=[1, 2],
-        importer_content_sha256=session.importer_content_sha256(root))
+        importer_code_sha256=session.importer_content_sha256(root))
 
 
 def test_same_version_changed_core_rejects_resume_without_touching_completed_geometry(tmp_path):

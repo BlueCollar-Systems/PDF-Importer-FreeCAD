@@ -14179,6 +14179,7 @@ def _session_state_payload(session_state: Dict[str, Any]) -> Dict[str, Any]:
         "source_sha256": session_state["source_sha256"],
         "options_sha256": session_state["options_sha256"],
         "importer_version": session_state["importer_version"],
+        "importer_content_sha256": session_state["importer_content_sha256"],
         "requested_pages": list(session_state["requested_pages"]),
         "completed_pages": list(session_state["completed_pages"]),
         # Completed, so a resume will not redo them; never certified, so every
@@ -14428,12 +14429,18 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                 raise ValueError(f"Resume session {resume_name!r} was not found")
             session_state = read_session_object(session_host)
             validate_completed_page_groups(fc_doc, session_state)
+            if session_state["importer_content_sha256"] != identity["importer_content_sha256"]:
+                raise ValueError(
+                    "Importer code has changed since this checkpoint was created. "
+                    "Start a new import or use its original importer; existing output is kept."
+                )
             identity_fields = (
                 "schema",
                 "source_sha256",
                 "options_json",
                 "options_sha256",
                 "importer_version",
+                "importer_content_sha256",
                 "requested_pages",
             )
             if any(session_state[field] != identity[field] for field in identity_fields):

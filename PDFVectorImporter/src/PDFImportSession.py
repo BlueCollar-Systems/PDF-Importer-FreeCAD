@@ -5,15 +5,62 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 
-SESSION_SCHEMA = "bcs.freecad_import_session/1.0"
+SESSION_SCHEMA = "bcs.freecad_import_session/1.1"
+LEGACY_SESSION_SCHEMA = "bcs.freecad_import_session/1.0"
 PROPERTY_GROUP = "PDF Import Resume"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 STATUS_VALUES = {"running", "cancelled", "complete", "failed"}
+MAX_IMPORTER_CODE_FILES = 256
+MAX_IMPORTER_CODE_BYTES = 32 * 1024 * 1024
+
+
+def importer_content_sha256(package_root: Path | None = None) -> str:
+    """Bind resume to bounded first-party code bytes, independent of version.
+
+    Vendored runtimes, generated caches, tests, and documentation do not enter
+    this identity. Read bytes rather than timestamps: an in-place update can
+    retain both the package version and file metadata.
+    """
+    root = (Path(package_root) if package_root is not None
+            else Path(__file__).resolve().parents[1]).resolve()
+    paths = []
+    for directory, subdirectories, files in os.walk(root, followlinks=False):
+        subdirectories[:] = sorted(name for name in subdirectories
+            if name.casefold() not in {"lib", "tests", "test", "__pycache__", ".git"})
+        for name in sorted(files):
+            if not name.endswith(".py"):
+                continue
+            path = Path(directory) / name
+            if path.is_symlink():
+                raise ValueError("importer code identity cannot include linked files")
+            try:
+                path.resolve().relative_to(root)
+            except ValueError as exc:
+                raise ValueError("importer code identity is outside its package") from exc
+            paths.append(path)
+            if len(paths) > MAX_IMPORTER_CODE_FILES:
+                raise ValueError("importer code file count exceeds identity limit")
+    if not paths:
+        raise ValueError("importer code identity has no Python files")
+    digest = hashlib.sha256()
+    total_bytes = 0
+    for path in sorted(paths):
+        with path.open("rb") as source:
+            content = source.read(MAX_IMPORTER_CODE_BYTES + 1)
+        total_bytes += len(content)
+        if total_bytes > MAX_IMPORTER_CODE_BYTES:
+            raise ValueError("importer code bytes exceed identity limit")
+        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(content).digest())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 # Public result/transport controls do not change created model content and must
 # not make an otherwise exact session impossible to resume.
@@ -92,11 +139,16 @@ def build_identity(
     opts: Any,
     importer_version: str,
     requested_pages: Iterable[int],
+    importer_code_sha256: str | None = None,
 ) -> dict[str, Any]:
     source_digest = str(source_sha256).lower()
     if not SHA256_RE.fullmatch(source_digest):
         raise ValueError("source SHA-256 is invalid")
     option_payload = canonical_json(content_options(opts))
+    content_digest = (str(importer_code_sha256).lower() if importer_code_sha256 is not None
+                      else importer_content_sha256())
+    if not SHA256_RE.fullmatch(content_digest):
+        raise ValueError("importer content SHA-256 is invalid")
     return {
         "schema": SESSION_SCHEMA,
         "source_sha256": source_digest,
@@ -104,6 +156,7 @@ def build_identity(
         "options_json": option_payload,
         "options_sha256": hashlib.sha256(option_payload.encode("utf-8")).hexdigest(),
         "importer_version": str(importer_version),
+        "importer_content_sha256": content_digest,
         "requested_pages": _normalize_pages(requested_pages),
     }
 
@@ -115,6 +168,7 @@ _PROPERTIES = (
     ("App::PropertyString", "PDFOptionsJSON"),
     ("App::PropertyString", "PDFOptionsSHA256"),
     ("App::PropertyString", "PDFImporterVersion"),
+    ("App::PropertyString", "PDFImporterContentSHA256"),
     ("App::PropertyString", "PDFRequestedPagesJSON"),
     ("App::PropertyString", "PDFCompletedPagesJSON"),
     ("App::PropertyString", "PDFDegradedPagesJSON"),
@@ -134,6 +188,11 @@ def _validate_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
     source_digest = str(identity.get("source_sha256") or "").lower()
     option_digest = str(identity.get("options_sha256") or "").lower()
     options_json = str(identity.get("options_json") or "")
+    if identity.get("schema") == LEGACY_SESSION_SCHEMA:
+        raise ValueError(
+            "This older import checkpoint has no importer code identity. "
+            "Start a new import or use its original importer; existing output is kept."
+        )
     if identity.get("schema") != SESSION_SCHEMA:
         raise ValueError("import session schema is invalid")
     if not SHA256_RE.fullmatch(source_digest):
@@ -150,6 +209,9 @@ def _validate_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
     importer_version = str(identity.get("importer_version") or "")
     if not importer_version:
         raise ValueError("import session package identity is missing")
+    content_digest = str(identity.get("importer_content_sha256") or "").lower()
+    if not SHA256_RE.fullmatch(content_digest):
+        raise ValueError("import session importer code identity is missing or invalid")
     return {
         "schema": SESSION_SCHEMA,
         "source_sha256": source_digest,
@@ -157,6 +219,7 @@ def _validate_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
         "options_json": canonical_options,
         "options_sha256": option_digest,
         "importer_version": importer_version,
+        "importer_content_sha256": content_digest,
         "requested_pages": _normalize_pages(identity.get("requested_pages") or []),
     }
 
@@ -180,6 +243,7 @@ def create_session_object(document: Any, identity: Mapping[str, Any]) -> Any:
         "PDFOptionsJSON": exact["options_json"],
         "PDFOptionsSHA256": exact["options_sha256"],
         "PDFImporterVersion": exact["importer_version"],
+        "PDFImporterContentSHA256": exact["importer_content_sha256"],
         "PDFRequestedPagesJSON": canonical_json(exact["requested_pages"]),
         "PDFCompletedPagesJSON": "[]",
         # Imported, so a resume will not redo the page - but never certified.
@@ -201,6 +265,7 @@ def read_session_object(host: Any) -> dict[str, Any]:
             "options_json": getattr(host, "PDFOptionsJSON", ""),
             "options_sha256": getattr(host, "PDFOptionsSHA256", ""),
             "importer_version": getattr(host, "PDFImporterVersion", ""),
+            "importer_content_sha256": getattr(host, "PDFImporterContentSHA256", ""),
             "requested_pages": json.loads(getattr(host, "PDFRequestedPagesJSON", "[]")),
         }
     )
@@ -292,10 +357,24 @@ def find_matching_session(document: Any, identity: Mapping[str, Any]) -> Any | N
         "options_json",
         "options_sha256",
         "importer_version",
+        "importer_content_sha256",
         "requested_pages",
     )
+    incompatible = False
     for host in reversed(list(getattr(document, "Objects", []) or [])):
-        if getattr(host, "PDFImportSessionSchema", "") != SESSION_SCHEMA:
+        schema = getattr(host, "PDFImportSessionSchema", "")
+        if schema not in {SESSION_SCHEMA, LEGACY_SESSION_SCHEMA}:
+            continue
+        same_request = (
+            getattr(host, "PDFSourceSHA256", "") == expected["source_sha256"]
+            and getattr(host, "PDFOptionsSHA256", "") == expected["options_sha256"]
+            and getattr(host, "PDFImporterVersion", "") == expected["importer_version"]
+            and getattr(host, "PDFRequestedPagesJSON", "") == canonical_json(expected["requested_pages"])
+            and getattr(host, "PDFImportStatus", "") in {"running", "cancelled"}
+        )
+        if same_request and (schema == LEGACY_SESSION_SCHEMA
+                or getattr(host, "PDFImporterContentSHA256", "") != expected["importer_content_sha256"]):
+            incompatible = True
             continue
         try:
             state = read_session_object(host)
@@ -306,6 +385,11 @@ def find_matching_session(document: Any, identity: Mapping[str, Any]) -> Any | N
             continue
         if all(state[field] == expected[field] for field in fields):
             return host
+    if incompatible:
+        raise ValueError(
+            "Importer code has changed or this older checkpoint has no code identity. "
+            "Start a new import or use its original importer; existing output is kept."
+        )
     return None
 
 

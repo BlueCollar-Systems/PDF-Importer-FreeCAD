@@ -8,6 +8,7 @@ must reach the operator (one console line per import) and the import report
 from __future__ import annotations
 
 import json
+import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,6 +35,11 @@ class Vector:
 
 class Wire:
     def __init__(self, edges):
+        # Like Part.Wire: edges that do not join end to start are not one wire
+        # (OCC refuses them with "BRep_API: command not done").
+        for left, right in zip(edges, edges[1:], strict=False):
+            if (left[1][-1].x, left[1][-1].y) != (right[1][0].x, right[1][0].y):
+                raise RuntimeError("BRep_API: command not done")
         self.edges = edges
 
     def isClosed(self):
@@ -57,7 +63,15 @@ class Compound(tuple):
         return not self[1]
 
     def isValid(self):
-        return bool(self[1]) and all(shape.isValid() for shape in self[1])
+        return bool(self[1]) and all(_member_is_valid(shape) for shape in self[1])
+
+
+def _member_is_valid(shape):
+    """A wire answers for itself; a bare fake edge is valid when its points are finite."""
+    if hasattr(shape, "isValid"):
+        return shape.isValid()
+    _kind, points = shape
+    return all(math.isfinite(point.x) and math.isfinite(point.y) for point in points)
 
 
 class HostObject:

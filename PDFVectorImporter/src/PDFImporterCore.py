@@ -6257,7 +6257,11 @@ def _persist_text3d_source_metadata(
     target_advance_fc: float,
     horizontal_scale: float,
 ) -> None:
-    """Keep the exact source span and geometry recipe editable after save/reopen."""
+    """Record the exact source span and geometry recipe for save/reopen.
+
+    The values are provenance only: changing them would not reshape the solid
+    letters, so each one is shown read-only in the property editor.
+    """
     if not isinstance(source_text, str) or not source_text or "\x00" in source_text:
         raise ValueError("3D Text source metadata is invalid")
     if not isinstance(font_path, str) or not font_path:
@@ -6288,11 +6292,15 @@ def _persist_text3d_source_metadata(
             "exact_glyph_solid_compound_v1",
         ),
     )
+    set_editor_mode = getattr(obj, "setEditorMode", None)
     for property_kind, property_name, property_value in values:
         if property_name not in properties and callable(add_property):
             add_property(property_kind, property_name, "PDF Import")
             properties.add(property_name)
         setattr(obj, property_name, property_value)
+        if callable(set_editor_mode):
+            # 1 = read-only in the property editor; Python can still set it.
+            set_editor_mode(property_name, 1)
 
 
 def _closed_text3d_wires(wire_shapes: List[Any]) -> List[Any]:

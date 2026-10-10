@@ -39,7 +39,8 @@ def test_operator_keeps_visible_hatching_for_every_requested_text_mode(label, ex
     dialog.import_text_chk = SimpleNamespace(isChecked=lambda: True)
     dialog.text_combo = SimpleNamespace(currentText=lambda: label)
     dialog.scale_spin = SimpleNamespace(value=lambda: 25.4 / 72)
-    dialog.grouping_combo = SimpleNamespace(currentText=lambda: "Per Page")
+    dialog.grouping_combo = SimpleNamespace(
+        currentText=lambda: "Page > PDF layers, else colors (recommended)")
     dialog.page_arrangement_combo = SimpleNamespace(currentText=lambda: "Spread (20% gap)")
     dialog._parse_pages = lambda: [1, 3]
 
@@ -54,6 +55,7 @@ def test_operator_keeps_visible_hatching_for_every_requested_text_mode(label, ex
     assert options.import_mode == (strategy.lower() if strategy else "auto")
     assert options.make_faces is (strategy != "Raster")
     assert options.ignore_images is (strategy == "Raster")
+    assert options.layer_mode == "auto"
 
 
 @pytest.mark.parametrize("explicit_mode", ["import", "group", "skip"])

@@ -30,6 +30,18 @@ class Shape:
         result.Volume = self.Volume * abs(m.A11*m.A22 - m.A12*m.A21)
         return result
 
+    def transformed(self, m, _copy=False):
+        # The importer moves each proven glyph to its character origin with a
+        # translation-only copy; the same affine arithmetic applies.
+        return self.transformGeometry(m)
+
+    @property
+    def BoundBox(self):
+        lows = [min(p[i] for p in self.points) for i in range(3)]
+        highs = [max(p[i] for p in self.points) for i in range(3)]
+        return SimpleNamespace(XMin=lows[0], YMin=lows[1], ZMin=lows[2],
+                               XMax=highs[0], YMax=highs[1], ZMax=highs[2])
+
 
 @pytest.fixture
 def host(monkeypatch):

@@ -6363,10 +6363,16 @@ class _Text3DOutlineMemo:
     def __init__(self):
         self._cache: Dict[Tuple[str, str], Tuple[Any, float, int]] = {}
         self._solid_cache: Dict[tuple, Tuple[Any, float, float, float]] = {}
+        # Glyph solids after one character's font-matrix linear part (scale,
+        # rotation, shear; no translation), each proven once: see
+        # _verified_text3d_linear_glyph.
+        self._linear_cache: Dict[tuple, Tuple[Any, float, int, Tuple[float, ...]]] = {}
         self.hits = 0
         self.misses = 0
         self.solid_hits = 0
         self.solid_misses = 0
+        self.linear_hits = 0
+        self.linear_misses = 0
         self.evictions = 0
         self.last_solid_volume = 0.0
         self.last_solid_count = 0
@@ -6463,6 +6469,18 @@ class _Text3DOutlineMemo:
             float(verified_advance),
         )
 
+    def get_or_build_linear(self, key, builder):
+        """Return (linear_shape, verified_volume, solid_count, bounds) for key."""
+        cached = self._linear_cache.get(key)
+        if cached is not None:
+            self.linear_hits += 1
+            return cached
+        self.linear_misses += 1
+        built = builder()
+        self._evict_oldest_if_full(self._linear_cache)
+        self._linear_cache[key] = built
+        return built
+
     def snapshot_stats(self) -> Dict[str, int]:
         return {
             "hits": int(self.hits),
@@ -6470,11 +6488,14 @@ class _Text3DOutlineMemo:
             "evictions": int(self.evictions),
             "solid_hits": int(self.solid_hits),
             "solid_misses": int(self.solid_misses),
+            "linear_hits": int(self.linear_hits),
+            "linear_misses": int(self.linear_misses),
         }
 
     def clear(self) -> None:
         self._cache.clear()
         self._solid_cache.clear()
+        self._linear_cache.clear()
 
 
 _ACTIVE_TEXT3D_OUTLINE_MEMO: Optional[_Text3DOutlineMemo] = None
@@ -7010,93 +7031,190 @@ def _source_em_text3d_pen_advance(source_text, font_path, font_size_fc):
     return advance
 
 
+def _text3d_linear_glyph_key(text, font_path, font_size_fc, depth, baseline, up):
+    """Memo key for one glyph solid under one character's font-matrix linear part.
+
+    Size and depth follow the source-solid memo (9 decimals). The linear terms
+    are rounded to 1e-12, which merges float noise only; the stored shape is
+    built from the first exact matrix seen with that key.
+    """
+    return (
+        str(text),
+        str(font_path),
+        round(float(font_size_fc), 9),
+        round(float(depth), 9),
+        tuple(round(float(value), 12) for value in (baseline[0], baseline[1], up[0], up[1])),
+    )
+
+
+def _text3d_solid_mass_center(shape):
+    """Volume-weighted centre of a shape's solids, measured once per solid.
+
+    OCC exposes a mass center on each Solid, not on a Compound. Derive the
+    centre from live solids so compound glyphs (i, punctuation, disconnected
+    font contours) receive the same check. Each property access runs an OCC
+    mass calculation, so each solid's measurements are read exactly once.
+    """
+    masses = [(float(solid.Volume), solid.CenterOfMass) for solid in shape.Solids]
+    total = sum(volume for volume, _center in masses)
+    if not math.isfinite(total) or total <= 0.0:
+        raise RuntimeError("3D source character has no positive solid mass")
+    return FreeCAD.Vector(*(sum(volume * getattr(center, axis)
+        for volume, center in masses) / total
+        for axis in ("x", "y", "z")))
+
+
+def _verified_text3d_linear_glyph(source_shape, baseline, up):
+    """Apply a character's font-matrix linear part and prove it, once per key.
+
+    Returns (linear_shape, verified_volume, solid_count, bounds). The proofs
+    are the ones every character used to repeat: solid count, volume-weighted
+    mass centre, every vertex, and the affine volume. Translation is applied
+    afterwards per character (see _text3d_translated_glyph_copy); a pure
+    translation cannot change any of these measurements.
+    """
+    matrix = FreeCAD.Matrix()
+    matrix.A11, matrix.A21 = baseline[0], baseline[1]
+    matrix.A12, matrix.A22 = up[0], up[1]
+    matrix.A14, matrix.A24, matrix.A34 = 0.0, 0.0, 0.0
+    # Always run transformGeometry, even for an identity linear part: it is
+    # what turns the glyph faces into the BSpline surfaces main has always
+    # delivered (and that the page-edge clip proof accepts).
+    transformed = source_shape.transformGeometry(matrix)
+    source_solids = _shape_solid_count(source_shape)
+    if (transformed is None or transformed.isNull()
+            or _shape_solid_count(transformed) != source_solids):
+        raise RuntimeError("3D source character transform lost solid geometry")
+
+    def verify_point(source_point, actual_point):
+        expected = (baseline[0] * source_point.x + up[0] * source_point.y,
+                    baseline[1] * source_point.x + up[1] * source_point.y,
+                    source_point.z)
+        actual = (actual_point.x, actual_point.y, actual_point.z)
+        if any(not math.isfinite(value) for value in actual) or any(
+            not math.isclose(a, b, rel_tol=1e-10, abs_tol=1e-8)
+            for a, b in zip(actual, expected, strict=True)
+        ):
+            raise RuntimeError("3D source character affine coordinates were not preserved")
+
+    verify_point(_text3d_solid_mass_center(source_shape),
+                 _text3d_solid_mass_center(transformed))
+    source_vertices, target_vertices = source_shape.Vertexes, transformed.Vertexes
+    if len(source_vertices) != len(target_vertices):
+        raise RuntimeError("3D source character transform changed vertex inventory")
+    for source_vertex, target_vertex in zip(source_vertices, target_vertices, strict=True):
+        verify_point(source_vertex.Point, target_vertex.Point)
+    determinant = baseline[0] * up[1] - baseline[1] * up[0]
+    expected_volume = float(source_shape.Volume) * abs(determinant)
+    if not math.isclose(float(transformed.Volume), expected_volume,
+                        rel_tol=1e-7, abs_tol=1e-9):
+        raise RuntimeError("3D source character affine volume was not preserved")
+    box = transformed.BoundBox
+    bounds = tuple(float(getattr(box, name)) for name in
+                   ("XMin", "YMin", "ZMin", "XMax", "YMax", "ZMax"))
+    if not all(math.isfinite(value) for value in bounds):
+        raise RuntimeError("3D source character bounds are not finite")
+    return transformed, expected_volume, source_solids, bounds
+
+
+def _text3d_translated_glyph_copy(linear_shape, origin):
+    """Independent copy of a proven glyph solid, moved to the character origin.
+
+    The translation is baked into the copied geometry (no OCC location), so
+    each character gets exactly the poles a single full-matrix
+    transformGeometry produces.
+    """
+    matrix = FreeCAD.Matrix()
+    matrix.A11, matrix.A21 = 1.0, 0.0
+    matrix.A12, matrix.A22 = 0.0, 1.0
+    matrix.A14, matrix.A24, matrix.A34 = origin
+    transformed = getattr(linear_shape, "transformed", None)
+    if callable(transformed):
+        return transformed(matrix, True)
+    placed = linear_shape.copy()
+    placed.transformShape(matrix, True)
+    return placed
+
+
 def _build_positioned_text3d_compound_shape(
     *, source_text, font_path, font_size_fc, depth, target_advance_fc,
     source_character_layout,
 ):
-    """Keep each native solid glyph at its actual PDF character transform."""
+    """Keep each native solid glyph at its actual PDF character transform.
+
+    Each character's matrix is split into its linear part (font scale,
+    rotation, shear) and its origin. The glyph solid under a given linear
+    part is built and proven once per import (memo key: character, font,
+    size, depth, linear terms); every character then gets an independent
+    copy moved to its own origin, checked by its bounding-box shift.
+    """
     characters = source_character_layout["characters"]
     if "".join(row["text"] for row in characters) != source_text:
         raise ValueError("3D source character layout is incomplete")
+    memo = _ACTIVE_TEXT3D_OUTLINE_MEMO
+    local_linear: Dict[tuple, tuple] = {}
+
+    def linear_glyph(key, builder):
+        if memo is not None:
+            return memo.get_or_build_linear(key, builder)
+        cached = local_linear.get(key)
+        if cached is None:
+            cached = local_linear[key] = builder()
+        return cached
+
     shapes = []
     expected_solids = 0
     expected_total_volume = 0.0
     for row in characters:
         if row["text"].isspace():
             continue
-        try:
-            em_advance = _source_em_text3d_pen_advance(
-                row["text"], font_path, font_size_fc)
-            baked = _build_exact_text3d_compound_shape(
-                source_text=row["text"], font_path=font_path,
-                font_size_fc=font_size_fc, depth=depth,
-                target_advance_fc=em_advance,
-            )
-        except Text3DExactFontOutlinesUnavailable:
-            # One empty glyph is not impossibility proof for the whole item.
-            # Recheck the complete source string before the existing verified
-            # ShapeString/representation ladder is allowed to see that proof.
-            _build_exact_text3d_outline_template(source_text, font_path)
-            raise RuntimeError("isolated source glyph outline is unavailable") from None
-        source_shape = baked[0]
-        expected_solids += _shape_solid_count(source_shape)
         baseline_scale = float(row["baseline_scale"])
         up_scale = float(row["up_scale"])
-        if any(not math.isfinite(value) or value <= 0.0
-               for value in (baseline_scale, up_scale)):
-            raise ValueError("3D source character matrix scale is invalid")
         baseline = [component * baseline_scale for component in row["baseline_axis"]]
         up = [component * up_scale for component in row["up_axis"]]
-        matrix = FreeCAD.Matrix()
-        matrix.A11, matrix.A21 = baseline[0], baseline[1]
-        matrix.A12, matrix.A22 = up[0], up[1]
-        matrix.A14, matrix.A24, matrix.A34 = row["local_origin"]
-        transformed = source_shape.transformGeometry(matrix)
-        if (transformed is None or transformed.isNull()
-                or _shape_solid_count(transformed) != _shape_solid_count(source_shape)):
+
+        def build_linear(text=row["text"], baseline=baseline, up=up,
+                         scales=(baseline_scale, up_scale)):
+            try:
+                em_advance = _source_em_text3d_pen_advance(
+                    text, font_path, font_size_fc)
+                baked = _build_exact_text3d_compound_shape(
+                    source_text=text, font_path=font_path,
+                    font_size_fc=font_size_fc, depth=depth,
+                    target_advance_fc=em_advance,
+                )
+            except Text3DExactFontOutlinesUnavailable:
+                # One empty glyph is not impossibility proof for the whole item.
+                # Recheck the complete source string before the existing verified
+                # ShapeString/representation ladder is allowed to see that proof.
+                _build_exact_text3d_outline_template(source_text, font_path)
+                raise RuntimeError("isolated source glyph outline is unavailable") from None
+            if any(not math.isfinite(value) or value <= 0.0 for value in scales):
+                raise ValueError("3D source character matrix scale is invalid")
+            return _verified_text3d_linear_glyph(baked[0], baseline, up)
+
+        linear_shape, glyph_volume, glyph_solids, linear_bounds = linear_glyph(
+            _text3d_linear_glyph_key(row["text"], font_path, font_size_fc, depth,
+                                     baseline, up),
+            build_linear,
+        )
+        origin = tuple(float(value) for value in row["local_origin"])
+        placed = _text3d_translated_glyph_copy(linear_shape, origin)
+        if (placed is None or placed.isNull()
+                or _shape_solid_count(placed) != glyph_solids):
             raise RuntimeError("3D source character transform lost solid geometry")
-        def expected_point(point, baseline=baseline, up=up, origin=tuple(row["local_origin"])):
-            return (baseline[0] * point.x + up[0] * point.y + origin[0],
-                    baseline[1] * point.x + up[1] * point.y + origin[1],
-                    point.z + origin[2])
-
-        def verify_point(source_point, actual_point):
-            expected = expected_point(source_point)
-            actual = (actual_point.x, actual_point.y, actual_point.z)
-            if any(not math.isfinite(value) for value in actual) or any(
-                not math.isclose(a, b, rel_tol=1e-10, abs_tol=1e-8)
-                for a, b in zip(actual, expected, strict=True)
-            ):
-                raise RuntimeError("3D source character affine coordinates were not preserved")
-
-        # OCC exposes a mass center on each Solid, not on a Compound. Derive
-        # the volume-weighted center from live solids so compound glyphs (i,
-        # punctuation, disconnected font contours) receive the same check.
-        def solid_mass_center(shape):
-            # Each property access runs an OCC mass calculation. Reuse those
-            # exact measurements for all three axes instead of recomputing
-            # them seven times per solid; keep the summation order unchanged.
-            masses = [(float(solid.Volume), solid.CenterOfMass) for solid in shape.Solids]
-            total = sum(volume for volume, _center in masses)
-            if not math.isfinite(total) or total <= 0.0:
-                raise RuntimeError("3D source character has no positive solid mass")
-            return FreeCAD.Vector(*(sum(volume * getattr(center, axis)
-                for volume, center in masses) / total
-                for axis in ("x", "y", "z")))
-
-        verify_point(solid_mass_center(source_shape), solid_mass_center(transformed))
-        source_vertices, target_vertices = source_shape.Vertexes, transformed.Vertexes
-        if len(source_vertices) != len(target_vertices):
-            raise RuntimeError("3D source character transform changed vertex inventory")
-        for source_vertex, target_vertex in zip(source_vertices, target_vertices, strict=True):
-            verify_point(source_vertex.Point, target_vertex.Point)
-        determinant = baseline[0] * up[1] - baseline[1] * up[0]
-        expected_volume = float(source_shape.Volume) * abs(determinant)
-        if not math.isclose(float(transformed.Volume), expected_volume,
-                            rel_tol=1e-7, abs_tol=1e-9):
-            raise RuntimeError("3D source character affine volume was not preserved")
-        expected_total_volume += expected_volume
-        shapes.append(transformed)
+        box = placed.BoundBox
+        placed_bounds = tuple(float(getattr(box, name)) for name in
+                              ("XMin", "YMin", "ZMin", "XMax", "YMax", "ZMax"))
+        shifts = origin + origin
+        if any(not math.isfinite(actual) or not math.isclose(
+                actual, expected + shift, rel_tol=0.0, abs_tol=1e-9)
+               for actual, expected, shift in zip(
+                   placed_bounds, linear_bounds, shifts, strict=True)):
+            raise RuntimeError("3D source character affine coordinates were not preserved")
+        expected_solids += glyph_solids
+        expected_total_volume += glyph_volume
+        shapes.append(placed)
     if not shapes or expected_solids <= 0:
         raise RuntimeError("3D source character layout produced no solids")
     compound = Part.Compound(shapes)
@@ -7112,6 +7230,25 @@ def _build_positioned_text3d_compound_shape(
     # Each glyph retains its own font matrix and origin. The declared source
     # advance describes pen positions; it never stretches the glyph ink.
     return compound, 1.0, target_advance_fc, target_advance_fc, volume, expected_solids
+
+
+def _shape_keeps_verified_volume(shape, verified_shape, verified_volume) -> bool:
+    """True when ``shape`` still carries the already-verified solid volume.
+
+    A host shape that shares the verified OCC geometry (isPartner: same
+    geometry, any placement) has exactly the verified volume, so the costly
+    re-integration of every glyph solid is skipped. Anything else is
+    measured again.
+    """
+    is_partner = getattr(shape, "isPartner", None)
+    if verified_shape is not None and callable(is_partner):
+        try:
+            if bool(is_partner(verified_shape)):
+                return True
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+    volume = float(getattr(shape, "Volume", 0.0) or 0.0)
+    return math.isclose(volume, float(verified_volume), rel_tol=1e-7, abs_tol=1e-9)
 
 
 def _create_verified_compound_text3d_entity(
@@ -7182,7 +7319,7 @@ def _create_verified_compound_text3d_entity(
             raise RuntimeError("Part::Feature did not preserve verified solid 3D text")
         if source_character_layout is not None and (
             _shape_solid_count(shape) != baked_solid_count
-            or not math.isclose(float(shape.Volume), baked_volume, rel_tol=1e-7, abs_tol=1e-9)
+            or not _shape_keeps_verified_volume(shape, compound, baked_volume)
         ):
             raise RuntimeError("Part::Feature changed positioned source glyph geometry")
         text_group.addObject(host_obj)
@@ -8941,6 +9078,9 @@ def _deliver_text_item_3d(
             verified_advance_fc,
         ) = created[:4]
         baked_volume = float(created[4]) if len(created) > 4 else 0.0
+        # The creator verified this host shape against the baked compound.
+        # Keep a handle so the final check can prove it is still that shape.
+        verified_host_shape = getattr(compound_entity, "Shape", None)
         add_owned(compound_entity)
         stage = "compound_source_metadata"
         _persist_text3d_source_metadata(
@@ -9013,12 +9153,11 @@ def _deliver_text_item_3d(
             volume = float(getattr(shape, "Volume", 0.0) or 0.0) if shape is not None else 0.0
         if source_character_layout is not None:
             actual_solid_count = _shape_solid_count(shape) if shape is not None else 0
-            actual_volume = float(getattr(shape, "Volume", 0.0) or 0.0)
-            if actual_solid_count != solid_count or not math.isclose(
-                actual_volume, volume, rel_tol=1e-7, abs_tol=1e-9
+            if actual_solid_count != solid_count or not _shape_keeps_verified_volume(
+                shape, verified_host_shape, volume
             ):
                 raise RuntimeError("assigned positioned source glyph geometry changed")
-            solid_count, volume = actual_solid_count, actual_volume
+            solid_count = actual_solid_count
         live_object = doc.getObject(compound_id) if compound_id else None
         metadata_verified = bool(
             getattr(compound_entity, "PDFSourceText", None) == source_text
@@ -10700,6 +10839,12 @@ def _render_canonical_text_items(
     profile = getattr(opts, "_active_page_profile", {}) or {}
     drawing_units = int(profile.get("drawing_operations", 0) or 0)
     total_units = int(profile.get("total_units", 0) or 0)
+    # 3D Text builds solid letters and can take most of a second per item, so
+    # its progress (and the Cancel check) also ticks every quarter second
+    # instead of only every 25 items.
+    progress_label = "Building 3D text" if requested == "3d_text" else "Importing text"
+    timed_progress = requested == "3d_text"
+    last_progress_at = time.monotonic()
     for item_index, item in enumerate(items):
         if item["source_item_id"] in control_omissions:
             # Preserve the complete roster without claiming a native object or
@@ -10707,12 +10852,16 @@ def _render_canonical_text_items(
             delivered_source_ids.append(item["source_item_id"])
             text_characters_done += len(item["text"])
             continue
-        if getattr(opts, "progress_callback", None) and item_index % 25 == 0:
+        if getattr(opts, "progress_callback", None) and (
+            item_index % 25 == 0
+            or (timed_progress and time.monotonic() - last_progress_at >= 0.25)
+        ):
+            last_progress_at = time.monotonic()
             _emit_progress(
                 opts,
                 page_number=int(page_num),
                 stage="text",
-                label=f"Importing text {item_index}/{len(items)}",
+                label=f"{progress_label} {item_index}/{len(items)}",
                 page_percent=86 + int(8 * item_index / max(len(items), 1)),
                 completed_units=min(
                     total_units,
@@ -10765,7 +10914,7 @@ def _render_canonical_text_items(
             opts,
             page_number=int(page_num),
             stage="text",
-            label=f"Importing text {len(items)}/{len(items)}",
+            label=f"{progress_label} {len(items)}/{len(items)}",
             page_percent=94,
             completed_units=min(
                 total_units,

@@ -465,5 +465,246 @@ def test_wirestring_memo_scope_without_part_is_inert(monkeypatch):
         assert memo is None
 
 
+
+# --- P5: one linear transform + proof per glyph key, translation per char ---
+#
+# The positioned 3D Text builder splits each character's PDF matrix into its
+# linear part (font scale, rotation, shear) and its origin. The glyph solid
+# under one linear part is transformed and proven once per import; every
+# character then gets an independent translated copy. These fakes count the
+# expensive OCC calls.
+
+
+class _GlyphLog:
+    def __init__(self):
+        self.transform_geometry = []
+        self.translations = []
+        self.bakes = []
+
+
+def _matrix():
+    return types.SimpleNamespace(A11=1.0, A12=0.0, A14=0.0, A21=0.0, A22=1.0,
+                                 A24=0.0, A34=0.0)
+
+
+class CountingGlyph:
+    """Fake glyph solid: corner points, one solid, plain affine arithmetic."""
+
+    def __init__(self, points, log, volume=1.0, solids=1):
+        self.points = [tuple(float(v) for v in point) for point in points]
+        self.log = log
+        self.Volume = float(volume)
+        self.solid_count = int(solids)
+
+    def countElement(self, kind):
+        assert kind == "Solid"
+        return self.solid_count
+
+    @property
+    def Vertexes(self):
+        return [types.SimpleNamespace(Point=types.SimpleNamespace(x=x, y=y, z=z))
+                for x, y, z in self.points]
+
+    @property
+    def Solids(self):
+        n = len(self.points)
+        center = types.SimpleNamespace(**{axis: sum(p[i] for p in self.points) / n
+                                          for i, axis in enumerate("xyz")})
+        return [types.SimpleNamespace(Volume=self.Volume, CenterOfMass=center)]
+
+    @property
+    def BoundBox(self):
+        lows = [min(p[i] for p in self.points) for i in range(3)]
+        highs = [max(p[i] for p in self.points) for i in range(3)]
+        return types.SimpleNamespace(XMin=lows[0], YMin=lows[1], ZMin=lows[2],
+                                     XMax=highs[0], YMax=highs[1], ZMax=highs[2])
+
+    def isNull(self):
+        return False
+
+    def _apply(self, m):
+        return CountingGlyph([(m.A11 * x + m.A12 * y + m.A14,
+                               m.A21 * x + m.A22 * y + m.A24, z + m.A34)
+                              for x, y, z in self.points], self.log,
+                             self.Volume * abs(m.A11 * m.A22 - m.A12 * m.A21),
+                             self.solid_count)
+
+    def transformGeometry(self, m):
+        self.log.transform_geometry.append((m.A11, m.A21, m.A12, m.A22, m.A14, m.A24, m.A34))
+        return self._apply(m)
+
+    def transformed(self, m, copy=False):
+        assert copy is True, "each character must get an independent copy"
+        assert (m.A11, m.A21, m.A12, m.A22) == (1.0, 0.0, 0.0, 1.0)
+        self.log.translations.append((m.A14, m.A24, m.A34))
+        return self._apply(m)
+
+
+@pytest.fixture
+def glyph_host(monkeypatch):
+    log = _GlyphLog()
+
+    def bake(**kwargs):
+        log.bakes.append((kwargs["source_text"], kwargs["font_size_fc"]))
+        size = float(kwargs["font_size_fc"])
+        return (CountingGlyph([(0.0, 0.0, 0.0), (size * 0.6, size, kwargs["depth"])], log),
+                1.0, 1.0, 1.0)
+
+    def compound(shapes):
+        result = CountingGlyph([p for shape in shapes for p in shape.points], log,
+                               solids=sum(shape.solid_count for shape in shapes))
+        result.Volume = sum(shape.Volume for shape in shapes)
+        return result
+
+    monkeypatch.setattr(core, "_build_exact_text3d_compound_shape", bake)
+    monkeypatch.setattr(core, "_source_em_text3d_pen_advance", lambda *_a: 2.0)
+    monkeypatch.setattr(core, "FreeCAD", types.SimpleNamespace(
+        Matrix=_matrix, Vector=lambda x, y, z: types.SimpleNamespace(x=x, y=y, z=z)))
+    monkeypatch.setattr(core, "Part", types.SimpleNamespace(Compound=compound))
+    monkeypatch.setattr(core, "_ACTIVE_TEXT3D_OUTLINE_MEMO", None)
+    return log
+
+
+def _char(text, x, y, baseline_scale=1.0, up_scale=1.0, baseline=(1.0, 0.0), up=(0.0, 1.0)):
+    return dict(text=text, local_origin=[x, y, 0.0], advance=2.0,
+                baseline_axis=list(baseline), up_axis=list(up),
+                baseline_scale=baseline_scale, up_scale=up_scale)
+
+
+def _build_span(chars, size=3.5):
+    return core._build_positioned_text3d_compound_shape(
+        source_text="".join(row["text"] for row in chars), font_path="exact.ttf",
+        font_size_fc=size, depth=0.42, target_advance_fc=10.0,
+        source_character_layout={"characters": chars})
+
+
+def test_same_linear_transform_runs_transform_geometry_once(glyph_host):
+    nonuniform = dict(baseline_scale=0.9985797026172729, up_scale=1.0014223174965449)
+    _compound, _stretch, _na, _va, volume, solids = _build_span(
+        [_char("A", 0.0, 0.0, **nonuniform), _char("A", 2.5, 0.0, **nonuniform),
+         _char("A", 5.0, -1.0, **nonuniform)])
+    assert len(glyph_host.transform_geometry) == 1
+    assert glyph_host.transform_geometry[0][4:] == (0.0, 0.0, 0.0), (
+        "the shared linear shape must not carry any character's origin")
+    assert len(glyph_host.bakes) == 1
+    assert len(glyph_host.translations) == 3
+    assert solids == 3
+    assert volume == pytest.approx(3 * 0.9985797026172729 * 1.0014223174965449)
+
+
+def test_identity_linear_characters_share_one_geometry_conversion(glyph_host):
+    # FreeCAD's transformGeometry also turns the glyph faces into BSpline
+    # surfaces, which is what the importer has always delivered (and what
+    # the page-edge clip proof accepts). Identity characters therefore still
+    # get that conversion, but only once per glyph key, never per character.
+    _build_span([_char("E", 0.0, 0.0), _char("E", 3.0, 0.0), _char("E", 6.0, 0.0),
+                 _char("E", 9.0, 0.0)])
+    assert glyph_host.transform_geometry == [(1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)]
+    assert len(glyph_host.translations) == 4
+
+
+def test_each_character_translation_equals_its_local_origin(glyph_host):
+    chars = [_char("B", 5.0, -2.0, baseline_scale=2.0),
+             _char("B", 7.25, 1.5, baseline_scale=2.0),
+             _char("C", -3.0, 4.0, baseline=(0.0, 1.0), up=(-0.8, 0.6))]
+    compound = _build_span(chars)[0]
+    assert glyph_host.translations == [(5.0, -2.0, 0.0), (7.25, 1.5, 0.0), (-3.0, 4.0, 0.0)]
+    # Same result as one full-matrix transform per character.
+    assert compound.points[0] == (5.0, -2.0, 0.0)
+    assert compound.points[3] == pytest.approx((7.25 + 2.0 * 3.5 * 0.6, 1.5 + 3.5, 0.42))
+    assert compound.points[5] == pytest.approx((-3.0 - 0.8 * 3.5, 4.0 + 2.1 + 0.6 * 3.5, 0.42))
+
+
+def test_font_size_change_is_a_separate_key_and_memo_spans_items(glyph_host, monkeypatch):
+    memo = core._Text3DOutlineMemo()
+    monkeypatch.setattr(core, "_ACTIVE_TEXT3D_OUTLINE_MEMO", memo)
+    _build_span([_char("D", 0.0, 0.0)], size=3.5)
+    _build_span([_char("D", 0.0, 0.0)], size=3.6)
+    assert len(glyph_host.transform_geometry) == 2
+    assert memo.linear_misses == 2 and memo.linear_hits == 0
+    # A later item with the same character, font, size and matrix reuses it.
+    _build_span([_char("D", 4.0, 1.0)], size=3.5)
+    assert len(glyph_host.transform_geometry) == 2
+    assert memo.linear_hits == 1
+    assert memo.snapshot_stats()["linear_hits"] == 1
+    memo.clear()
+    assert memo._linear_cache == {}
+
+
+def test_lost_character_translation_is_rejected(glyph_host, monkeypatch):
+    def ignore_translation(self, _m, copy=False):
+        return CountingGlyph(self.points, self.log, self.Volume, self.solid_count)
+
+    monkeypatch.setattr(CountingGlyph, "transformed", ignore_translation)
+    with pytest.raises(RuntimeError, match="affine coordinates"):
+        _build_span([_char("F", 0.0, 0.0), _char("F", 3.0, 0.5)])
+
+
+def test_host_check_skips_volume_reintegration_only_for_the_same_geometry():
+    class Host:
+        volume_reads = 0
+
+        def __init__(self, partner):
+            self.partner = partner
+
+        def isPartner(self, other):
+            return other is self.partner
+
+        @property
+        def Volume(self):
+            Host.volume_reads += 1
+            return 5.0
+
+    verified = object()
+    assert core._shape_keeps_verified_volume(Host(verified), verified, 5.0)
+    assert Host.volume_reads == 0
+    assert core._shape_keeps_verified_volume(Host(object()), verified, 5.0)
+    assert Host.volume_reads == 1
+    assert not core._shape_keeps_verified_volume(Host(object()), verified, 7.0)
+
+
+def test_3d_text_progress_ticks_on_time_with_a_plain_label(monkeypatch):
+    import time as real_time
+
+    class Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return Clock.now
+
+        def __getattr__(self, name):
+            return getattr(real_time, name)
+
+    items = [{"source_item_id": "p1:b0:l0:s%d" % index, "page_number": 1,
+              "pdf_sha256": "a" * 64, "bbox": (0.0, 0.0, 1.0, 1.0), "text": "x"}
+             for index in range(4)]
+    events = []
+    monkeypatch.setattr(core, "time", Clock())
+    monkeypatch.setattr(core, "_iter_text_source_items", lambda *_args: iter(items))
+    monkeypatch.setattr(core, "_cache_canonical_text_metadata", lambda *_a, **_k: None)
+    monkeypatch.setattr(core, "_prepare_native_text_object_index", lambda *_a, **_k: None)
+
+    def deliver(item, *_args):
+        Clock.now += 0.3  # each solid-letter item takes a noticeable moment
+        return {"source_item_id": item["source_item_id"], "final_type": "3d_text",
+                "created_entity_ids": [item["source_item_id"]],
+                "delivery_entity_ids": [item["source_item_id"]], "delivery_count": 1}
+
+    monkeypatch.setattr(core, "_run_text_item_fallback_ladder", deliver)
+    opts = core.ImportOptions(text_mode="3d_text", progress_callback=events.append)
+    opts._active_page_index = 1
+    opts._active_page_total = 1
+    opts._active_page_profile = {"drawing_operations": 0, "text_characters": 4,
+                                 "image_instances": 0, "total_units": 4}
+    core._render_canonical_text_items(
+        pdf_doc=object(), page=types.SimpleNamespace(get_text=lambda _kind: {"blocks": []}),
+        pdf_path="fixture.pdf", page_num=1, page_h=100.0, page_w=80.0, scale=1.0,
+        fc_doc=object(), parent_group=object(), opts=opts, pdf_sha256="a" * 64,
+        raw_tdict={"blocks": []})
+    assert [event["label"] for event in events] == [
+        "Building 3D text 0/4", "Building 3D text 1/4", "Building 3D text 2/4",
+        "Building 3D text 3/4", "Building 3D text 4/4"]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

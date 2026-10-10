@@ -2208,6 +2208,20 @@ def _find_freecadcmd() -> str:
     return shutil.which("FreeCADCmd") or ""
 
 
+def _probe_env(tmp_path, **paths):
+    """Hand the probe its paths through the environment, never argv.
+
+    FreeCADCmd opens every argument after the script as a file once the
+    script ends, so trailing paths made it import the PDF a second time with
+    whatever copy of the add-on is installed on the PC.
+    """
+    env = dict(os.environ)
+    for key, value in paths.items():
+        env["BCS_PROBE_" + key.upper()] = str(value)
+    env["BC_PDF_TEMP_DIR"] = str(tmp_path)
+    return env
+
+
 def _gdi_style_symbolic_subset(font_path: Path) -> bytes:
     """Subset a system TrueType font the way a Windows GDI print driver does.
 
@@ -2505,7 +2519,9 @@ def test_symbolic_cmap_repair_falls_back_to_mac_roman_only_without_pdf_encoding(
 
 _SYMBOLIC_HOST_PROBE = r"""
 import hashlib, json, os, sys, traceback
-out_path, report_path, pdf_path = sys.argv[-3], sys.argv[-2], sys.argv[-1]
+out_path = os.environ["BCS_PROBE_OUT"]
+report_path = os.environ["BCS_PROBE_REPORT"]
+pdf_path = os.environ["BCS_PROBE_PDF"]
 result = {"ok": False}
 try:
     import FreeCAD
@@ -2585,7 +2601,8 @@ def test_gdi_symbolic_truetype_subset_delivers_native_3d_text_in_freecad(tmp_pat
     out_path = tmp_path / "symbolic_result.json"
     report_path = tmp_path / "symbolic_import_report.json"
     completed = subprocess.run(
-        [freecadcmd, str(probe_path), str(out_path), str(report_path), str(pdf_path)],
+        [freecadcmd, str(probe_path)],
+        env=_probe_env(tmp_path, out=out_path, report=report_path, pdf=pdf_path),
         capture_output=True,
         text=True,
         timeout=600,
@@ -2595,6 +2612,9 @@ def test_gdi_symbolic_truetype_subset_delivers_native_3d_text_in_freecad(tmp_pat
         % (completed.returncode, completed.stdout[-800:], completed.stderr[-800:])
     )
     result = json.loads(out_path.read_text(encoding="utf-8"))
+    assert "Exception while processing file" not in (
+        completed.stdout + completed.stderr
+    ), "FreeCADCmd opened extra files after the probe (argv leak)"
     assert result.get("ok"), "probe failed: %s" % result.get("error", "")
     assert result["text_mode"] == "3d_text"
     assert result["completed"] is True

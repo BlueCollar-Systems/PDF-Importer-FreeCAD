@@ -37,11 +37,25 @@ def _find_freecadcmd() -> str:
     return shutil.which("FreeCADCmd") or ""
 
 
+def _probe_env(tmp_path, **paths):
+    """Hand the probe its paths through the environment, never argv.
+
+    FreeCADCmd opens every argument after the script as a file once the
+    script ends, so trailing paths made it import the PDF a second time with
+    whatever copy of the add-on is installed on the PC.
+    """
+    env = dict(os.environ)
+    for key, value in paths.items():
+        env["BCS_PROBE_" + key.upper()] = str(value)
+    env["BC_PDF_TEMP_DIR"] = str(tmp_path)
+    return env
+
+
 PROBE_SOURCE = r"""
 import json, os, sys, traceback
-out_path = sys.argv[-3]
-report_path = sys.argv[-2]
-pdf_path = sys.argv[-1]
+out_path = os.environ["BCS_PROBE_OUT"]
+report_path = os.environ["BCS_PROBE_REPORT"]
+pdf_path = os.environ["BCS_PROBE_PDF"]
 result = {"ok": False}
 try:
     import FreeCAD
@@ -93,7 +107,8 @@ def test_raster_only_fixture_delivers_image_plane_with_honest_report(tmp_path):
     report_path = tmp_path / "raster_fixture_import_report.json"
 
     completed = subprocess.run(
-        [freecadcmd, str(probe_path), str(out_path), str(report_path), str(fixture)],
+        [freecadcmd, str(probe_path)],
+        env=_probe_env(tmp_path, out=out_path, report=report_path, pdf=fixture),
         capture_output=True,
         text=True,
         timeout=300,
@@ -103,6 +118,9 @@ def test_raster_only_fixture_delivers_image_plane_with_honest_report(tmp_path):
         % (completed.returncode, completed.stdout[-500:], completed.stderr[-500:])
     )
     result = json.loads(out_path.read_text(encoding="utf-8"))
+    assert "Exception while processing file" not in (
+        completed.stdout + completed.stderr
+    ), "FreeCADCmd opened extra files after the probe (argv leak)"
     assert result.get("ok"), "probe failed: %s" % result.get("error", "")
 
     # --- delivery: the raster rung actually produced a persistent host image ---

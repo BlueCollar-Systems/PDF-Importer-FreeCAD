@@ -69,6 +69,20 @@ def _find_freecadcmd() -> str:
     return shutil.which("FreeCADCmd") or ""
 
 
+def _probe_env(tmp_path, **paths):
+    """Hand the probe its paths through the environment, never argv.
+
+    FreeCADCmd opens every argument after the script as a file once the
+    script ends, so trailing paths made it import the PDF a second time with
+    whatever copy of the add-on is installed on the PC.
+    """
+    env = dict(os.environ)
+    for key, value in paths.items():
+        env["BCS_PROBE_" + key.upper()] = str(value)
+    env["BC_PDF_TEMP_DIR"] = str(tmp_path)
+    return env
+
+
 def _find_embed_font() -> str:
     for candidate in _EMBED_FONT_CANDIDATES:
         if candidate and Path(candidate).is_file():
@@ -250,9 +264,9 @@ def _plane_dark_frac(plane, model_bbox) -> float:
 
 PROBE_SOURCE = r"""
 import json, os, shutil, sys, traceback
-out_path = sys.argv[-3]
-report_path = sys.argv[-2]
-pdf_path = sys.argv[-1]
+out_path = os.environ["BCS_PROBE_OUT"]
+report_path = os.environ["BCS_PROBE_REPORT"]
+pdf_path = os.environ["BCS_PROBE_PDF"]
 result = {"ok": False}
 
 
@@ -424,7 +438,8 @@ def test_hybrid_delivers_per_image_planes_without_full_page_underlay(tmp_path):
     report_path = tmp_path / "hybrid_dedupe_import_report.json"
 
     completed = subprocess.run(
-        [freecadcmd, str(probe_path), str(out_path), str(report_path), str(fixture)],
+        [freecadcmd, str(probe_path)],
+        env=_probe_env(tmp_path, out=out_path, report=report_path, pdf=fixture),
         capture_output=True,
         text=True,
         timeout=600,
@@ -434,6 +449,9 @@ def test_hybrid_delivers_per_image_planes_without_full_page_underlay(tmp_path):
         % (completed.returncode, completed.stdout[-500:], completed.stderr[-500:])
     )
     result = json.loads(out_path.read_text(encoding="utf-8"))
+    assert "Exception while processing file" not in (
+        completed.stdout + completed.stderr
+    ), "FreeCADCmd opened extra files after the probe (argv leak)"
     assert result.get("ok"), "probe failed: %s\nattempt: %s" % (
         result.get("error", ""), result.get("attempt"),
     )
@@ -602,7 +620,8 @@ def test_dense_embedded_images_use_one_exact_persistent_transparent_composite(
     out_path = tmp_path / "dense_images_result.json"
     report_path = tmp_path / "dense_images_import_report.json"
     completed = subprocess.run(
-        [freecadcmd, str(probe_path), str(out_path), str(report_path), str(fixture)],
+        [freecadcmd, str(probe_path)],
+        env=_probe_env(tmp_path, out=out_path, report=report_path, pdf=fixture),
         capture_output=True,
         text=True,
         timeout=600,
@@ -612,6 +631,9 @@ def test_dense_embedded_images_use_one_exact_persistent_transparent_composite(
         % (completed.returncode, completed.stdout[-2000:], completed.stderr[-2000:])
     )
     result = json.loads(out_path.read_text(encoding="utf-8"))
+    assert "Exception while processing file" not in (
+        completed.stdout + completed.stderr
+    ), "FreeCADCmd opened extra files after the probe (argv leak)"
     assert result.get("ok"), "dense probe failed: %s" % result.get("error", "")
 
     planes = result.get("image_planes") or []

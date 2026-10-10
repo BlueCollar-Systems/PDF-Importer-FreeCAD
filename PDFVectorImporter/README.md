@@ -2,7 +2,7 @@
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Version: 4.0.111](https://img.shields.io/badge/Version-4.0.111-green.svg)
-![Platform: FreeCAD 0.21+](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B-orange.svg)
+![Platform: FreeCAD 1.0+ (Python 3.10+)](https://img.shields.io/badge/Platform-FreeCAD%201.0%2B%20%28Python%203.10%2B%29-orange.svg)
 
 **Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.**
 
@@ -138,36 +138,40 @@ Native wire outlines and general vector lineweights remain screen-dependent; Ras
 |---|---|
 | **PDF Parsing** | PyMuPDF-powered vector extraction with full path, text, and image support |
 | **Import Modes** | Auto (default), Vector, Raster, Hybrid — every mode targets maximum fidelity (BCS-ARCH-001) |
-| **Text Rendering** | Labels, 3D Text, Glyphs, Geometry — orthogonal to mode |
+| **Text Rendering** | Text, Labels, 3D Text (default), Glyphs, Geometry, Raster — orthogonal to mode |
 | **Arc Reconstruction** | Kasa algebraic circle fit converts polyline segments back to true arcs |
 | **Layer Support** | OCG layers (PDF Optional Content Groups) map to FreeCAD groups |
 | **Color Grouping** | Geometry automatically organized by stroke/fill color |
 | **Dash Patterns** | Hidden, center, and phantom line types mapped from PDF dash arrays |
 | **Scale by Reference** | Pick two points on a known dimension, type the real-world value |
-| **Quick Scale** | Architectural presets from 1:1 through 1:200 |
-| **Text Import** | Labels, 3D Text, and vector glyph/geometry via pdftocairo or bundled PyMuPDF fallback |
+| **Quick Scale** | Type a factor (2.0) or a ratio (1:50) to scale the imported drawing |
+| **Text Import** | Editable Text and Labels, 3D Text (solid letter shapes, not re-typeable), and vector glyph/geometry via pdftocairo or bundled PyMuPDF fallback |
 | **Raster Fallback** | Scanned pages imported as positioned images when no vectors are found |
 | **Image Extraction** | Embedded images extracted and placed in the model |
-| **Hatch Detection** | Three modes: Import, Group, or Skip detected hatch regions |
-| **Batch Import** | Multi-file import and drag-and-drop support |
-| **SKP Bridge** | Import SketchUp `.skp` models via workbench command when backend support exists |
+| **Batch Import** | Select several PDFs in File > Import; each one opens its own options dialog |
 | **Auto View** | Orthographic top-down view set automatically after import |
 
 ---
 
 ## Installation
 
+On Windows the easy way is `FreeCAD-PDF-Importer-Setup_vX.Y.Z.exe` from the
+[Releases page](https://github.com/BlueCollar-Systems/PDF-Importer-FreeCAD/releases):
+close FreeCAD, run it normally (not as administrator), start FreeCAD again.
+This importer is not listed in FreeCAD's Addon Manager yet. To install by hand:
+
 1. Copy the `PDFVectorImporter` folder into your FreeCAD `Mod` directory:
 
    | OS | Typical Path |
    |---|---|
-   | **Windows** | `%APPDATA%\FreeCAD\Mod\` |
+   | **Windows (FreeCAD 1.1)** | `%APPDATA%\FreeCAD\v1-1\Mod\` |
+   | **Windows (older profile folder)** | `%APPDATA%\FreeCAD\Mod\` |
    | **macOS** | `~/Library/Application Support/FreeCAD/Mod/` |
    | **Linux** | `~/.FreeCAD/Mod/` |
 
 2. Restart FreeCAD.
 3. Switch to the **PDF Vector Importer** workbench from the workbench selector.
-4. Release ZIP/Setup installs include shared PyMuPDF under `src/lib/common` and exact CPython 3.10/3.11 fontTools payloads under `src/lib/cp310` and `src/lib/cp311`. FreeCAD selects only its matching ABI tree. Source checkouts can use **PDF Vector Importer > Install / Update PDF Dependencies** for the current user.
+4. Release ZIP/Setup installs include shared PyMuPDF under `src/lib/common` and exact CPython 3.10/3.11 fontTools payloads under `src/lib/cp310` and `src/lib/cp311`. FreeCAD selects only its matching ABI tree. If PyMuPDF or fontTools is missing (for example in a source checkout), switching to the workbench offers to install them for the current user. (The **Install / Update PDF Dependencies** command exists but is not on a menu yet.)
 
 ---
 
@@ -175,7 +179,7 @@ Native wire outlines and general vector lineweights remain screen-dependent; Ras
 
 | Dependency | Required | Notes |
 |---|---|---|
-| **FreeCAD** | 0.21+ | Offline bundle supports embedded CPython 3.10 and 3.11; 1.1 installer smoke verified |
+| **FreeCAD** | 1.0+ (Python 3.10+) | Offline bundle supports embedded CPython 3.10 and 3.11; tested by hand on 1.1.4 |
 | **PyMuPDF** | Yes | Version 1.28.2 bundled once in the shared stable-ABI tree |
 | **fontTools** | Yes | Version 4.63.0 bundled separately for cp310 and cp311 to preserve embedded fonts and Unicode mappings |
 | **pdftocairo** | Optional | Preferred SVG renderer for text-as-geometry; bundled PyMuPDF is used when Poppler is absent |
@@ -189,12 +193,12 @@ PDFVectorImporter/
 |-- Init.py                     # FreeCAD workbench registration
 |-- InitGui.py                  # GUI commands and menus
 |-- PDFImportHandler.py         # Top-level import orchestration
-|-- PDFTools.py                 # Toolbar actions (Scale, Quick Scale, Batch)
+|-- PDFTools.py                 # Utility commands (Check Environment, Batch Import, dependency install); not on a menu yet
 |-- src/
 |   |-- PDFImporterCore.py      # Central import pipeline
 |   |-- PDFStyleRestore.py      # Re-applies PDF* App metadata to view providers on GUI open
 |   |-- PDFImporterCmd.py       # FreeCAD command wrappers
-|   |-- PDFScaleTool.py         # Scale by Reference implementation
+|   |-- PDFScaleTool.py         # Scale by Reference and Quick Scale
 |   |-- PDFHatchDetector.py     # Hatch region detection engine
 |   |-- PDFSvgTextRenderer.py   # SVG/text rendering pipeline
 ```
@@ -230,7 +234,7 @@ The test harness supports multiple target platforms through an adapter pattern:
 
 | Adapter | Target | Description |
 |---|---|---|
-| **FreeCAD** | FreeCAD 0.21+ | Full integration tests against live FreeCAD |
+| **FreeCAD** | FreeCAD 1.x | Full integration tests against live FreeCAD |
 | **SketchUp** | SketchUp | Cross-platform validation via SketchUp adapter |
 | **Blender** | Blender 3.6+ | Headless CLI validation via Blender importer adapter |
 | **LibreCAD** | LibreCAD (DXF flow) | PDF-to-DXF validation via LibreCAD adapter |
@@ -273,10 +277,11 @@ python run_pdf_vector_importer_tests.py --init-workbook qa_workbook.xlsx
 ## Usage
 
 1. Open FreeCAD and switch to the **PDF Vector Importer** workbench.
-2. Click **Import PDF** or drag a PDF file onto the 3D view.
-3. Select an import mode (leave as **Auto** for most files — it picks the right strategy per page).
-4. Geometry appears as editable Part objects, grouped by color and layer.
-5. Use **Scale by Reference** to calibrate to real-world dimensions.
+2. Click **Import PDF Vector…** (or use **File → Import**) and choose the PDF.
+3. Pick a **Text Mode**: 3D Text (the default) looks closest to the PDF but the words cannot be re-typed; Text or Labels keep the words editable.
+4. Leave the import strategy on **Auto** for most files (tick **Advanced** to force Vector, Raster or Hybrid), then click **OK**.
+5. Geometry appears as editable Part objects, grouped by page (other grouping choices are in the dialog).
+6. Use **Scale by Reference** to calibrate to real-world dimensions.
 
 ---
 

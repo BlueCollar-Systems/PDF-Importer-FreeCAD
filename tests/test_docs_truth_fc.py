@@ -131,6 +131,22 @@ def test_docs_name_no_menu_item_that_is_not_on_a_menu():
                     assert "File > Import" in row or "File → Import" in row, row
 
 
+def test_docs_point_to_the_tools_menu_when_the_commands_are_on_it():
+    """Once the Tools submenu holds the dependency installer, no page may still
+    say it is missing from the menus or name it one level too high."""
+    placed = _workbench_menu_commands()
+    if "PDF_InstallPyMuPDF" not in placed:
+        return
+    for path in DOCS:
+        text = _text(path)
+        flat = " ".join(text.split())
+        assert "Install / Update PDF Dependencies** command exists but is not on a menu" not in flat, _name(path)
+        assert "does the same but is not on a menu yet" not in flat, _name(path)
+        assert "PDF Vector Importer > Install / Update" not in flat, _name(path)
+    for row in _table_rows(_text(PACKAGED_README)):
+        if "Quick Scale" in row:
+            assert "full size" in row, row
+
 def test_3d_text_is_described_as_solid_shapes_not_editable_shapestring():
     for path in DOCS:
         for row in _table_rows(_text(path)):

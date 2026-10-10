@@ -143,8 +143,8 @@ Native wire outlines and general vector lineweights remain screen-dependent; Ras
 | **Layer Support** | OCG layers (PDF Optional Content Groups) map to FreeCAD groups |
 | **Color Grouping** | Geometry automatically organized by stroke/fill color |
 | **Dash Patterns** | Hidden, center, and phantom line types mapped from PDF dash arrays |
-| **Scale by Reference** | Pick two points on a known dimension, type the real-world value |
-| **Quick Scale** | Type a factor (2.0) or a ratio (1:50) to scale the imported drawing |
+| **Scale by Reference** | Pick two points on a known dimension, type the real-world value; pictures and the paper sheet scale with the lines |
+| **Quick Scale** | Pick or type the drawing scale from the title block (1:50, 1/4"=1'-0") to enlarge the drawing to full size, or type a plain factor (2 = double); asks first, one Undo puts it back |
 | **Text Import** | Editable Text and Labels, 3D Text (solid letter shapes, not re-typeable), and vector glyph/geometry via pdftocairo or bundled PyMuPDF fallback |
 | **Raster Fallback** | Scanned pages imported as positioned images when no vectors are found |
 | **Image Extraction** | Embedded images extracted and placed in the model |
@@ -171,7 +171,7 @@ This importer is not listed in FreeCAD's Addon Manager yet. To install by hand:
 
 2. Restart FreeCAD.
 3. Switch to the **PDF Vector Importer** workbench from the workbench selector.
-4. Release ZIP/Setup installs include shared PyMuPDF under `src/lib/common` and exact CPython 3.10/3.11 fontTools payloads under `src/lib/cp310` and `src/lib/cp311`. FreeCAD selects only its matching ABI tree. If PyMuPDF or fontTools is missing (for example in a source checkout), switching to the workbench offers to install them for the current user. (The **Install / Update PDF Dependencies** command exists but is not on a menu yet.)
+4. Release ZIP/Setup installs include shared PyMuPDF under `src/lib/common` and exact CPython 3.10/3.11 fontTools payloads under `src/lib/cp310` and `src/lib/cp311`. FreeCAD selects only its matching ABI tree. If PyMuPDF or fontTools is missing (for example in a source checkout), switching to the workbench offers to install them for the current user. (You can also run it any time from **PDF Vector Importer > Tools > Install / Update PDF Dependencies**.)
 
 ---
 
@@ -193,7 +193,7 @@ PDFVectorImporter/
 |-- Init.py                     # FreeCAD workbench registration
 |-- InitGui.py                  # GUI commands and menus
 |-- PDFImportHandler.py         # Top-level import orchestration
-|-- PDFTools.py                 # Utility commands (Check Environment, Batch Import, dependency install); not on a menu yet
+|-- PDFTools.py                 # Utility commands: Check Environment and dependency install (Tools menu); Batch Import (not on a menu)
 |-- src/
 |   |-- PDFImporterCore.py      # Central import pipeline
 |   |-- PDFStyleRestore.py      # Re-applies PDF* App metadata to view providers on GUI open

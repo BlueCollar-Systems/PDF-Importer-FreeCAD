@@ -85,7 +85,7 @@ Searching FreeCAD's Addon Manager will not find this importer yet (it is not lis
    - **Windows (FreeCAD 0.21):** `%APPDATA%\FreeCAD\Mod\`
    - **macOS:** `~/Library/Application Support/FreeCAD/Mod/`
    - **Linux:** `~/.local/share/FreeCAD/Mod/`
-3. Release ZIP/Setup installs bundle an offline runtime matrix under `PDFVectorImporter/src/lib`: shared PyMuPDF in `common/` and ABI-specific fontTools in `cp310/` and `cp311/`. A source checkout without that runtime: switch to the **PDF Vector Importer** workbench and it offers to install PyMuPDF and fontTools for the current FreeCAD user. (The **Install / Update PDF Dependencies** command exists but is not on a menu yet.)
+3. Release ZIP/Setup installs bundle an offline runtime matrix under `PDFVectorImporter/src/lib`: shared PyMuPDF in `common/` and ABI-specific fontTools in `cp310/` and `cp311/`. A source checkout without that runtime: switch to the **PDF Vector Importer** workbench and it offers to install PyMuPDF and fontTools for the current FreeCAD user. (You can also run it any time from **PDF Vector Importer > Tools > Install / Update PDF Dependencies**.)
 4. Restart FreeCAD
 
 ## Building Release Artifacts
@@ -320,8 +320,8 @@ view prints `Import report: <path>` after every import.
 When an import fails, one **Import Failed** box gives the reason, the page and the
 report path, with an **Open report folder** button; nothing is added to your
 drawing. When an import finishes but some items were drawn another way or left
-out (text items, or a drawing item drawn as plain lines), one warning box says how
-many and where; a clean import shows no box. File > Open followed by Cancel leaves
+out (text items, a drawing item drawn as plain lines, or a picture left out), one
+warning box says how many and where; a clean import shows no box. File > Open followed by Cancel leaves
 no empty document behind. Headless and batch runs never show a box; they print the
 same sentences.
 

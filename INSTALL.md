@@ -114,8 +114,8 @@ private ABI-selected runtime under:
 That means release users do not need system Python, pip, or any operating
 system Python packages on CPython 3.10/3.11. For a source/dev install without
 that runtime, switching to the **PDF Vector Importer** workbench offers to
-install compatible packages into FreeCAD's user site (the **Install / Update
-PDF Dependencies** command does the same but is not on a menu yet). Release builds
+install compatible packages into FreeCAD's user site (the **PDF Vector Importer > Tools > Install / Update PDF Dependencies**
+menu item does the same). Release builds
 intentionally reject `--no-vendor-deps`: ignored local `src/lib` bytes are not
 commit-bound, so the release builder regenerates them from three hashed locks.
 

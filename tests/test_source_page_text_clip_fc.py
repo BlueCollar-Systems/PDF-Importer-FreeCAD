@@ -25,6 +25,56 @@ class Placement:
         return self.xyz
 
 
+def test_legacy_bounds_use_owned_clean_geometry_without_unsafe_arguments(monkeypatch):
+    monkeypatch.setattr(clip_module, "_legacy_analytic_bounds_required", lambda: True)
+    calls = []
+    class LegacyShape:
+        def __init__(self, mesh=True):
+            self.mesh = mesh
+            self.geometry = (1., 2., 3., 4., 5., 6.)
+            self.Faces = [SimpleNamespace(Surface=object())]
+            self.Edges = [SimpleNamespace(Length=1., Curve=object())]
+
+        def cleaned(self):
+            calls.append(("cleaned", self.mesh))
+            return LegacyShape(mesh=False)
+
+        def optimalBoundingBox(self, *args):
+            assert args == (), "legacy parser must never receive optional arguments"
+            assert not self.mesh, "display triangulation cannot prove analytic ink"
+            calls.append(("bounds", args))
+            return SimpleNamespace(**dict(zip(
+                ("XMin", "YMin", "ZMin", "XMax", "YMax", "ZMax"), self.geometry, strict=True)))
+
+    source = LegacyShape()
+    assert clip_module._bounds(source) == source.geometry
+    assert source.mesh is True and source.geometry == (1., 2., 3., 4., 5., 6.)
+    assert calls == [("cleaned", True), ("bounds", ())]
+
+
+def test_legacy_bounds_reject_unowned_clean_result(monkeypatch):
+    monkeypatch.setattr(clip_module, "_legacy_analytic_bounds_required", lambda: True)
+    source = SimpleNamespace()
+    source.Faces, source.Edges = [], []
+    source.cleaned = lambda: source
+    with pytest.raises(ValueError, match="owned clean shape"):
+        clip_module._bounds(source)
+
+
+@pytest.mark.parametrize("missing", ["surface", "curve"])
+def test_legacy_bounds_reject_polygon_only_topology(monkeypatch, missing):
+    monkeypatch.setattr(clip_module, "_legacy_analytic_bounds_required", lambda: True)
+    source = SimpleNamespace(Faces=[SimpleNamespace(Surface=object())],
+        Edges=[SimpleNamespace(Length=1., Curve=object())])
+    source.cleaned = lambda: pytest.fail("polygon-only shape must be rejected before copying")
+    if missing == "surface":
+        source.Faces[0].Surface = None
+    else:
+        source.Edges[0].Curve = None
+    with pytest.raises(ValueError, match="native analytic"):
+        clip_module._bounds(source)
+
+
 class Shape:
     """Analytic rectangle/prism double; native curved cases run in the GUI probe."""
     def __init__(self, box, dimension="Volume", measure=None, corrupt=False):

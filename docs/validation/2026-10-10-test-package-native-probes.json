@@ -1,0 +1,264 @@
+{
+  "schema": "bcs.local-test-native-summary/1",
+  "local_test_build": true,
+  "published_release": false,
+  "archive": "FreeCAD-PDF-Importer_v4.0.111-test-2026-10-10-r4.zip",
+  "sha256": "4687272201d0dc625f72d03f36aca29c6cd3dced5a635baad1bb0578dd084e02",
+  "bytes": 23012496,
+  "source_files": {
+    "PDFVectorImporter/package.xml": "26f6d821eab97e275e49d2cbc06bd24497fec70b63cf2aed7f112967b234481c",
+    "PDFVectorImporter/pdfcadcore/embedded_fonts.py": "80ad2ad02f49e7972f5871c238b3e58097b1ff7f0e5f6190c3004ba741550be7",
+    "PDFVectorImporter/pdfcadcore/primitive_extractor.py": "8602183cab654fdeadbf0319329f258df8c0d071b3ef22af2cdd2ca366170e2f",
+    "PDFVectorImporter/pdfcadcore/primitives.py": "ee480136c214b4e6cc16a0071a9ab57b4238be5f5b1f16e65534715e75e97100",
+    "PDFVectorImporter/PDFTools.py": "0ec5e6984c091e3cee35f87bf2e40eb65fc2a38e2291e3c146eb7a0b76bf5385",
+    "PDFVectorImporter/runtime_paths.py": "458a8faade9075c3750ebca4c1d5c30f15dbcbb72d4519205e0d76dfba0867de",
+    "PDFVectorImporter/src/PDFImporterCore.py": "e268bebbc53fc60313629505f2dc5ee9c29a54455d7d93faaed502c165ed701c",
+    "PDFVectorImporter/src/PDFImportSession.py": "5149d534636da1b26fe65b636c4ea5f9929c30ff6151b13b247f04a51126495b",
+    "PDFVectorImporter/src/PDFPageTextClip.py": "28508191c727e661a0a4509e3241e7496cc86aa77e70f2ca2f508a595b3bed2c"
+  },
+  "hosts": [
+    {
+      "host": [
+        "0",
+        "21",
+        "2",
+        "33771 (Git)",
+        "https://github.com/FreeCAD/FreeCAD",
+        "2023/11/14 02:33:39",
+        "(HEAD detached at 0.21.2)",
+        "b9bfa5c5507506e4515816414cd27f4851d00489"
+      ],
+      "python": "3.10.13 | packaged by conda-forge | (main, Oct 26 2023, 18:01:37) [MSC v.1935 64 bit (AMD64)]",
+      "passed": true,
+      "modes": [
+        {
+          "mode": "text",
+          "case": "synthetic-two-page-fixture",
+          "result": true,
+          "status": "success",
+          "text_degraded": 0,
+          "native_object_count": 9,
+          "input_unchanged": true,
+          "contract_ready": true
+        },
+        {
+          "mode": "3d_text",
+          "case": "synthetic-two-page-fixture",
+          "result": true,
+          "status": "success",
+          "text_degraded": 0,
+          "native_object_count": 9,
+          "input_unchanged": true,
+          "contract_ready": true
+        },
+        {
+          "mode": "glyphs",
+          "case": "synthetic-two-page-fixture",
+          "result": true,
+          "status": "success",
+          "text_degraded": 0,
+          "native_object_count": 9,
+          "input_unchanged": true,
+          "contract_ready": true
+        },
+        {
+          "mode": "geometry",
+          "case": "synthetic-two-page-fixture",
+          "result": true,
+          "status": "success",
+          "text_degraded": 0,
+          "native_object_count": 9,
+          "input_unchanged": true,
+          "contract_ready": true
+        },
+        {
+          "mode": "raster",
+          "case": "synthetic-two-page-fixture",
+          "result": true,
+          "status": "success",
+          "text_degraded": 0,
+          "native_object_count": 9,
+          "input_unchanged": true,
+          "contract_ready": true
+        },
+        {
+          "mode": "labels",
+          "case": "synthetic-two-page-fixture",
+          "result": true,
+          "status": "success",
+          "text_degraded": 0,
+          "native_object_count": 9,
+          "input_unchanged": true,
+          "contract_ready": true
+        },
+        {
+          "mode": "3d_text",
+          "case": "private-shop-drawing",
+          "result": true,
+          "status": "success",
+          "text_degraded": 0,
+          "native_object_count": 74,
+          "input_unchanged": true,
+          "contract_ready": true
+        }
+      ],
+      "controls": {
+        "legacy_analytic_bounds_on_meshed_owned_shape": true,
+        "installed_layout_files": true,
+        "invalid_pages_rejected_without_document_changes": true,
+        "reversed_duplicate_pages_normalized": true,
+        "same_version_same_size_same_mtime_code_change_rejected_native": true,
+        "rejected_resume_kept_existing_geometry": true,
+        "native_partial_page_cancel_and_resume": true,
+        "progress_events": 15,
+        "completed_pages_after_resume": [
+          1,
+          2
+        ]
+      },
+      "runtime_versions": {
+        "PyMuPDF": "1.28.2",
+        "FontTools": "4.63.0"
+      },
+      "synthetic_spacing": {
+        "count": 1,
+        "native_flags": 532,
+        "painted_glyph_id": null,
+        "source_font_binding_verified": true
+      },
+      "legacy_analytic_bounds_proof": {
+        "source_geometry_unchanged": true,
+        "source_display_unchanged": true,
+        "native_measures_unchanged": true,
+        "placement_unchanged": true,
+        "source_cached_display_bounds": [
+          8.181124394791057,
+          17.515994900049524,
+          29.063597232993548,
+          13.112998026121145,
+          21.984416572887653,
+          33.596413756329525
+        ],
+        "owned_analytic_bounds": [
+          8.19565374600447,
+          17.52833853044722,
+          29.075195747635576,
+          13.098468674907735,
+          21.97207294248995,
+          33.5848152416875
+        ],
+        "parser_arguments": []
+      }
+    },
+    {
+      "host": [
+        "1",
+        "1",
+        "4",
+        "20260928 (Git shallow)",
+        "Unknown",
+        "2026/09/28 13:46:34",
+        "(HEAD detached at 4fd3bf320)",
+        "4fd3bf320d9566a27e60069fc8387448aaa3a094"
+      ],
+      "python": "3.11.14 | packaged by conda-forge | (main, Oct 13 2025, 14:00:26) [MSC v.1944 64 bit (AMD64)]",
+      "passed": true,
+      "modes": [
+        {
+          "mode": "text",
+          "case": "synthetic-two-page-fixture",
+          "result": true,
+          "status": "success",
+          "text_degraded": 0,
+          "native_object_count": 9,
+          "input_unchanged": true,
+          "contract_ready": true
+        },
+        {
+          "mode": "3d_text",
+          "case": "synthetic-two-page-fixture",
+          "result": true,
+          "status": "success",
+          "text_degraded": 0,
+          "native_object_count": 9,
+          "input_unchanged": true,
+          "contract_ready": true
+        },
+        {
+          "mode": "glyphs",
+          "case": "synthetic-two-page-fixture",
+          "result": true,
+          "status": "success",
+          "text_degraded": 0,
+          "native_object_count": 9,
+          "input_unchanged": true,
+          "contract_ready": true
+        },
+        {
+          "mode": "geometry",
+          "case": "synthetic-two-page-fixture",
+          "result": true,
+          "status": "success",
+          "text_degraded": 0,
+          "native_object_count": 9,
+          "input_unchanged": true,
+          "contract_ready": true
+        },
+        {
+          "mode": "raster",
+          "case": "synthetic-two-page-fixture",
+          "result": true,
+          "status": "success",
+          "text_degraded": 0,
+          "native_object_count": 9,
+          "input_unchanged": true,
+          "contract_ready": true
+        },
+        {
+          "mode": "labels",
+          "case": "synthetic-two-page-fixture",
+          "result": true,
+          "status": "success",
+          "text_degraded": 0,
+          "native_object_count": 9,
+          "input_unchanged": true,
+          "contract_ready": true
+        },
+        {
+          "mode": "3d_text",
+          "case": "private-shop-drawing",
+          "result": true,
+          "status": "success",
+          "text_degraded": 0,
+          "native_object_count": 74,
+          "input_unchanged": true,
+          "contract_ready": true
+        }
+      ],
+      "controls": {
+        "installed_layout_files": true,
+        "invalid_pages_rejected_without_document_changes": true,
+        "reversed_duplicate_pages_normalized": true,
+        "same_version_same_size_same_mtime_code_change_rejected_native": true,
+        "rejected_resume_kept_existing_geometry": true,
+        "native_partial_page_cancel_and_resume": true,
+        "progress_events": 15,
+        "completed_pages_after_resume": [
+          1,
+          2
+        ]
+      },
+      "runtime_versions": {
+        "PyMuPDF": "1.28.2",
+        "FontTools": "4.63.0"
+      },
+      "synthetic_spacing": {
+        "count": 1,
+        "native_flags": 532,
+        "painted_glyph_id": null,
+        "source_font_binding_verified": true
+      }
+    }
+  ],
+  "boundary": "Headless actual host APIs/operators and explicit callback events; selected fixtures, no GUI pixel comparison."
+}

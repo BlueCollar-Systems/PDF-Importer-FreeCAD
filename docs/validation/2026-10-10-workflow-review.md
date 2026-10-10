@@ -95,8 +95,10 @@ release artifact was replaced by these checks.
 
 ## Boundaries and remaining work
 
-These are **source checkout changes**; no installed workbench was replaced, no
-installer was rebuilt, and no publication was performed. The minimum host
+The initial review above covered **source checkout changes**. The subsequent
+owner-authorized installable test snapshot and native extracted-package checks
+are recorded in `2026-10-10-test-package-review.md`. No installed workbench was
+replaced and no publication was performed. The minimum host
 remains FreeCAD 0.21. Windows offline bundles currently cover Python 3.10/3.11;
 other host Python versions still require separately available dependencies.
 Legacy FreeCAD 0.19/0.20 support is not established by this run. For comparison,

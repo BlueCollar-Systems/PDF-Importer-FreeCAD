@@ -430,27 +430,41 @@ def test_actual_page_cancellation_rolls_back_shapes_and_delivery_telemetry(monke
     assert not opts._report_extra.get('source_compound_fill_delivery')
 
 
-def test_page_geometry_failure_cleans_prior_owned_objects_and_is_not_READY(monkeypatch,tmp_path):
+def test_page_geometry_failure_steps_down_to_outline_keeps_page_and_is_not_READY(monkeypatch,tmp_path):
+    # One compound fill this host cannot build costs that fill, never the page:
+    # its outline is drawn in the fill colour and the item is listed.
     contours=[rectangle(10,10,20,20),rectangle(15,15,10,10)]
-    page_host(monkeypatch,contours)
+    styles=page_host(monkeypatch,contours)
     kernel=core.Part;original=kernel.Face
     def invalid(wire):
         result=original(wire);result.valid=False;return result
     kernel.Face=invalid
     opts=fixture.options(hatch_to_faces=True,compound_batch_size=0,scale_to_mm=False)
     document=fixture.Document()
-    with pytest.raises(core.DrawingGeometryFailure) as caught:
-        run_page_wrapper(monkeypatch,tmp_path,contours,opts,document)
-    assert not document.Objects and opts.import_status=='failed'
+    group,_=run_page_wrapper(monkeypatch,tmp_path,contours,opts,document)
+    assert group is not None and opts.import_status=='success'
+    assert not document.named('SourceCompoundFill') and not document.named('Face')
     assert not opts._report_extra.get('source_compound_fill_delivery')
-    report=tmp_path/'failure-report.json'
-    opts.import_report_path=str(report)
-    core._write_terminal_representation_failure_report(
-        pdf_path=str(tmp_path/'source.pdf'),opts=opts,pages_imported=0,total_pages=1,
-        elapsed_ms=1.,failure=caught.value)
+    entry,=opts._report_extra['geometry_items_degraded']['items']
+    assert (entry['kind'],entry['delivered'],entry['page_number'])==('compound_fill','outline',1)
+    assert 'Compound source fill delivery failed' in entry['reason']
+    outlines=[document.getObject(name) for name in entry['created_entity_ids']]
+    assert outlines and all(obj is not None and obj in group.Group for obj in outlines)
+    def edges(shape):
+        return list(shape.Edges) if hasattr(shape,'Edges') else list(shape[1])
+    drawn=[[(p.x,100.-p.y) for p in edge.points] for obj in outlines for edge in edges(obj.Shape)]
+    assert sorted(drawn)==sorted([list(cmd[1:]) for c in contours for cmd in c])
+    # Plain lines in the fill colour; no face carries the refused fill.
+    outline_styles=[style for style in styles if style[0] in entry['created_entity_ids']]
+    assert outline_styles and all(style[1]==pytest.approx((.2,.6,.1),abs=1e-6) and style[2] is None
+                                  for style in outline_styles)
+    report=tmp_path/'step-down-report.json'
+    core.write_import_report(pdf_path=str(tmp_path/'source.pdf'),output_path=str(report),opts=opts,
+                             pages_imported=1,total_pages=1,elapsed_ms=1.)
     result=json.loads(report.read_text())
-    assert result['extra']['result_status']=='failed'
     assert result['extra']['import_contract_ready']['ready'] is False
+    assert result['extra']['import_contract_ready']['checks']['geometry_delivery'] is False
+    assert result['fallback']['used'] is True and result['result']['warnings']>=1
 
 
 def test_original_clipped_helper_is_byte_and_AST_unchanged():

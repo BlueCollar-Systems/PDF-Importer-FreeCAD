@@ -24,7 +24,6 @@
 
       <!-- FreeCAD version support -->
       <freecadmin>0.21</freecadmin>
-      <freecadmax>1.99</freecadmax>
     </workbench>
   </content>
 

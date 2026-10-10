@@ -182,7 +182,9 @@ def test_identity_boolean_is_typed(result):
         fill._native_same(left, left)
 
 
-def test_shell_refusal_rolls_back_page_and_persists_failed_nonready_report(monkeypatch, tmp_path):
+def test_shell_refusal_steps_down_to_outline_and_persists_nonready_report(monkeypatch, tmp_path):
+    # A refused shell costs that one fill, not the page: its outline is drawn,
+    # the item is listed, and the report is not ready.
     contours = [page_fixture.rectangle(10, 10, 20, 20),
                 page_fixture.rectangle(15, 15, 10, 10)]
     page_fixture.page_host(monkeypatch, contours)
@@ -192,17 +194,20 @@ def test_shell_refusal_rolls_back_page_and_persists_failed_nonready_report(monke
     monkeypatch.setattr(fill, "_shell_connected_paint_faces", refuse)
     opts = page_fixture.fixture.options(hatch_to_faces=True, compound_batch_size=0, scale_to_mm=False)
     document = page_fixture.fixture.Document()
-    with pytest.raises(page_fixture.core.DrawingGeometryFailure) as caught:
-        page_fixture.run_page_wrapper(monkeypatch, tmp_path, contours, opts, document)
-    assert not document.Objects and opts.import_status == "failed"
+    group, _ = page_fixture.run_page_wrapper(monkeypatch, tmp_path, contours, opts, document)
+    assert group is not None and opts.import_status == "success"
+    assert not document.named("SourceCompoundFill")
     assert not opts._report_extra.get("source_compound_fill_delivery")
-    report = tmp_path / "failure-report.json"
-    opts.import_report_path = str(report)
-    page_fixture.core._write_terminal_representation_failure_report(
-        pdf_path=str(tmp_path / "source.pdf"), opts=opts, pages_imported=0,
-        total_pages=1, elapsed_ms=1., failure=caught.value)
+    entry, = opts._report_extra["geometry_items_degraded"]["items"]
+    assert entry["kind"] == "compound_fill" and entry["delivered"] == "outline"
+    assert "shell identity changed" in entry["reason"]
+    assert all(document.getObject(name) in group.Group for name in entry["created_entity_ids"])
+    report = tmp_path / "step-down-report.json"
+    page_fixture.core.write_import_report(
+        pdf_path=str(tmp_path / "source.pdf"), output_path=str(report), opts=opts,
+        pages_imported=1, total_pages=1, elapsed_ms=1.)
     result = json.loads(report.read_text())
-    assert result["extra"]["result_status"] == "failed"
+    assert result["extra"]["geometry_items_degraded"]["total"] == 1
     assert result["extra"]["import_contract_ready"]["ready"] is False
 
 

@@ -18,6 +18,7 @@ import math
 from contextlib import contextmanager
 import os
 import re
+import shutil
 import struct
 import sys
 import tempfile
@@ -75,11 +76,57 @@ except ImportError:
     FreeCAD = Draft = Part = None
     Vector = Placement = Rotation = None
 
-try:
-    import ImageGui  # noqa: F401
-    IMAGE_WB = True
-except ImportError:
-    IMAGE_WB = False
+# Whether this FreeCAD can place pictures (Image::ImagePlane). Worked out on
+# first use, never at import: FreeCAD 1.x has no ImageGui module, so the old
+# "import ImageGui" test turned picture import off for options-less imports.
+_IMAGE_IMPORT_AVAILABLE: Optional[bool] = None
+
+
+def _image_import_available(doc=None) -> bool:
+    """True when ``Image::ImagePlane`` objects can be created in this FreeCAD.
+
+    Checks ``doc`` (or the active document, or a hidden temporary document
+    that is closed again) for the type; older FreeCAD falls back to ImageGui.
+    """
+    global _IMAGE_IMPORT_AVAILABLE
+    if _IMAGE_IMPORT_AVAILABLE is not None:
+        return _IMAGE_IMPORT_AVAILABLE
+    available = None
+    if FreeCAD is not None:
+        probe = doc if doc is not None else getattr(FreeCAD, "ActiveDocument", None)
+        temp_name = None
+        try:
+            if probe is None and hasattr(FreeCAD, "newDocument"):
+                probe = FreeCAD.newDocument("PDFImageProbe", "PDFImageProbe", True)
+                temp_name = probe.Name
+            if probe is not None and hasattr(probe, "supportedTypes"):
+                if "Image::ImagePlane" in probe.supportedTypes():
+                    available = True
+                else:
+                    try:
+                        import Image  # noqa: F401  # registers the type on older FreeCAD
+                    except ImportError:
+                        pass
+                    else:
+                        if "Image::ImagePlane" in probe.supportedTypes():
+                            available = True
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            available = None
+        finally:
+            if temp_name:
+                try:
+                    FreeCAD.closeDocument(temp_name)
+                except (AttributeError, RuntimeError, NameError):
+                    pass
+    if available is None:
+        try:
+            import ImageGui  # noqa: F401
+            available = True
+        except ImportError:
+            available = False
+    if FreeCAD is not None:
+        _IMAGE_IMPORT_AVAILABLE = available
+    return available
 
 # ──────────────────────────────────────────────────────────────────────
 # Constants
@@ -697,6 +744,74 @@ def _default_import_report_path(pdf_path: str) -> str:
     return os.path.join(directory, f"{base}_import_report.json")
 
 
+IMPORT_REPORT_FOLDER_NAME = "PDF Import Reports"
+IMPORT_REPORT_KEEP = 50
+
+
+def _publish_report_copy(path: str, pdf_path: str = "") -> str:
+    """Copy one import report to a fixed folder a person can find again.
+
+    The private mkdtemp original stays where it is (hosts cannot collide);
+    the copy goes to <FreeCAD user data>/PDF Import Reports/
+    <pdf>_<yyyymmdd-hhmmss>_import_report.json and only the newest
+    IMPORT_REPORT_KEEP reports are kept. Returns the copy's path, or "" when
+    there is no user data folder or the copy failed (only a warning).
+    """
+    try:
+        user_dir = FreeCAD.getUserAppDataDir() if FreeCAD else ""
+    except Exception:
+        user_dir = ""
+    if not user_dir or not path or not os.path.isfile(path):
+        return ""
+    try:
+        folder = os.path.join(str(user_dir), IMPORT_REPORT_FOLDER_NAME)
+        os.makedirs(folder, exist_ok=True)
+        base = os.path.splitext(os.path.basename(pdf_path or path))[0] or "pdf"
+        base = re.sub(r"[^A-Za-z0-9._ -]+", "_", base).strip(" .")[:80] or "pdf"
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        target = os.path.join(folder, "%s_%s_import_report.json" % (base, stamp))
+        suffix = 1
+        while os.path.exists(target):
+            suffix += 1
+            target = os.path.join(folder, "%s_%s-%d_import_report.json" % (base, stamp, suffix))
+        shutil.copyfile(path, target)
+        reports = sorted(
+            (entry for entry in os.scandir(folder)
+             if entry.is_file() and entry.name.endswith("_import_report.json")),
+            key=lambda entry: entry.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in reports[IMPORT_REPORT_KEEP:]:
+            try:
+                os.remove(stale.path)
+            except OSError:
+                pass
+        return target
+    except (OSError, TypeError, ValueError) as exc:
+        _warn("Import report copy to %s was not made: %s" % (IMPORT_REPORT_FOLDER_NAME, exc))
+        return ""
+
+
+def _remember_import_report(opts: "ImportOptions", path: str, pdf_path: str) -> str:
+    """Publish the report copy and remember the path a person should open."""
+    published = _publish_report_copy(path, pdf_path)
+    shown = published or str(path or "")
+    try:
+        opts._last_import_report_path = shown
+    except AttributeError:
+        pass
+    return shown
+
+
+def _attach_failure_location(failure: BaseException, report_path: str, page) -> None:
+    """Let the UI name the page and the report without parsing messages."""
+    try:
+        failure.bcs_report_path = str(report_path or "")
+        failure.bcs_failed_page = page
+    except AttributeError:
+        pass
+
+
 def _pdf_file_sha256(pdf_path: str) -> str:
     digest = hashlib.sha256()
     with open(pdf_path, "rb") as source:
@@ -1149,6 +1264,205 @@ def _text_degrade_summary_note(
     return (
         "%s; this import is not certified - see text_items_degraded in the "
         "import report" % "; ".join(parts)
+    )
+
+
+# One drawing item (a stroke, a fill, a source quadrilateral) this host cannot
+# build as requested costs that item, never the page or the file: it is drawn
+# as plain lines in its own colour when it can be, left out when even that is
+# impossible, and always listed in geometry_items_degraded.
+GEOMETRY_ITEM_DEGRADE_REPORT_LIMIT = 200
+GEOMETRY_ITEM_DEGRADE_CONSOLE_LIMIT = 20
+_GEOMETRY_DEGRADE_BUCKETS = {
+    "outline": "delivered_as_outline",
+    "partial": "partly_delivered",
+    "skipped": "skipped",
+}
+
+
+def _new_geometry_degrade_block() -> Dict[str, Any]:
+    return {
+        "schema": "bcs.geometry_items_degraded/1.0",
+        "total": 0,
+        "delivered_as_outline": 0,
+        "partly_delivered": 0,
+        "skipped": 0,
+        "pages": [],
+        "items": [],
+        "items_truncated": False,
+    }
+
+
+def _geometry_failure_reason(error: BaseException) -> str:
+    """Why one drawing item failed, with the native cause; never raises."""
+    try:
+        text = str(error) or type(error).__name__
+    except Exception:
+        text = type(error).__name__
+    cause = getattr(error, "__cause__", None)
+    if cause is not None:
+        try:
+            cause_text = "%s: %s" % (type(cause).__name__, cause)
+        except Exception:
+            cause_text = type(cause).__name__
+        text = "%s (%s)" % (text, cause_text)
+    return _bounded_report_text(text, 300)
+
+
+def _record_degraded_geometry_item(opts: ImportOptions, entry: Dict[str, Any]) -> None:
+    """Add one stepped-down drawing item to this run's degrade record.
+
+    Like the text record it lives in ``_report_extra``, so it accumulates over
+    pages and is removed with a cancelled or rolled-back page.
+    """
+    report_extra = getattr(opts, "_report_extra", None)
+    if not isinstance(report_extra, dict):
+        report_extra = opts._report_extra = {}
+    block = report_extra.setdefault(
+        "geometry_items_degraded", _new_geometry_degrade_block()
+    )
+    block["total"] = int(block.get("total", 0) or 0) + 1
+    bucket = _GEOMETRY_DEGRADE_BUCKETS.get(str(entry.get("delivered")), "skipped")
+    block[bucket] = int(block.get(bucket, 0) or 0) + 1
+    page = int(entry.get("page_number") or 0)
+    if page and page not in block["pages"]:
+        block["pages"].append(page)
+    if len(block["items"]) < GEOMETRY_ITEM_DEGRADE_REPORT_LIMIT:
+        block["items"].append(entry)
+    else:
+        block["items_truncated"] = True
+    if block["total"] <= GEOMETRY_ITEM_DEGRADE_CONSOLE_LIMIT:
+        _warn(_degraded_geometry_item_warning_line(entry))
+
+
+def _degraded_geometry_item_warning_line(entry: Dict[str, Any]) -> str:
+    """One bounded operator sentence per stepped-down drawing item."""
+    consequence = {
+        "outline": "drawn as plain lines instead",
+        "partial": "only partly drawn as plain lines",
+    }.get(str(entry.get("delivered")), "nothing was drawn for it")
+    line = (
+        "PDF import: a drawing item (%s, drawing order %s) on page %s could not "
+        "be built as requested - %s. Reason: %s."
+        % (
+            entry.get("kind"),
+            entry.get("source_paint_order"),
+            entry.get("page_number"),
+            consequence,
+            str(entry.get("reason") or "unknown").rstrip("."),
+        )
+    )
+    return _bounded_report_text(line, 400)
+
+
+def _geometry_degrade_console_overflow_line(opts: ImportOptions) -> str:
+    """The one console line that names the stepped-down items the cap left out."""
+    block = (getattr(opts, "_report_extra", None) or {}).get("geometry_items_degraded")
+    total = int(block.get("total", 0) or 0) if isinstance(block, dict) else 0
+    extra = total - GEOMETRY_ITEM_DEGRADE_CONSOLE_LIMIT
+    if extra <= 0:
+        return ""
+    return (
+        "PDF import: ... and %d more drawing item%s could not be built as "
+        "requested; see geometry_items_degraded in the import report."
+        % (extra, "" if extra == 1 else "s")
+    )
+
+
+def _geometry_degrade_summary_note(block: Any) -> str:
+    """The plain sentence the human summary carries; '' when nothing degraded."""
+    total = int(block.get("total", 0) or 0) if isinstance(block, dict) else 0
+    if total <= 0:
+        return ""
+    outlined = int(block.get("delivered_as_outline", 0) or 0)
+    partial = int(block.get("partly_delivered", 0) or 0)
+    skipped = int(block.get("skipped", 0) or 0)
+    counts = ["%d drawn as plain lines" % outlined]
+    if partial:
+        counts.append("%d only partly drawn" % partial)
+    counts.append("%d not drawn" % skipped)
+    pages = sorted({int(page) for page in (block.get("pages") or [])})
+    where = (
+        " on page%s %s" % ("" if len(pages) == 1 else "s", ", ".join(str(p) for p in pages))
+        if pages
+        else ""
+    )
+    return (
+        "%d drawing item%s%s could not be built as requested (%s); this import "
+        "is not certified - see geometry_items_degraded in the import report"
+        % (total, "" if total == 1 else "s", where, ", ".join(counts))
+    )
+
+
+def _geometry_degraded_pages(opts: ImportOptions) -> List[int]:
+    """Pages a drawing item or a picture stepped down on (never certified)."""
+    pages = set()
+    for key in ("geometry_items_degraded", "picture_items_degraded"):
+        block = (getattr(opts, "_report_extra", None) or {}).get(key)
+        if isinstance(block, dict):
+            pages.update(int(page) for page in (block.get("pages") or []))
+    return sorted(pages)
+
+
+# One picture this host cannot place (its pixels cannot be written or copied
+# into FreeCAD's document cache) costs that picture, never the page or the
+# file: it is left out, the editable lines under it stay, and it is listed in
+# picture_items_degraded. Failures that leave the document unusable still
+# roll back the run.
+def _new_picture_degrade_block() -> Dict[str, Any]:
+    return {
+        "schema": "bcs.picture_items_degraded/1.0",
+        "total": 0,
+        "skipped": 0,
+        "pages": [],
+        "items": [],
+        "items_truncated": False,
+    }
+
+
+def _record_degraded_picture_item(opts: ImportOptions, entry: Dict[str, Any]) -> None:
+    """Add one picture that was not delivered to this run's degrade record."""
+    report_extra = getattr(opts, "_report_extra", None)
+    if not isinstance(report_extra, dict):
+        report_extra = opts._report_extra = {}
+    block = report_extra.setdefault("picture_items_degraded", _new_picture_degrade_block())
+    block["total"] = int(block.get("total", 0) or 0) + 1
+    block["skipped"] = int(block.get("skipped", 0) or 0) + 1
+    entry = {key: _finite_json(value) for key, value in dict(entry).items()}
+    entry["reason"] = _bounded_report_text(entry.get("reason") or "picture not delivered", 400)
+    page = int(entry.get("page_number") or 0)
+    if page and page not in block["pages"]:
+        block["pages"].append(page)
+    if len(block["items"]) < GEOMETRY_ITEM_DEGRADE_REPORT_LIMIT:
+        block["items"].append(entry)
+    else:
+        block["items_truncated"] = True
+    if block["total"] <= GEOMETRY_ITEM_DEGRADE_CONSOLE_LIMIT:
+        _warn(_bounded_report_text(
+            "PDF import: a picture (%s, drawing order %s) on page %s could not be "
+            "placed - it was left out%s. Reason: %s."
+            % (entry.get("kind"), entry.get("source_paint_order"), entry.get("page_number"),
+               "; the editable lines under it are kept" if entry.get("editable_geometry_kept") else "",
+               str(entry.get("reason")).rstrip(".")),
+            400,
+        ))
+
+
+def _picture_degrade_summary_note(block: Any) -> str:
+    """The plain sentence the human summary carries; '' when every picture arrived."""
+    total = int(block.get("total", 0) or 0) if isinstance(block, dict) else 0
+    if total <= 0:
+        return ""
+    pages = sorted({int(page) for page in (block.get("pages") or [])})
+    where = (
+        " on page%s %s" % ("" if len(pages) == 1 else "s", ", ".join(str(p) for p in pages))
+        if pages
+        else ""
+    )
+    return (
+        "%d picture%s%s could not be placed and %s left out; this import is not "
+        "certified - see picture_items_degraded in the import report"
+        % (total, "" if total == 1 else "s", where, "was" if total == 1 else "were")
     )
 
 
@@ -1804,6 +2118,33 @@ def write_import_report(
         fallback_used = True
         fallback_reason = fallback_reason or "text_items_degraded"
 
+    # A drawing item this host could not build was drawn as plain lines or
+    # left out (deliver, step down, report): counted, explained, never certified.
+    geometry_degrade_block = extra.get("geometry_items_degraded")
+    geometry_degrade_warnings = (
+        int(geometry_degrade_block.get("total", 0) or 0)
+        if isinstance(geometry_degrade_block, dict)
+        else 0
+    )
+    geometry_degrade_note = _geometry_degrade_summary_note(geometry_degrade_block)
+    if geometry_degrade_note:
+        extra["geometry_degrade_note"] = geometry_degrade_note
+    if geometry_degrade_warnings:
+        fallback_used = True
+        fallback_reason = fallback_reason or "geometry_items_degraded"
+    picture_degrade_block = extra.get("picture_items_degraded")
+    picture_degrade_warnings = (
+        int(picture_degrade_block.get("total", 0) or 0)
+        if isinstance(picture_degrade_block, dict)
+        else 0
+    )
+    picture_degrade_note = _picture_degrade_summary_note(picture_degrade_block)
+    if picture_degrade_note:
+        extra["picture_degrade_note"] = picture_degrade_note
+    if picture_degrade_warnings:
+        fallback_used = True
+        fallback_reason = fallback_reason or "picture_items_degraded"
+
     report = build_import_report(
         host_app="freecad",
         host_version=_freecad_version(),
@@ -1839,11 +2180,28 @@ def write_import_report(
             clip_fill_warnings
             + host_font_warnings
             + text_degrade_warnings
+            + geometry_degrade_warnings
+            + picture_degrade_warnings
             + glyph_code_warnings
             + len(session_degraded_pages)
         ),
         extra=extra,
     )
+
+    if geometry_degrade_warnings or picture_degrade_warnings:
+        # The shared contract gate only reads text delivery. A sheet with a
+        # drawing item drawn as plain lines or left out, or a picture left out,
+        # is not ready either.
+        contract = report.extra.get("import_contract_ready")
+        if isinstance(contract, dict):
+            checks = contract.get("checks")
+            if isinstance(checks, dict):
+                if geometry_degrade_warnings:
+                    checks["geometry_delivery"] = False
+                if picture_degrade_warnings:
+                    checks["picture_delivery"] = False
+            contract["ready"] = False
+            contract["note"] = "one or more import report contract checks need review"
 
     control_only_report = (
         text_count == 0 and reported_source_roster_valid
@@ -1866,7 +2224,8 @@ def write_import_report(
                           "item attempt history without changing the requested representation.")
         ]
 
-    if host_font_summary["note"] or text_degrade_note or control_only_report:
+    if (host_font_summary["note"] or text_degrade_note or geometry_degrade_note
+            or picture_degrade_note or control_only_report):
         # The shared core overwrites extra["font_substitution_note"] from its
         # PDF audit inside build_import_report, so the host note is appended
         # here and the human summary is rebuilt to carry it.
@@ -1889,6 +2248,11 @@ def write_import_report(
             # so the degrade sentence is appended to the rebuilt paragraph
             # instead of being published through that field.
             summary = "%s %s." % (summary.rstrip(), text_degrade_note.rstrip("."))
+        if geometry_degrade_note:
+            # Same channel rule: a separate sentence, not a font note.
+            summary = "%s %s." % (summary.rstrip(), geometry_degrade_note.rstrip("."))
+        if picture_degrade_note:
+            summary = "%s %s." % (summary.rstrip(), picture_degrade_note.rstrip("."))
         report.extra["human_summary"] = summary
         for host_font_warning in host_font_summary["console_warnings"]:
             _warn(host_font_warning)
@@ -2421,9 +2785,68 @@ def _make_shape_obj(edges: List, closed: bool, make_face: bool, fc_doc=None):
     except (RuntimeError, ValueError, TypeError) as exc:
         raise DrawingGeometryFailure("Native drawing construction failed") from exc
     obj = doc.addObject("Part::Feature", name)
-    obj.Shape = shape
-    _require_valid_drawing_shape(obj.Shape, "stored " + name)
+    try:
+        obj.Shape = shape
+        _require_valid_drawing_shape(obj.Shape, "stored " + name)
+    except DrawingGeometryFailure:
+        # Never leave the refused shape behind for the caller to trip over.
+        _discard_host_objects(doc, [obj])
+        raise
     return obj
+
+
+def _discard_host_objects(doc, objects, parent=None) -> List[str]:
+    """Remove objects one failed drawing item created; returns the names removed.
+
+    Best effort and never raises: it runs while a failure is being contained.
+    """
+    removed = []
+    for host_obj in reversed([obj for obj in (objects or []) if obj is not None]):
+        name = str(getattr(host_obj, "Name", "") or "")
+        if parent is not None:
+            try:
+                if host_obj in list(getattr(parent, "Group", []) or []):
+                    parent.removeObject(host_obj)
+            except Exception:
+                pass
+        try:
+            doc.removeObject(name)
+            removed.append(name)
+        except Exception:
+            pass
+    return removed
+
+
+def _edges_have_nonfinite_points(edges) -> bool:
+    """True when any readable edge vertex is NaN or infinite."""
+    for edge in edges:
+        try:
+            points = [vertex.Point for vertex in edge.Vertexes]
+        except (AttributeError, RuntimeError, TypeError):
+            continue
+        for point in points:
+            try:
+                coords = (float(point.x), float(point.y), float(getattr(point, "z", 0.0)))
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                return True
+            if not all(math.isfinite(value) for value in coords):
+                return True
+    return False
+
+
+def _outline_closing_edge(edges):
+    """The edge a closed source path implies between its last and first point."""
+    try:
+        first = edges[0].Vertexes[0].Point
+        last = edges[-1].Vertexes[-1].Point
+    except (AttributeError, IndexError, RuntimeError, TypeError):
+        return None
+    try:
+        if _len2d(_v(first.x, first.y), _v(last.x, last.y)) <= ZERO_TOL:
+            return None
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return _edge_line(last, first)
 
 
 def _attach_source_fill_boundary(obj, proof, page_num, page_h, opts, scale, pdf_path):
@@ -6257,7 +6680,11 @@ def _persist_text3d_source_metadata(
     target_advance_fc: float,
     horizontal_scale: float,
 ) -> None:
-    """Keep the exact source span and geometry recipe editable after save/reopen."""
+    """Record the exact source span and geometry recipe for save/reopen.
+
+    The values are provenance only: changing them would not reshape the solid
+    letters, so each one is shown read-only in the property editor.
+    """
     if not isinstance(source_text, str) or not source_text or "\x00" in source_text:
         raise ValueError("3D Text source metadata is invalid")
     if not isinstance(font_path, str) or not font_path:
@@ -6288,11 +6715,15 @@ def _persist_text3d_source_metadata(
             "exact_glyph_solid_compound_v1",
         ),
     )
+    set_editor_mode = getattr(obj, "setEditorMode", None)
     for property_kind, property_name, property_value in values:
         if property_name not in properties and callable(add_property):
             add_property(property_kind, property_name, "PDF Import")
             properties.add(property_name)
         setattr(obj, property_name, property_value)
+        if callable(set_editor_mode):
+            # 1 = read-only in the property editor; Python can still set it.
+            set_editor_mode(property_name, 1)
 
 
 def _closed_text3d_wires(wire_shapes: List[Any]) -> List[Any]:
@@ -6363,10 +6794,16 @@ class _Text3DOutlineMemo:
     def __init__(self):
         self._cache: Dict[Tuple[str, str], Tuple[Any, float, int]] = {}
         self._solid_cache: Dict[tuple, Tuple[Any, float, float, float]] = {}
+        # Glyph solids after one character's font-matrix linear part (scale,
+        # rotation, shear; no translation), each proven once: see
+        # _verified_text3d_linear_glyph.
+        self._linear_cache: Dict[tuple, Tuple[Any, float, int, Tuple[float, ...]]] = {}
         self.hits = 0
         self.misses = 0
         self.solid_hits = 0
         self.solid_misses = 0
+        self.linear_hits = 0
+        self.linear_misses = 0
         self.evictions = 0
         self.last_solid_volume = 0.0
         self.last_solid_count = 0
@@ -6463,6 +6900,18 @@ class _Text3DOutlineMemo:
             float(verified_advance),
         )
 
+    def get_or_build_linear(self, key, builder):
+        """Return (linear_shape, verified_volume, solid_count, bounds) for key."""
+        cached = self._linear_cache.get(key)
+        if cached is not None:
+            self.linear_hits += 1
+            return cached
+        self.linear_misses += 1
+        built = builder()
+        self._evict_oldest_if_full(self._linear_cache)
+        self._linear_cache[key] = built
+        return built
+
     def snapshot_stats(self) -> Dict[str, int]:
         return {
             "hits": int(self.hits),
@@ -6470,11 +6919,14 @@ class _Text3DOutlineMemo:
             "evictions": int(self.evictions),
             "solid_hits": int(self.solid_hits),
             "solid_misses": int(self.solid_misses),
+            "linear_hits": int(self.linear_hits),
+            "linear_misses": int(self.linear_misses),
         }
 
     def clear(self) -> None:
         self._cache.clear()
         self._solid_cache.clear()
+        self._linear_cache.clear()
 
 
 _ACTIVE_TEXT3D_OUTLINE_MEMO: Optional[_Text3DOutlineMemo] = None
@@ -7010,93 +7462,190 @@ def _source_em_text3d_pen_advance(source_text, font_path, font_size_fc):
     return advance
 
 
+def _text3d_linear_glyph_key(text, font_path, font_size_fc, depth, baseline, up):
+    """Memo key for one glyph solid under one character's font-matrix linear part.
+
+    Size and depth follow the source-solid memo (9 decimals). The linear terms
+    are rounded to 1e-12, which merges float noise only; the stored shape is
+    built from the first exact matrix seen with that key.
+    """
+    return (
+        str(text),
+        str(font_path),
+        round(float(font_size_fc), 9),
+        round(float(depth), 9),
+        tuple(round(float(value), 12) for value in (baseline[0], baseline[1], up[0], up[1])),
+    )
+
+
+def _text3d_solid_mass_center(shape):
+    """Volume-weighted centre of a shape's solids, measured once per solid.
+
+    OCC exposes a mass center on each Solid, not on a Compound. Derive the
+    centre from live solids so compound glyphs (i, punctuation, disconnected
+    font contours) receive the same check. Each property access runs an OCC
+    mass calculation, so each solid's measurements are read exactly once.
+    """
+    masses = [(float(solid.Volume), solid.CenterOfMass) for solid in shape.Solids]
+    total = sum(volume for volume, _center in masses)
+    if not math.isfinite(total) or total <= 0.0:
+        raise RuntimeError("3D source character has no positive solid mass")
+    return FreeCAD.Vector(*(sum(volume * getattr(center, axis)
+        for volume, center in masses) / total
+        for axis in ("x", "y", "z")))
+
+
+def _verified_text3d_linear_glyph(source_shape, baseline, up):
+    """Apply a character's font-matrix linear part and prove it, once per key.
+
+    Returns (linear_shape, verified_volume, solid_count, bounds). The proofs
+    are the ones every character used to repeat: solid count, volume-weighted
+    mass centre, every vertex, and the affine volume. Translation is applied
+    afterwards per character (see _text3d_translated_glyph_copy); a pure
+    translation cannot change any of these measurements.
+    """
+    matrix = FreeCAD.Matrix()
+    matrix.A11, matrix.A21 = baseline[0], baseline[1]
+    matrix.A12, matrix.A22 = up[0], up[1]
+    matrix.A14, matrix.A24, matrix.A34 = 0.0, 0.0, 0.0
+    # Always run transformGeometry, even for an identity linear part: it is
+    # what turns the glyph faces into the BSpline surfaces main has always
+    # delivered (and that the page-edge clip proof accepts).
+    transformed = source_shape.transformGeometry(matrix)
+    source_solids = _shape_solid_count(source_shape)
+    if (transformed is None or transformed.isNull()
+            or _shape_solid_count(transformed) != source_solids):
+        raise RuntimeError("3D source character transform lost solid geometry")
+
+    def verify_point(source_point, actual_point):
+        expected = (baseline[0] * source_point.x + up[0] * source_point.y,
+                    baseline[1] * source_point.x + up[1] * source_point.y,
+                    source_point.z)
+        actual = (actual_point.x, actual_point.y, actual_point.z)
+        if any(not math.isfinite(value) for value in actual) or any(
+            not math.isclose(a, b, rel_tol=1e-10, abs_tol=1e-8)
+            for a, b in zip(actual, expected, strict=True)
+        ):
+            raise RuntimeError("3D source character affine coordinates were not preserved")
+
+    verify_point(_text3d_solid_mass_center(source_shape),
+                 _text3d_solid_mass_center(transformed))
+    source_vertices, target_vertices = source_shape.Vertexes, transformed.Vertexes
+    if len(source_vertices) != len(target_vertices):
+        raise RuntimeError("3D source character transform changed vertex inventory")
+    for source_vertex, target_vertex in zip(source_vertices, target_vertices, strict=True):
+        verify_point(source_vertex.Point, target_vertex.Point)
+    determinant = baseline[0] * up[1] - baseline[1] * up[0]
+    expected_volume = float(source_shape.Volume) * abs(determinant)
+    if not math.isclose(float(transformed.Volume), expected_volume,
+                        rel_tol=1e-7, abs_tol=1e-9):
+        raise RuntimeError("3D source character affine volume was not preserved")
+    box = transformed.BoundBox
+    bounds = tuple(float(getattr(box, name)) for name in
+                   ("XMin", "YMin", "ZMin", "XMax", "YMax", "ZMax"))
+    if not all(math.isfinite(value) for value in bounds):
+        raise RuntimeError("3D source character bounds are not finite")
+    return transformed, expected_volume, source_solids, bounds
+
+
+def _text3d_translated_glyph_copy(linear_shape, origin):
+    """Independent copy of a proven glyph solid, moved to the character origin.
+
+    The translation is baked into the copied geometry (no OCC location), so
+    each character gets exactly the poles a single full-matrix
+    transformGeometry produces.
+    """
+    matrix = FreeCAD.Matrix()
+    matrix.A11, matrix.A21 = 1.0, 0.0
+    matrix.A12, matrix.A22 = 0.0, 1.0
+    matrix.A14, matrix.A24, matrix.A34 = origin
+    transformed = getattr(linear_shape, "transformed", None)
+    if callable(transformed):
+        return transformed(matrix, True)
+    placed = linear_shape.copy()
+    placed.transformShape(matrix, True)
+    return placed
+
+
 def _build_positioned_text3d_compound_shape(
     *, source_text, font_path, font_size_fc, depth, target_advance_fc,
     source_character_layout,
 ):
-    """Keep each native solid glyph at its actual PDF character transform."""
+    """Keep each native solid glyph at its actual PDF character transform.
+
+    Each character's matrix is split into its linear part (font scale,
+    rotation, shear) and its origin. The glyph solid under a given linear
+    part is built and proven once per import (memo key: character, font,
+    size, depth, linear terms); every character then gets an independent
+    copy moved to its own origin, checked by its bounding-box shift.
+    """
     characters = source_character_layout["characters"]
     if "".join(row["text"] for row in characters) != source_text:
         raise ValueError("3D source character layout is incomplete")
+    memo = _ACTIVE_TEXT3D_OUTLINE_MEMO
+    local_linear: Dict[tuple, tuple] = {}
+
+    def linear_glyph(key, builder):
+        if memo is not None:
+            return memo.get_or_build_linear(key, builder)
+        cached = local_linear.get(key)
+        if cached is None:
+            cached = local_linear[key] = builder()
+        return cached
+
     shapes = []
     expected_solids = 0
     expected_total_volume = 0.0
     for row in characters:
         if row["text"].isspace():
             continue
-        try:
-            em_advance = _source_em_text3d_pen_advance(
-                row["text"], font_path, font_size_fc)
-            baked = _build_exact_text3d_compound_shape(
-                source_text=row["text"], font_path=font_path,
-                font_size_fc=font_size_fc, depth=depth,
-                target_advance_fc=em_advance,
-            )
-        except Text3DExactFontOutlinesUnavailable:
-            # One empty glyph is not impossibility proof for the whole item.
-            # Recheck the complete source string before the existing verified
-            # ShapeString/representation ladder is allowed to see that proof.
-            _build_exact_text3d_outline_template(source_text, font_path)
-            raise RuntimeError("isolated source glyph outline is unavailable") from None
-        source_shape = baked[0]
-        expected_solids += _shape_solid_count(source_shape)
         baseline_scale = float(row["baseline_scale"])
         up_scale = float(row["up_scale"])
-        if any(not math.isfinite(value) or value <= 0.0
-               for value in (baseline_scale, up_scale)):
-            raise ValueError("3D source character matrix scale is invalid")
         baseline = [component * baseline_scale for component in row["baseline_axis"]]
         up = [component * up_scale for component in row["up_axis"]]
-        matrix = FreeCAD.Matrix()
-        matrix.A11, matrix.A21 = baseline[0], baseline[1]
-        matrix.A12, matrix.A22 = up[0], up[1]
-        matrix.A14, matrix.A24, matrix.A34 = row["local_origin"]
-        transformed = source_shape.transformGeometry(matrix)
-        if (transformed is None or transformed.isNull()
-                or _shape_solid_count(transformed) != _shape_solid_count(source_shape)):
+
+        def build_linear(text=row["text"], baseline=baseline, up=up,
+                         scales=(baseline_scale, up_scale)):
+            try:
+                em_advance = _source_em_text3d_pen_advance(
+                    text, font_path, font_size_fc)
+                baked = _build_exact_text3d_compound_shape(
+                    source_text=text, font_path=font_path,
+                    font_size_fc=font_size_fc, depth=depth,
+                    target_advance_fc=em_advance,
+                )
+            except Text3DExactFontOutlinesUnavailable:
+                # One empty glyph is not impossibility proof for the whole item.
+                # Recheck the complete source string before the existing verified
+                # ShapeString/representation ladder is allowed to see that proof.
+                _build_exact_text3d_outline_template(source_text, font_path)
+                raise RuntimeError("isolated source glyph outline is unavailable") from None
+            if any(not math.isfinite(value) or value <= 0.0 for value in scales):
+                raise ValueError("3D source character matrix scale is invalid")
+            return _verified_text3d_linear_glyph(baked[0], baseline, up)
+
+        linear_shape, glyph_volume, glyph_solids, linear_bounds = linear_glyph(
+            _text3d_linear_glyph_key(row["text"], font_path, font_size_fc, depth,
+                                     baseline, up),
+            build_linear,
+        )
+        origin = tuple(float(value) for value in row["local_origin"])
+        placed = _text3d_translated_glyph_copy(linear_shape, origin)
+        if (placed is None or placed.isNull()
+                or _shape_solid_count(placed) != glyph_solids):
             raise RuntimeError("3D source character transform lost solid geometry")
-        def expected_point(point, baseline=baseline, up=up, origin=tuple(row["local_origin"])):
-            return (baseline[0] * point.x + up[0] * point.y + origin[0],
-                    baseline[1] * point.x + up[1] * point.y + origin[1],
-                    point.z + origin[2])
-
-        def verify_point(source_point, actual_point):
-            expected = expected_point(source_point)
-            actual = (actual_point.x, actual_point.y, actual_point.z)
-            if any(not math.isfinite(value) for value in actual) or any(
-                not math.isclose(a, b, rel_tol=1e-10, abs_tol=1e-8)
-                for a, b in zip(actual, expected, strict=True)
-            ):
-                raise RuntimeError("3D source character affine coordinates were not preserved")
-
-        # OCC exposes a mass center on each Solid, not on a Compound. Derive
-        # the volume-weighted center from live solids so compound glyphs (i,
-        # punctuation, disconnected font contours) receive the same check.
-        def solid_mass_center(shape):
-            # Each property access runs an OCC mass calculation. Reuse those
-            # exact measurements for all three axes instead of recomputing
-            # them seven times per solid; keep the summation order unchanged.
-            masses = [(float(solid.Volume), solid.CenterOfMass) for solid in shape.Solids]
-            total = sum(volume for volume, _center in masses)
-            if not math.isfinite(total) or total <= 0.0:
-                raise RuntimeError("3D source character has no positive solid mass")
-            return FreeCAD.Vector(*(sum(volume * getattr(center, axis)
-                for volume, center in masses) / total
-                for axis in ("x", "y", "z")))
-
-        verify_point(solid_mass_center(source_shape), solid_mass_center(transformed))
-        source_vertices, target_vertices = source_shape.Vertexes, transformed.Vertexes
-        if len(source_vertices) != len(target_vertices):
-            raise RuntimeError("3D source character transform changed vertex inventory")
-        for source_vertex, target_vertex in zip(source_vertices, target_vertices, strict=True):
-            verify_point(source_vertex.Point, target_vertex.Point)
-        determinant = baseline[0] * up[1] - baseline[1] * up[0]
-        expected_volume = float(source_shape.Volume) * abs(determinant)
-        if not math.isclose(float(transformed.Volume), expected_volume,
-                            rel_tol=1e-7, abs_tol=1e-9):
-            raise RuntimeError("3D source character affine volume was not preserved")
-        expected_total_volume += expected_volume
-        shapes.append(transformed)
+        box = placed.BoundBox
+        placed_bounds = tuple(float(getattr(box, name)) for name in
+                              ("XMin", "YMin", "ZMin", "XMax", "YMax", "ZMax"))
+        shifts = origin + origin
+        if any(not math.isfinite(actual) or not math.isclose(
+                actual, expected + shift, rel_tol=0.0, abs_tol=1e-9)
+               for actual, expected, shift in zip(
+                   placed_bounds, linear_bounds, shifts, strict=True)):
+            raise RuntimeError("3D source character affine coordinates were not preserved")
+        expected_solids += glyph_solids
+        expected_total_volume += glyph_volume
+        shapes.append(placed)
     if not shapes or expected_solids <= 0:
         raise RuntimeError("3D source character layout produced no solids")
     compound = Part.Compound(shapes)
@@ -7112,6 +7661,25 @@ def _build_positioned_text3d_compound_shape(
     # Each glyph retains its own font matrix and origin. The declared source
     # advance describes pen positions; it never stretches the glyph ink.
     return compound, 1.0, target_advance_fc, target_advance_fc, volume, expected_solids
+
+
+def _shape_keeps_verified_volume(shape, verified_shape, verified_volume) -> bool:
+    """True when ``shape`` still carries the already-verified solid volume.
+
+    A host shape that shares the verified OCC geometry (isPartner: same
+    geometry, any placement) has exactly the verified volume, so the costly
+    re-integration of every glyph solid is skipped. Anything else is
+    measured again.
+    """
+    is_partner = getattr(shape, "isPartner", None)
+    if verified_shape is not None and callable(is_partner):
+        try:
+            if bool(is_partner(verified_shape)):
+                return True
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+    volume = float(getattr(shape, "Volume", 0.0) or 0.0)
+    return math.isclose(volume, float(verified_volume), rel_tol=1e-7, abs_tol=1e-9)
 
 
 def _create_verified_compound_text3d_entity(
@@ -7182,7 +7750,7 @@ def _create_verified_compound_text3d_entity(
             raise RuntimeError("Part::Feature did not preserve verified solid 3D text")
         if source_character_layout is not None and (
             _shape_solid_count(shape) != baked_solid_count
-            or not math.isclose(float(shape.Volume), baked_volume, rel_tol=1e-7, abs_tol=1e-9)
+            or not _shape_keeps_verified_volume(shape, compound, baked_volume)
         ):
             raise RuntimeError("Part::Feature changed positioned source glyph geometry")
         text_group.addObject(host_obj)
@@ -8941,6 +9509,9 @@ def _deliver_text_item_3d(
             verified_advance_fc,
         ) = created[:4]
         baked_volume = float(created[4]) if len(created) > 4 else 0.0
+        # The creator verified this host shape against the baked compound.
+        # Keep a handle so the final check can prove it is still that shape.
+        verified_host_shape = getattr(compound_entity, "Shape", None)
         add_owned(compound_entity)
         stage = "compound_source_metadata"
         _persist_text3d_source_metadata(
@@ -9013,12 +9584,11 @@ def _deliver_text_item_3d(
             volume = float(getattr(shape, "Volume", 0.0) or 0.0) if shape is not None else 0.0
         if source_character_layout is not None:
             actual_solid_count = _shape_solid_count(shape) if shape is not None else 0
-            actual_volume = float(getattr(shape, "Volume", 0.0) or 0.0)
-            if actual_solid_count != solid_count or not math.isclose(
-                actual_volume, volume, rel_tol=1e-7, abs_tol=1e-9
+            if actual_solid_count != solid_count or not _shape_keeps_verified_volume(
+                shape, verified_host_shape, volume
             ):
                 raise RuntimeError("assigned positioned source glyph geometry changed")
-            solid_count, volume = actual_solid_count, actual_volume
+            solid_count = actual_solid_count
         live_object = doc.getObject(compound_id) if compound_id else None
         metadata_verified = bool(
             getattr(compound_entity, "PDFSourceText", None) == source_text
@@ -10700,6 +11270,12 @@ def _render_canonical_text_items(
     profile = getattr(opts, "_active_page_profile", {}) or {}
     drawing_units = int(profile.get("drawing_operations", 0) or 0)
     total_units = int(profile.get("total_units", 0) or 0)
+    # 3D Text builds solid letters and can take most of a second per item, so
+    # its progress (and the Cancel check) also ticks every quarter second
+    # instead of only every 25 items.
+    progress_label = "Building 3D text" if requested == "3d_text" else "Importing text"
+    timed_progress = requested == "3d_text"
+    last_progress_at = time.monotonic()
     for item_index, item in enumerate(items):
         if item["source_item_id"] in control_omissions:
             # Preserve the complete roster without claiming a native object or
@@ -10707,12 +11283,16 @@ def _render_canonical_text_items(
             delivered_source_ids.append(item["source_item_id"])
             text_characters_done += len(item["text"])
             continue
-        if getattr(opts, "progress_callback", None) and item_index % 25 == 0:
+        if getattr(opts, "progress_callback", None) and (
+            item_index % 25 == 0
+            or (timed_progress and time.monotonic() - last_progress_at >= 0.25)
+        ):
+            last_progress_at = time.monotonic()
             _emit_progress(
                 opts,
                 page_number=int(page_num),
                 stage="text",
-                label=f"Importing text {item_index}/{len(items)}",
+                label=f"{progress_label} {item_index}/{len(items)}",
                 page_percent=86 + int(8 * item_index / max(len(items), 1)),
                 completed_units=min(
                     total_units,
@@ -10765,7 +11345,7 @@ def _render_canonical_text_items(
             opts,
             page_number=int(page_num),
             stage="text",
-            label=f"Importing text {len(items)}/{len(items)}",
+            label=f"{progress_label} {len(items)}/{len(items)}",
             page_percent=94,
             completed_units=min(
                 total_units,
@@ -12062,10 +12642,10 @@ def import_pdf_page(pdf_path: str, page_num: int = 1,
                     autofit: bool = True):
     """Import a single PDF page into the active FreeCAD document."""
     _cancel_import_view_reframe()
-    if opts is None:
-        opts = ImportOptions(ignore_images=not IMAGE_WB)
-    _reset_import_run_state(opts)
     fc_doc = _ensure_doc()  # Store reference — don't rely on ActiveDocument later
+    if opts is None:
+        opts = ImportOptions(ignore_images=not _image_import_available(fc_doc))
+    _reset_import_run_state(opts)
 
     # This entry point may run inside a caller-owned transaction.  Do not open
     # or abort it: remove only objects created by this page, just as the
@@ -12116,6 +12696,9 @@ def import_pdf_page(pdf_path: str, page_num: int = 1,
     if clip_fill_warning:
         _warn(clip_fill_warning)
     _emit_glyph_code_console_line(opts)
+    geometry_degrade_overflow = _geometry_degrade_console_overflow_line(opts)
+    if geometry_degrade_overflow:
+        _warn(geometry_degrade_overflow)
 
     if autofit:
         _autofit_import_view(fc_doc)
@@ -12746,10 +13329,11 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                         pass
             _batch_shapes[key] = []
 
-    def _add_to_batch(shape, parent, stroke_rgb, fill_rgb, width, dashes):
+    def _add_to_batch(shape, parent, stroke_rgb, fill_rgb, width, dashes, *, validated=False):
         """Add a shape to the batch or create immediately if batching disabled."""
         nonlocal obj_count
-        _require_valid_drawing_shape(shape, "batch input")
+        if not validated:
+            _require_valid_drawing_shape(shape, "batch input")
         if not _batch_size or path_group.get("seqno") in image_order_strokes:
             # No batching — original behavior
             obj = fc_doc.addObject("Part::Feature", "Wire")
@@ -12771,6 +13355,85 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         _batch_shapes[style_key].append(shape)
         if len(_batch_shapes[style_key]) >= _batch_size:
             _flush_batch(style_key, force=True)
+
+    # ── One bad drawing item: step down, never lose the page ──
+    # Only DrawingGeometryFailure raised for one item is contained here. Host
+    # faults (RuntimeError/OSError outside these sites) still roll back the run.
+    def _step_down_failed_drawing(edges, is_closed, parent, stroke_rgb, fill_rgb,
+                                  width, dashes):
+        """Deliver one drawing item this host could not build as plain lines.
+
+        The line colour is the stroke's, or the fill's when the path has no
+        stroke. Returns the new object's name, or None when even plain lines
+        cannot be built (non-finite source points, or the outline is refused):
+        the item is then left out. Never raises a geometry error.
+        """
+        nonlocal obj_count
+        line_rgb = stroke_rgb if stroke_rgb is not None else fill_rgb
+        created = []
+        try:
+            outline = [edge for edge in (edges or []) if edge is not None]
+            if not outline or _edges_have_nonfinite_points(outline):
+                return None
+            if is_closed:
+                closer = _outline_closing_edge(outline)
+                if closer is not None:
+                    outline.append(closer)
+            shape = _require_valid_drawing_shape(Part.makeCompound(outline), "step-down outline")
+            obj = fc_doc.addObject("Part::Feature", "StepDownOutline")
+            created.append(obj)
+            obj.Shape = shape
+            _require_valid_drawing_shape(obj.Shape, "stored step-down outline")
+            _bind_image_order_stroke(obj, path_group.get("seqno"))
+            _apply_style(obj, line_rgb, None, width, dashes, opts)
+            parent.addObject(obj)
+        except (DrawingGeometryFailure, RuntimeError, ValueError, TypeError, AttributeError):
+            _discard_host_objects(fc_doc, created, parent)
+            return None
+        obj_count += 1
+        return obj.Name
+
+    def _note_item_failure(record, kind, error):
+        """Accumulate one failed part of the current drawing item."""
+        if record is None:
+            record = {"kind": kind, "reasons": [], "parts_failed": 0,
+                      "parts_not_drawn": 0, "created": []}
+        record["parts_failed"] += 1
+        reason = _geometry_failure_reason(error)
+        if reason not in record["reasons"]:
+            record["reasons"].append(reason)
+        return record
+
+    def _step_down_item_part(record, kind, error, edges, is_closed, parent,
+                             stroke_rgb, fill_rgb, width, dashes):
+        """One part of the current item failed: draw it as plain lines, or note it."""
+        record = _note_item_failure(record, kind, error)
+        name = _step_down_failed_drawing(edges, is_closed, parent, stroke_rgb, fill_rgb,
+                                         width, dashes)
+        if name:
+            record["created"].append(name)
+        else:
+            record["parts_not_drawn"] += 1
+        return record
+
+    def _finish_item_step_down(record):
+        """List the current drawing item once, however many of its parts failed."""
+        created = list(record["created"])
+        if not created:
+            delivered = "skipped"
+        elif record["parts_not_drawn"]:
+            delivered = "partial"
+        else:
+            delivered = "outline"
+        _record_degraded_geometry_item(opts, {
+            "page_number": int(page_num),
+            "source_paint_order": _finite_json(path_group.get("seqno")),
+            "kind": record["kind"],
+            "reason": _bounded_report_text("; ".join(record["reasons"]), 600),
+            "delivered": delivered,
+            "created_entity_ids": created,
+            "parts_failed": int(record["parts_failed"]),
+        })
 
     # ── Progress update frequency ──
     # On heavy pages, throttle to every 500 paths instead of 100.
@@ -12917,12 +13580,18 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         # Filling each contour independently would erase even-odd counters and
         # misinterpret nonzero winding. Keep original fs stroke paint separate.
         compound_fill_delivered = False
+        # A drawing item that steps down: its failed parts and what was drawn.
+        item_degrade = None
+        # The compound fill could not be built: draw its outline instead.
+        compound_step_down = False
         if ((opts.hatch_to_faces or opts.make_faces) and fill is not None
                 and path_group.get("seqno") not in image_order_strokes):
             try:
                 from .PDFSourceFill import SourceFillError, source_contours, build_compound_fill
             except ImportError:
                 from PDFSourceFill import SourceFillError, source_contours, build_compound_fill
+            compound_owned = []
+            compound_counted = 0
             try:
                 contours = source_contours(path_group, _parse_rect)
                 if contours is not None and len(contours) > 1:
@@ -12952,6 +13621,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     fill_receipt["created_entity_ids"] = []
                     if shape is not None:
                         obj = fc_doc.addObject("Part::Feature", "SourceCompoundFill")
+                        compound_owned.append(obj)
                         obj.Shape = shape
                         _require_valid_drawing_shape(obj.Shape, "stored source compound fill")
                         _apply_style(obj, None, fill_rgb, None, None, opts)
@@ -12962,16 +13632,19 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                         if json.loads(obj.PDFSourceCompoundFillJSON) != fill_receipt:
                             raise DrawingGeometryFailure("Compound fill provenance was not retained")
                         obj_count += 1
+                        compound_counted += 1
                         if _model3d_should_extrude(
                                 opts, is_closed=True, fill=fill,
                                 face_area=float(shape.Area), page_area=page_area_units):
                             solid = fc_doc.addObject("Part::Feature", "PDF_3D_Solid")
+                            compound_owned.append(solid)
                             solid.Shape = shape.copy()
                             if not _extrude_model3d_obj(solid, opts):
                                 raise DrawingGeometryFailure("Compound source fill extrusion failed")
                             _apply_style(solid, None, fill_rgb, None, None, opts)
                             parent.addObject(solid)
                             obj_count += 1
+                            compound_counted += 1
                             opts._model3d_solids = int(getattr(opts, "_model3d_solids", 0) or 0) + 1
                     report_extra = dict(getattr(opts, "_report_extra", {}) or {})
                     report_extra.setdefault("source_compound_fill_delivery", []).append(fill_receipt)
@@ -12982,14 +13655,28 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     # Original source edges below retain stroke width, dashes,
                     # closure and paint. A compound fs fill is never repeated.
                     fill_rgb = None
-            except SourceFillError as exc:
-                raise DrawingGeometryFailure("Compound source fill delivery failed: %s" % exc) from exc
+            except (SourceFillError, DrawingGeometryFailure) as exc:
+                # One compound fill this host cannot build costs its fill, not
+                # the page: what it created is removed, no fill receipt is kept,
+                # and the source edges below draw its outline instead.
+                failure = exc
+                if isinstance(exc, SourceFillError):
+                    failure = DrawingGeometryFailure("Compound source fill delivery failed: %s" % exc)
+                    failure.__cause__ = exc
+                _discard_host_objects(fc_doc, compound_owned, parent)
+                obj_count -= compound_counted
+                compound_step_down = True
+                item_degrade = _note_item_failure(item_degrade, "compound_fill", failure)
+                if stroke_rgb is None:
+                    # The outline carries the fill's colour as its line colour.
+                    stroke_rgb = fill_rgb
+                fill_rgb = None
 
         # Cancel only a proved zero-area retraced fill bridge. Keep the source
         # path dictionary intact and construct its retained boundary exactly.
         source_fill_proof = None
         source_open_stroke_edges = None
-        if (not compound_fill_delivered
+        if (not compound_fill_delivered and not compound_step_down
                 and (opts.hatch_to_faces or (opts.make_faces and close_path))
                 and path_group.get("seqno") not in image_order_strokes):
             items, source_fill_proof = _source_fill_without_retraced_bridge(path_group)
@@ -13180,7 +13867,13 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     if any(edge is None for edge in edges):
                         raise ValueError("Quadrilateral source edge was not built")
                 except (RuntimeError, AttributeError, TypeError, ValueError) as exc:
-                    raise DrawingGeometryFailure("Native source quadrilateral construction failed") from exc
+                    # A quadrilateral with unusable corners has nothing to draw
+                    # as lines either: it is left out and listed, never invented.
+                    failure = DrawingGeometryFailure("Native source quadrilateral construction failed")
+                    failure.__cause__ = exc
+                    item_degrade = _note_item_failure(item_degrade, "quad", failure)
+                    item_degrade["parts_not_drawn"] += 1
+                    continue
                 wires_edges.append((edges, True))
 
             elif kind == "re":  # rectangle
@@ -13228,66 +13921,98 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             want_face = (source_fill_proof is not None
                          or (opts.hatch_to_faces and fill is not None)
                          or (opts.make_faces and is_closed))
-            if compound_fill_delivered or source_quad_stroke:
+            if compound_fill_delivered or source_quad_stroke or compound_step_down:
                 want_face = False
             if path_group.get("seqno") in image_order_strokes:
                 # Source-qualified later paint is a stroke; an invisible fs
                 # fill must not acquire an opaque native face above the image.
                 want_face = False
-            if _batch_size and not want_face:
+            if _batch_size and not want_face and not compound_step_down:
                 # Batch wires into compounds to reduce GDI handle count
                 try:
-                    wire = Part.Wire(edges)
-                    if is_closed and not wire.isClosed():
-                        if wire.Vertexes:
-                            p0 = wire.Vertexes[0].Point
-                            pN = wire.Vertexes[-1].Point
-                            if _len2d(_v(p0.x, p0.y), _v(pN.x, pN.y)) > ZERO_TOL:
-                                closer = Part.LineSegment(pN, p0).toShape()
-                                wire = Part.Wire(edges + [closer])
-                    _add_to_batch(wire, parent, stroke_rgb, fill_rgb, width, dashes)
+                    try:
+                        wire = Part.Wire(edges)
+                        if is_closed and not wire.isClosed():
+                            if wire.Vertexes:
+                                p0 = wire.Vertexes[0].Point
+                                pN = wire.Vertexes[-1].Point
+                                if _len2d(_v(p0.x, p0.y), _v(pN.x, pN.y)) > ZERO_TOL:
+                                    closer = Part.LineSegment(pN, p0).toShape()
+                                    wire = Part.Wire(edges + [closer])
+                    except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
+                        raise DrawingGeometryFailure("Native drawing stroke construction failed") from exc
+                    _require_valid_drawing_shape(wire, "batch input")
+                except DrawingGeometryFailure as exc:
+                    item_degrade = _step_down_item_part(
+                        item_degrade, "stroke", exc, edges, is_closed, parent,
+                        stroke_rgb, fill_rgb, width, dashes)
+                    continue
+                try:
+                    _add_to_batch(wire, parent, stroke_rgb, fill_rgb, width, dashes, validated=True)
                 except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
                     raise DrawingGeometryFailure("Native drawing stroke construction failed") from exc
             else:
-                # Faces and non-batchable shapes: create individually
-                obj = _make_shape_obj(edges, False if source_fill_proof is not None else is_closed,
-                                      make_face=want_face, fc_doc=fc_doc)
-                if obj is not None:
-                    if source_fill_proof is not None:
-                        _attach_source_fill_boundary(obj, source_fill_proof, page_num, page_h,
-                                                     opts, scale, pdf_path)
-                    _bind_image_order_stroke(obj, path_group.get("seqno"))
-                    implicit_fill = (source_fill_proof is not None
-                                     and source_fill_proof["policy"] == "close_connected_pdf_fill")
-                    _apply_style(obj, None if implicit_fill else stroke_rgb, fill_rgb,
-                                 None if implicit_fill else width, None if implicit_fill else dashes, opts)
-                    parent.addObject(obj)
-                    obj_count += 1
-                    if source_open_stroke_edges is not None:
-                        stroke_obj = _make_shape_obj(source_open_stroke_edges, False, False, fc_doc)
-                        stroke_proof = dict(source_fill_proof, policy="retain_open_pdf_stroke")
-                        _attach_source_fill_boundary(stroke_obj, stroke_proof, page_num, page_h,
-                                                     opts, scale, pdf_path)
-                        _apply_style(stroke_obj, stroke_rgb, None, width, dashes, opts)
-                        parent.addObject(stroke_obj)
+                # Faces and non-batchable shapes: create individually. Every
+                # object this item creates is owned, so a refused item leaves
+                # nothing half-built behind before it steps down.
+                owned = []
+                owned_counted = 0
+                try:
+                    obj = _make_shape_obj(edges, False if source_fill_proof is not None else is_closed,
+                                          make_face=want_face, fc_doc=fc_doc)
+                    if obj is not None:
+                        owned.append(obj)
+                        if source_fill_proof is not None:
+                            _attach_source_fill_boundary(obj, source_fill_proof, page_num, page_h,
+                                                         opts, scale, pdf_path)
+                        _bind_image_order_stroke(obj, path_group.get("seqno"))
+                        implicit_fill = (source_fill_proof is not None
+                                         and source_fill_proof["policy"] == "close_connected_pdf_fill")
+                        _apply_style(obj, None if implicit_fill else stroke_rgb, fill_rgb,
+                                     None if implicit_fill else width, None if implicit_fill else dashes, opts)
+                        parent.addObject(obj)
                         obj_count += 1
-                    try:
-                        face_area = float(getattr(obj.Shape, "Area", 0.0) or 0.0)
-                    except (AttributeError, TypeError, ValueError):
-                        face_area = 0.0
-                    if not compound_fill_delivered and _model3d_should_extrude(
-                        opts,
-                        is_closed=is_closed,
-                        fill=fill,
-                        face_area=abs(face_area),
-                        page_area=page_area_units,
-                    ):
-                        solid = _make_model3d_obj(edges, fc_doc=fc_doc)
-                        if solid is not None and _extrude_model3d_obj(solid, opts):
-                            _apply_style(solid, stroke_rgb, fill_rgb, width, dashes, opts)
-                            parent.addObject(solid)
+                        owned_counted += 1
+                        if source_open_stroke_edges is not None:
+                            stroke_obj = _make_shape_obj(source_open_stroke_edges, False, False, fc_doc)
+                            owned.append(stroke_obj)
+                            stroke_proof = dict(source_fill_proof, policy="retain_open_pdf_stroke")
+                            _attach_source_fill_boundary(stroke_obj, stroke_proof, page_num, page_h,
+                                                         opts, scale, pdf_path)
+                            _apply_style(stroke_obj, stroke_rgb, None, width, dashes, opts)
+                            parent.addObject(stroke_obj)
                             obj_count += 1
-                            opts._model3d_solids = int(getattr(opts, "_model3d_solids", 0) or 0) + 1
+                            owned_counted += 1
+                        try:
+                            face_area = float(getattr(obj.Shape, "Area", 0.0) or 0.0)
+                        except (AttributeError, TypeError, ValueError):
+                            face_area = 0.0
+                        if not compound_fill_delivered and not compound_step_down and _model3d_should_extrude(
+                            opts,
+                            is_closed=is_closed,
+                            fill=fill,
+                            face_area=abs(face_area),
+                            page_area=page_area_units,
+                        ):
+                            solid = _make_model3d_obj(edges, fc_doc=fc_doc)
+                            if solid is not None and _extrude_model3d_obj(solid, opts):
+                                _apply_style(solid, stroke_rgb, fill_rgb, width, dashes, opts)
+                                parent.addObject(solid)
+                                obj_count += 1
+                                opts._model3d_solids = int(getattr(opts, "_model3d_solids", 0) or 0) + 1
+                except DrawingGeometryFailure as exc:
+                    _discard_host_objects(fc_doc, owned, parent)
+                    obj_count -= owned_counted
+                    kind = ("fill" if fill is not None else "face") if want_face else "stroke"
+                    item_degrade = _step_down_item_part(
+                        item_degrade, kind, exc, edges, is_closed, parent,
+                        stroke_rgb, fill_rgb, width, dashes)
+                else:
+                    if compound_step_down and obj is not None:
+                        item_degrade["created"].append(obj.Name)
+
+        if item_degrade is not None:
+            _finish_item_step_down(item_degrade)
 
     # ── Flush remaining batched shapes ──
     if _batch_size:
@@ -13565,6 +14290,16 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             raise
         except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as e:
             _warn(f"Image import failed: {e}")
+            # Not only a console line: the report says pictures are missing.
+            _record_degraded_picture_item(opts, {
+                "page_number": int(page_num),
+                "source_paint_order": None,
+                "kind": "embedded_images",
+                "delivered": "skipped",
+                "reason": "pictures not delivered (some or all embedded pictures on "
+                          "this page were not placed): %s: %s" % (type(e).__name__, e),
+                "editable_geometry_kept": False,
+            })
 
     if rect_order_plans:
         try:
@@ -13621,6 +14356,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         except ImportError:
             from PDFNonTextComposite import apply_composites
             from PDFNonTextCompositeProof import multiply_modes
+        pictures_not_delivered: List[Dict[str, Any]] = []
         composite_displays = apply_composites(
             page, stroke_footprints, pdf_path=pdf_path,
             source_sha256=str(getattr(opts, "_pdf_sha256", "") or _pdf_file_sha256(pdf_path)),
@@ -13629,7 +14365,10 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             mapper=lambda point: _to_fc(point, page_h, opts, scale),
             asset_dir=_raster_asset_dir(), fitz=fitz,
             remaining_pixels=max(0, 64_000_000-int(getattr(opts, "_nontext_composite_pixels", 0))),
+            undelivered=pictures_not_delivered,
         )
+        for picture in pictures_not_delivered:
+            _record_degraded_picture_item(opts, picture)
         opts._nontext_composite_pixels = int(getattr(opts, "_nontext_composite_pixels", 0)) + sum(
             row["pixels"]["width"] * row["pixels"]["height"] for row in composite_displays
         )
@@ -13639,6 +14378,9 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             report_extra.get("nontext_source_composite_displays", [])
         ) + composite_displays
         applied_orders = {row["recipe"]["source_paint_order"] for row in composite_displays}
+        # A picture that was qualified but could not be placed is listed in
+        # picture_items_degraded with its own reason, not as unsupported.
+        applied_orders |= {row.get("source_paint_order") for row in pictures_not_delivered}
         unsupported = [seq for seq, proof in stroke_footprints.items()
                        if multiply_modes(proof.get("source_blend_modes")) and seq not in applied_orders]
         report_extra["unsupported_nontext_composites"] = list(
@@ -14094,7 +14836,7 @@ def estimate_import_work(pdf_path: str, opts: Optional[ImportOptions] = None) ->
     from pdfcadcore.fitz_loader import safe_open
 
     if opts is None:
-        opts = ImportOptions(ignore_images=not IMAGE_WB)
+        opts = ImportOptions(ignore_images=not _image_import_available())
     profiles: List[Dict[str, int]] = []
     with safe_open(pdf_path) as pdf_doc:
         total_pages = len(pdf_doc)
@@ -14251,13 +14993,69 @@ def find_resumable_import_session(
     return read_session_object(host) if host is not None else None
 
 
+def discard_import_session(
+    session_state: Dict[str, Any],
+    fc_doc=None,
+) -> Dict[str, Any]:
+    """Remove a stopped import's recorded page groups and its session object.
+
+    Used by "Start over" on the resume prompt. Only the page groups the session
+    itself recorded (with everything inside them) and the session object are
+    removed, all in one undo step named "Start PDF import over".
+    """
+    host = session_state.get("host")
+    document = fc_doc or getattr(host, "Document", None) or _ensure_doc()
+
+    ordered: List[str] = []
+    seen = set()
+
+    def collect(obj):
+        name = _host_object_id(obj)
+        if not name or name in seen:
+            return
+        seen.add(name)
+        try:
+            is_group = bool(obj.isDerivedFrom("App::DocumentObjectGroup"))
+        except (AttributeError, RuntimeError, TypeError):
+            is_group = False
+        if is_group:
+            for child in list(getattr(obj, "Group", None) or []):
+                collect(child)
+        ordered.append(name)  # children before the group that holds them
+
+    removed_groups: List[str] = []
+    groups = session_state.get("page_groups") or {}
+    for _page, group_name in sorted(groups.items(), key=lambda item: int(item[0])):
+        group = document.getObject(str(group_name))
+        if group is None:
+            continue
+        removed_groups.append(str(group_name))
+        collect(group)
+    host_name = _host_object_id(host) if host is not None else ""
+    if host_name and host_name not in seen:
+        ordered.append(host_name)
+
+    document.openTransaction("Start PDF import over")
+    try:
+        removed = 0
+        for name in ordered:
+            if document.getObject(name) is not None:
+                document.removeObject(name)
+                removed += 1
+    except Exception:
+        document.abortTransaction()
+        raise
+    document.commitTransaction()
+    return {"removed_objects": removed, "page_groups": removed_groups}
+
+
 @_memoized_wirestrings
 def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     """Import one or more pages from a PDF file."""
     _cancel_import_view_reframe()
-    if opts is None:
-        opts = ImportOptions(ignore_images=not IMAGE_WB)
     fc_doc = _ensure_doc()
+    if opts is None:
+        opts = ImportOptions(ignore_images=not _image_import_available(fc_doc))
     t_import_start = time.perf_counter()
     _reset_import_run_state(opts)
     obj_count_before = len(fc_doc.Objects)
@@ -14501,7 +15299,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                 raise
             except ImportCancelled:
                 raise
-            except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as exc:
+            except Exception as exc:
                 _err(
                     f"Failed to import page {page_number}: {exc}\n"
                     f"{traceback.format_exc()}"
@@ -14547,8 +15345,11 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             degraded_block = (
                 getattr(opts, "_report_extra", None) or {}
             ).get("text_items_degraded") or {}
+            degraded_page_numbers = {
+                int(page) for page in (degraded_block.get("pages") or [])
+            } | set(_geometry_degraded_pages(opts))
             if (
-                page_number in {int(page) for page in (degraded_block.get("pages") or [])}
+                page_number in degraded_page_numbers
                 and page_number not in session_degraded_pages
             ):
                 session_degraded_pages.append(page_number)
@@ -14609,19 +15410,23 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             opts.phase_timings_ms["pages_import_ms"] = (
                 time.perf_counter() - t_phase
             ) * 1000.0
+            cancel_report = ""
             try:
-                _write_terminal_representation_failure_report(
+                cancel_report = _remember_import_report(opts, _write_terminal_representation_failure_report(
                     pdf_path=pdf_path, opts=opts, total_pages=total_pages,
                     pages_imported=len(previously_certified_pages),
                     elapsed_ms=(time.perf_counter() - t_import_start) * 1000.0,
                     failure=cancel,
-                )
+                ), pdf_path)
             except (OSError, RuntimeError, TypeError, ValueError, ImportError) as report_error:
                 _err("Terminal import failure report could not be written: %s" % report_error)
-            raise RuntimeError(
+            cleanup_failure = RuntimeError(
                 "Cancellation could not remove the incomplete active page: "
                 f"cleanup={cleanup}, rollback={rollback}"
-            ) from cancel
+            )
+            _attach_failure_location(
+                cleanup_failure, cancel_report, evaluated_pages[-1] if evaluated_pages else None)
+            raise cleanup_failure from cancel
         update_session_object(
             session_host,
             status="cancelled",
@@ -14678,21 +15483,24 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         opts.phase_timings_ms["pages_import_ms"] = (
             time.perf_counter() - t_phase
         ) * 1000.0
+        failed_page = evaluated_pages[-1] if evaluated_pages else None
+        failure_report = ""
         try:
-            failure_report = _write_terminal_representation_failure_report(
+            failure_report = _remember_import_report(opts, _write_terminal_representation_failure_report(
                 pdf_path=pdf_path,
                 opts=opts,
                 total_pages=total_pages,
                 pages_imported=len(previously_certified_pages),
                 elapsed_ms=elapsed_ms,
                 failure=failure,
-            )
+            ), pdf_path)
             _err(
                 f"Import stopped because requested {opts.text_mode} could not be "
                 f"delivered. Failure report: {failure_report}"
             )
         except (OSError, RuntimeError, TypeError, ValueError, ImportError) as report_error:
             _err(f"Terminal import failure report could not be written: {report_error}")
+        _attach_failure_location(failure, failure_report, failed_page)
         raise
     except Exception as failure:
         rollback = _rollback_import_transaction(
@@ -14718,17 +15526,27 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             "rollback_cleanup_complete": rollback["cleanup_complete"],
         }
         opts._report_extra = report_extra
+        failed_page = evaluated_pages[-1] if evaluated_pages else None
+        failure_report = ""
         try:
-            _write_terminal_representation_failure_report(
+            failure_report = _remember_import_report(opts, _write_terminal_representation_failure_report(
                 pdf_path=pdf_path, opts=opts, total_pages=total_pages,
                 pages_imported=len(previously_certified_pages),
-                elapsed_ms=(time.perf_counter() - t_import_start) * 1000.0, failure=failure)
+                elapsed_ms=(time.perf_counter() - t_import_start) * 1000.0, failure=failure), pdf_path)
         except (OSError, RuntimeError, TypeError, ValueError, ImportError) as report_error:
             _err("Terminal import failure report could not be written: %s" % report_error)
+        _err(
+            "Import failed%s: %s. Report: %s"
+            % (" on page %s" % failed_page if failed_page is not None else "",
+               failure, failure_report or "not written")
+        )
+        _attach_failure_location(failure, failure_report, failed_page)
         if not rollback["cleanup_complete"]:
-            raise RuntimeError(
+            incomplete = RuntimeError(
                 "Import failed and rollback was incomplete: %s" % rollback
-            ) from failure
+            )
+            _attach_failure_location(incomplete, failure_report, failed_page)
+            raise incomplete from failure
         raise
     finally:
         try:
@@ -14814,6 +15632,9 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     text_degrade_overflow = _text_degrade_console_overflow_line(opts)
     if text_degrade_overflow:
         _warn(text_degrade_overflow)
+    geometry_degrade_overflow = _geometry_degrade_console_overflow_line(opts)
+    if geometry_degrade_overflow:
+        _warn(geometry_degrade_overflow)
 
     try:
         report_path = opts.import_report_path or _default_import_report_path(pdf_path)
@@ -14852,7 +15673,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                             opts._report_extra.get("text_items_degraded") or {}
                         ).get("pages")
                         or []
-                    ),
+                    ) + _geometry_degraded_pages(opts),
                     previously_degraded_pages=resumed_degraded_pages,
                 )
             )
@@ -14890,8 +15711,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             fallback_used=fallback_used,
             fallback_reason=fallback_reason,
         )
-        if opts.verbose:
-            _msg(f"Import report: {report_path}")
+        _msg(f"Import report: {_remember_import_report(opts, report_path, pdf_path)}")
     except (OSError, RuntimeError, TypeError, ValueError, ImportError) as e:
         _warn(f"Import report write failed: {e}")
 

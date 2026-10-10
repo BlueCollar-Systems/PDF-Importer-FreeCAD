@@ -88,14 +88,23 @@ def test_genuine_pdf_split_zero_fill_retains_both_quad_strokes(monkeypatch, tmp_
 @pytest.mark.parametrize("quad", [SimpleNamespace(),
                                   SimpleNamespace(ul=(0, 0), ur=(float("nan"), 1), lr=(2, 2), ll=(0, 2)),
                                   SimpleNamespace(ul=(0, 0), ur=(float("inf"), 1), lr=(2, 2), ll=(0, 2))])
-def test_malformed_quad_is_geometry_failure_instead_of_silent_success(monkeypatch, quad):
+def test_malformed_quad_is_left_out_and_listed_and_the_page_survives(monkeypatch, quad):
     host(monkeypatch)
-    with pytest.raises(core.DrawingGeometryFailure, match="quadrilateral"):
-        source.fixture.import_page([quad_row(quad)])
+    good = quad_row(core.fitz.Quad((10, 10), (35, 15), (5, 40), (30, 50)))
+    good["seqno"] = 1
+    opts = source.fixture.options(compound_batch_size=0, scale_to_mm=False, detect_arcs=False)
+    doc, opts, group = source.fixture.import_page([quad_row(quad), good], opts)
+    assert group is not None and len(doc.named("Wire")) == 1      # the good quad still arrives
+    entry, = opts._report_extra["geometry_items_degraded"]["items"]
+    assert (entry["kind"], entry["delivered"], entry["source_paint_order"]) == ("quad", "skipped", 0)
+    assert "quadrilateral" in entry["reason"] and entry["created_entity_ids"] == []
 
 
-def test_unbuilt_source_edge_is_geometry_failure(monkeypatch):
+def test_unbuilt_source_edge_is_left_out_and_listed(monkeypatch):
     host(monkeypatch)
     monkeypatch.setattr(core, "_edge_line", lambda *args: None)
-    with pytest.raises(core.DrawingGeometryFailure, match="quadrilateral"):
-        source.fixture.import_page([quad_row(core.fitz.Quad((0, 0), (1, 0), (0, 1), (1, 1)))])
+    doc, opts, group = source.fixture.import_page([quad_row(core.fitz.Quad((0, 0), (1, 0), (0, 1), (1, 1)))])
+    assert group is not None and not doc.named("Wire") and not doc.named("StepDownOutline")
+    block = opts._report_extra["geometry_items_degraded"]
+    assert (block["total"], block["skipped"], block["pages"]) == (1, 1, [1])
+    assert "Quadrilateral source edge was not built" in block["items"][0]["reason"]

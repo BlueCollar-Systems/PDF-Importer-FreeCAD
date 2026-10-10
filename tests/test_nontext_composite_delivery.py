@@ -211,3 +211,47 @@ def test_new_composite_uses_supported_native_image_mode(case, monkeypatch):
     view = args["doc"].Objects[-1].ViewObject
     assert view.DisplayMode == "No shading" and view.Lighting == "One side"
     assert len(view.RootNode.children) == 1
+
+
+class _CacheRefusingImage(Object):
+    """An ImagePlane whose file copy into the document cache fails, as on a
+    destination path longer than Windows allows."""
+
+    def __setattr__(self, name, value):
+        if name == "ImageFile":
+            raise OSError("could not copy the picture into the document cache")
+        super().__setattr__(name, value)
+
+
+def _refusing_images(args, monkeypatch):
+    original = args["doc"].addObject
+
+    def add(kind, name):
+        if kind != "Image::ImagePlane":
+            return original(kind, name)
+        obj = _CacheRefusingImage(name + str(len(args["doc"].Objects)), kind)
+        args["doc"].Objects.append(obj)
+        return obj
+
+    monkeypatch.setattr(args["doc"], "addObject", add)
+
+
+def test_a_picture_the_document_cache_refuses_is_left_out_and_listed(case, monkeypatch):
+    page, proofs, args, capsule = case
+    _refusing_images(args, monkeypatch)
+    undelivered = []
+    assert delivery.apply_composites(page, proofs, undelivered=undelivered, **args) == []
+    assert args["doc"].Objects == [capsule]                 # the editable capsule stays, alone
+    (entry,) = undelivered
+    assert entry["kind"] == "nontext_composite" and entry["delivered"] == "skipped"
+    assert entry["reason"].startswith("picture not delivered: OSError: could not copy")
+    assert entry["editable_geometry_kept"] is True and entry["canonical_object"] == capsule.Name
+    assert entry["page_number"] == 1 and entry["source_paint_order"] in proofs
+
+
+def test_a_caller_that_cannot_list_the_picture_keeps_the_fail_closed_rule(case, monkeypatch):
+    page, proofs, args, capsule = case
+    _refusing_images(args, monkeypatch)
+    with pytest.raises(OSError):
+        delivery.apply_composites(page, proofs, **args)
+    assert args["doc"].Objects == [capsule]

@@ -80,6 +80,12 @@ def _probe_env(tmp_path, **paths):
     for key, value in paths.items():
         env["BCS_PROBE_" + key.upper()] = str(value)
     env["BC_PDF_TEMP_DIR"] = str(tmp_path)
+    # A private FreeCAD user folder: every import copies its report into
+    # <user data>/PDF Import Reports, and a test run must not fill the
+    # developer's own FreeCAD profile (it keeps only the newest 50).
+    home = Path(tmp_path) / "freecad_user_home"
+    home.mkdir(exist_ok=True)
+    env["FREECAD_USER_HOME"] = str(home)
     return env
 
 

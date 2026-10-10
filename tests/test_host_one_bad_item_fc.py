@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -91,10 +90,11 @@ def _run_probe(tmp_path: Path, pdf: Path):
     report = tmp_path / "probe_import_report.json"
     work = tmp_path / "bc_temp"
     work.mkdir()
-    home = tempfile.mkdtemp(prefix="bcfc-")
+    home = tmp_path / "freecad_user_home"  # private: no report copy lands in your profile
+    home.mkdir()
     env = dict(os.environ, BCS_PROBE_REPO=str(REPO_ROOT), BCS_PROBE_PDF=str(pdf),
                BCS_PROBE_OUT=str(out), BCS_PROBE_REPORT=str(report),
-               BC_PDF_TEMP_DIR=str(work), FREECAD_USER_HOME=home)
+               BC_PDF_TEMP_DIR=str(work), FREECAD_USER_HOME=str(home))
     completed = subprocess.run([FREECADCMD, str(probe)], env=env, stdin=subprocess.DEVNULL,
                                capture_output=True, text=True, timeout=600)
     assert out.is_file(), "probe wrote nothing (rc=%s)\n%s\n%s" % (

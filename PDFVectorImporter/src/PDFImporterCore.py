@@ -18,6 +18,7 @@ import math
 from contextlib import contextmanager
 import os
 import re
+import shutil
 import struct
 import sys
 import tempfile
@@ -695,6 +696,74 @@ def _default_import_report_path(pdf_path: str) -> str:
     base = os.path.splitext(os.path.basename(pdf_path))[0]
     directory = tempfile.mkdtemp(prefix="bcs-freecad-import-")
     return os.path.join(directory, f"{base}_import_report.json")
+
+
+IMPORT_REPORT_FOLDER_NAME = "PDF Import Reports"
+IMPORT_REPORT_KEEP = 50
+
+
+def _publish_report_copy(path: str, pdf_path: str = "") -> str:
+    """Copy one import report to a fixed folder a person can find again.
+
+    The private mkdtemp original stays where it is (hosts cannot collide);
+    the copy goes to <FreeCAD user data>/PDF Import Reports/
+    <pdf>_<yyyymmdd-hhmmss>_import_report.json and only the newest
+    IMPORT_REPORT_KEEP reports are kept. Returns the copy's path, or "" when
+    there is no user data folder or the copy failed (only a warning).
+    """
+    try:
+        user_dir = FreeCAD.getUserAppDataDir() if FreeCAD else ""
+    except Exception:
+        user_dir = ""
+    if not user_dir or not path or not os.path.isfile(path):
+        return ""
+    try:
+        folder = os.path.join(str(user_dir), IMPORT_REPORT_FOLDER_NAME)
+        os.makedirs(folder, exist_ok=True)
+        base = os.path.splitext(os.path.basename(pdf_path or path))[0] or "pdf"
+        base = re.sub(r"[^A-Za-z0-9._ -]+", "_", base).strip(" .")[:80] or "pdf"
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        target = os.path.join(folder, "%s_%s_import_report.json" % (base, stamp))
+        suffix = 1
+        while os.path.exists(target):
+            suffix += 1
+            target = os.path.join(folder, "%s_%s-%d_import_report.json" % (base, stamp, suffix))
+        shutil.copyfile(path, target)
+        reports = sorted(
+            (entry for entry in os.scandir(folder)
+             if entry.is_file() and entry.name.endswith("_import_report.json")),
+            key=lambda entry: entry.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in reports[IMPORT_REPORT_KEEP:]:
+            try:
+                os.remove(stale.path)
+            except OSError:
+                pass
+        return target
+    except (OSError, TypeError, ValueError) as exc:
+        _warn("Import report copy to %s was not made: %s" % (IMPORT_REPORT_FOLDER_NAME, exc))
+        return ""
+
+
+def _remember_import_report(opts: "ImportOptions", path: str, pdf_path: str) -> str:
+    """Publish the report copy and remember the path a person should open."""
+    published = _publish_report_copy(path, pdf_path)
+    shown = published or str(path or "")
+    try:
+        opts._last_import_report_path = shown
+    except AttributeError:
+        pass
+    return shown
+
+
+def _attach_failure_location(failure: BaseException, report_path: str, page) -> None:
+    """Let the UI name the page and the report without parsing messages."""
+    try:
+        failure.bcs_report_path = str(report_path or "")
+        failure.bcs_failed_page = page
+    except AttributeError:
+        pass
 
 
 def _pdf_file_sha256(pdf_path: str) -> str:
@@ -14870,7 +14939,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                 raise
             except ImportCancelled:
                 raise
-            except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as exc:
+            except Exception as exc:
                 _err(
                     f"Failed to import page {page_number}: {exc}\n"
                     f"{traceback.format_exc()}"
@@ -14981,19 +15050,23 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             opts.phase_timings_ms["pages_import_ms"] = (
                 time.perf_counter() - t_phase
             ) * 1000.0
+            cancel_report = ""
             try:
-                _write_terminal_representation_failure_report(
+                cancel_report = _remember_import_report(opts, _write_terminal_representation_failure_report(
                     pdf_path=pdf_path, opts=opts, total_pages=total_pages,
                     pages_imported=len(previously_certified_pages),
                     elapsed_ms=(time.perf_counter() - t_import_start) * 1000.0,
                     failure=cancel,
-                )
+                ), pdf_path)
             except (OSError, RuntimeError, TypeError, ValueError, ImportError) as report_error:
                 _err("Terminal import failure report could not be written: %s" % report_error)
-            raise RuntimeError(
+            cleanup_failure = RuntimeError(
                 "Cancellation could not remove the incomplete active page: "
                 f"cleanup={cleanup}, rollback={rollback}"
-            ) from cancel
+            )
+            _attach_failure_location(
+                cleanup_failure, cancel_report, evaluated_pages[-1] if evaluated_pages else None)
+            raise cleanup_failure from cancel
         update_session_object(
             session_host,
             status="cancelled",
@@ -15050,21 +15123,24 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
         opts.phase_timings_ms["pages_import_ms"] = (
             time.perf_counter() - t_phase
         ) * 1000.0
+        failed_page = evaluated_pages[-1] if evaluated_pages else None
+        failure_report = ""
         try:
-            failure_report = _write_terminal_representation_failure_report(
+            failure_report = _remember_import_report(opts, _write_terminal_representation_failure_report(
                 pdf_path=pdf_path,
                 opts=opts,
                 total_pages=total_pages,
                 pages_imported=len(previously_certified_pages),
                 elapsed_ms=elapsed_ms,
                 failure=failure,
-            )
+            ), pdf_path)
             _err(
                 f"Import stopped because requested {opts.text_mode} could not be "
                 f"delivered. Failure report: {failure_report}"
             )
         except (OSError, RuntimeError, TypeError, ValueError, ImportError) as report_error:
             _err(f"Terminal import failure report could not be written: {report_error}")
+        _attach_failure_location(failure, failure_report, failed_page)
         raise
     except Exception as failure:
         rollback = _rollback_import_transaction(
@@ -15090,17 +15166,27 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             "rollback_cleanup_complete": rollback["cleanup_complete"],
         }
         opts._report_extra = report_extra
+        failed_page = evaluated_pages[-1] if evaluated_pages else None
+        failure_report = ""
         try:
-            _write_terminal_representation_failure_report(
+            failure_report = _remember_import_report(opts, _write_terminal_representation_failure_report(
                 pdf_path=pdf_path, opts=opts, total_pages=total_pages,
                 pages_imported=len(previously_certified_pages),
-                elapsed_ms=(time.perf_counter() - t_import_start) * 1000.0, failure=failure)
+                elapsed_ms=(time.perf_counter() - t_import_start) * 1000.0, failure=failure), pdf_path)
         except (OSError, RuntimeError, TypeError, ValueError, ImportError) as report_error:
             _err("Terminal import failure report could not be written: %s" % report_error)
+        _err(
+            "Import failed%s: %s. Report: %s"
+            % (" on page %s" % failed_page if failed_page is not None else "",
+               failure, failure_report or "not written")
+        )
+        _attach_failure_location(failure, failure_report, failed_page)
         if not rollback["cleanup_complete"]:
-            raise RuntimeError(
+            incomplete = RuntimeError(
                 "Import failed and rollback was incomplete: %s" % rollback
-            ) from failure
+            )
+            _attach_failure_location(incomplete, failure_report, failed_page)
+            raise incomplete from failure
         raise
     finally:
         try:
@@ -15265,8 +15351,7 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
             fallback_used=fallback_used,
             fallback_reason=fallback_reason,
         )
-        if opts.verbose:
-            _msg(f"Import report: {report_path}")
+        _msg(f"Import report: {_remember_import_report(opts, report_path, pdf_path)}")
     except (OSError, RuntimeError, TypeError, ValueError, ImportError) as e:
         _warn(f"Import report write failed: {e}")
 

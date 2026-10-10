@@ -538,7 +538,20 @@ session to continue; unsaved process crashes are not claimed as recoverable.
 
 ## Import report / scale trust
 
-Imports write `<output>_import_report.json` with `extra.resolved_scale` when detected.
+Every import writes `<pdf name>_import_report.json` and keeps a copy you can find
+again in the FreeCAD user data folder, under `PDF Import Reports`
+(`<pdf name>_<date-time>_import_report.json`; the newest 50 are kept). The Report
+view prints `Import report: <path>` after every import.
+
+When an import fails, one **Import Failed** box gives the reason, the page and the
+report path, with an **Open report folder** button; nothing is added to your
+drawing. When an import finishes but some items were drawn another way or left
+out (text items, or a drawing item drawn as plain lines), one warning box says how
+many and where; a clean import shows no box. File > Open followed by Cancel leaves
+no empty document behind. Headless and batch runs never show a box; they print the
+same sentences.
+
+The report carries `extra.resolved_scale` when a scale is detected.
 
 - Use `factor` for scaling **only when** `confidence >= 0.70` **and** `fallback_reason` is not `no_scale_detected`.
 - Otherwise treat scale as unknown.

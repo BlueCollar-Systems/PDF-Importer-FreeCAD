@@ -53,6 +53,46 @@ objects with zero degraded text and a ready report. Evidence is under
 per-mode reports. The compact native result snapshot is retained as
 `2026-10-10-native-probe.json` beside this record.
 
+## Final shared-core review
+
+The shared font-binding changes were reviewed separately from the initial
+utility changes above. Same-name font programs are identified by their exact
+original program SHA and character occurrence. Missing printable paint traces
+remain unverified. An inferred U+0020 space is accepted only with the native
+MuPDF synthetic flag, a unique original occurrence without a painted trace,
+and an empty space glyph in the original exact font program. It retains its
+source quad and semantic gap with no invented painted glyph ID. Visible or
+missing original space glyphs remain rejected. The CFF proof uses the existing
+original CFF wrapper directly; an empty PDF Unicode census cannot gate that
+nonpainting proof.
+
+After the synthetic-spacing files and tests were synchronized, **270 focused
+font, positioned 3D text, font staging, zero-extent glyph, and glyph-fill tests
+passed** (39.38 seconds). The real Helvetica A-gap-B extraction probe retained
+native synthetic flags 532, exact font binding, and no paint glyph ID for the
+inferred space. The shared-core synchronization check passed.
+
+Native FreeCAD 1.1.4, using its bundled Python 3.11, actual FreeCAD/Part
+libraries, and the source checkout, also imported that new synthetic-spacing
+fixture in all six text modes. Every mode returned explicit success, reported
+zero degraded text, and wrote `extra.import_contract_ready.ready=true`.
+The synthetic-only result snapshot is
+`2026-10-10-synthetic-spacing-probe.json` beside this record; full temporary
+reports remain under `C:/TMP/pdf-import-audit-20261010/`.
+
+The final competing-paint guard also rejects a synthetic space when exactly
+one painted occurrence shares its identity/origin, and clears any stale trace
+ID. The settled source-font regression file passed **28 tests** (10.00 seconds)
+after that final guard was synchronized. The native spacing fixture has no
+competing paint at its inferred space, so this tightening preserves its
+recorded acceptance. The earlier broad and native runs precede this last
+negative-case change.
+
+This review did not create commits. Concurrent workspace activity committed
+the earlier workflow changes as `626f676`; the final synthetic-spacing changes
+were reviewed as subsequent source checkout edits. No installed workbench or
+release artifact was replaced by these checks.
+
 ## Boundaries and remaining work
 
 These are **source checkout changes**; no installed workbench was replaced, no

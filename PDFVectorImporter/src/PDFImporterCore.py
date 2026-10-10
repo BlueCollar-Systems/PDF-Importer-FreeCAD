@@ -14305,6 +14305,62 @@ def find_resumable_import_session(
     return read_session_object(host) if host is not None else None
 
 
+def discard_import_session(
+    session_state: Dict[str, Any],
+    fc_doc=None,
+) -> Dict[str, Any]:
+    """Remove a stopped import's recorded page groups and its session object.
+
+    Used by "Start over" on the resume prompt. Only the page groups the session
+    itself recorded (with everything inside them) and the session object are
+    removed, all in one undo step named "Start PDF import over".
+    """
+    host = session_state.get("host")
+    document = fc_doc or getattr(host, "Document", None) or _ensure_doc()
+
+    ordered: List[str] = []
+    seen = set()
+
+    def collect(obj):
+        name = _host_object_id(obj)
+        if not name or name in seen:
+            return
+        seen.add(name)
+        try:
+            is_group = bool(obj.isDerivedFrom("App::DocumentObjectGroup"))
+        except (AttributeError, RuntimeError, TypeError):
+            is_group = False
+        if is_group:
+            for child in list(getattr(obj, "Group", None) or []):
+                collect(child)
+        ordered.append(name)  # children before the group that holds them
+
+    removed_groups: List[str] = []
+    groups = session_state.get("page_groups") or {}
+    for _page, group_name in sorted(groups.items(), key=lambda item: int(item[0])):
+        group = document.getObject(str(group_name))
+        if group is None:
+            continue
+        removed_groups.append(str(group_name))
+        collect(group)
+    host_name = _host_object_id(host) if host is not None else ""
+    if host_name and host_name not in seen:
+        ordered.append(host_name)
+
+    document.openTransaction("Start PDF import over")
+    try:
+        removed = 0
+        for name in ordered:
+            if document.getObject(name) is not None:
+                document.removeObject(name)
+                removed += 1
+    except Exception:
+        document.abortTransaction()
+        raise
+    document.commitTransaction()
+    return {"removed_objects": removed, "page_groups": removed_groups}
+
+
 @_memoized_wirestrings
 def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     """Import one or more pages from a PDF file."""

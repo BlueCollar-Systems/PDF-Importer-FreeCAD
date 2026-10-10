@@ -117,6 +117,31 @@ class ImportProgressController:
         self.dialog.close()
 
 
+def _ask_resume_choice(parent, prompt, complete):
+    """Ask Resume / Start over / Cancel for a stopped import. Returns the choice."""
+    box = QtWidgets.QMessageBox(parent)
+    box.setWindowTitle("Resume PDF Import")
+    box.setText(prompt)
+    box.setIcon(QtWidgets.QMessageBox.Question)
+    pages = "1 page" if complete == 1 else f"{complete} pages"
+    resume_btn = box.addButton(
+        "Resume remaining pages", QtWidgets.QMessageBox.AcceptRole)
+    restart_btn = box.addButton(
+        f"Start over (replace the {pages} already imported)",
+        QtWidgets.QMessageBox.DestructiveRole)
+    cancel_btn = box.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+    box.setDefaultButton(resume_btn)
+    box.setEscapeButton(cancel_btn)
+    exec_fn = getattr(box, "exec", None) or getattr(box, "exec_", None)
+    exec_fn()
+    clicked = box.clickedButton()
+    if clicked is resume_btn:
+        return "resume"
+    if clicked is restart_btn:
+        return "start_over"
+    return "cancel"
+
+
 def run_interactive_import(core, pdf_path, opts, parent=None):
     """Plan, confirm, run, and report an interactive import truthfully."""
     progress = ImportProgressController(parent)
@@ -130,23 +155,36 @@ def run_interactive_import(core, pdf_path, opts, parent=None):
             complete = len(resumable["completed_pages"])
             requested = len(resumable["requested_pages"])
             prompt = (
-                f"{summary}\n\nA matching import session has {complete} of "
-                f"{requested} pages complete. Resume the remaining pages?"
+                f"{summary}\n\nThis PDF was imported into this document before "
+                f"and stopped with {complete} of {requested} pages done.\n"
+                "Resume the remaining pages, or start over and replace the "
+                "pages already imported?"
             )
-            title = "Resume PDF Import"
+            choice = _ask_resume_choice(parent, prompt, complete)
         else:
             prompt = f"{summary}\n\nStart this import?"
             title = "PDF Import Work Estimate"
-        buttons = QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel
-        answer = QtWidgets.QMessageBox.question(
-            parent, title, prompt, buttons, QtWidgets.QMessageBox.Yes
-        )
-        if answer != QtWidgets.QMessageBox.Yes:
+            buttons = QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel
+            answer = QtWidgets.QMessageBox.question(
+                parent, title, prompt, buttons, QtWidgets.QMessageBox.Yes
+            )
+            choice = "start" if answer == QtWidgets.QMessageBox.Yes else "cancel"
+        if choice == "cancel":
             opts.import_status = "cancelled"
             FreeCAD.Console.PrintMessage("PDF import cancelled before model changes.\n")
             return False
-        if resumable:
+        if choice == "resume":
             opts.resume_session_name = resumable["host"].Name
+        elif choice == "start_over":
+            # One undo step removes only the pages that session recorded (and
+            # the session itself); then a fresh import runs as usual.
+            discarded = core.discard_import_session(resumable)
+            FreeCAD.Console.PrintMessage(
+                f"Removed the {len(discarded.get('page_groups', []))} page(s) from the "
+                "earlier stopped import; Edit > Undo 'Start PDF import over' "
+                "brings them back.\n"
+            )
+            opts.resume_session_name = None
         completed = bool(core.import_pdf(pdf_path, opts))
         if not completed:
             session_info = (getattr(opts, "_report_extra", {}) or {}).get(

@@ -22,6 +22,7 @@ Accepts compound: 5'-6" or 5' 6 1/2"
 """
 from __future__ import annotations
 
+import json
 import math
 import re
 
@@ -165,6 +166,102 @@ def parse_dimension_mm(text: str) -> float:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Drawing scale (title block) parsing for Quick Scale
+# ──────────────────────────────────────────────────────────────────────
+# Title-block scales a shop drawing uses. Each one enlarges the imported
+# sheet (paper size) to full size: 1:50 -> 50x, 1/4"=1'-0" -> 48x.
+DRAWING_SCALE_PRESETS = (
+    "1:1", "1:2", "1:5", "1:10", "1:20", "1:25", "1:50", "1:100", "1:200",
+    "3\"=1'-0\"", "1-1/2\"=1'-0\"", "1\"=1'-0\"", "3/4\"=1'-0\"",
+    "1/2\"=1'-0\"", "3/8\"=1'-0\"", "1/4\"=1'-0\"", "3/16\"=1'-0\"",
+    "1/8\"=1'-0\"",
+)
+
+_SCALE_HELP = (
+    "Type a drawing scale like 1:50 or 1/4\"=1'-0\", "
+    "or a number like 2 to double the size."
+)
+
+# 3   0.25   1/4   1-1/2   1 1/2
+_AMOUNT = r"(?:\d+(?:\.\d+)?(?:\s*[-\s]\s*\d+\s*/\s*\d+)?|\d+\s*/\s*\d+|\.\d+)"
+_RE_RATIO = re.compile(r"^\s*(\d*\.?\d+)\s*:\s*(\d*\.?\d+)\s*$")
+_RE_ARCH = re.compile(
+    r"^\s*(?P<paper>" + _AMOUNT + r")\s*(?:\"|in\b|inch(?:es)?\b)\s*=\s*"
+    r"(?P<feet>\d+(?:\.\d+)?)\s*(?:'|ft\b|feet\b|foot\b)\s*"
+    r"(?:-?\s*(?P<inches>" + _AMOUNT + r")\s*(?:\"|in\b|inch(?:es)?\b)?)?\s*$",
+    re.IGNORECASE)
+
+
+def _parse_amount(text: str) -> float:
+    """'3', '0.25', '1/4', '1-1/2' or '1 1/2' -> a number."""
+    text = text.strip()
+    mixed = re.fullmatch(r"(\d+(?:\.\d+)?)\s*[-\s]\s*(\d+)\s*/\s*(\d+)", text)
+    if mixed:
+        return float(mixed.group(1)) + int(mixed.group(2)) / int(mixed.group(3))
+    frac = re.fullmatch(r"(\d+)\s*/\s*(\d+)", text)
+    if frac:
+        return int(frac.group(1)) / int(frac.group(2))
+    return float(text)
+
+
+def _plain_scale_text(text: str) -> str:
+    """Straighten curly quotes/primes and long dashes typed or pasted in."""
+    t = str(text or "").strip()
+    for curly, plain in (("\u2019", "'"), ("\u2032", "'"), ("\u201d", '"'),
+                         ("\u2033", '"'), ("\u201c", '"'), ("\u2013", "-"),
+                         ("\u2014", "-")):
+        t = t.replace(curly, plain)
+    return t
+
+
+def parse_drawing_scale(text: str) -> float:
+    """Return the factor that takes a drawing at this scale to full size.
+
+    1:50 -> 50 (enlarge 50 times), 2:1 -> 0.5, 1/4"=1'-0" -> 48,
+    1-1/2"=1'-0" -> 8. A plain number is a custom factor (2 = double).
+    Zero, negative or unreadable entries raise ValueError in plain words.
+    """
+    raw = str(text or "")
+    t = _plain_scale_text(raw)
+    factor = None
+    try:
+        ratio = _RE_RATIO.match(t)
+        arch = _RE_ARCH.match(t)
+        if ratio:
+            paper, real = float(ratio.group(1)), float(ratio.group(2))
+            if paper > 0 and real > 0:
+                factor = real / paper
+        elif arch:
+            paper_in = _parse_amount(arch.group("paper"))
+            real_in = float(arch.group("feet")) * 12.0
+            if arch.group("inches"):
+                real_in += _parse_amount(arch.group("inches"))
+            if paper_in > 0 and real_in > 0:
+                factor = real_in / paper_in
+        elif re.fullmatch(r"\d*\.?\d+", t):
+            factor = float(t)
+    except (ValueError, ZeroDivisionError):
+        factor = None
+    if factor is None or not math.isfinite(factor) or factor <= 0:
+        raise ValueError(f"'{raw.strip()}' is not a drawing scale. {_SCALE_HELP}")
+    return factor
+
+
+def quick_scale_question(text: str, factor: float) -> str:
+    """The plain-English confirmation shown before Quick Scale changes anything."""
+    label = str(text or "").strip()
+    plain = _plain_scale_text(label)
+    is_scale = bool(_RE_RATIO.match(plain) or _RE_ARCH.match(plain))
+    if factor > 1:
+        how = f"Enlarge the drawing {factor:g}x"
+    else:
+        how = f"Shrink the drawing to {factor:g}x"
+    if is_scale:
+        return f"{how} ({label} to full size)?"
+    return f"{how} (custom factor {label})?"
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Get selected points from FreeCAD selection
 # ──────────────────────────────────────────────────────────────────────
 def _get_selected_points() -> list:
@@ -251,6 +348,59 @@ def _transform_shape_about_origin(shape, factor: float, origin: "Vector"):
     mat.scale(factor, factor, factor)
     mat.move(origin)
     return shape.transformGeometry(mat)
+
+
+# The white paper sheet stores its corners (relative to its Placement) here.
+_PAPER_PROPERTY = "PDFPaperDisplayJSON"
+
+
+def _scale_point(point, factor: float, origin: "Vector"):
+    return origin + (point - origin) * factor
+
+
+def _scale_placement_base(obj, factor: float, origin: "Vector"):
+    """Move an object's position about the origin (rotation is kept)."""
+    if not hasattr(obj, "Placement"):
+        return
+    placement = obj.Placement
+    placement.Base = _scale_point(placement.Base, factor, origin)
+    obj.Placement = placement
+
+
+def _scale_image_plane(obj, factor: float, origin: "Vector"):
+    """Pictures are centred on their Placement: move the centre, resize the sheet."""
+    _scale_placement_base(obj, factor, origin)
+    obj.XSize = float(obj.XSize) * abs(factor)
+    obj.YSize = float(obj.YSize) * abs(factor)
+
+
+def _scale_paper(obj, factor: float, origin: "Vector"):
+    """Grow the white paper sheet with the drawing that sits on it."""
+    try:
+        from .PDFPaperDisplay import validate
+    except ImportError:
+        from PDFPaperDisplay import validate
+    data = json.loads(getattr(obj, _PAPER_PROPERTY))
+    data["corners_mm"] = [
+        [float(x) * factor, float(y) * factor, float(z)]
+        for x, y, z in data.get("corners_mm", ())
+    ]
+    validate(data)
+    _scale_placement_base(obj, factor, origin)
+    setattr(obj, _PAPER_PROPERTY, json.dumps(data, sort_keys=True))
+
+
+def _is_draft_label(obj) -> bool:
+    return getattr(getattr(obj, "Proxy", None), "Type", None) == "Label"
+
+
+def _scale_label_leader(obj, factor: float, origin: "Vector"):
+    """Keep a Draft Label's (hidden) leader pointing at the scaled drawing."""
+    if hasattr(obj, "TargetPoint"):
+        obj.TargetPoint = _scale_point(obj.TargetPoint, factor, origin)
+    points = getattr(obj, "Points", None)
+    if points:
+        obj.Points = [_scale_point(p, factor, origin) for p in points]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -415,13 +565,16 @@ def _scale_objects(objects, factor: float, origin: "Vector"):
         except (AttributeError, RuntimeError):
             progress = None
 
+    if origin is None:
+        origin = Vector(0, 0, 0)
     # Build a scale matrix once when scaling about global zero
     mat = None
-    if origin is None or (abs(origin.x) < 1e-12 and abs(origin.y) < 1e-12 and abs(origin.z) < 1e-12):
+    if abs(origin.x) < 1e-12 and abs(origin.y) < 1e-12 and abs(origin.z) < 1e-12:
         mat = FreeCAD.Matrix()
         mat.scale(factor, factor, factor)
 
     scaled = 0
+    not_scaled = []
     for i, obj in enumerate(objects):
         if progress and i % 200 == 0:
             progress.setValue(i)
@@ -435,8 +588,19 @@ def _scale_objects(objects, factor: float, origin: "Vector"):
                 pass
 
         try:
+            if getattr(obj, "TypeId", "") == "Image::ImagePlane":
+                # Pictures (scanned pages, embedded images, raster text) have
+                # no Shape: resize the picture itself, not just its position.
+                _scale_image_plane(obj, factor, origin)
+                scaled += 1
+                continue
+            if getattr(obj, _PAPER_PROPERTY, None):
+                _scale_paper(obj, factor, origin)
+                scaled += 1
+                continue
+
             has_shape = hasattr(obj, "Shape") and not obj.Shape.isNull()
-            has_font = (hasattr(obj, "ViewObject") 
+            has_font = (hasattr(obj, "ViewObject")
                         and hasattr(obj.ViewObject, "FontSize"))
 
             if has_shape:
@@ -446,9 +610,7 @@ def _scale_objects(objects, factor: float, origin: "Vector"):
                 scaled += 1
             elif has_font:
                 # Text/annotation objects: scale position + font size
-                if hasattr(obj, "Placement"):
-                    pos = obj.Placement.Base
-                    obj.Placement.Base = origin + (pos - origin) * factor
+                _scale_placement_base(obj, factor, origin)
                 try:
                     obj.ViewObject.FontSize = obj.ViewObject.FontSize * factor
                 except (AttributeError, TypeError):
@@ -456,17 +618,22 @@ def _scale_objects(objects, factor: float, origin: "Vector"):
                 scaled += 1
             else:
                 # Other objects (groups, etc.): just scale placement
-                if hasattr(obj, "Placement"):
-                    pos = obj.Placement.Base
-                    obj.Placement.Base = origin + (pos - origin) * factor
+                _scale_placement_base(obj, factor, origin)
+            if _is_draft_label(obj):
+                _scale_label_leader(obj, factor, origin)
         except (AttributeError, TypeError, ValueError, RuntimeError):
-            pass
+            not_scaled.append(str(getattr(obj, "Label", "") or getattr(obj, "Name", "")))
 
     if progress:
         progress.setValue(n)
         progress.close()
 
     FreeCAD.Console.PrintMessage(f"Transformed {scaled} shapes.\n")
+    if not_scaled:
+        FreeCAD.Console.PrintWarning(
+            f"Scale: {len(not_scaled)} object(s) could not be scaled and kept "
+            f"their size: {', '.join(not_scaled[:10])}"
+            f"{' ...' if len(not_scaled) > 10 else ''}\n")
 
 
 def apply_scale(measured_mm: float, real_mm: float, target_group_name=None, origin=None):
@@ -574,46 +741,71 @@ class ScaleByReferenceCommand:
 
 
 class QuickScaleCommand:
-    """Scale by a typed factor or ratio."""
+    """Enlarge the drawing to full size from its title-block scale."""
 
     def GetResources(self):
         return {
             "Pixmap": "",
-            "MenuText": "Quick Scale Factor…",
-            "ToolTip": "Enter a scale factor (2.0 = double) or ratio (1:50).",
+            "MenuText": "Quick Scale (drawing scale)…",
+            "ToolTip": ("Enlarge the drawing to full size from the scale in its title block\n"
+                        "(1:50 makes it 50 times bigger; 1/4\"=1'-0\" makes it 48 times bigger).\n"
+                        "Or type a number as a custom factor (2 = double, 0.5 = half).\n"
+                        "Scales the selected objects, or the whole drawing when nothing\n"
+                        "is selected. Edit > Undo puts it back."),
         }
 
     def IsActive(self):
         return FreeCAD.ActiveDocument is not None
 
     def Activated(self):
-        text, ok = QtWidgets.QInputDialog.getText(
-            None, "Quick Scale",
-            "Enter scale factor (e.g. 2.0) or ratio (e.g. 1:50):",
-            text="1.0")
-        if not ok or not text.strip():
+        text, ok = QtWidgets.QInputDialog.getItem(
+            None,
+            "Drawing scale (from the title block) - enlarges the drawing to full size",
+            "Pick or type the drawing scale printed in the title block.\n"
+            "1:50 makes the drawing 50 times bigger, 1/4\"=1'-0\" makes it 48 times bigger.\n"
+            "Or type a number as a custom factor (2 = double, 0.5 = half).",
+            list(DRAWING_SCALE_PRESETS), 0, True)
+        if not ok or not str(text).strip():
             return
+        text = str(text).strip()
         try:
-            t = text.strip()
-            if ":" in t:
-                a, b = t.split(":", 1)
-                factor = float(a) / float(b)
-            else:
-                factor = float(t)
-        except (ValueError, ZeroDivisionError):
-            QtWidgets.QMessageBox.warning(
-                None, "Invalid", f"Cannot parse '{text}' as a scale factor.")
+            factor = parse_drawing_scale(text)
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(None, "Quick Scale", str(exc))
+            return
+        if abs(factor - 1.0) < 1e-12:
+            QtWidgets.QMessageBox.information(
+                None, "Quick Scale",
+                f"{text} is already full size. Nothing was changed.")
             return
 
         doc = FreeCAD.ActiveDocument
         sel = FreeCADGui.Selection.getSelection()
         objects = sel if sel else doc.Objects
-        _scale_objects(_collect_scale_targets(list(objects)), factor, Vector(0, 0, 0))
-        doc.recompute()
+        what = (f"This scales the {len(sel)} selected object(s)." if sel
+                else "This scales the whole drawing.")
+        answer = QtWidgets.QMessageBox.question(
+            None, "Quick Scale",
+            f"{quick_scale_question(text, factor)}\n\n{what}\n"
+            "Edit > Undo puts it back.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.Yes)
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+
+        # One undo step, like Scale by Reference.
+        doc.openTransaction("Quick Scale")
+        try:
+            _scale_objects(_collect_scale_targets(list(objects)), factor, Vector(0, 0, 0))
+            doc.recompute()
+        except Exception:
+            doc.abortTransaction()
+            raise
+        doc.commitTransaction()
 
         try:
             FreeCADGui.ActiveDocument.ActiveView.fitAll()
         except (AttributeError, RuntimeError):
             pass
 
-        FreeCAD.Console.PrintMessage(f"Quick scaled by {factor:.6f}\n")
+        FreeCAD.Console.PrintMessage(f"Quick scaled by {factor:.6f} ({text})\n")

@@ -117,6 +117,31 @@ class ImportProgressController:
         self.dialog.close()
 
 
+def _ask_resume_choice(parent, prompt, complete):
+    """Ask Resume / Start over / Cancel for a stopped import. Returns the choice."""
+    box = QtWidgets.QMessageBox(parent)
+    box.setWindowTitle("Resume PDF Import")
+    box.setText(prompt)
+    box.setIcon(QtWidgets.QMessageBox.Question)
+    pages = "1 page" if complete == 1 else f"{complete} pages"
+    resume_btn = box.addButton(
+        "Resume remaining pages", QtWidgets.QMessageBox.AcceptRole)
+    restart_btn = box.addButton(
+        f"Start over (replace the {pages} already imported)",
+        QtWidgets.QMessageBox.DestructiveRole)
+    cancel_btn = box.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+    box.setDefaultButton(resume_btn)
+    box.setEscapeButton(cancel_btn)
+    exec_fn = getattr(box, "exec", None) or getattr(box, "exec_", None)
+    exec_fn()
+    clicked = box.clickedButton()
+    if clicked is resume_btn:
+        return "resume"
+    if clicked is restart_btn:
+        return "start_over"
+    return "cancel"
+
+
 def run_interactive_import(core, pdf_path, opts, parent=None):
     """Plan, confirm, run, and report an interactive import truthfully."""
     progress = ImportProgressController(parent)
@@ -130,23 +155,36 @@ def run_interactive_import(core, pdf_path, opts, parent=None):
             complete = len(resumable["completed_pages"])
             requested = len(resumable["requested_pages"])
             prompt = (
-                f"{summary}\n\nA matching import session has {complete} of "
-                f"{requested} pages complete. Resume the remaining pages?"
+                f"{summary}\n\nThis PDF was imported into this document before "
+                f"and stopped with {complete} of {requested} pages done.\n"
+                "Resume the remaining pages, or start over and replace the "
+                "pages already imported?"
             )
-            title = "Resume PDF Import"
+            choice = _ask_resume_choice(parent, prompt, complete)
         else:
             prompt = f"{summary}\n\nStart this import?"
             title = "PDF Import Work Estimate"
-        buttons = QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel
-        answer = QtWidgets.QMessageBox.question(
-            parent, title, prompt, buttons, QtWidgets.QMessageBox.Yes
-        )
-        if answer != QtWidgets.QMessageBox.Yes:
+            buttons = QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel
+            answer = QtWidgets.QMessageBox.question(
+                parent, title, prompt, buttons, QtWidgets.QMessageBox.Yes
+            )
+            choice = "start" if answer == QtWidgets.QMessageBox.Yes else "cancel"
+        if choice == "cancel":
             opts.import_status = "cancelled"
             FreeCAD.Console.PrintMessage("PDF import cancelled before model changes.\n")
             return False
-        if resumable:
+        if choice == "resume":
             opts.resume_session_name = resumable["host"].Name
+        elif choice == "start_over":
+            # One undo step removes only the pages that session recorded (and
+            # the session itself); then a fresh import runs as usual.
+            discarded = core.discard_import_session(resumable)
+            FreeCAD.Console.PrintMessage(
+                f"Removed the {len(discarded.get('page_groups', []))} page(s) from the "
+                "earlier stopped import; Edit > Undo 'Start PDF import over' "
+                "brings them back.\n"
+            )
+            opts.resume_session_name = None
         completed = bool(core.import_pdf(pdf_path, opts))
         if not completed:
             session_info = (getattr(opts, "_report_extra", {}) or {}).get(
@@ -484,8 +522,9 @@ class ImportPDFDialog(QtWidgets.QDialog):
         self.text_combo.setToolTip(
             "How text is rendered when Import text is enabled:\n"
             "Text — native FreeCAD annotation text, editable\n"
-            "Labels — FreeCAD Draft Text labels, editable\n"
-            "3D Text — extruded 3D letterforms\n"
+            "Labels — FreeCAD Draft labels, editable\n"
+            "3D Text — solid letter shapes that match the PDF look "
+            "(cannot be retyped; choose Text or Labels to edit words)\n"
             "Glyphs — exact glyph geometry from the PDF font\n"
             "Geometry — raw text-outline edges grouped per source text item\n"
             "Raster — one visually exact raster patch per source text item")
@@ -494,19 +533,26 @@ class ImportPDFDialog(QtWidgets.QDialog):
         self.import_text_chk.toggled.connect(self.text_combo.setEnabled)
 
         # ── Grouping (workflow — kept) ──
+        # Every label is a grouping the core really builds (see
+        # _GROUPING_LAYER_MODE); the list order matches that table.
         self.grouping_combo = QtWidgets.QComboBox()
         self.grouping_combo.addItems([
-            "Single", "Per Page", "Per Layer", "Per Color",
-            "Nested Page>Layer", "Nested Page>Lineweight"])
-        self.grouping_combo.setCurrentText("Per Page")
+            "Page > PDF layers, else colors (recommended)",
+            "Page > colors",
+            "Page > PDF layers",
+            "Page only (no layer or color sub-groups)",
+        ])
+        self.grouping_combo.setCurrentText(self._GROUPING_DEFAULT)
         self.grouping_combo.setToolTip(
-            "How imported objects are grouped in the model tree:\n"
-            "Single = everything in one group\n"
-            "Per Page = one group per PDF page\n"
-            "Per Layer = one group per PDF layer (OCG)\n"
-            "Per Color = one group per stroke/fill color\n"
-            "Nested Page>Layer = pages containing layer sub-groups\n"
-            "Nested Page>Lineweight = pages containing lineweight sub-groups")
+            "How imported lines are grouped in the model tree. Every page gets\n"
+            "its own group; this choice sets the sub-groups inside each page:\n"
+            "Page > PDF layers, else colors = one sub-group per PDF layer when\n"
+            "    the PDF has layers, otherwise one per line color\n"
+            "Page > colors = one sub-group per line color\n"
+            "Page > PDF layers = one sub-group per PDF layer.\n"
+            "    A PDF without layers gets no layer sub-groups.\n"
+            "Page only = lines go straight into the page group\n"
+            "Text, pictures and hatching keep their own sub-groups in every choice.")
 
         # ── Page arrangement (workflow — kept) ──
         self.page_arrangement_combo = QtWidgets.QComboBox()
@@ -630,9 +676,9 @@ class ImportPDFDialog(QtWidgets.QDialog):
             scale = grp.GetFloat("LastScale", 0.0)
             if scale > 0:
                 self.scale_spin.setValue(scale)
-            grouping = grp.GetString("LastGroupingMode", "")
-            if grouping:
-                self.grouping_combo.setCurrentText(grouping)
+            self.grouping_combo.setCurrentText(
+                self._grouping_label_for_saved(grp.GetString("LastGroupingMode", ""))
+            )
             page_arrangement = grp.GetString("LastPageArrangement", "")
             if page_arrangement:
                 self.page_arrangement_combo.setCurrentText(page_arrangement)
@@ -660,12 +706,34 @@ class ImportPDFDialog(QtWidgets.QDialog):
         except (AttributeError, RuntimeError, ValueError):
             pass
 
-    # Mapping tables for combo dropdowns (internal value -> UI label)
-    _GROUPING_MAP = {
-        "single": "Single", "per_page": "Per Page", "per_layer": "Per Layer",
-        "per_color": "Per Color", "nested_page_layer": "Nested Page>Layer",
-        "nested_page_lineweight": "Nested Page>Lineweight",
+    # Grouping label -> core ImportOptions.layer_mode. Only groupings the core
+    # builds are offered. "Everything in one group" is not: create_top_group
+    # False cannot place layer/color sub-groups, and no lineweight grouping
+    # exists in the core.
+    _GROUPING_DEFAULT = "Page > PDF layers, else colors (recommended)"
+    _GROUPING_LAYER_MODE = {
+        "Page > PDF layers, else colors (recommended)": "auto",
+        "Page > colors": "color",
+        "Page > PDF layers": "ocg",
+        "Page only (no layer or color sub-groups)": "none",
     }
+    # Labels saved by earlier versions (whose choices all built the
+    # recommended tree) -> the label that now builds what they asked for.
+    _LEGACY_GROUPING_LABELS = {
+        "Per Color": "Page > colors",
+        "Per Layer": "Page > PDF layers",
+        "Nested Page>Layer": "Page > PDF layers",
+    }
+
+    @classmethod
+    def _grouping_label_for_saved(cls, saved):
+        """Return the dropdown label for a saved (possibly older) grouping."""
+        saved = str(saved or "")
+        if saved in cls._GROUPING_LAYER_MODE:
+            return saved
+        return cls._LEGACY_GROUPING_LABELS.get(saved, cls._GROUPING_DEFAULT)
+
+    # Mapping tables for combo dropdowns (internal value -> UI label)
     _PAGE_ARRANGEMENT_MAP = {
         "spread": "Spread (20% gap)",
         "compact": "Compact gap",
@@ -798,8 +866,9 @@ class ImportPDFDialog(QtWidgets.QDialog):
             text_mode = "none"
 
         # Reverse-map UI labels to internal values for workflow controls
-        _grp_rev = {v: k for k, v in self._GROUPING_MAP.items()}
         _arr_rev = {v: k for k, v in self._PAGE_ARRANGEMENT_MAP.items()}
+        layer_mode = self._GROUPING_LAYER_MODE.get(
+            self.grouping_combo.currentText(), "auto")
 
         # Consolidated defaults per BCS-ARCH-001 parameter table.
         # Quality-tier dials are hardcoded — no UI exposure.
@@ -822,6 +891,7 @@ class ImportPDFDialog(QtWidgets.QDialog):
             strict_text_fidelity=True,
             hatch_mode="import",
             group_by_color=True,
+            layer_mode=layer_mode,
             assign_linewidth=True,
             map_dashes=(import_mode != "raster"),
             detect_arcs=(import_mode != "raster"),
@@ -839,7 +909,6 @@ class ImportPDFDialog(QtWidgets.QDialog):
         opts.arc_mode = "auto"
         opts.cleanup_level = "balanced"
         opts.lineweight_mode = "preserve"
-        opts.grouping_mode = _grp_rev.get(self.grouping_combo.currentText(), "per_page")
         if SHAPE_EXTRUSION_UI_ENABLED:
             _m3d_rev = {v: k for k, v in self._MODEL3D_MAP.items()}
             opts.model3d_mode = _m3d_rev.get(self.model3d_combo.currentText(), "off")

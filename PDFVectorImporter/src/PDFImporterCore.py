@@ -76,11 +76,57 @@ except ImportError:
     FreeCAD = Draft = Part = None
     Vector = Placement = Rotation = None
 
-try:
-    import ImageGui  # noqa: F401
-    IMAGE_WB = True
-except ImportError:
-    IMAGE_WB = False
+# Whether this FreeCAD can place pictures (Image::ImagePlane). Worked out on
+# first use, never at import: FreeCAD 1.x has no ImageGui module, so the old
+# "import ImageGui" test turned picture import off for options-less imports.
+_IMAGE_IMPORT_AVAILABLE: Optional[bool] = None
+
+
+def _image_import_available(doc=None) -> bool:
+    """True when ``Image::ImagePlane`` objects can be created in this FreeCAD.
+
+    Checks ``doc`` (or the active document, or a hidden temporary document
+    that is closed again) for the type; older FreeCAD falls back to ImageGui.
+    """
+    global _IMAGE_IMPORT_AVAILABLE
+    if _IMAGE_IMPORT_AVAILABLE is not None:
+        return _IMAGE_IMPORT_AVAILABLE
+    available = None
+    if FreeCAD is not None:
+        probe = doc if doc is not None else getattr(FreeCAD, "ActiveDocument", None)
+        temp_name = None
+        try:
+            if probe is None and hasattr(FreeCAD, "newDocument"):
+                probe = FreeCAD.newDocument("PDFImageProbe", "PDFImageProbe", True)
+                temp_name = probe.Name
+            if probe is not None and hasattr(probe, "supportedTypes"):
+                if "Image::ImagePlane" in probe.supportedTypes():
+                    available = True
+                else:
+                    try:
+                        import Image  # noqa: F401  # registers the type on older FreeCAD
+                    except ImportError:
+                        pass
+                    else:
+                        if "Image::ImagePlane" in probe.supportedTypes():
+                            available = True
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            available = None
+        finally:
+            if temp_name:
+                try:
+                    FreeCAD.closeDocument(temp_name)
+                except (AttributeError, RuntimeError, NameError):
+                    pass
+    if available is None:
+        try:
+            import ImageGui  # noqa: F401
+            available = True
+        except ImportError:
+            available = False
+    if FreeCAD is not None:
+        _IMAGE_IMPORT_AVAILABLE = available
+    return available
 
 # ──────────────────────────────────────────────────────────────────────
 # Constants
@@ -6634,7 +6680,11 @@ def _persist_text3d_source_metadata(
     target_advance_fc: float,
     horizontal_scale: float,
 ) -> None:
-    """Keep the exact source span and geometry recipe editable after save/reopen."""
+    """Record the exact source span and geometry recipe for save/reopen.
+
+    The values are provenance only: changing them would not reshape the solid
+    letters, so each one is shown read-only in the property editor.
+    """
     if not isinstance(source_text, str) or not source_text or "\x00" in source_text:
         raise ValueError("3D Text source metadata is invalid")
     if not isinstance(font_path, str) or not font_path:
@@ -6665,11 +6715,15 @@ def _persist_text3d_source_metadata(
             "exact_glyph_solid_compound_v1",
         ),
     )
+    set_editor_mode = getattr(obj, "setEditorMode", None)
     for property_kind, property_name, property_value in values:
         if property_name not in properties and callable(add_property):
             add_property(property_kind, property_name, "PDF Import")
             properties.add(property_name)
         setattr(obj, property_name, property_value)
+        if callable(set_editor_mode):
+            # 1 = read-only in the property editor; Python can still set it.
+            set_editor_mode(property_name, 1)
 
 
 def _closed_text3d_wires(wire_shapes: List[Any]) -> List[Any]:
@@ -12439,10 +12493,10 @@ def import_pdf_page(pdf_path: str, page_num: int = 1,
                     autofit: bool = True):
     """Import a single PDF page into the active FreeCAD document."""
     _cancel_import_view_reframe()
-    if opts is None:
-        opts = ImportOptions(ignore_images=not IMAGE_WB)
-    _reset_import_run_state(opts)
     fc_doc = _ensure_doc()  # Store reference — don't rely on ActiveDocument later
+    if opts is None:
+        opts = ImportOptions(ignore_images=not _image_import_available(fc_doc))
+    _reset_import_run_state(opts)
 
     # This entry point may run inside a caller-owned transaction.  Do not open
     # or abort it: remove only objects created by this page, just as the
@@ -14633,7 +14687,7 @@ def estimate_import_work(pdf_path: str, opts: Optional[ImportOptions] = None) ->
     from pdfcadcore.fitz_loader import safe_open
 
     if opts is None:
-        opts = ImportOptions(ignore_images=not IMAGE_WB)
+        opts = ImportOptions(ignore_images=not _image_import_available())
     profiles: List[Dict[str, int]] = []
     with safe_open(pdf_path) as pdf_doc:
         total_pages = len(pdf_doc)
@@ -14790,13 +14844,69 @@ def find_resumable_import_session(
     return read_session_object(host) if host is not None else None
 
 
+def discard_import_session(
+    session_state: Dict[str, Any],
+    fc_doc=None,
+) -> Dict[str, Any]:
+    """Remove a stopped import's recorded page groups and its session object.
+
+    Used by "Start over" on the resume prompt. Only the page groups the session
+    itself recorded (with everything inside them) and the session object are
+    removed, all in one undo step named "Start PDF import over".
+    """
+    host = session_state.get("host")
+    document = fc_doc or getattr(host, "Document", None) or _ensure_doc()
+
+    ordered: List[str] = []
+    seen = set()
+
+    def collect(obj):
+        name = _host_object_id(obj)
+        if not name or name in seen:
+            return
+        seen.add(name)
+        try:
+            is_group = bool(obj.isDerivedFrom("App::DocumentObjectGroup"))
+        except (AttributeError, RuntimeError, TypeError):
+            is_group = False
+        if is_group:
+            for child in list(getattr(obj, "Group", None) or []):
+                collect(child)
+        ordered.append(name)  # children before the group that holds them
+
+    removed_groups: List[str] = []
+    groups = session_state.get("page_groups") or {}
+    for _page, group_name in sorted(groups.items(), key=lambda item: int(item[0])):
+        group = document.getObject(str(group_name))
+        if group is None:
+            continue
+        removed_groups.append(str(group_name))
+        collect(group)
+    host_name = _host_object_id(host) if host is not None else ""
+    if host_name and host_name not in seen:
+        ordered.append(host_name)
+
+    document.openTransaction("Start PDF import over")
+    try:
+        removed = 0
+        for name in ordered:
+            if document.getObject(name) is not None:
+                document.removeObject(name)
+                removed += 1
+    except Exception:
+        document.abortTransaction()
+        raise
+    document.commitTransaction()
+    return {"removed_objects": removed, "page_groups": removed_groups}
+
+
 @_memoized_wirestrings
 def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     """Import one or more pages from a PDF file."""
     _cancel_import_view_reframe()
-    if opts is None:
-        opts = ImportOptions(ignore_images=not IMAGE_WB)
     fc_doc = _ensure_doc()
+    if opts is None:
+        opts = ImportOptions(ignore_images=not _image_import_available(fc_doc))
     t_import_start = time.perf_counter()
     _reset_import_run_state(opts)
     obj_count_before = len(fc_doc.Objects)

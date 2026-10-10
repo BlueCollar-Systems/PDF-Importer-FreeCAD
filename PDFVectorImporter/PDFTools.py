@@ -77,6 +77,45 @@ def _find_python() -> str:
     return exe
 
 
+def _image_plane_supported() -> bool:
+    """True when this FreeCAD can place pictures (Image::ImagePlane objects).
+
+    FreeCAD 1.x has no ImageGui module: the picture type is checked in a
+    document's supportedTypes() instead, using the open document or a hidden
+    temporary one that is closed again. Older FreeCAD falls back to ImageGui.
+    """
+    if FreeCAD is not None:
+        doc = getattr(FreeCAD, "ActiveDocument", None)
+        temp_name = None
+        try:
+            if doc is None and hasattr(FreeCAD, "newDocument"):
+                doc = FreeCAD.newDocument("PDFImageProbe", "PDFImageProbe", True)
+                temp_name = doc.Name
+            if doc is not None and hasattr(doc, "supportedTypes"):
+                if "Image::ImagePlane" in doc.supportedTypes():
+                    return True
+                try:
+                    import Image  # noqa: F401  # registers the type on older FreeCAD
+                except ImportError:
+                    pass
+                else:
+                    if "Image::ImagePlane" in doc.supportedTypes():
+                        return True
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+        finally:
+            if temp_name:
+                try:
+                    FreeCAD.closeDocument(temp_name)
+                except (AttributeError, RuntimeError, NameError):
+                    pass
+    try:
+        import ImageGui  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def _wb_base() -> str:
     """Return workbench root directory."""
     for root in (FreeCAD.getUserAppDataDir(), FreeCAD.getResourceDir()):
@@ -137,12 +176,12 @@ class CheckEnvironmentCommand:
             except (ImportError, ModuleNotFoundError) as e:
                 _warn(f"  {mod}: MISSING — {e}")
 
-        # Image WB
-        try:
-            import ImageGui  # noqa: F401
-            _msg("  Image Workbench: available")
-        except ImportError:
-            _warn("  Image Workbench: NOT available (embedded image import disabled)")
+        # Pictures (scanned pages, embedded images) become Image::ImagePlane objects.
+        if _image_plane_supported():
+            _msg("  Picture import: available")
+        else:
+            _warn("  Picture import: NOT available — this FreeCAD cannot create "
+                  "Image::ImagePlane objects, so pictures in a PDF are skipped")
 
         # PySide version
         try:

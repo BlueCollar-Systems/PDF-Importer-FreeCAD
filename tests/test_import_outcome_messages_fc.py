@@ -291,6 +291,15 @@ def test_finished_import_with_a_stepped_down_drawing_item_says_so(ui):
     assert len(warning_boxes()) == 1
 
 
+def test_finished_import_with_a_picture_left_out_says_so(ui):
+    extra = {"picture_items_degraded": {"total": 1, "skipped": 1, "pages": [1]}}
+    opts = options()
+    opts._last_import_report_path = written_report(ui.tmp, extra)
+    text = ui.command.show_import_result(opts)
+    assert "1 picture could not be placed (page 1) and was left out." in text
+    assert len(warning_boxes()) == 1
+
+
 def test_clean_import_shows_no_box(ui, monkeypatch):
     extra = {"scale_crosscheck": {"level": "warn", "reasons": ["no_scale_detected"],
                                   "banner": "Check scale"}}

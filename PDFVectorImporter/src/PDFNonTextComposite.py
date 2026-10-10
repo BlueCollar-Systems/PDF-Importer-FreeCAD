@@ -157,9 +157,30 @@ def _canonical_capsule(objects, recipe):
     return obj, hashlib.sha256(obj.Shape.exportBrepToString().encode()).hexdigest()
 
 
+def _discard_picture(doc, parent, obj):
+    """Remove one display plane that could not be completed; never raises."""
+    try:
+        if parent is not doc and obj in list(getattr(parent, "Group", []) or []):
+            parent.removeObject(obj)
+    except Exception:
+        pass
+    try:
+        doc.removeObject(obj.Name)
+    except Exception:
+        pass
+
+
 def apply_composites(page, capsule_proofs, *, pdf_path, source_sha256, page_number,
-                     doc, parent, objects, mapper, asset_dir, fitz, remaining_pixels=64_000_000):
-    """Create separate embedded display planes; never replace a text item."""
+                     doc, parent, objects, mapper, asset_dir, fitz, remaining_pixels=64_000_000,
+                     undelivered=None):
+    """Create separate embedded display planes; never replace a text item.
+
+    One picture whose pixels cannot be written or copied into FreeCAD's
+    document cache (OSError) is left out instead of failing the page: the
+    retained editable source geometry under it stays, and the picture is
+    appended to ``undelivered`` so the caller lists it in the import report.
+    Proof failures (changed source, altered geometry) still fail the page.
+    """
     if not any(multiply_modes(p.get("source_blend_modes")) for p in capsule_proofs.values()):
         return []
     if int(page.number) + 1 != page_number:
@@ -181,32 +202,53 @@ def apply_composites(page, capsule_proofs, *, pdf_path, source_sha256, page_numb
     records, created = [], []
     try:
         for recipe, ((capsule, shape_sha), geometry), (png, pixel_proof) in zip(recipes, bindings, pixels, strict=True):
-            path = Path(asset_dir) / ("nontext_" + pixel_proof["png_sha256"] + ".png")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if not path.exists():
-                # Content-addressed bytes are identical across references.
-                with path.open("xb") as stream:
-                    stream.write(png)
-            if _sha(path) != pixel_proof["png_sha256"]:
-                raise ValueError("Source composite asset bytes changed")
-            obj = doc.addObject("Image::ImagePlane", "PDF_NonText_Composite")
-            created.append(obj)
-            obj.Label = "PDF non-text composite (hide to edit source geometry)"
-            obj.ImageFile = str(path)
-            obj.XSize, obj.YSize = geometry["width_mm"], geometry["height_mm"]
-            obj.Placement = App.Placement(App.Vector(*geometry["center_mm"]), App.Rotation())
-            data = dict(schema="bcs.freecad.nontext-composite/1", recipe=recipe,
-                        pixels=pixel_proof, placement=geometry, source_geometry_z=0.,
-                        display_z_mm=offset_z, canonical_object=capsule.Name,
-                        canonical_brep_sha256=shape_sha,
-                        display_resolution_limit="600 DPI source pixels; hide this plane to edit the retained exact source curves and capsule")
-            _property(obj, "App::PropertyFileIncluded", "PDFRasterFile", str(path))
-            _property(obj, "App::PropertyString", "PDFRasterSHA256", pixel_proof["png_sha256"])
-            _property(obj, "App::PropertyString", "PDFSourceSHA256", source_sha256)
-            _property(obj, "App::PropertyBool", "PDFDisplayOnlyGeometry", True)
-            _property(obj, "App::PropertyString", PROPERTY, json.dumps(data, sort_keys=True))
-            if parent is not doc and hasattr(parent, "addObject"):
-                parent.addObject(obj)
+            obj = None
+            try:
+                path = Path(asset_dir) / ("nontext_" + pixel_proof["png_sha256"] + ".png")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if not path.exists():
+                    # Content-addressed bytes are identical across references.
+                    with path.open("xb") as stream:
+                        stream.write(png)
+                if _sha(path) != pixel_proof["png_sha256"]:
+                    raise ValueError("Source composite asset bytes changed")
+                obj = doc.addObject("Image::ImagePlane", "PDF_NonText_Composite")
+                created.append(obj)
+                obj.Label = "PDF non-text composite (hide to edit source geometry)"
+                obj.ImageFile = str(path)
+                obj.XSize, obj.YSize = geometry["width_mm"], geometry["height_mm"]
+                obj.Placement = App.Placement(App.Vector(*geometry["center_mm"]), App.Rotation())
+                data = dict(schema="bcs.freecad.nontext-composite/1", recipe=recipe,
+                            pixels=pixel_proof, placement=geometry, source_geometry_z=0.,
+                            display_z_mm=offset_z, canonical_object=capsule.Name,
+                            canonical_brep_sha256=shape_sha,
+                            display_resolution_limit="600 DPI source pixels; hide this plane to edit the retained exact source curves and capsule")
+                _property(obj, "App::PropertyFileIncluded", "PDFRasterFile", str(path))
+                _property(obj, "App::PropertyString", "PDFRasterSHA256", pixel_proof["png_sha256"])
+                _property(obj, "App::PropertyString", "PDFSourceSHA256", source_sha256)
+                _property(obj, "App::PropertyBool", "PDFDisplayOnlyGeometry", True)
+                _property(obj, "App::PropertyString", PROPERTY, json.dumps(data, sort_keys=True))
+                if parent is not doc and hasattr(parent, "addObject"):
+                    parent.addObject(obj)
+            except OSError as exc:
+                if undelivered is None:
+                    raise  # a caller that cannot list it keeps the old fail-closed rule
+                # Step down: this picture is left out and listed; the editable
+                # source geometry under it is untouched and every other item stays.
+                if obj is not None:
+                    created.remove(obj)
+                    _discard_picture(doc, parent, obj)
+                if undelivered is not None:
+                    undelivered.append(dict(
+                        page_number=int(page_number),
+                        source_paint_order=recipe.get("source_paint_order"),
+                        kind="nontext_composite",
+                        delivered="skipped",
+                        reason="picture not delivered: %s: %s" % (type(exc).__name__, exc),
+                        editable_geometry_kept=True,
+                        canonical_object=str(getattr(capsule, "Name", "") or ""),
+                    ))
+                continue
             if (obj.TypeId != "Image::ImagePlane"
                     or not math.isclose(float(obj.XSize), geometry["width_mm"], abs_tol=1e-9)
                     or not math.isclose(float(obj.YSize), geometry["height_mm"], abs_tol=1e-9)

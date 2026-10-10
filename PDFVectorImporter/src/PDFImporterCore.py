@@ -1349,10 +1349,75 @@ def _geometry_degrade_summary_note(block: Any) -> str:
 
 
 def _geometry_degraded_pages(opts: ImportOptions) -> List[int]:
-    block = (getattr(opts, "_report_extra", None) or {}).get("geometry_items_degraded")
-    if not isinstance(block, dict):
-        return []
-    return sorted({int(page) for page in (block.get("pages") or [])})
+    """Pages a drawing item or a picture stepped down on (never certified)."""
+    pages = set()
+    for key in ("geometry_items_degraded", "picture_items_degraded"):
+        block = (getattr(opts, "_report_extra", None) or {}).get(key)
+        if isinstance(block, dict):
+            pages.update(int(page) for page in (block.get("pages") or []))
+    return sorted(pages)
+
+
+# One picture this host cannot place (its pixels cannot be written or copied
+# into FreeCAD's document cache) costs that picture, never the page or the
+# file: it is left out, the editable lines under it stay, and it is listed in
+# picture_items_degraded. Failures that leave the document unusable still
+# roll back the run.
+def _new_picture_degrade_block() -> Dict[str, Any]:
+    return {
+        "schema": "bcs.picture_items_degraded/1.0",
+        "total": 0,
+        "skipped": 0,
+        "pages": [],
+        "items": [],
+        "items_truncated": False,
+    }
+
+
+def _record_degraded_picture_item(opts: ImportOptions, entry: Dict[str, Any]) -> None:
+    """Add one picture that was not delivered to this run's degrade record."""
+    report_extra = getattr(opts, "_report_extra", None)
+    if not isinstance(report_extra, dict):
+        report_extra = opts._report_extra = {}
+    block = report_extra.setdefault("picture_items_degraded", _new_picture_degrade_block())
+    block["total"] = int(block.get("total", 0) or 0) + 1
+    block["skipped"] = int(block.get("skipped", 0) or 0) + 1
+    entry = {key: _finite_json(value) for key, value in dict(entry).items()}
+    entry["reason"] = _bounded_report_text(entry.get("reason") or "picture not delivered", 400)
+    page = int(entry.get("page_number") or 0)
+    if page and page not in block["pages"]:
+        block["pages"].append(page)
+    if len(block["items"]) < GEOMETRY_ITEM_DEGRADE_REPORT_LIMIT:
+        block["items"].append(entry)
+    else:
+        block["items_truncated"] = True
+    if block["total"] <= GEOMETRY_ITEM_DEGRADE_CONSOLE_LIMIT:
+        _warn(_bounded_report_text(
+            "PDF import: a picture (%s, drawing order %s) on page %s could not be "
+            "placed - it was left out%s. Reason: %s."
+            % (entry.get("kind"), entry.get("source_paint_order"), entry.get("page_number"),
+               "; the editable lines under it are kept" if entry.get("editable_geometry_kept") else "",
+               str(entry.get("reason")).rstrip(".")),
+            400,
+        ))
+
+
+def _picture_degrade_summary_note(block: Any) -> str:
+    """The plain sentence the human summary carries; '' when every picture arrived."""
+    total = int(block.get("total", 0) or 0) if isinstance(block, dict) else 0
+    if total <= 0:
+        return ""
+    pages = sorted({int(page) for page in (block.get("pages") or [])})
+    where = (
+        " on page%s %s" % ("" if len(pages) == 1 else "s", ", ".join(str(p) for p in pages))
+        if pages
+        else ""
+    )
+    return (
+        "%d picture%s%s could not be placed and %s left out; this import is not "
+        "certified - see picture_items_degraded in the import report"
+        % (total, "" if total == 1 else "s", where, "was" if total == 1 else "were")
+    )
 
 
 def _auto_raster_needs_text_overlay(
@@ -2021,6 +2086,18 @@ def write_import_report(
     if geometry_degrade_warnings:
         fallback_used = True
         fallback_reason = fallback_reason or "geometry_items_degraded"
+    picture_degrade_block = extra.get("picture_items_degraded")
+    picture_degrade_warnings = (
+        int(picture_degrade_block.get("total", 0) or 0)
+        if isinstance(picture_degrade_block, dict)
+        else 0
+    )
+    picture_degrade_note = _picture_degrade_summary_note(picture_degrade_block)
+    if picture_degrade_note:
+        extra["picture_degrade_note"] = picture_degrade_note
+    if picture_degrade_warnings:
+        fallback_used = True
+        fallback_reason = fallback_reason or "picture_items_degraded"
 
     report = build_import_report(
         host_app="freecad",
@@ -2058,20 +2135,25 @@ def write_import_report(
             + host_font_warnings
             + text_degrade_warnings
             + geometry_degrade_warnings
+            + picture_degrade_warnings
             + glyph_code_warnings
             + len(session_degraded_pages)
         ),
         extra=extra,
     )
 
-    if geometry_degrade_warnings:
+    if geometry_degrade_warnings or picture_degrade_warnings:
         # The shared contract gate only reads text delivery. A sheet with a
-        # drawing item drawn as plain lines or left out is not ready either.
+        # drawing item drawn as plain lines or left out, or a picture left out,
+        # is not ready either.
         contract = report.extra.get("import_contract_ready")
         if isinstance(contract, dict):
             checks = contract.get("checks")
             if isinstance(checks, dict):
-                checks["geometry_delivery"] = False
+                if geometry_degrade_warnings:
+                    checks["geometry_delivery"] = False
+                if picture_degrade_warnings:
+                    checks["picture_delivery"] = False
             contract["ready"] = False
             contract["note"] = "one or more import report contract checks need review"
 
@@ -2097,7 +2179,7 @@ def write_import_report(
         ]
 
     if (host_font_summary["note"] or text_degrade_note or geometry_degrade_note
-            or control_only_report):
+            or picture_degrade_note or control_only_report):
         # The shared core overwrites extra["font_substitution_note"] from its
         # PDF audit inside build_import_report, so the host note is appended
         # here and the human summary is rebuilt to carry it.
@@ -2123,6 +2205,8 @@ def write_import_report(
         if geometry_degrade_note:
             # Same channel rule: a separate sentence, not a font note.
             summary = "%s %s." % (summary.rstrip(), geometry_degrade_note.rstrip("."))
+        if picture_degrade_note:
+            summary = "%s %s." % (summary.rstrip(), picture_degrade_note.rstrip("."))
         report.extra["human_summary"] = summary
         for host_font_warning in host_font_summary["console_warnings"]:
             _warn(host_font_warning)
@@ -14003,6 +14087,16 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             raise
         except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as e:
             _warn(f"Image import failed: {e}")
+            # Not only a console line: the report says pictures are missing.
+            _record_degraded_picture_item(opts, {
+                "page_number": int(page_num),
+                "source_paint_order": None,
+                "kind": "embedded_images",
+                "delivered": "skipped",
+                "reason": "pictures not delivered (some or all embedded pictures on "
+                          "this page were not placed): %s: %s" % (type(e).__name__, e),
+                "editable_geometry_kept": False,
+            })
 
     if rect_order_plans:
         try:
@@ -14059,6 +14153,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         except ImportError:
             from PDFNonTextComposite import apply_composites
             from PDFNonTextCompositeProof import multiply_modes
+        pictures_not_delivered: List[Dict[str, Any]] = []
         composite_displays = apply_composites(
             page, stroke_footprints, pdf_path=pdf_path,
             source_sha256=str(getattr(opts, "_pdf_sha256", "") or _pdf_file_sha256(pdf_path)),
@@ -14067,7 +14162,10 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             mapper=lambda point: _to_fc(point, page_h, opts, scale),
             asset_dir=_raster_asset_dir(), fitz=fitz,
             remaining_pixels=max(0, 64_000_000-int(getattr(opts, "_nontext_composite_pixels", 0))),
+            undelivered=pictures_not_delivered,
         )
+        for picture in pictures_not_delivered:
+            _record_degraded_picture_item(opts, picture)
         opts._nontext_composite_pixels = int(getattr(opts, "_nontext_composite_pixels", 0)) + sum(
             row["pixels"]["width"] * row["pixels"]["height"] for row in composite_displays
         )
@@ -14077,6 +14175,9 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             report_extra.get("nontext_source_composite_displays", [])
         ) + composite_displays
         applied_orders = {row["recipe"]["source_paint_order"] for row in composite_displays}
+        # A picture that was qualified but could not be placed is listed in
+        # picture_items_degraded with its own reason, not as unsupported.
+        applied_orders |= {row.get("source_paint_order") for row in pictures_not_delivered}
         unsupported = [seq for seq, proof in stroke_footprints.items()
                        if multiply_modes(proof.get("source_blend_modes")) and seq not in applied_orders]
         report_extra["unsupported_nontext_composites"] = list(

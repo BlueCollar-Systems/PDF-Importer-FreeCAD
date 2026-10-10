@@ -330,8 +330,16 @@ def _degrade_sentences(extra):
             "%d left out."
             % (_plural(total, "drawing item"), _pages_text(geometry.get("pages")), outlined,
                ", %d only partly drawn" % partial if partial else "", skipped))
+    pictures = extra.get("picture_items_degraded")
+    if isinstance(pictures, dict) and int(pictures.get("total", 0) or 0) > 0:
+        total = int(pictures.get("total", 0) or 0)
+        sentences.append(
+            "%s could not be placed%s and %s left out."
+            % (_plural(total, "picture"), _pages_text(pictures.get("pages")),
+               "was" if total == 1 else "were"))
+    known = {"text_items_degraded", "geometry_items_degraded", "picture_items_degraded"}
     for key, block in sorted(extra.items()):
-        if (key.endswith("_items_degraded") and key not in {"text_items_degraded", "geometry_items_degraded"}
+        if (key.endswith("_items_degraded") and key not in known
                 and isinstance(block, dict) and int(block.get("total", 0) or 0) > 0):
             sentences.append(
                 "%s could not be delivered as requested%s."

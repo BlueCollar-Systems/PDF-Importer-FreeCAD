@@ -1,0 +1,74 @@
+# Workflow review - 2026-10-10
+
+## Changes made in this review
+
+`PDFVectorImporter/PDFTools.py` no longer invents 9,999 pages when a PDF cannot
+open. Utility selections are checked against the actual PDF before allocation;
+invalid entries reject with clear errors, reversed ranges work, and duplicate
+selections import once. Recursive batches prune generated import-evidence
+folders instead of re-importing copied QA inputs.
+
+Batch Import now has a progress dialog and a Cancel button connected to the
+core's object-creation heartbeats. Cancelling stops subsequent work and keeps
+completed pages. A bad file does not stop the remaining batch. Only an explicit
+successful core result, or pages confirmed complete in a cancelled session,
+count as completed; a false/absent failure is reported. Selected pages now share
+one core invocation per PDF, avoiding repeated font/outline-cache rebuilding,
+allowing deferred recomputes, and preserving the chosen multi-page layout.
+Import via Console likewise no longer prints success after a failed or cancelled
+result.
+
+`tests/test_utility_page_selection_fc.py` and `tests/test_batch_workflow_fc.py`
+exercise page validation, unreadable PDFs, huge-range rejection, evidence
+pruning, corrupt-file isolation, false-result accounting, and callback
+cancellation. README usage now describes these behaviors. No shared
+`pdfcadcore` files were changed.
+
+## Validation
+
+- Initial complete suite with an explicit writable temporary directory:
+  **2,272 passed, 21 skipped, 11 subtests passed**, with one existing deprecation
+  warning (223.64 seconds).
+- The new focused cases plus existing file-enumeration checks: **20 passed**.
+- Repeat complete suite: **2,293 passed, 21 skipped, 11 subtests passed**, with
+  the same deprecation warning (359.52 seconds), including concurrently authored
+  stroke-subpath cases. The final per-PDF batch optimization was made after this
+  run loaded its utility module. Its final validation was **31 focused tests
+  passed**, including existing progress/resume contracts, plus clean Ruff.
+- Before the fix, the new page/evidence cases reproduced **11 failures / 3
+  passes**; the huge-range test was intentionally excluded from that unfixed
+  run to avoid allocating an enormous range.
+- Ruff on the changed Python files: passed.
+- `python pdfcadcore_sync_check.py`: passed.
+- Initial pytest runs encountered Windows ACL errors in the machine's existing
+  default temporary directories. The complete run used
+  `--basetemp=C:/TMP/audit-freecad-20261010-01`; no fidelity assertion was weakened.
+
+Native **FreeCAD 1.1.4**, using its bundled Python 3.11 and actual FreeCAD/Part
+libraries, imported an exact-font synthetic fixture in all six text modes.
+Each returned explicit success, reported zero degraded text items, and wrote
+`import_contract_ready.ready=true`. One private shop drawing produced 74 native
+objects with zero degraded text and a ready report. Evidence is under
+`C:/TMP/pdf-import-audit-20261010/`, including `native-freecad.json` and the
+per-mode reports. The compact native result snapshot is retained as
+`2026-10-10-native-probe.json` beside this record.
+
+## Boundaries and remaining work
+
+These are **source checkout changes**; no installed workbench was replaced, no
+installer was rebuilt, and no publication was performed. The minimum host
+remains FreeCAD 0.21. Windows offline bundles currently cover Python 3.10/3.11;
+other host Python versions still require separately available dependencies.
+Legacy FreeCAD 0.19/0.20 support is not established by this run. For comparison,
+the current Blender host used elsewhere in this review is 5.2.2 LTS, documented
+on the official [Blender download page](https://www.blender.org/download/).
+
+The native checks verify recorded delivery contracts for selected inputs. They
+do not certify every PDF, every host release, or a pixel-perfect GUI comparison.
+The batch GUI transport was exercised with lightweight widget adapters; a human
+interactive usability pass remains useful on the supported host versions.
+
+Concurrent edits to `src/PDFImporterCore.py` and
+`tests/test_disconnected_stroke_subpath_fc.py` were observed and preserved. They
+address disconnected stroke subpaths and are separate from this utility-workflow
+change.

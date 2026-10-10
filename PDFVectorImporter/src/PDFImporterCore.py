@@ -240,6 +240,18 @@ def _len2d(a: "Vector", b: "Vector") -> float:
     return math.hypot(a.x - b.x, a.y - b.y)
 
 
+def _disconnected_stroke_starts_new_subpath(current_pt, start_pt) -> bool:
+    """A self-contained segment that misses the open subpath starts a new one.
+
+    PyMuPDF can put several two-point lines in one path with no moveto between
+    them. A page-sized X is that case. Part.Wire rejects the gap, and that
+    exception used to fail the page and roll every earlier page back with it.
+    """
+    if current_pt is None or start_pt is None:
+        return False
+    return _len2d(current_pt, start_pt) > CLOSE_TOL
+
+
 def _pts_closed(pts: List["Vector"], tol: float = CLOSE_TOL) -> bool:
     return len(pts) > 2 and _len2d(pts[0], pts[-1]) <= tol
 
@@ -13036,6 +13048,8 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     x1, y1 = _xy(data[1])
                     p_start = _to_fc((x0, y0), page_h, opts, scale)
                     p_end   = _to_fc((x1, y1), page_h, opts, scale)
+                    if _disconnected_stroke_starts_new_subpath(current_pt, p_start):
+                        flush_sub(False)
                     seg = _len2d(p_start, p_end)
                     if seg > max(ZERO_TOL, opts.min_seg_len):
                         e = _edge_line(p_start, p_end)
@@ -13068,6 +13082,8 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     p1 = _to_fc((x1, y1), page_h, opts, scale)
                     p2 = _to_fc((x2, y2), page_h, opts, scale)
                     p3 = _to_fc((x3, y3), page_h, opts, scale)
+                    if _disconnected_stroke_starts_new_subpath(current_pt, p0):
+                        flush_sub(False)
                     current_pt = p0  # set current in case it was None
                 else:
                     if current_pt is None:

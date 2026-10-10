@@ -1,0 +1,102 @@
+[
+  {
+    "host": [
+      "1",
+      "1",
+      "4",
+      "20260928 (Git shallow)",
+      "Unknown",
+      "2026/09/28 13:46:34",
+      "(HEAD detached at 4fd3bf320)",
+      "4fd3bf320d9566a27e60069fc8387448aaa3a094"
+    ],
+    "python": "3.11.14 | packaged by conda-forge | (main, Oct 13 2025, 14:00:26) [MSC v.1944 64 bit (AMD64)]"
+  },
+  {
+    "case": "text",
+    "result": true,
+    "status": "success",
+    "text_degraded": 0,
+    "types": [
+      "App::DocumentObjectGroup",
+      "App::FeaturePython",
+      "Part::Feature"
+    ],
+    "objects": 9,
+    "report": "C:\\TMP\\pdf-import-audit-20261010\\freecad-text.json"
+  },
+  {
+    "case": "3d_text",
+    "result": true,
+    "status": "success",
+    "text_degraded": 0,
+    "types": [
+      "App::DocumentObjectGroup",
+      "App::FeaturePython",
+      "Part::Feature"
+    ],
+    "objects": 9,
+    "report": "C:\\TMP\\pdf-import-audit-20261010\\freecad-3d_text.json"
+  },
+  {
+    "case": "glyphs",
+    "result": true,
+    "status": "success",
+    "text_degraded": 0,
+    "types": [
+      "App::DocumentObjectGroup",
+      "App::FeaturePython",
+      "Part::Feature"
+    ],
+    "objects": 9,
+    "report": "C:\\TMP\\pdf-import-audit-20261010\\freecad-glyphs.json"
+  },
+  {
+    "case": "geometry",
+    "result": true,
+    "status": "success",
+    "text_degraded": 0,
+    "types": [
+      "App::DocumentObjectGroup",
+      "App::FeaturePython",
+      "Part::Feature"
+    ],
+    "objects": 9,
+    "report": "C:\\TMP\\pdf-import-audit-20261010\\freecad-geometry.json"
+  },
+  {
+    "case": "raster",
+    "result": true,
+    "status": "success",
+    "text_degraded": 0,
+    "types": [
+      "App::DocumentObjectGroup",
+      "App::FeaturePython",
+      "Image::ImagePlane",
+      "Part::Feature"
+    ],
+    "objects": 9,
+    "report": "C:\\TMP\\pdf-import-audit-20261010\\freecad-raster.json"
+  },
+  {
+    "case": "labels",
+    "result": true,
+    "status": "success",
+    "text_degraded": 0,
+    "types": [
+      "App::DocumentObjectGroup",
+      "App::FeaturePython",
+      "Part::Feature"
+    ],
+    "objects": 9,
+    "report": "C:\\TMP\\pdf-import-audit-20261010\\freecad-labels.json"
+  },
+  {
+    "case": "private-shop-drawing",
+    "result": true,
+    "status": "success",
+    "text_degraded": 0,
+    "objects": 74,
+    "report": "C:\\TMP\\pdf-import-audit-20261010\\freecad-shop.json"
+  }
+]

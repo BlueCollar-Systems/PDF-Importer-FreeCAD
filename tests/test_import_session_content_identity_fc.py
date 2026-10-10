@@ -79,3 +79,26 @@ def test_content_identity_is_bounded_and_rejects_empty_package(tmp_path, monkeyp
     monkeypatch.setattr(session, "MAX_IMPORTER_CODE_BYTES", 2)
     with pytest.raises(ValueError, match="limit|bound"):
         session.importer_content_sha256(tmp_path)
+
+
+def test_code_identity_rejects_partial_walk_on_unreadable_subtree(tmp_path, monkeypatch):
+    def broken_walk(_root, **kwargs):
+        kwargs["onerror"](PermissionError("unreadable first-party subtree"))
+        return iter(())
+
+    monkeypatch.setattr(session.os, "walk", broken_walk)
+    with pytest.raises(ValueError, match="traverse"):
+        session.importer_content_sha256(tmp_path)
+
+
+def test_code_identity_rejects_linked_first_party_directory(tmp_path):
+    root = tmp_path / "package"
+    target = tmp_path / "linked-code"
+    root.mkdir(); target.mkdir()
+    (target / "engine.py").write_text("value = 1\n")
+    try:
+        (root / "src").symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("Windows account cannot create directory symlinks")
+    with pytest.raises(ValueError, match="linked directories"):
+        session.importer_content_sha256(root)

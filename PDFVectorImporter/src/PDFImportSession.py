@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import stat
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -30,14 +31,27 @@ def importer_content_sha256(package_root: Path | None = None) -> str:
     root = (Path(package_root) if package_root is not None
             else Path(__file__).resolve().parents[1]).resolve()
     paths = []
-    for directory, subdirectories, files in os.walk(root, followlinks=False):
+    def traversal_error(error):
+        raise ValueError("importer code identity could not traverse its package") from error
+
+    def linked(path):
+        metadata = path.lstat()
+        return stat.S_ISLNK(metadata.st_mode) or bool(
+            getattr(metadata, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        )
+
+    for directory, subdirectories, files in os.walk(root, followlinks=False, onerror=traversal_error):
         subdirectories[:] = sorted(name for name in subdirectories
             if name.casefold() not in {"lib", "tests", "test", "__pycache__", ".git"})
+        for name in subdirectories:
+            if linked(Path(directory) / name):
+                raise ValueError("importer code identity cannot include linked directories")
         for name in sorted(files):
             if not name.endswith(".py"):
                 continue
             path = Path(directory) / name
-            if path.is_symlink():
+            if linked(path):
                 raise ValueError("importer code identity cannot include linked files")
             try:
                 path.resolve().relative_to(root)

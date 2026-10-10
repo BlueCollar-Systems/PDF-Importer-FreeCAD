@@ -240,6 +240,90 @@ def _len2d(a: "Vector", b: "Vector") -> float:
     return math.hypot(a.x - b.x, a.y - b.y)
 
 
+# PyMuPDF often omits moveto and stores the next subpath only as the next
+# segment's start point. 0.01 mm is the same gap pdfcadcore uses, so a donut's
+# inner ring is not welded onto the outer ring (that weld makes Part.Wire fail
+# and used to throw away the whole page).
+SUBPATH_BREAK_MM = 0.01
+
+
+def _subpath_break(current_end, segment_start, subpath_origin):
+    """Return ``(flush, closed)`` when ``segment_start`` opens a new subpath.
+
+    ``closed`` is true when the subpath being flushed already returns to its
+    own start, which is how PDF circle pairs are stored.
+    """
+    if current_end is None or segment_start is None:
+        return False, False
+    try:
+        gap = _len2d(current_end, segment_start)
+    except (AttributeError, TypeError, ValueError):
+        return False, False
+    if gap <= SUBPATH_BREAK_MM:
+        return False, False
+    closed = False
+    if subpath_origin is not None:
+        try:
+            closed = _len2d(current_end, subpath_origin) <= SUBPATH_BREAK_MM
+        except (AttributeError, TypeError, ValueError):
+            closed = False
+    return True, closed
+
+
+_GROUPING_MODES = {
+    "single",
+    "per_page",
+    "per_layer",
+    "per_color",
+    "nested_page_layer",
+    "nested_page_lineweight",
+}
+
+
+def resolve_grouping(opts) -> Dict[str, Any]:
+    """Translate the Grouping dropdown into parent-folder rules.
+
+    An unset ``grouping_mode`` keeps the historical automatic mix (PDF layers
+    when the file has them, otherwise color). A dialog choice replaces that
+    mix so the dropdown does what its label says.
+    """
+    requested = str(getattr(opts, "grouping_mode", "") or "").strip().lower()
+    if requested not in _GROUPING_MODES:
+        return {
+            "mode": "auto",
+            "single_root": False,
+            "use_layers": False,
+            "use_color": False,
+            "use_lineweight": False,
+            "layers_at_document_root": False,
+        }
+    if requested == "single":
+        kind = "flat"
+        single_root = True
+    elif requested == "per_page":
+        kind = "flat"
+        single_root = False
+    elif requested == "per_color":
+        kind = "color"
+        single_root = False
+    elif requested == "nested_page_lineweight":
+        kind = "lineweight"
+        single_root = False
+    else:
+        kind = "layer"
+        single_root = False
+    return {
+        "mode": kind,
+        "single_root": single_root,
+        "use_layers": kind == "layer",
+        "use_color": kind == "color",
+        "use_lineweight": kind == "lineweight",
+        # "Per layer" is one folder per layer for the whole import.
+        # "Nested page > layer" keeps those folders inside each page.
+        "layers_at_document_root": requested == "per_layer",
+    }
+
+
 def _pts_closed(pts: List["Vector"], tol: float = CLOSE_TOL) -> bool:
     return len(pts) > 2 and _len2d(pts[0], pts[-1]) <= tol
 
@@ -2769,8 +2853,76 @@ def _apply_style(
 def _make_group(parent, label: str, fc_doc=None):
     doc = fc_doc or FreeCAD.ActiveDocument
     grp = doc.addObject("App::DocumentObjectGroup", label)
-    parent.addObject(grp)
+    try:
+        grp.Label = label
+    except (AttributeError, RuntimeError, TypeError):
+        pass
+    if parent is not None and parent is not doc and hasattr(parent, "addObject"):
+        parent.addObject(grp)
     return grp
+
+
+def _ensure_labeled_group(doc, label: str, parent=None, reuse: bool = False):
+    """Find or create a document group with a stable label."""
+    if reuse:
+        for obj in list(getattr(doc, "Objects", []) or []):
+            type_id = str(getattr(obj, "TypeId", "") or "")
+            if getattr(obj, "Label", "") == label and "DocumentObjectGroup" in type_id:
+                return obj
+    return _make_group(parent if parent is not None else doc, label, doc)
+
+
+def _group_member_names(group) -> set:
+    names = set()
+    stack = list(getattr(group, "Group", []) or [])
+    while stack:
+        obj = stack.pop()
+        name = getattr(obj, "Name", None)
+        if not name or name in names:
+            continue
+        names.add(str(name))
+        nested = getattr(obj, "Group", None)
+        if nested:
+            stack.extend(list(nested))
+    return names
+
+
+def _shift_placement_y(obj, dy: float) -> None:
+    if not dy:
+        return
+    placement = getattr(obj, "Placement", None)
+    base = getattr(placement, "Base", None)
+    if base is None or not hasattr(base, "y"):
+        return
+    try:
+        base.y = float(base.y) + float(dy)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+
+
+def _record_stroke_wire_repair(opts, page_num, error) -> None:
+    """Remember a stroke that had to be delivered as separate edges."""
+    extra = dict(getattr(opts, "_report_extra", {}) or {})
+    block = extra.get("stroke_wire_repairs")
+    if not isinstance(block, dict):
+        block = {"schema": "bcs.freecad.stroke_wire_repairs/1", "total": 0, "items": []}
+    items = list(block.get("items") or [])
+    total = int(block.get("total", 0) or 0) + 1
+    if len(items) < 50:
+        items.append({
+            "page": int(page_num),
+            "error": str(error)[:300],
+        })
+    extra["stroke_wire_repairs"] = {
+        "schema": "bcs.freecad.stroke_wire_repairs/1",
+        "total": total,
+        "items": items,
+    }
+    opts._report_extra = extra
+    _warn(
+        f"Page {page_num}: one stroke could not be a single wire "
+        f"({error}); its edges were kept separately."
+    )
 
 
 _temp_files: List[str] = []
@@ -12343,39 +12495,68 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         _enforce_page_complexity_budget(page_num, complexity_profile, complexity_limit)
 
     # Create host objects only after the explicit complexity gate passes.
+    grouping = resolve_grouping(opts)
     top_group = None
     if opts.create_top_group:
         top_group = fc_doc.addObject(
             "App::DocumentObjectGroup", f"PDF_Page_{page_num}")
+        if grouping["single_root"] and top_group is not None:
+            root = _ensure_labeled_group(fc_doc, "PDF Import", reuse=True)
+            try:
+                root.addObject(top_group)
+            except (AttributeError, RuntimeError, TypeError):
+                pass
 
-    # ── Layer / color grouping ──
+    # ── Layer / color / lineweight grouping ──
+    # Dialog choices win. Scripted imports that never set grouping_mode keep
+    # the previous automatic layer-or-color behavior.
     use_ocg = False
-    if opts.layer_mode in ("auto", "ocg"):
-        try:
-            ocgs = pdf_doc.get_ocgs()
-            use_ocg = bool(ocgs)
-        except (RuntimeError, AttributeError, ValueError):
-            use_ocg = False
-
     group_by_color = False
-    if opts.layer_mode == "color":
-        group_by_color = True
-    elif opts.layer_mode == "none":
-        group_by_color = False
-    elif opts.layer_mode == "ocg":
-        group_by_color = False
-    else:  # auto
-        group_by_color = opts.group_by_color and not use_ocg
+    group_by_lineweight = False
+    layers_at_document_root = bool(grouping["layers_at_document_root"])
+    if grouping["mode"] == "auto":
+        if opts.layer_mode in ("auto", "ocg"):
+            try:
+                ocgs = pdf_doc.get_ocgs()
+                use_ocg = bool(ocgs)
+            except (RuntimeError, AttributeError, ValueError):
+                use_ocg = False
+        if opts.layer_mode == "color":
+            group_by_color = True
+        elif opts.layer_mode == "none":
+            group_by_color = False
+        elif opts.layer_mode == "ocg":
+            group_by_color = False
+        else:  # auto
+            group_by_color = opts.group_by_color and not use_ocg
+    else:
+        use_ocg = bool(grouping["use_layers"])
+        group_by_color = bool(grouping["use_color"])
+        group_by_lineweight = bool(grouping["use_lineweight"])
 
     color_groups: Dict[Tuple[float, float, float], object] = {}
     layer_groups: Dict[str, object] = {}
+    weight_groups: Dict[str, object] = {}
 
-    def _parent_for(stroke_rgb, layer_name):
+    def _parent_for(stroke_rgb, layer_name, stroke_width=None):
         parent = top_group or fc_doc
         if use_ocg and layer_name:
             if layer_name not in layer_groups:
-                layer_groups[layer_name] = _make_group(parent, f"Layer_{layer_name}", fc_doc)
+                label = f"Layer_{layer_name}"
+                if layers_at_document_root:
+                    layer_groups[layer_name] = _ensure_labeled_group(
+                        fc_doc, label, reuse=True)
+                else:
+                    layer_groups[layer_name] = _make_group(parent, label, fc_doc)
             return layer_groups[layer_name]
+        if group_by_lineweight:
+            if stroke_width is None:
+                label = "Weight_fill"
+            else:
+                label = "Weight_%.2fpt" % float(stroke_width)
+            if label not in weight_groups:
+                weight_groups[label] = _make_group(parent, label, fc_doc)
+            return weight_groups[label]
         if group_by_color and stroke_rgb is not None:
             key = stroke_rgb
             if key not in color_groups:
@@ -12844,7 +13025,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
 
         # Bounds cannot distinguish background paint from a border, diagonal,
         # or large filled feature. Preserve every visible source drawing here.
-        parent = _parent_for(stroke_rgb or fill_rgb, layer_name)
+        parent = _parent_for(stroke_rgb or fill_rgb, layer_name, width)
 
         if opts.assign_linewidth:
             # A near-zero centerline with round caps is still a full-size ink
@@ -13011,12 +13192,23 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             # Closure was proved in source space. Never invent a closing edge.
             wires_edges.append((_source_fill_boundary_edges(items, page_h, opts, scale), close_path))
 
+        subpath_origin = None
+
         def flush_sub(close_flag: bool, _wires=wires_edges):
-            nonlocal sub_edges, current_pt
+            nonlocal sub_edges, current_pt, subpath_origin
             if sub_edges:
                 _wires.append((sub_edges[:], close_flag))
             sub_edges = []
             current_pt = None
+            subpath_origin = None
+
+        def begin_segment(start, previous_end):
+            nonlocal subpath_origin
+            should_flush, closed = _subpath_break(previous_end, start, subpath_origin)
+            if should_flush:
+                flush_sub(closed)
+            if subpath_origin is None:
+                subpath_origin = start
 
         for item in (() if source_fill_proof is not None else items):
             kind = item[0]
@@ -13026,6 +13218,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 flush_sub(False)
                 x, y = _parse_point(data)
                 current_pt = _to_fc((x, y), page_h, opts, scale)
+                subpath_origin = current_pt
 
             elif kind == "l":  # lineto
                 # PyMuPDF may give ('l', start_pt, end_pt) with BOTH points,
@@ -13036,6 +13229,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     x1, y1 = _xy(data[1])
                     p_start = _to_fc((x0, y0), page_h, opts, scale)
                     p_end   = _to_fc((x1, y1), page_h, opts, scale)
+                    begin_segment(p_start, current_pt)
                     seg = _len2d(p_start, p_end)
                     if seg > max(ZERO_TOL, opts.min_seg_len):
                         e = _edge_line(p_start, p_end)
@@ -13068,6 +13262,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     p1 = _to_fc((x1, y1), page_h, opts, scale)
                     p2 = _to_fc((x2, y2), page_h, opts, scale)
                     p3 = _to_fc((x3, y3), page_h, opts, scale)
+                    begin_segment(p0, current_pt)
                     current_pt = p0  # set current in case it was None
                 else:
                     if current_pt is None:
@@ -13235,19 +13430,47 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 # fill must not acquire an opaque native face above the image.
                 want_face = False
             if _batch_size and not want_face:
-                # Batch wires into compounds to reduce GDI handle count
+                # Batch wires into compounds to reduce GDI handle count.
+                # One stroke that cannot be a single wire costs that stroke,
+                # not the page: its edges are kept as separate editable curves.
+                wire = None
+                wire_error = None
                 try:
                     wire = Part.Wire(edges)
-                    if is_closed and not wire.isClosed():
-                        if wire.Vertexes:
-                            p0 = wire.Vertexes[0].Point
-                            pN = wire.Vertexes[-1].Point
-                            if _len2d(_v(p0.x, p0.y), _v(pN.x, pN.y)) > ZERO_TOL:
-                                closer = Part.LineSegment(pN, p0).toShape()
-                                wire = Part.Wire(edges + [closer])
-                    _add_to_batch(wire, parent, stroke_rgb, fill_rgb, width, dashes)
                 except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
-                    raise DrawingGeometryFailure("Native drawing stroke construction failed") from exc
+                    wire_error = exc
+                if wire is None:
+                    placed = 0
+                    for edge in edges:
+                        try:
+                            _add_to_batch(edge, parent, stroke_rgb, fill_rgb, width, dashes)
+                            placed += 1
+                        except ImportCancelled:
+                            raise
+                        except (RuntimeError, ValueError, TypeError, AttributeError):
+                            continue
+                    if placed:
+                        _record_stroke_wire_repair(opts, page_num, wire_error)
+                    else:
+                        raise DrawingGeometryFailure(
+                            "Native drawing stroke construction failed"
+                        ) from wire_error
+                else:
+                    try:
+                        if is_closed and not wire.isClosed():
+                            if wire.Vertexes:
+                                p0 = wire.Vertexes[0].Point
+                                pN = wire.Vertexes[-1].Point
+                                if _len2d(_v(p0.x, p0.y), _v(pN.x, pN.y)) > ZERO_TOL:
+                                    closer = Part.LineSegment(pN, p0).toShape()
+                                    wire = Part.Wire(edges + [closer])
+                        _add_to_batch(wire, parent, stroke_rgb, fill_rgb, width, dashes)
+                    except ImportCancelled:
+                        raise
+                    except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
+                        raise DrawingGeometryFailure(
+                            "Native drawing stroke construction failed"
+                        ) from exc
             else:
                 # Faces and non-batchable shapes: create individually
                 obj = _make_shape_obj(edges, False if source_fill_proof is not None else is_closed,
@@ -13679,6 +13902,11 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
     _recompute_page_if_needed(fc_doc, opts)
     elapsed_total = time.time() - _import_start
     _msg(f"Page {page_num}: {obj_count} objects created in {elapsed_total:.1f}s")
+    opts._last_page_created_names = [
+        str(obj.Name)
+        for obj in (getattr(fc_doc, "Objects", []) or [])
+        if getattr(obj, "Name", None) not in page_existing_object_names
+    ]
     return top_group, text_entity_info
 
 
@@ -14535,6 +14763,22 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                                     sub.Placement.Base.y += y_shift
                     except (AttributeError, RuntimeError):
                         pass
+            # "Per layer" folders live on the document, shared by every page,
+            # so the page-folder walk above never sees them. Shift only the
+            # objects this page just created.
+            if y_shift:
+                contained = _group_member_names(page_group) if page_group is not None else set()
+                if page_group is not None and getattr(page_group, "Name", None):
+                    contained.add(str(page_group.Name))
+                for name in list(getattr(opts, "_last_page_created_names", []) or []):
+                    if name in contained:
+                        continue
+                    host = fc_doc.getObject(name) if hasattr(fc_doc, "getObject") else None
+                    if host is None:
+                        continue
+                    if "DocumentObjectGroup" in str(getattr(host, "TypeId", "") or ""):
+                        continue
+                    _shift_placement_y(host, y_shift)
 
             completed_pages.append(page_number)
             current_invocation_completed_pages.append(page_number)

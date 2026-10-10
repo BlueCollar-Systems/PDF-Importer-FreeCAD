@@ -75,11 +75,57 @@ except ImportError:
     FreeCAD = Draft = Part = None
     Vector = Placement = Rotation = None
 
-try:
-    import ImageGui  # noqa: F401
-    IMAGE_WB = True
-except ImportError:
-    IMAGE_WB = False
+# Whether this FreeCAD can place pictures (Image::ImagePlane). Worked out on
+# first use, never at import: FreeCAD 1.x has no ImageGui module, so the old
+# "import ImageGui" test turned picture import off for options-less imports.
+_IMAGE_IMPORT_AVAILABLE: Optional[bool] = None
+
+
+def _image_import_available(doc=None) -> bool:
+    """True when ``Image::ImagePlane`` objects can be created in this FreeCAD.
+
+    Checks ``doc`` (or the active document, or a hidden temporary document
+    that is closed again) for the type; older FreeCAD falls back to ImageGui.
+    """
+    global _IMAGE_IMPORT_AVAILABLE
+    if _IMAGE_IMPORT_AVAILABLE is not None:
+        return _IMAGE_IMPORT_AVAILABLE
+    available = None
+    if FreeCAD is not None:
+        probe = doc if doc is not None else getattr(FreeCAD, "ActiveDocument", None)
+        temp_name = None
+        try:
+            if probe is None and hasattr(FreeCAD, "newDocument"):
+                probe = FreeCAD.newDocument("PDFImageProbe", "PDFImageProbe", True)
+                temp_name = probe.Name
+            if probe is not None and hasattr(probe, "supportedTypes"):
+                if "Image::ImagePlane" in probe.supportedTypes():
+                    available = True
+                else:
+                    try:
+                        import Image  # noqa: F401  # registers the type on older FreeCAD
+                    except ImportError:
+                        pass
+                    else:
+                        if "Image::ImagePlane" in probe.supportedTypes():
+                            available = True
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            available = None
+        finally:
+            if temp_name:
+                try:
+                    FreeCAD.closeDocument(temp_name)
+                except (AttributeError, RuntimeError, NameError):
+                    pass
+    if available is None:
+        try:
+            import ImageGui  # noqa: F401
+            available = True
+        except ImportError:
+            available = False
+    if FreeCAD is not None:
+        _IMAGE_IMPORT_AVAILABLE = available
+    return available
 
 # ──────────────────────────────────────────────────────────────────────
 # Constants
@@ -12070,10 +12116,10 @@ def import_pdf_page(pdf_path: str, page_num: int = 1,
                     autofit: bool = True):
     """Import a single PDF page into the active FreeCAD document."""
     _cancel_import_view_reframe()
-    if opts is None:
-        opts = ImportOptions(ignore_images=not IMAGE_WB)
-    _reset_import_run_state(opts)
     fc_doc = _ensure_doc()  # Store reference — don't rely on ActiveDocument later
+    if opts is None:
+        opts = ImportOptions(ignore_images=not _image_import_available(fc_doc))
+    _reset_import_run_state(opts)
 
     # This entry point may run inside a caller-owned transaction.  Do not open
     # or abort it: remove only objects created by this page, just as the
@@ -14102,7 +14148,7 @@ def estimate_import_work(pdf_path: str, opts: Optional[ImportOptions] = None) ->
     from pdfcadcore.fitz_loader import safe_open
 
     if opts is None:
-        opts = ImportOptions(ignore_images=not IMAGE_WB)
+        opts = ImportOptions(ignore_images=not _image_import_available())
     profiles: List[Dict[str, int]] = []
     with safe_open(pdf_path) as pdf_doc:
         total_pages = len(pdf_doc)
@@ -14263,9 +14309,9 @@ def find_resumable_import_session(
 def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
     """Import one or more pages from a PDF file."""
     _cancel_import_view_reframe()
-    if opts is None:
-        opts = ImportOptions(ignore_images=not IMAGE_WB)
     fc_doc = _ensure_doc()
+    if opts is None:
+        opts = ImportOptions(ignore_images=not _image_import_available(fc_doc))
     t_import_start = time.perf_counter()
     _reset_import_run_state(opts)
     obj_count_before = len(fc_doc.Objects)

@@ -288,9 +288,10 @@ def _len2d(a: "Vector", b: "Vector") -> float:
 
 
 # PyMuPDF often omits moveto and stores the next subpath only as the next
-# segment's start point. 0.01 mm is the same gap pdfcadcore uses, so a donut's
-# inner ring is not welded onto the outer ring. That weld makes Part.Wire fail;
-# the audit's step-down then keeps an outline instead of a face with a hole.
+# segment's start point. 0.01 mm is the same gap pdfcadcore uses. A ring that
+# has already returned to its own start is split off, so a hole is not welded
+# onto the outer ring. An open gap is left for the audit step-down, which
+# draws those edges as plain lines and lists the item.
 SUBPATH_BREAK_MM = 0.01
 
 
@@ -13753,9 +13754,13 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         def begin_segment(start, previous_end):
             nonlocal subpath_origin
             should_flush, closed = _subpath_break(previous_end, start, subpath_origin)
-            if should_flush:
-                flush_sub(closed)
-            if subpath_origin is None:
+            # Only a ring that has already returned to its own start is split
+            # off. An open gap stays one item: Part.Wire refuses it, and the
+            # audit step-down draws those plain lines and lists the item.
+            # Splitting the open gap would hide that report.
+            if should_flush and closed:
+                flush_sub(True)
+            if subpath_origin is None or (should_flush and closed):
                 subpath_origin = start
 
         for item in (() if source_fill_proof is not None else items):

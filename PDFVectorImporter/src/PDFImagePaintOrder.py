@@ -7,10 +7,10 @@ import math
 from pathlib import Path
 
 try:
-    from .PDFImagePaintOrderProof import plan_opaque_images, _close
+    from .PDFImagePaintOrderProof import plan_opaque_images, _close, _tolerance
     from .PDFNonTextComposite import _upright, display_top
 except ImportError:
-    from PDFImagePaintOrderProof import plan_opaque_images, _close
+    from PDFImagePaintOrderProof import plan_opaque_images, _close, _tolerance
     from PDFNonTextComposite import _upright, display_top
 
 PROPERTY = "PDFImageOrderDisplayJSON"
@@ -144,10 +144,25 @@ def apply_image_order(page, plans, *, pdf_path, source_sha256, doc, objects,
             raise ValueError("Native image differs from original opaque source pixels")
         quad = [_xyz(mapper(p)) for p in plan["source_quad_pdf"]]
         a, b, c, d = quad
-        if (not _close(_xyz(image.Placement.Base), [(a[0]+c[0])/2, (a[1]+c[1])/2, 0.])
+        # Source quads are float32. A placed ImagePlane is an upright
+        # rectangle, so accept only a quad that is axis-aligned within that
+        # source rounding, and compare its span rather than one corner order.
+        xs = [a[0], b[0], c[0], d[0]]
+        ys = [a[1], b[1], c[1], d[1]]
+        tol_x = _tolerance(*xs)
+        tol_y = _tolerance(*ys)
+        axis_aligned = (
+            abs(a[1] - b[1]) <= tol_y and abs(d[1] - c[1]) <= tol_y
+            and abs(a[0] - d[0]) <= tol_x and abs(b[0] - c[0]) <= tol_x
+        )
+        span_x = max(xs) - min(xs)
+        span_y = max(ys) - min(ys)
+        center = [(min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0, 0.0]
+        if (not axis_aligned
+                or not _close(_xyz(image.Placement.Base), center)
                 or not _upright(image)
-                or not math.isclose(float(image.XSize), b[0]-a[0], abs_tol=1e-8)
-                or not math.isclose(float(image.YSize), a[1]-d[1], abs_tol=1e-8)):
+                or not math.isclose(float(image.XSize), span_x, abs_tol=tol_x)
+                or not math.isclose(float(image.YSize), span_y, abs_tol=tol_y)):
             raise ValueError("Native image does not retain the source affine corners")
         strokes = []
         for seq, spec in sorted(plan["later_strokes"].items()):

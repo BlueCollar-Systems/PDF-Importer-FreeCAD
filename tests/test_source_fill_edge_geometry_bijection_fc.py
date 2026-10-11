@@ -246,11 +246,12 @@ def test_bad_joined_edge_cannot_pass_genuine_pdf_source_contour(tmp_path, fault)
         def __init__(self, edges):
             super().__init__(edges)
             boundary = self.Edges[1]
-            if fault == "endpoint": boundary.Vertexes[-1].Point.z = math.ulp(1.)
-            elif fault == "trim": boundary.FirstParameter = math.ulp(1.)
+            # Sub-nanometer kernel roundoff is the same edge. A micron is not.
+            if fault == "endpoint": boundary.Vertexes[-1].Point.z = 1e-6
+            elif fault == "trim": boundary.FirstParameter = 1e-6
             elif fault == "control":
                 point = boundary.Curve.Location
-                boundary.Curve.Location = SimpleNamespace(x=point.x,y=point.y,z=math.ulp(1.))
+                boundary.Curve.Location = SimpleNamespace(x=point.x,y=point.y,z=1e-6)
             else: boundary.Curve = type("BSplineCurve",(),{"isPeriodic":lambda self:False})()
     kernel.Wire = BadWire
     with pytest.raises(fill.SourceFillError): fixture.compose(contours,kernel=kernel)

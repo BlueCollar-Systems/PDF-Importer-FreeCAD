@@ -18,6 +18,11 @@ on:
       # must never recursively mint another product release.
       - "release-bookkeeping/**"
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Publish validated assets after all current work and native checks are complete; false builds only.'
+        type: boolean
+        default: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -36,7 +41,9 @@ concurrency:
 
 jobs:
   version-build-release:
-    if: "!startsWith(github.event.head_commit.message, 'chore: bump version to') && !contains(github.event.head_commit.message, 'automation/version-bump') && !contains(github.event.head_commit.message, '[skip release]')"
+    if: "github.event_name == 'workflow_dispatch'"
+    # Push/PR validation remains in fc-pdfimporter-ci; this workflow is manual.
+    # [skip release] commits run the separate CI and cannot publish on push.
     runs-on: windows-latest
     env:
       # Private identifiers stay in a masked repository secret and never enter
@@ -64,7 +71,7 @@ jobs:
       # Skipping is the correct outcome, not a failure: an unbumped version means
       # the author did not intend to release. Nothing here can mint a release by
       # accident, and cutting one stays explicit.
-      - name: Decide whether this push mints a release
+      - name: Decide whether this manual run builds or publishes a release
         id: preflight
         run: |
           version="$(sed -n 's:.*<version>\([0-9][0-9.]*\)</version>.*:\1:p' \
@@ -74,6 +81,12 @@ jobs:
             exit 1
           fi
           tag="v${version}"
+          if [ "${{ inputs.publish_release }}" != "true" ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "version=${version}" >> "$GITHUB_OUTPUT"
+            echo "::notice::Build-only dispatch: validate ZIP/installers without tags, release uploads or bookkeeping."
+            exit 0
+          fi
           head="$(git rev-parse HEAD)"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
@@ -88,7 +101,7 @@ jobs:
           if [ "$tagged" = "$head" ]; then
             echo "::notice::${tag} already points at this commit; nothing to mint."
           else
-            echo "::notice::Skipping release: committed version is still ${version}, and ${tag} already points at ${tagged}. This commit changes the product without preparing a release, which is normal. To cut one, run scripts/prepare_release.py <new-version> and push that commit."
+            echo "::notice::Skipping release: committed version is still ${version}, and ${tag} already points at ${tagged}. This commit changes the product without preparing a release, which is normal. To cut one, prepare and push an approved new version, then manually dispatch with publish_release=true."
           fi
 
       - name: Set up Python 3.10 runtime builder
@@ -224,8 +237,19 @@ jobs:
         if: steps.preflight.outputs.release == 'true'
         run: python scripts/smoke_release_zip.py "FreeCAD-PDF-Importer_v*.zip" --python310 "$PYTHON310" --python311 "$PYTHON311"
 
-      - name: Create or verify exact tag and release
+      - name: Upload validated production assets for inspection
         if: steps.preflight.outputs.release == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: freecad-production-assets-${{ steps.version.outputs.version }}-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            FreeCAD-PDF-Importer_v*.zip
+            dist/FreeCAD-PDF-Importer-Setup_v*.exe
+            dist/FreeCAD-PDF-Importer-Setup_v*.attestation.json
+
+      - name: Create or verify exact tag and release
+        if: steps.preflight.outputs.release == 'true' && github.event_name == 'workflow_dispatch' && inputs.publish_release == true
         id: mint
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -261,7 +285,7 @@ jobs:
           fi
 
       - name: Record verified release artifact digests without a release loop
-        if: steps.mint.outputs.release_verified == 'true'
+        if: steps.mint.outputs.release_verified == 'true' && github.event_name == 'workflow_dispatch' && inputs.publish_release == true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

@@ -90,7 +90,12 @@ def test_workflow_uses_exact_convergent_nonlatest_publisher() -> None:
     )
     assert "scripts/build_steel_shapes_release.py" in workflow
     assert "scripts/publish_release.py" in workflow
-    assert '--target "$GITHUB_SHA"' in workflow
+    # Manual dispatch can select a tag different from the dispatch ref.
+    assert 'ref: ${{ inputs.tag || github.ref }}' in workflow
+    assert '--tag "$STEEL_TAG"' in workflow
+    assert '--target "$(git rev-parse HEAD)"' in workflow
+    assert '--target "$GITHUB_SHA"' not in workflow
+    assert "if: github.event_name == 'workflow_dispatch' && inputs.publish_release == true" in workflow
     assert "--no-latest" in workflow
     assert "softprops/action-gh-release" not in workflow
     assert "overwrite_files" not in workflow

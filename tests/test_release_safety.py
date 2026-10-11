@@ -682,7 +682,11 @@ class TestReleaseSafety:
         )
         publish_block = workflow[publish_at:]
         assert "scripts/publish_release.py" in publish_block
-        assert '--target "$GITHUB_SHA"' in publish_block
+        assert 'ref: ${{ inputs.tag || github.ref }}' in workflow
+        assert '--tag "$STEEL_TAG"' in publish_block
+        assert '--target "$(git rev-parse HEAD)"' in publish_block
+        assert '--target "$GITHUB_SHA"' not in publish_block
+        assert "if: github.event_name == 'workflow_dispatch' && inputs.publish_release == true" in publish_block
         assert "--no-latest" in publish_block
         assert "softprops/action-gh-release" not in publish_block
         assert "--clobber" not in publish_block

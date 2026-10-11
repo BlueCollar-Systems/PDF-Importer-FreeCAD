@@ -3,6 +3,11 @@
 These notes used to sit at the top of the main [README](../README.md), in the
 same order. Install steps and the feature list are in the README.
 
+## Recent fixes (v4.0.113)
+
+- A sparse vector page keeps its editable lines even when it contains fewer than five drawing items and no text. Whole-page raster fallback is considered only when the page has no vector drawings.
+- Publishing ZIPs, installers and shape packs requires an explicit manual release run; normal pushes continue to validate the source.
+
 ## Recent fixes (v4.0.112)
 
 - The import dialog uses the PDF you picked. Choosing another file no longer imports the previous one, and All still means every page. A page range that is larger than the file is refused before the importer tries to build it.

@@ -9,8 +9,10 @@ Fixtures are fictional (job D042, mark EX101), built from raw content streams:
     1.9e-6 pt (6.7e-7 mm in the model): inside the importer's endpoint
     tolerance, so it stays one subpath, but above OCC's own 1e-7, so OCC
     refuses it as one wire ("BRep_API: command not done");
-  * two sheets, sheet 2 holds a self-crossing filled outline (bow tie) whose
-    face OCC refuses;
+  * two sheets, sheet 2 holds a self-crossing filled outline (bow tie). Its
+    fill cannot be a face (PyMuPDF gives it as an open path, and OCC refuses
+    the self-crossing face anyway): its outline arrives in the fill colour and
+    the unpainted fill is listed;
   * three sheets, sheet 2 holds "60 200 m 300 200 l 60 190 m 300 190 l S"
     (two lines in one stroke). Since the disconnected-subpath fix these are
     two subpaths, so both lines arrive and nothing is stepped down.
@@ -66,6 +68,11 @@ try:
     result["outlines"] = [
         {"name": o.Name, "edges": len(o.Shape.Edges), "valid": bool(o.Shape.isValid())}
         for o in doc.Objects if o.Name.startswith("StepDownOutline")]
+    result["shapes"] = {
+        o.Name: {"edges": len(o.Shape.Edges), "valid": bool(o.Shape.isValid())}
+        for o in doc.Objects
+        if hasattr(o, "Shape") and not o.isDerivedFrom("App::DocumentObjectGroup")
+        and not o.Shape.isNull()}
 
     def long_edges(group, found):
         for child in getattr(group, "Group", None) or []:
@@ -155,9 +162,15 @@ def test_a_fill_occ_cannot_face_is_drawn_as_its_outline_and_both_sheets_arrive(
     block = report["extra"]["geometry_items_degraded"]
     assert (block["total"], block["pages"]) == (1, [2])
     (entry,) = block["items"]
+    assert entry["kind"] == "fill"
     assert entry["delivered"] == "outline" and "face" in entry["reason"].lower()
-    assert result["outlines"] and all(row["valid"] for row in result["outlines"])
+    # The outline that stands in for the fill: its own line since PR #97, a
+    # StepDownOutline before; either way it is named in the report and valid.
+    created = entry["created_entity_ids"]
+    assert created and all(result["shapes"][name]["valid"] for name in created)
+    assert sum(result["shapes"][name]["edges"] for name in created) == 4
     assert "1 drawing item on page 2 could not be built as requested" in report["extra"]["human_summary"]
+    assert report["fallback"]["used"] is True
     assert report["extra"]["import_contract_ready"]["ready"] is False
 
 

@@ -61,6 +61,16 @@ def triangle_fill(seqno=3, fill=(0.8, 0.1, 0.1)):
             "items": [("l", a, b), ("l", b, c), ("l", c, a)]}
 
 
+def open_bow_tie_fill(seqno=7, fill=(0.9, 0.1, 0.1)):
+    # "100 250 m 200 330 l 200 250 l 100 330 l h f" as PyMuPDF gives it: an
+    # explicit line back to the start and closePath False. It crosses itself,
+    # so the importer cannot prove its fill boundary, and it is not closed.
+    corners = [(100, 10), (160, 60), (160, 10), (100, 60), (100, 10)]
+    return {"type": "f", "level": 0, "seqno": seqno, "rect": core.fitz.Rect(100, 10, 160, 60),
+            "fill": fill, "fill_opacity": 1.0, "even_odd": False, "closePath": False,
+            "items": [("l", core.fitz.Point(*a), core.fitz.Point(*b)) for a, b in zip(corners, corners[1:], strict=False)]}
+
+
 def run_import(monkeypatch, tmp_path, pages, **changes):
     """The real multi-page entry point over the fixture's facade pages."""
     from pdfcadcore import fitz_loader
@@ -184,6 +194,34 @@ def test_a_refused_fill_face_is_drawn_as_its_outline_in_the_fill_colour(host, mo
     assert outline_edges(outline) == [[(100, 90), (160, 90)], [(160, 90), (130, 40)], [(130, 40), (100, 90)]]
     assert (outline.Name, (0.8, 0.1, 0.1), None) in styles             # fill colour as the line colour
     assert len(document.named("Batch")) == 1                            # the rest of the page
+
+
+@pytest.mark.parametrize("batch_size", [None, 0])
+def test_an_open_fill_keeps_its_line_and_is_listed_as_not_painted(host, monkeypatch, batch_size):
+    # PR #97: a fill whose boundary is not closed is no longer forced into a
+    # face (that always failed); its line is delivered as itself. The fill is
+    # still not painted, so it is listed like any other stepped-down item.
+    styles = []
+    monkeypatch.setattr(core, "_apply_style", lambda obj, stroke, fill, width, dashes, opts, **_kw:
+                        styles.append((obj.Name, stroke, fill)))
+    changes = {"hatch_to_faces": True}
+    if batch_size is not None:
+        changes["compound_batch_size"] = batch_size
+    document, opts, group = fixture.import_page([open_bow_tie_fill(), plain_row(seqno=4)],
+                                                fixture.options(**changes))
+    assert group is not None
+    assert not document.named("Face") and not document.named("StepDownOutline")
+    block = opts._report_extra["geometry_items_degraded"]
+    assert (block["total"], block["delivered_as_outline"], block["pages"]) == (1, 1, [1])
+    entry, = block["items"]
+    assert (entry["kind"], entry["delivered"], entry["source_paint_order"]) == ("fill", "outline", 7)
+    assert "not closed" in entry["reason"] and "face" in entry["reason"]
+    line = document.getObject(entry["created_entity_ids"][0])
+    assert line is not None and line.Name.startswith("Wire") and line in group.Group
+    assert len(line.Shape.edges) == 4
+    assert (line.Name, None, (0.9, 0.1, 0.1)) in styles               # drawn in the fill colour
+    warning, = [text for text in host["warning"] if "drawing item" in text]
+    assert "fill, drawing order 7" in warning and "drawn as plain lines instead" in warning
 
 
 # (3) a quadrilateral with a NaN corner

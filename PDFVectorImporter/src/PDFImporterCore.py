@@ -14001,15 +14001,22 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             # An open stroke that also carries a fill is not a face. Forcing
             # one used to fail the item ("open boundary") and step it down
             # to an outline even though the line itself is fine.
+            # The line is still delivered as itself, but the fill it carries
+            # is not painted, so it is listed like any other stepped-down
+            # item (deliver, step down, report).
+            open_fill_unpainted = False
             if source_fill_proof is None and not is_closed:
+                open_fill_unpainted = bool(want_face and fill is not None)
                 want_face = False
             if compound_fill_delivered or source_quad_stroke or compound_step_down:
                 want_face = False
+                open_fill_unpainted = False
             if path_group.get("seqno") in image_order_strokes:
                 # Source-qualified later paint is a stroke; an invisible fs
                 # fill must not acquire an opaque native face above the image.
                 want_face = False
-            if _batch_size and not want_face and not compound_step_down:
+                open_fill_unpainted = False
+            if _batch_size and not want_face and not compound_step_down and not open_fill_unpainted:
                 # Batch wires into compounds to reduce GDI handle count
                 try:
                     try:
@@ -14091,6 +14098,12 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                         stroke_rgb, fill_rgb, width, dashes)
                 else:
                     if compound_step_down and obj is not None:
+                        item_degrade["created"].append(obj.Name)
+                    if open_fill_unpainted and obj is not None:
+                        # Built on its own (not batched) so the report can
+                        # name the line that stands in for the fill.
+                        item_degrade = _note_item_failure(item_degrade, "fill", DrawingGeometryFailure(
+                            "Native drawing fill boundary is not closed, so no face was built"))
                         item_degrade["created"].append(obj.Name)
 
         if item_degrade is not None:

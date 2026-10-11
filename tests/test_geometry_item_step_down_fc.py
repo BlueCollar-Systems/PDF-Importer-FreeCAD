@@ -87,6 +87,16 @@ def page_groups(document):
     return sorted(obj.Name.rsplit("_", 1)[0] for obj in document.named("PDF_Page_"))
 
 
+def keep_gapped_stroke_in_one_wire(monkeypatch):
+    """These cases are the step-down that remains when a gap is not split.
+
+    Main now starts a new subpath at every real gap, so the same two-point
+    stroke imports as two wires. Forcing the predicate off keeps the older
+    contract: one wire is refused, and the item is drawn as plain lines.
+    """
+    monkeypatch.setattr(core, "_disconnected_stroke_starts_new_subpath", lambda *_args, **_kwargs: False)
+
+
 def outline_edges(obj):
     """The fake edges inside a step-down outline compound, as (x, y) point pairs."""
     return [[(point.x, point.y) for point in edge[1]] for edge in obj.Shape[1]]
@@ -107,6 +117,19 @@ def test_disconnected_source_strokes_keep_separate_editable_wires_without_degrad
     assert not document.named("StepDownOutline")
     assert "geometry_items_degraded" not in opts._report_extra
     assert host["warning"] == []
+
+
+def test_an_unsplit_gap_refused_by_the_host_keeps_both_source_lines(host, monkeypatch):
+    keep_gapped_stroke_in_one_wire(monkeypatch)
+    document, opts, group = fixture.import_page([gap_row()], fixture.options(compound_batch_size=0))
+    entry, = opts._report_extra["geometry_items_degraded"]["items"]
+    assert (entry["kind"], entry["delivered"]) == ("stroke", "outline")
+    assert "BRep_API: command not done" in entry["reason"]
+    outlines = [document.getObject(name) for name in entry["created_entity_ids"]]
+    assert len(outlines) == 1 and outlines[0] in group.Group
+    assert outline_edges(outlines[0]) == [[(20, 60), (180, 60)], [(20, 70), (180, 70)]]
+    assert not document.named("Wire")
+
 
 def test_a_refused_stroke_is_drawn_as_plain_lines_and_every_page_arrives(host, monkeypatch, tmp_path):
     refuse_gap_wires(monkeypatch)

@@ -87,9 +87,12 @@ def page_groups(document):
 def keep_gapped_stroke_in_one_wire(monkeypatch):
     """These cases are the step-down that remains when a gap is not split.
 
-    Main now starts a new subpath at every real gap, so the same two-point
-    stroke imports as two wires. Forcing the predicate off keeps the older
-    contract: one wire is refused, and the item is drawn as plain lines.
+    Main now starts a new subpath at every real gap, so two separate lines in
+    one stroke (two_line_row) import as two wires. gap_row's corner miss is
+    inside the importer's endpoint tolerance, so it is not split anyway;
+    forcing the predicate off as well keeps these cases about the step-down
+    alone, whatever the split threshold becomes: one wire is refused, and the
+    item is drawn as plain lines.
     """
     monkeypatch.setattr(core, "_disconnected_stroke_starts_new_subpath", lambda *_args, **_kwargs: False)
 

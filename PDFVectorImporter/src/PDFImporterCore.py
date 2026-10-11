@@ -13210,7 +13210,9 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         # Fall through to vector import below
 
     # ── Legacy raster fallback (vectors mode, backwards compat) ──
-    if effective_mode == "vector" and opts.raster_fallback and n_drawings < 5:
+    # A sparse drawing is still editable vector content. Only pages without
+    # any drawing items can take this full-page scanned-PDF fallback.
+    if effective_mode == "vector" and opts.raster_fallback and n_drawings == 0:
         tdict = raw_tdict if raw_tdict is not None else _page_text_dict(page, opts)
         n_text = sum(1 for b in tdict.get("blocks", []) if b.get("type") == 0)
         if n_text == 0:

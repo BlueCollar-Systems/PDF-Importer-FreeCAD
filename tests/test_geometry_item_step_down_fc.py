@@ -128,6 +128,38 @@ def outline_edges(obj):
 
 # (1) disconnected source subpaths are valid; an explicit host refusal is separate
 
+@pytest.mark.parametrize("count", [1, 2, 3, 4])
+def test_sparse_vector_page_keeps_editable_strokes_with_default_raster_fallback(host, monkeypatch, count):
+    assert core.ImportOptions().raster_fallback is True
+    raster_calls = []
+
+    def raster(*_args, **_kwargs):
+        raster_calls.append(True)
+        raise AssertionError("A sparse vector page must not become a full-page image")
+
+    monkeypatch.setattr(core, "_import_page_as_raster", raster)
+    rows = [gap_row(index + 1) for index in range(count)]
+    document, opts, group = fixture.import_page(rows, fixture.options(
+        raster_fallback=True, compound_batch_size=0))
+    wires = document.named("Wire")
+    assert len(wires) == count * 2
+    assert all(obj in group.Group and obj.Shape.isValid() for obj in wires)
+    assert not raster_calls and opts.raster_page_count == 0
+    assert "geometry_items_degraded" not in opts._report_extra
+
+
+def test_page_without_vectors_retains_explicit_scanned_page_fallback(host, monkeypatch):
+    raster_calls = []
+
+    def raster(*_args, **_kwargs):
+        raster_calls.append(True)
+        return {"created_entity_ids": ["OwnedPageImage"]}
+
+    monkeypatch.setattr(core, "_import_page_as_raster", raster)
+    document, opts, _group = fixture.import_page([], fixture.options(raster_fallback=True))
+    assert raster_calls == [True] and opts.raster_page_count == 1
+    assert not document.named("Wire")
+
 def test_disconnected_source_strokes_keep_separate_editable_wires_without_degrading(host, monkeypatch):
     styles = []
     monkeypatch.setattr(core, "_apply_style", lambda obj, stroke, fill, width, dashes, opts, **_kw:

@@ -1,6 +1,6 @@
 """One drawing item this host cannot build costs that item, never the page or file.
 
-Owner rule: deliver, step down, report. A stroke whose edges do not join, a fill
+Owner rule: deliver, step down, report. A stroke whose wire is refused, a fill
 whose face is refused, a source quadrilateral with unusable corners, or a compound
 fill the Boolean builder refuses is drawn as plain lines in its own colour (or
 left out when even that is impossible). Every other item and page still arrives,
@@ -30,24 +30,51 @@ def line_row(seqno, *segments, color=(0.0, 0.0, 0.0)):
             "width": 1.0, "items": [("l", core.fitz.Point(*a), core.fitz.Point(*b)) for a, b in segments]}
 
 
+def gap_row(seqno=5):
+    # "20 60 m 180 60 l 20 70 m 180 70 l S": two parallel lines in one stroke.
+    # The second segment does not start where the first ends.
+    return line_row(seqno, ((20, 40), (180, 40)), ((20, 30), (180, 30)), color=(0.0, 0.0, 1.0))
+
+
+def refuse_gap_wires(monkeypatch):
+    """Refuse these source subpaths explicitly; a gap alone is valid geometry.
+
+    The production builder now splits disconnected source segments before
+    Part.Wire. Each one-edge wire is valid, so tests of the failure route must
+    make the host actually refuse it rather than depend on the previous bug.
+    """
+    original = core.Part.Wire
+
+    def wire(edges):
+        if any(edge[1][0].x == 20 for edge in edges):
+            raise RuntimeError("BRep_API: command not done")
+        return original(edges)
+
+    monkeypatch.setattr(core.Part, "Wire", wire)
+
+
 # Half of the importer's endpoint tolerance (core.CLOSE_TOL = 1e-6).
 NEAR_GAP = 5e-7
 
 
-def gap_row(seqno=5):
+def near_gap_row(seqno=8):
     # An L-shaped stroke whose corner misses by NEAR_GAP. That is inside the
     # importer's endpoint tolerance, so the two segments stay ONE subpath, but
     # the host refuses to join them: real OCC (FreeCAD 1.1.4) refuses any gap
     # above its own 1e-7 tolerance with "BRep_API: command not done"; this fake
-    # host refuses any gap at all. This is the stroke that still steps down.
+    # host refuses any gap at all. No monkeypatch is needed to reach the step-down.
     return line_row(seqno, ((20, 40), (180, 40)), ((180 + NEAR_GAP, 40), (180, 10)), color=(0.0, 0.0, 1.0))
 
 
-def two_line_row(seqno=6):
-    # "20 60 m 180 60 l 20 70 m 180 70 l S": two parallel lines in one stroke,
-    # given as two-point lines with no moveto between them. The importer splits
-    # them into two subpaths (the disconnected-subpath fix), so nothing fails.
-    return line_row(seqno, ((20, 40), (180, 40)), ((20, 30), (180, 30)), color=(0.0, 0.0, 1.0))
+def open_bow_tie_fill(seqno=7, fill=(0.9, 0.1, 0.1)):
+    # "100 250 m 200 330 l 200 250 l 100 330 l h f" as PyMuPDF gives it: an
+    # explicit line back to the start and closePath False. It crosses itself,
+    # so the importer cannot prove its fill boundary, and it is not closed.
+    corners = [(100, 10), (160, 60), (160, 10), (100, 60), (100, 10)]
+    return {"type": "f", "level": 0, "seqno": seqno, "rect": core.fitz.Rect(100, 10, 160, 60),
+            "fill": fill, "fill_opacity": 1.0, "even_odd": False, "closePath": False,
+            "items": [("l", core.fitz.Point(*a), core.fitz.Point(*b))
+                      for a, b in zip(corners, corners[1:], strict=False)]}
 
 
 def plain_row(seqno=1):
@@ -59,16 +86,6 @@ def triangle_fill(seqno=3, fill=(0.8, 0.1, 0.1)):
     return {"type": "f", "level": 0, "seqno": seqno, "rect": core.fitz.Rect(100, 10, 160, 60),
             "fill": fill, "fill_opacity": 1.0, "even_odd": False, "closePath": True,
             "items": [("l", a, b), ("l", b, c), ("l", c, a)]}
-
-
-def open_bow_tie_fill(seqno=7, fill=(0.9, 0.1, 0.1)):
-    # "100 250 m 200 330 l 200 250 l 100 330 l h f" as PyMuPDF gives it: an
-    # explicit line back to the start and closePath False. It crosses itself,
-    # so the importer cannot prove its fill boundary, and it is not closed.
-    corners = [(100, 10), (160, 60), (160, 10), (100, 60), (100, 10)]
-    return {"type": "f", "level": 0, "seqno": seqno, "rect": core.fitz.Rect(100, 10, 160, 60),
-            "fill": fill, "fill_opacity": 1.0, "even_odd": False, "closePath": False,
-            "items": [("l", core.fitz.Point(*a), core.fitz.Point(*b)) for a, b in zip(corners, corners[1:], strict=False)]}
 
 
 def run_import(monkeypatch, tmp_path, pages, **changes):
@@ -97,12 +114,9 @@ def page_groups(document):
 def keep_gapped_stroke_in_one_wire(monkeypatch):
     """These cases are the step-down that remains when a gap is not split.
 
-    Main now starts a new subpath at every real gap, so two separate lines in
-    one stroke (two_line_row) import as two wires. gap_row's corner miss is
-    inside the importer's endpoint tolerance, so it is not split anyway;
-    forcing the predicate off as well keeps these cases about the step-down
-    alone, whatever the split threshold becomes: one wire is refused, and the
-    item is drawn as plain lines.
+    Main now starts a new subpath at every real gap, so the same two-point
+    stroke imports as two wires. Forcing the predicate off keeps the older
+    contract: one wire is refused, and the item is drawn as plain lines.
     """
     monkeypatch.setattr(core, "_disconnected_stroke_starts_new_subpath", lambda *_args, **_kwargs: False)
 
@@ -112,10 +126,37 @@ def outline_edges(obj):
     return [[(point.x, point.y) for point in edge[1]] for edge in obj.Shape[1]]
 
 
-# (1) a stroke whose edges do not join, on page 2 of 3
+# (1) disconnected source subpaths are valid; an explicit host refusal is separate
 
-def test_a_stroke_that_is_not_one_wire_is_drawn_as_plain_lines_and_every_page_arrives(host, monkeypatch, tmp_path):
+def test_disconnected_source_strokes_keep_separate_editable_wires_without_degrading(host, monkeypatch):
+    styles = []
+    monkeypatch.setattr(core, "_apply_style", lambda obj, stroke, fill, width, dashes, opts, **_kw:
+                        styles.append((obj.Name, stroke, fill, width)))
+    document, opts, group = fixture.import_page([gap_row()], fixture.options(compound_batch_size=0))
+    wires = document.named("Wire")
+    assert len(wires) == 2 and all(obj in group.Group and obj.Shape.isValid() for obj in wires)
+    assert [[(point.x, point.y) for point in obj.Shape.edges[0][1]] for obj in wires] == [
+        [(20, 60), (180, 60)], [(20, 70), (180, 70)]]
+    assert all((obj.Name, (0.0, 0.0, 1.0), None, 1.0) in styles for obj in wires)
+    assert not document.named("StepDownOutline")
+    assert "geometry_items_degraded" not in opts._report_extra
+    assert host["warning"] == []
+
+
+def test_an_unsplit_gap_refused_by_the_host_keeps_both_source_lines(host, monkeypatch):
     keep_gapped_stroke_in_one_wire(monkeypatch)
+    document, opts, group = fixture.import_page([gap_row()], fixture.options(compound_batch_size=0))
+    entry, = opts._report_extra["geometry_items_degraded"]["items"]
+    assert (entry["kind"], entry["delivered"]) == ("stroke", "outline")
+    assert "BRep_API: command not done" in entry["reason"]
+    outlines = [document.getObject(name) for name in entry["created_entity_ids"]]
+    assert len(outlines) == 1 and outlines[0] in group.Group
+    assert outline_edges(outlines[0]) == [[(20, 60), (180, 60)], [(20, 70), (180, 70)]]
+    assert not document.named("Wire")
+
+
+def test_a_refused_stroke_is_drawn_as_plain_lines_and_every_page_arrives(host, monkeypatch, tmp_path):
+    refuse_gap_wires(monkeypatch)
     styles = []
     monkeypatch.setattr(core, "_apply_style", lambda obj, stroke, fill, width, dashes, opts, **_kw:
                         styles.append((obj.Name, stroke, fill, width)))
@@ -129,31 +170,45 @@ def test_a_stroke_that_is_not_one_wire_is_drawn_as_plain_lines_and_every_page_ar
     assert (entry["page_number"], entry["source_paint_order"], entry["kind"], entry["delivered"]) == (2, 5, "stroke", "outline")
     assert "Native drawing stroke construction failed" in entry["reason"]
     assert "BRep_API: command not done" in entry["reason"]                 # the native cause is kept
-    outline = document.getObject(entry["created_entity_ids"][0])
-    assert outline is not None and outline.Name.startswith("StepDownOutline")
-    assert outline_edges(outline) == [[(20, 60), (180, 60)], [(180 + NEAR_GAP, 60), (180, 90)]]
+    outlines = [document.getObject(name) for name in entry["created_entity_ids"]]
+    assert len(outlines) == 2 and all(obj is not None and obj.Name.startswith("StepDownOutline") for obj in outlines)
+    assert [edge for obj in outlines for edge in outline_edges(obj)] == [
+        [(20, 60), (180, 60)], [(20, 70), (180, 70)]]
     # In its own stroke colour and width.
-    assert (outline.Name, (0.0, 0.0, 1.0), None, 1.0) in styles
+    assert all((obj.Name, (0.0, 0.0, 1.0), None, 1.0) in styles for obj in outlines)
     # It sits in page 2's group, like every other item of that page.
     page2 = next(obj for obj in document.named("PDF_Page_2"))
-    assert outline in page2.Group
+    assert all(obj in page2.Group for obj in outlines)
     # One console line names it.
     lines = [text for text in host["warning"] if "drawing item" in text]
     assert len(lines) == 1 and "page 2" in lines[0] and "plain lines" in lines[0]
 
 
-def test_two_lines_in_one_stroke_are_two_good_lines_not_a_step_down(host, tmp_path, monkeypatch):
-    # The disconnected-subpath fix on main and the step-down meet here: a stroke
-    # that only LOOKS unjoinable (two separate lines) is split and delivered, so
-    # it neither fails the page nor is listed as stepped down.
+def test_a_corner_that_misses_by_less_than_the_split_rule_steps_down_unpatched(host, monkeypatch, tmp_path):
+    # The real split rule and the real step-down together, nothing patched:
+    # the near miss is not split, the host refuses the wire, and the stroke is
+    # drawn as plain lines while all three pages arrive.
     document, opts, result = run_import(
-        monkeypatch, tmp_path, [[plain_row()], [plain_row(), two_line_row()], [plain_row()]])
+        monkeypatch, tmp_path, [[plain_row()], [plain_row(), near_gap_row()], [plain_row()]])
     assert result is True and opts.import_status == "success"
     assert page_groups(document) == ["PDF_Page_1", "PDF_Page_2", "PDF_Page_3"]
-    assert "geometry_items_degraded" not in opts._report_extra
+    entry, = opts._report_extra["geometry_items_degraded"]["items"]
+    assert (entry["page_number"], entry["source_paint_order"], entry["kind"], entry["delivered"]) == (2, 8, "stroke", "outline")
+    assert "BRep_API: command not done" in entry["reason"]
+    outline, = [document.getObject(name) for name in entry["created_entity_ids"]]
+    assert outline_edges(outline) == [[(20, 60), (180, 60)], [(180 + NEAR_GAP, 60), (180, 90)]]
+
+
+def test_two_lines_in_one_stroke_leave_the_written_report_clean(host, monkeypatch, tmp_path):
+    # Over the multi-page entry point: the split stroke is not a step-down, so
+    # the written report has no geometry block and no fallback.
+    document, opts, result = run_import(
+        monkeypatch, tmp_path, [[plain_row()], [plain_row(), gap_row()], [plain_row()]])
+    assert result is True and opts.import_status == "success"
+    assert page_groups(document) == ["PDF_Page_1", "PDF_Page_2", "PDF_Page_3"]
     assert not document.named("StepDownOutline")
-    assert not [text for text in host["warning"] if "drawing item" in text]
     report = json.loads((tmp_path / "D042_import_report.json").read_text(encoding="utf-8"))
+    assert "geometry_items_degraded" not in report["extra"]
     assert report["fallback"]["used"] is False
 
 
@@ -240,8 +295,7 @@ def test_a_nan_quad_is_left_out_and_listed_and_the_page_survives(host):
 
 
 def test_when_even_plain_lines_are_refused_the_item_is_left_out_and_listed(host, monkeypatch):
-    keep_gapped_stroke_in_one_wire(monkeypatch)
-
+    refuse_gap_wires(monkeypatch)
     def refuse(_shapes):
         raise RuntimeError("compound refused")
 
@@ -310,7 +364,7 @@ def test_a_compound_fill_that_fails_after_its_objects_exist_removes_them(monkeyp
 # (5) the written report: warnings, plain sentence, fallback
 
 def test_the_written_report_counts_explains_and_does_not_certify_the_step_down(host, monkeypatch, tmp_path):
-    keep_gapped_stroke_in_one_wire(monkeypatch)
+    refuse_gap_wires(monkeypatch)
     _document, opts, _result = run_import(monkeypatch, tmp_path, [[plain_row()], [gap_row()]])
     report = json.loads((tmp_path / "D042_import_report.json").read_text(encoding="utf-8"))
     extra = report["extra"]
@@ -339,7 +393,7 @@ def test_a_clean_report_has_no_geometry_block_and_no_extra_sentence(host, monkey
 # (6) the import session never certifies the page
 
 def test_the_session_lists_the_degraded_page(host, monkeypatch, tmp_path):
-    keep_gapped_stroke_in_one_wire(monkeypatch)
+    refuse_gap_wires(monkeypatch)
     _document, opts, _result = run_import(monkeypatch, tmp_path, [[plain_row()], [gap_row()], [plain_row()]])
     session = opts._report_extra["import_session"]
     assert session["degraded_pages"] == [2]
@@ -349,7 +403,7 @@ def test_the_session_lists_the_degraded_page(host, monkeypatch, tmp_path):
 # Console lines are capped; the report keeps them all (up to its own limit).
 
 def test_console_lines_are_capped_and_closed_by_one_overflow_line(host, monkeypatch):
-    keep_gapped_stroke_in_one_wire(monkeypatch)
+    refuse_gap_wires(monkeypatch)
     rows = [gap_row(seqno=index) for index in range(core.GEOMETRY_ITEM_DEGRADE_CONSOLE_LIMIT + 3)]
     _document, opts, _group = fixture.import_page(rows)
     block = opts._report_extra["geometry_items_degraded"]

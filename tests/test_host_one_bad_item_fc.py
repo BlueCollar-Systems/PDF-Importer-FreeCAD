@@ -1,26 +1,26 @@
-"""Real FreeCADCmd: one drawing item OCC refuses costs that item, not the import.
+"""Real FreeCADCmd: disconnected strokes stay editable; refused items step down.
 
 Opt-in: set BCS_FREECADCMD to FreeCADCmd.exe. The probe is FreeCADCmd's ONLY
 argument; every path travels by environment variable, because FreeCAD opens a
 .pdf argument itself after the script with default options.
 
 Fixtures are fictional (job D042, mark EX101), built from raw content streams:
+  * three sheets, sheet 2 holds "60 200 m 300 200 l 60 190 m 300 190 l S"
+    (two disconnected lines that must be built as two native wires);
   * three sheets, sheet 2 holds an L-shaped stroke whose corner misses by
     1.9e-6 pt (6.7e-7 mm in the model): inside the importer's endpoint
     tolerance, so it stays one subpath, but above OCC's own 1e-7, so OCC
-    refuses it as one wire ("BRep_API: command not done");
+    refuses it as one wire and it steps down;
   * two sheets, sheet 2 holds a self-crossing filled outline (bow tie). Its
     fill cannot be a face (PyMuPDF gives it as an open path, and OCC refuses
     the self-crossing face anyway): its outline arrives in the fill colour and
-    the unpainted fill is listed;
-  * three sheets, sheet 2 holds "60 200 m 300 200 l 60 190 m 300 190 l S"
-    (two lines in one stroke). Since the disconnected-subpath fix these are
-    two subpaths, so both lines arrive and nothing is stepped down.
-Before the step-down the first two imports ended with an empty document.
+    the unpainted fill is listed.
+Before the step-down the last two imports ended with an empty document.
 """
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 from pathlib import Path
@@ -39,7 +39,6 @@ GAP_STROKE = b"q 0 0 0 RG 1 w 60 200 m 300 200 l 60 190 m 300 190 l S Q"
 # PDF numbers are single precision: at x = 6 the next value up is 6.0000019,
 # and that is what 6.000002 becomes. Near x = 300 it would round back to 300.
 NEAR_GAP_STROKE = b"q 0 0 0 RG 1 w 6 300 m 6 200 l 6.000002 200 m 300 200 l S Q"
-GAP_LINE_MM = 240.0 * 25.4 / 72.0          # each line of GAP_STROKE, 60 to 300 pt
 BOW_TIE_FILL = b"q 1 0 0 rg 100 250 m 200 330 l 200 250 l 100 330 l h f Q"
 
 PROBE = r'''
@@ -68,24 +67,15 @@ try:
     result["outlines"] = [
         {"name": o.Name, "edges": len(o.Shape.Edges), "valid": bool(o.Shape.isValid())}
         for o in doc.Objects if o.Name.startswith("StepDownOutline")]
+    result["single_line_wires"] = [
+        {"length": float(wire.Length), "valid": bool(wire.isValid())}
+        for o in doc.Objects for wire in getattr(getattr(o, "Shape", None), "Wires", [])
+        if len(wire.Edges) == 1 and not wire.isClosed()]
     result["shapes"] = {
         o.Name: {"edges": len(o.Shape.Edges), "valid": bool(o.Shape.isValid())}
         for o in doc.Objects
         if hasattr(o, "Shape") and not o.isDerivedFrom("App::DocumentObjectGroup")
         and not o.Shape.isNull()}
-
-    def long_edges(group, found):
-        for child in getattr(group, "Group", None) or []:
-            if child.isDerivedFrom("App::DocumentObjectGroup"):
-                long_edges(child, found)
-            elif hasattr(child, "Shape") and not child.Shape.isNull():
-                found.extend(round(e.Length, 2) for e in child.Shape.Edges if e.Length > 50.0)
-        return found
-
-    result["long_edges_mm"] = {
-        o.Name: sorted(long_edges(o, []))
-        for o in doc.Objects
-        if o.Name.startswith("PDF_Page_") and o.isDerivedFrom("App::DocumentObjectGroup")}
     result["ok"] = True
 except BaseException:
     result["error"] = traceback.format_exc()[-3000:]
@@ -136,6 +126,24 @@ def _run_probe(tmp_path: Path, pdf: Path, user_home: Path):
     return result, saved, completed.stdout + completed.stderr
 
 
+def test_disconnected_stroke_subpaths_are_native_wires_without_step_down(
+        tmp_path, freecad_user_home):
+    pdf = tmp_path / "D042_gap_3_sheets.pdf"
+    _make_pdf(pdf, 3, 2, GAP_STROKE)
+    result, report, log = _run_probe(tmp_path, pdf, freecad_user_home)
+    assert result["raised"] is None, log[-3000:]
+    assert result["import_status"] == "success"
+    assert result["page_groups"] == ["PDF_Page_1", "PDF_Page_2", "PDF_Page_3"]
+    assert "geometry_items_degraded" not in report["extra"]
+    assert result["outlines"] == []
+    # Both original 240-PDF-point strokes survive as valid native one-edge
+    # wires, including when the importer batches them inside a compound.
+    gap_wires = [wire for wire in result["single_line_wires"]
+                 if math.isclose(wire["length"], 240.0 * 25.4 / 72.0, rel_tol=1e-10, abs_tol=1e-10)]
+    assert len(gap_wires) == 2 and all(wire["valid"] for wire in gap_wires)
+    assert "drawing item" not in report["extra"]["human_summary"]
+
+
 def test_a_stroke_occ_cannot_join_costs_that_stroke_not_the_three_sheets(
         tmp_path, freecad_user_home):
     pdf = tmp_path / "D042_near_gap_3_sheets.pdf"
@@ -146,6 +154,8 @@ def test_a_stroke_occ_cannot_join_costs_that_stroke_not_the_three_sheets(
     assert result["page_groups"] == ["PDF_Page_1", "PDF_Page_2", "PDF_Page_3"]
     block = report["extra"]["geometry_items_degraded"]
     assert (block["total"], block["pages"], block["delivered_as_outline"]) == (1, [2], 1)
+    (entry,) = block["items"]
+    assert entry["kind"] == "stroke" and "BRep_API: command not done" in entry["reason"]
     (outline,) = result["outlines"]
     assert outline["edges"] == 2 and outline["valid"] is True
     assert report["fallback"]["used"] is True
@@ -172,20 +182,3 @@ def test_a_fill_occ_cannot_face_is_drawn_as_its_outline_and_both_sheets_arrive(
     assert "1 drawing item on page 2 could not be built as requested" in report["extra"]["human_summary"]
     assert report["fallback"]["used"] is True
     assert report["extra"]["import_contract_ready"]["ready"] is False
-
-
-def test_two_lines_in_one_stroke_both_arrive_and_nothing_steps_down(
-        tmp_path, freecad_user_home):
-    pdf = tmp_path / "D042_gap_3_sheets.pdf"
-    _make_pdf(pdf, 3, 2, GAP_STROKE)
-    result, report, log = _run_probe(tmp_path, pdf, freecad_user_home)
-    assert result["raised"] is None, log[-3000:]
-    assert result["page_groups"] == ["PDF_Page_1", "PDF_Page_2", "PDF_Page_3"]
-    assert "geometry_items_degraded" not in report["extra"]
-    assert result["outlines"] == []
-    # Sheet 2 has exactly the two 240 pt lines more than sheet 1.
-    long_edges = result["long_edges_mm"]
-    extra = list(long_edges["PDF_Page_2"])
-    for length in long_edges["PDF_Page_1"]:
-        extra.remove(length)
-    assert extra == [round(GAP_LINE_MM, 2)] * 2

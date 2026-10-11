@@ -30,9 +30,23 @@ def line_row(seqno, *segments, color=(0.0, 0.0, 0.0)):
             "width": 1.0, "items": [("l", core.fitz.Point(*a), core.fitz.Point(*b)) for a, b in segments]}
 
 
+# Half of the importer's endpoint tolerance (core.CLOSE_TOL = 1e-6).
+NEAR_GAP = 5e-7
+
+
 def gap_row(seqno=5):
-    # "20 60 m 180 60 l 20 70 m 180 70 l S": two parallel lines in one stroke.
-    # The second segment does not start where the first ends.
+    # An L-shaped stroke whose corner misses by NEAR_GAP. That is inside the
+    # importer's endpoint tolerance, so the two segments stay ONE subpath, but
+    # the host refuses to join them: real OCC (FreeCAD 1.1.4) refuses any gap
+    # above its own 1e-7 tolerance with "BRep_API: command not done"; this fake
+    # host refuses any gap at all. This is the stroke that still steps down.
+    return line_row(seqno, ((20, 40), (180, 40)), ((180 + NEAR_GAP, 40), (180, 10)), color=(0.0, 0.0, 1.0))
+
+
+def two_line_row(seqno=6):
+    # "20 60 m 180 60 l 20 70 m 180 70 l S": two parallel lines in one stroke,
+    # given as two-point lines with no moveto between them. The importer splits
+    # them into two subpaths (the disconnected-subpath fix), so nothing fails.
     return line_row(seqno, ((20, 40), (180, 40)), ((20, 30), (180, 30)), color=(0.0, 0.0, 1.0))
 
 
@@ -93,7 +107,7 @@ def test_a_stroke_that_is_not_one_wire_is_drawn_as_plain_lines_and_every_page_ar
     assert "BRep_API: command not done" in entry["reason"]                 # the native cause is kept
     outline = document.getObject(entry["created_entity_ids"][0])
     assert outline is not None and outline.Name.startswith("StepDownOutline")
-    assert outline_edges(outline) == [[(20, 60), (180, 60)], [(20, 70), (180, 70)]]
+    assert outline_edges(outline) == [[(20, 60), (180, 60)], [(180 + NEAR_GAP, 60), (180, 90)]]
     # In its own stroke colour and width.
     assert (outline.Name, (0.0, 0.0, 1.0), None, 1.0) in styles
     # It sits in page 2's group, like every other item of that page.
@@ -102,6 +116,21 @@ def test_a_stroke_that_is_not_one_wire_is_drawn_as_plain_lines_and_every_page_ar
     # One console line names it.
     lines = [text for text in host["warning"] if "drawing item" in text]
     assert len(lines) == 1 and "page 2" in lines[0] and "plain lines" in lines[0]
+
+
+def test_two_lines_in_one_stroke_are_two_good_lines_not_a_step_down(host, tmp_path, monkeypatch):
+    # The disconnected-subpath fix on main and the step-down meet here: a stroke
+    # that only LOOKS unjoinable (two separate lines) is split and delivered, so
+    # it neither fails the page nor is listed as stepped down.
+    document, opts, result = run_import(
+        monkeypatch, tmp_path, [[plain_row()], [plain_row(), two_line_row()], [plain_row()]])
+    assert result is True and opts.import_status == "success"
+    assert page_groups(document) == ["PDF_Page_1", "PDF_Page_2", "PDF_Page_3"]
+    assert "geometry_items_degraded" not in opts._report_extra
+    assert not document.named("StepDownOutline")
+    assert not [text for text in host["warning"] if "drawing item" in text]
+    report = json.loads((tmp_path / "D042_import_report.json").read_text(encoding="utf-8"))
+    assert report["fallback"]["used"] is False
 
 
 # (2) a fill whose face the host refuses

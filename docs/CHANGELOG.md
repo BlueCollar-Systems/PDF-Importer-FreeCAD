@@ -3,6 +3,23 @@
 These notes used to sit at the top of the main [README](../README.md), in the
 same order. Install steps and the feature list are in the README.
 
+## Recent fixes (v4.0.112)
+
+- The import dialog uses the PDF you picked. Choosing another file no longer imports the previous one, and All still means every page. A page range that is larger than the file is refused before the importer tries to build it.
+- One line, fill, or picture that FreeCAD cannot build no longer wipes out the import. That item is drawn as plain lines, or left out when even that is impossible. The other pages still arrive, and a message says what happened and where the report is. Cancel does not leave an empty document tab.
+- A stroke that jumps to a new place is imported as separate lines. A ring that has already closed stays closed, so a hole is not welded onto the shape around it.
+- An open line that also carries a fill color stays a line. The fill that could not be painted is still listed in the report, and that page is not certified.
+- A zero-length closepath dot no longer knocks out a real fill. A source fill still matches when FreeCAD nudges a corner by a nanometer. A picture whose corners are a few nanometers off an upright rectangle is still that picture.
+- Advanced remembers whether you turned it on. A saved Vector, Raster, or Hybrid choice is no longer imported as Auto the next time.
+- Grouping has four choices, and each one builds the tree it names. 3D Text says its letters cannot be retyped.
+- Scale tools resize pictures and the paper sheet along with the lines. Quick Scale reads a title-block scale: 1:50 makes the drawing 50 times bigger, and one Undo puts it back.
+- 3D Text builds each repeated letter once and copies it into place. The shapes are the same, and a large sheet finishes in about half the time.
+- The Tools menu holds Install / Update PDF Dependencies and Check Environment. The picture check is correct on FreeCAD 1.x. A FreeCAD that is too old gets one plain sentence. The help pages match those menus and Quick Scale.
+- A stopped import can be started over. Start over removes only the pages from that stopped import, as one Undo step.
+- Batch import no longer invents thousands of pages when a file cannot be opened. A bad file does not stop the rest of the batch.
+- A space that the PDF marks as spacing, with no ink, is kept as a space. Two identical traces of the same letter in the same spot count as one.
+- A stopped import saved in a document will not resume after this update, because the saved checkpoint no longer matches the importer. Start a new import. What was already drawn stays.
+
 ## Recent fixes (v4.0.107)
 
 - Qualified round-cap ink, dash-dot dots, opaque image paint order, and source-bound Multiply display from the Codex draft now ship on this cut. Text modes stay in-mode; unproven appearance cases are reported.

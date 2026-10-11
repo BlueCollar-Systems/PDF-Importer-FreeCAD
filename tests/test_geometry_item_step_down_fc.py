@@ -1,6 +1,6 @@
 """One drawing item this host cannot build costs that item, never the page or file.
 
-Owner rule: deliver, step down, report. A stroke whose edges do not join, a fill
+Owner rule: deliver, step down, report. A stroke whose wire is refused, a fill
 whose face is refused, a source quadrilateral with unusable corners, or a compound
 fill the Boolean builder refuses is drawn as plain lines in its own colour (or
 left out when even that is impossible). Every other item and page still arrives,
@@ -34,6 +34,23 @@ def gap_row(seqno=5):
     # "20 60 m 180 60 l 20 70 m 180 70 l S": two parallel lines in one stroke.
     # The second segment does not start where the first ends.
     return line_row(seqno, ((20, 40), (180, 40)), ((20, 30), (180, 30)), color=(0.0, 0.0, 1.0))
+
+
+def refuse_gap_wires(monkeypatch):
+    """Refuse these source subpaths explicitly; a gap alone is valid geometry.
+
+    The production builder now splits disconnected source segments before
+    Part.Wire. Each one-edge wire is valid, so tests of the failure route must
+    make the host actually refuse it rather than depend on the previous bug.
+    """
+    original = core.Part.Wire
+
+    def wire(edges):
+        if any(edge[1][0].x == 20 for edge in edges):
+            raise RuntimeError("BRep_API: command not done")
+        return original(edges)
+
+    monkeypatch.setattr(core.Part, "Wire", wire)
 
 
 def plain_row(seqno=1):
@@ -75,9 +92,24 @@ def outline_edges(obj):
     return [[(point.x, point.y) for point in edge[1]] for edge in obj.Shape[1]]
 
 
-# (1) a stroke whose edges do not join, on page 2 of 3
+# (1) disconnected source subpaths are valid; an explicit host refusal is separate
 
-def test_a_stroke_that_is_not_one_wire_is_drawn_as_plain_lines_and_every_page_arrives(host, monkeypatch, tmp_path):
+def test_disconnected_source_strokes_keep_separate_editable_wires_without_degrading(host, monkeypatch):
+    styles = []
+    monkeypatch.setattr(core, "_apply_style", lambda obj, stroke, fill, width, dashes, opts, **_kw:
+                        styles.append((obj.Name, stroke, fill, width)))
+    document, opts, group = fixture.import_page([gap_row()], fixture.options(compound_batch_size=0))
+    wires = document.named("Wire")
+    assert len(wires) == 2 and all(obj in group.Group and obj.Shape.isValid() for obj in wires)
+    assert [[(point.x, point.y) for point in obj.Shape.edges[0][1]] for obj in wires] == [
+        [(20, 60), (180, 60)], [(20, 70), (180, 70)]]
+    assert all((obj.Name, (0.0, 0.0, 1.0), None, 1.0) in styles for obj in wires)
+    assert not document.named("StepDownOutline")
+    assert "geometry_items_degraded" not in opts._report_extra
+    assert host["warning"] == []
+
+def test_a_refused_stroke_is_drawn_as_plain_lines_and_every_page_arrives(host, monkeypatch, tmp_path):
+    refuse_gap_wires(monkeypatch)
     styles = []
     monkeypatch.setattr(core, "_apply_style", lambda obj, stroke, fill, width, dashes, opts, **_kw:
                         styles.append((obj.Name, stroke, fill, width)))
@@ -91,14 +123,15 @@ def test_a_stroke_that_is_not_one_wire_is_drawn_as_plain_lines_and_every_page_ar
     assert (entry["page_number"], entry["source_paint_order"], entry["kind"], entry["delivered"]) == (2, 5, "stroke", "outline")
     assert "Native drawing stroke construction failed" in entry["reason"]
     assert "BRep_API: command not done" in entry["reason"]                 # the native cause is kept
-    outline = document.getObject(entry["created_entity_ids"][0])
-    assert outline is not None and outline.Name.startswith("StepDownOutline")
-    assert outline_edges(outline) == [[(20, 60), (180, 60)], [(20, 70), (180, 70)]]
+    outlines = [document.getObject(name) for name in entry["created_entity_ids"]]
+    assert len(outlines) == 2 and all(obj is not None and obj.Name.startswith("StepDownOutline") for obj in outlines)
+    assert [edge for obj in outlines for edge in outline_edges(obj)] == [
+        [(20, 60), (180, 60)], [(20, 70), (180, 70)]]
     # In its own stroke colour and width.
-    assert (outline.Name, (0.0, 0.0, 1.0), None, 1.0) in styles
+    assert all((obj.Name, (0.0, 0.0, 1.0), None, 1.0) in styles for obj in outlines)
     # It sits in page 2's group, like every other item of that page.
     page2 = next(obj for obj in document.named("PDF_Page_2"))
-    assert outline in page2.Group
+    assert all(obj in page2.Group for obj in outlines)
     # One console line names it.
     lines = [text for text in host["warning"] if "drawing item" in text]
     assert len(lines) == 1 and "page 2" in lines[0] and "plain lines" in lines[0]
@@ -159,6 +192,7 @@ def test_a_nan_quad_is_left_out_and_listed_and_the_page_survives(host):
 
 
 def test_when_even_plain_lines_are_refused_the_item_is_left_out_and_listed(host, monkeypatch):
+    refuse_gap_wires(monkeypatch)
     def refuse(_shapes):
         raise RuntimeError("compound refused")
 
@@ -227,6 +261,7 @@ def test_a_compound_fill_that_fails_after_its_objects_exist_removes_them(monkeyp
 # (5) the written report: warnings, plain sentence, fallback
 
 def test_the_written_report_counts_explains_and_does_not_certify_the_step_down(host, monkeypatch, tmp_path):
+    refuse_gap_wires(monkeypatch)
     _document, opts, _result = run_import(monkeypatch, tmp_path, [[plain_row()], [gap_row()]])
     report = json.loads((tmp_path / "D042_import_report.json").read_text(encoding="utf-8"))
     extra = report["extra"]
@@ -255,6 +290,7 @@ def test_a_clean_report_has_no_geometry_block_and_no_extra_sentence(host, monkey
 # (6) the import session never certifies the page
 
 def test_the_session_lists_the_degraded_page(host, monkeypatch, tmp_path):
+    refuse_gap_wires(monkeypatch)
     _document, opts, _result = run_import(monkeypatch, tmp_path, [[plain_row()], [gap_row()], [plain_row()]])
     session = opts._report_extra["import_session"]
     assert session["degraded_pages"] == [2]
@@ -263,7 +299,8 @@ def test_the_session_lists_the_degraded_page(host, monkeypatch, tmp_path):
 
 # Console lines are capped; the report keeps them all (up to its own limit).
 
-def test_console_lines_are_capped_and_closed_by_one_overflow_line(host):
+def test_console_lines_are_capped_and_closed_by_one_overflow_line(host, monkeypatch):
+    refuse_gap_wires(monkeypatch)
     rows = [gap_row(seqno=index) for index in range(core.GEOMETRY_ITEM_DEGRADE_CONSOLE_LIMIT + 3)]
     _document, opts, _group = fixture.import_page(rows)
     block = opts._report_extra["geometry_items_degraded"]

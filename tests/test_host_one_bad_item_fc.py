@@ -1,4 +1,4 @@
-"""Real FreeCADCmd: one drawing item OCC refuses costs that item, not the import.
+"""Real FreeCADCmd: disconnected strokes stay editable; refused fills step down.
 
 Opt-in: set BCS_FREECADCMD to FreeCADCmd.exe. The probe is FreeCADCmd's ONLY
 argument; every path travels by environment variable, because FreeCAD opens a
@@ -6,7 +6,7 @@ argument; every path travels by environment variable, because FreeCAD opens a
 
 Fixtures are fictional (job D042, mark EX101), built from raw content streams:
   * three sheets, sheet 2 holds "60 200 m 300 200 l 60 190 m 300 190 l S"
-    (two lines in one stroke that OCC cannot join into one wire);
+    (two disconnected lines that must be built as two native wires);
   * two sheets, sheet 2 holds a self-crossing filled outline (bow tie) whose
     face OCC refuses.
 Before the step-down both imports ended with an empty document.
@@ -14,6 +14,7 @@ Before the step-down both imports ended with an empty document.
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 from pathlib import Path
@@ -57,6 +58,10 @@ try:
     result["outlines"] = [
         {"name": o.Name, "edges": len(o.Shape.Edges), "valid": bool(o.Shape.isValid())}
         for o in doc.Objects if o.Name.startswith("StepDownOutline")]
+    result["single_line_wires"] = [
+        {"length": float(wire.Length), "valid": bool(wire.isValid())}
+        for o in doc.Objects for wire in getattr(getattr(o, "Shape", None), "Wires", [])
+        if len(wire.Edges) == 1 and not wire.isClosed()]
     result["ok"] = True
 except BaseException:
     result["error"] = traceback.format_exc()[-3000:]
@@ -107,7 +112,7 @@ def _run_probe(tmp_path: Path, pdf: Path, user_home: Path):
     return result, saved, completed.stdout + completed.stderr
 
 
-def test_a_stroke_occ_cannot_join_costs_that_stroke_not_the_three_sheets(
+def test_disconnected_stroke_subpaths_are_native_wires_without_step_down(
         tmp_path, freecad_user_home):
     pdf = tmp_path / "D042_gap_3_sheets.pdf"
     _make_pdf(pdf, 3, 2, GAP_STROKE)
@@ -115,12 +120,14 @@ def test_a_stroke_occ_cannot_join_costs_that_stroke_not_the_three_sheets(
     assert result["raised"] is None, log[-3000:]
     assert result["import_status"] == "success"
     assert result["page_groups"] == ["PDF_Page_1", "PDF_Page_2", "PDF_Page_3"]
-    block = report["extra"]["geometry_items_degraded"]
-    assert (block["total"], block["pages"], block["delivered_as_outline"]) == (1, [2], 1)
-    (outline,) = result["outlines"]
-    assert outline["edges"] == 2 and outline["valid"] is True
-    assert report["fallback"]["used"] is True
-    assert "1 drawing item on page 2 could not be built as requested" in report["extra"]["human_summary"]
+    assert "geometry_items_degraded" not in report["extra"]
+    assert result["outlines"] == []
+    # Both original 240-PDF-point strokes survive as valid native one-edge
+    # wires, including when the importer batches them inside a compound.
+    gap_wires = [wire for wire in result["single_line_wires"]
+                 if math.isclose(wire["length"], 240.0 * 25.4 / 72.0, rel_tol=1e-10, abs_tol=1e-10)]
+    assert len(gap_wires) == 2 and all(wire["valid"] for wire in gap_wires)
+    assert "drawing item" not in report["extra"]["human_summary"]
 
 
 def test_a_fill_occ_cannot_face_is_drawn_as_its_outline_and_both_sheets_arrive(

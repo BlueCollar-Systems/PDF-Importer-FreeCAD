@@ -24,9 +24,9 @@ from pdfcadcore import primitive_extractor  # noqa: E402
 # September 20 adds six lines on the text path that call glyph_code_recovery
 # before anything derives from the text dictionary. A span whose raw glyph
 # codes are not proven is left byte for byte as MuPDF delivered it, so no
-# fraction predicate, layout rule or source-character proof changed here.
+# September 21 merges round-cap/synthetic spacing/batch improvements.
 REVIEWED_COMBINED_SUCCESSOR_SHA256 = (
-    "0064571305a21d5a73dee1849929d26632ade4b43971cd837bbf83b1e604b884"
+    "8602183cab654fdeadbf0319329f258df8c0d071b3ef22af2cdd2ca366170e2f"
 )
 
 

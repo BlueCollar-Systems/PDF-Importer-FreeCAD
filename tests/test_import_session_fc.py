@@ -271,6 +271,7 @@ def test_resume_requires_exact_source_options_package_and_pages(changed):
         "options_json": "{}",
         "options_sha256": hashlib.sha256(b"{}").hexdigest(),
         "importer_version": "4.0.80",
+        "importer_content_sha256": "c" * 64,
         "requested_pages": [1, 2, 4],
     }
     session.create_session_object(document, identity)
@@ -287,6 +288,7 @@ def test_invalid_persisted_session_fails_closed():
     host.PDFOptionsJSON = "{}"
     host.PDFOptionsSHA256 = "a" * 64
     host.PDFImporterVersion = "4.0.80"
+    host.PDFImporterContentSHA256 = "b" * 64
     host.PDFRequestedPagesJSON = "[1]"
     host.PDFCompletedPagesJSON = "[]"
     host.PDFPageGroupsJSON = "{}"

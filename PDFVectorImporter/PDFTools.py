@@ -46,7 +46,13 @@ def _collect_pdf_files(folder: str, recurse: bool) -> list[str]:
 
     pdfs = []
     if recurse:
-        for root, _, files in os.walk(folder):
+        generated_tree_names = {".bc_host_jobs", "imported evidence", "imported_evidence"}
+        for root, directories, files in os.walk(folder):
+            # Do not recursively feed copied QA inputs back into another batch.
+            directories[:] = [
+                name for name in directories
+                if name.casefold() not in generated_tree_names
+            ]
             for filename in files:
                 candidate = os.path.join(root, filename)
                 if filename.lower().endswith(".pdf") and os.path.isfile(candidate):
@@ -261,8 +267,13 @@ class ImportViaConsoleCommand:
             import PDFVectorImporter.src.PDFImporterCore as core
             pages = _parse_page_spec(pages_str, pdf)
             opts = core.ImportOptions(pages=pages)
-            core.import_pdf(pdf, opts)
-            _msg("Import completed.")
+            result = core.import_pdf(pdf, opts)
+            if result is True:
+                _msg("Import completed.")
+            elif getattr(opts, "import_status", "") == "cancelled":
+                _warn("Import cancelled; completed pages remain in the document.")
+            else:
+                _err("Import did not complete; review the import report and console errors.")
         except (RuntimeError, ValueError, TypeError, OSError, AttributeError, ImportError) as e:
             _err(f"Console import failed: {e}")
             _msg(traceback.format_exc())
@@ -308,20 +319,72 @@ class BatchImportCommand:
             return
 
         ok_count = fail_count = 0
+        cancelled = False
+        progress = QtWidgets.QProgressDialog("Preparing batch...", "Cancel", 0, 1000, None)
+        progress.setWindowTitle("Batch PDF Import")
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
         _msg(f"\n═══ Batch Import: {len(pdfs)} PDF files ═══")
-        for pdf_path in sorted(pdfs):
-            pages = _parse_page_spec(pages_str, pdf_path)
-            for pg in pages:
+        try:
+            for file_index, pdf_path in enumerate(sorted(pdfs)):
+                QtWidgets.QApplication.processEvents()
+                if progress.wasCanceled():
+                    cancelled = True
+                    break
+                try:
+                    pages = _parse_page_spec(pages_str, pdf_path)
+                except (RuntimeError, ValueError, TypeError, OSError, AttributeError, ImportError) as e:
+                    fail_count += 1
+                    _err(f"  FAIL: {pdf_path} — {e}")
+                    continue
+                page_count = len(pages)
+                def on_progress(event, _file_index=file_index, _page_count=page_count,
+                                _pdf_path=pdf_path):
+                    fraction = max(0.0, min(1.0, float(event.get("page_percent", 0)) / 100.0))
+                    page_index = max(1, int(event.get("page_index", 1) or 1))
+                    file_fraction = min(1.0, (page_index - 1 + fraction) / _page_count)
+                    progress.setValue(int(1000 * (_file_index + file_fraction) / len(pdfs)))
+                    progress.setLabelText(
+                        f"File {_file_index + 1}/{len(pdfs)}: {os.path.basename(_pdf_path)}\n"
+                        f"{event.get('label', 'Preparing selected pages')}"
+                    )
+                    QtWidgets.QApplication.processEvents()
+                    return not progress.wasCanceled()
+
+                if not on_progress({}):
+                    cancelled = True
+                    break
+                opts = None
                 try:
                     if FreeCAD.ActiveDocument is None:
                         FreeCAD.newDocument()
-                    opts = core.ImportOptions(pages=[pg])
-                    core.import_pdf(pdf_path, opts)
-                    ok_count += 1
-                except (RuntimeError, ValueError, TypeError, OSError, AttributeError) as e:
+                    # One invocation per PDF shares font/outline caches, defers
+                    # recomputes, and lets the core arrange all selected pages.
+                    opts = core.ImportOptions(pages=pages)
+                    opts.progress_callback = on_progress
+                    result = core.import_pdf(pdf_path, opts)
+                    if result is True:
+                        ok_count += page_count
+                    elif getattr(opts, "import_status", "") == "cancelled":
+                        session = (getattr(opts, "_report_extra", {}) or {}).get("import_session", {})
+                        completed = set(session.get("completed_pages", []) or [])
+                        ok_count += len(completed.intersection(pages))
+                        cancelled = True
+                        break
+                    else:
+                        fail_count += 1
+                        _err(f"  FAIL: {pdf_path} — import did not complete.")
+                except (RuntimeError, ValueError, TypeError, OSError, AttributeError, ImportError) as e:
                     fail_count += 1
-                    _err(f"  FAIL: {pdf_path} page {pg} — {e}")
-        _msg(f"═══ Batch done: {ok_count} ok, {fail_count} failed ═══\n")
+                    _err(f"  FAIL: {pdf_path} — {e}")
+                finally:
+                    if opts is not None:
+                        opts.progress_callback = None
+        finally:
+            progress.close()
+        state = "cancelled" if cancelled else "done"
+        _msg(f"═══ Batch {state}: {ok_count} page(s) completed, {fail_count} failed input(s) ═══\n")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -399,38 +462,34 @@ class InstallPyMuPDFCommand:
 # Helpers
 # ──────────────────────────────────────────────────────────────────────
 def _parse_page_spec(spec: str, pdf_path: str) -> list:
-    """Parse a page specification string into a list of 1-based page numbers."""
+    """Validate real PDF pages before scheduling any utility import work."""
+    from PDFVectorImporter.pdfcadcore.fitz_loader import PdfOpenError, safe_open
+
     try:
-        try:
-            import pymupdf as fitz  # PyMuPDF >= 1.24 preferred name
-        except ImportError:
-            import fitz  # Legacy fallback
-        pdoc = fitz.open(pdf_path)
-        n = len(pdoc)
-        pdoc.close()
-    except (ImportError, OSError, RuntimeError):
-        n = 9999
+        with safe_open(pdf_path) as document:
+            n = len(document)
+    except PdfOpenError as exc:
+        raise ValueError(str(exc)) from exc
 
     s = (spec or "1").strip().lower()
     if s in ("all", "a", "*"):
         return list(range(1, n + 1))
     if s in ("first", "1st"):
         return [1]
-    out = []
+    out = set()
     for part in s.split(","):
         part = part.strip()
         if not part:
-            continue
+            raise ValueError("Invalid empty page entry. Use all, first, or 1,3-5.")
         try:
             if "-" in part:
                 a, b = part.split("-", 1)
-                out += list(range(int(a), int(b) + 1))
+                lo, hi = sorted((int(a), int(b)))
             else:
-                out.append(int(part))
-        except ValueError:
-            _warn(f"  Page spec '{part}' is not a valid page number — skipped.")
-            continue
-    if not out:
-        _warn(f"  Page spec '{spec}' produced no valid pages — defaulting to page 1.")
-        return [1]
-    return out
+                lo = hi = int(part)
+        except ValueError as exc:
+            raise ValueError(f"Invalid page entry: {part}. Use all, first, or 1,3-5.") from exc
+        if lo < 1 or hi > n:
+            raise ValueError(f"Page out of range: {part}. This PDF has {n} page(s).")
+        out.update(range(lo, hi + 1))
+    return sorted(out)

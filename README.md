@@ -176,6 +176,13 @@ PDF Importer addon releases continue to use `v4.x.x` tags.
 
 To import several PDFs, select them all in **File → Import**; each one opens its own options dialog.
 
+**Batch Import** provides progress and a Cancel button during object creation.
+An unreadable PDF is reported and the batch continues with the next input;
+cancelled batches count only pages confirmed complete by the import session.
+Selected pages share one import per PDF, including font caches and page layout. Recursive
+batches skip generated import-evidence folders. Page ranges are validated
+against each PDF before work begins, and duplicate page selections import once.
+
 ## Import Modes (BCS-ARCH-001)
 
 Every mode targets **indistinguishable-from-source** fidelity within FreeCAD's

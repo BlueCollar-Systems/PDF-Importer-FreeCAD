@@ -67,9 +67,12 @@ try:
     result["outlines"] = [
         {"name": o.Name, "edges": len(o.Shape.Edges), "valid": bool(o.Shape.isValid())}
         for o in doc.Objects if o.Name.startswith("StepDownOutline")]
+    # Groups are skipped: on FreeCAD 1.x a group's Shape repeats its children,
+    # so each line would be counted once more per group level it sits in.
     result["single_line_wires"] = [
         {"length": float(wire.Length), "valid": bool(wire.isValid())}
-        for o in doc.Objects for wire in getattr(getattr(o, "Shape", None), "Wires", [])
+        for o in doc.Objects if not o.isDerivedFrom("App::DocumentObjectGroup")
+        for wire in getattr(getattr(o, "Shape", None), "Wires", [])
         if len(wire.Edges) == 1 and not wire.isClosed()]
     result["shapes"] = {
         o.Name: {"edges": len(o.Shape.Edges), "valid": bool(o.Shape.isValid())}

@@ -30,6 +30,10 @@ class TestFcGuiProfessionalImport(unittest.TestCase):
         self.assertIn('import_mode = "auto"', self.source)
         self.assertIn("self.advanced_group.isChecked()", self.source)
 
+    def test_advanced_checkbox_is_remembered(self) -> None:
+        self.assertIn('grp.GetBool("LastAdvanced", False)', self.source)
+        self.assertIn('grp.SetBool("LastAdvanced", self.advanced_group.isChecked())', self.source)
+
     def test_text_modes_include_freecad_capabilities(self) -> None:
         self.assertIn(
             '["Text", "Labels", "3D Text", "Glyphs", "Geometry", "Raster"]',

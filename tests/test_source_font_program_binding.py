@@ -380,8 +380,10 @@ def test_partial_trace_census_never_borrows_another_same_name_program_glyph():
     other = char("A", 0, "b" * 64)
     span = {"font": "Same", "chars": [unresolved, proven, other]}
     raw = {"blocks": [{"type": 0, "lines": [{"spans": [span]}]}]}
+    # Disagreeing glyph ids at one origin stay a partial census. Identical
+    # coincident passes are collapsed before the count and are not this case.
     trace = {"font": "Same", "chars": [(65, 8, (0, 0)), (65, 3, (10, 0)),
-                                             (65, 3, (10, 0)), (66, 4, (20, 0))]}
+                                             (65, 9, (10, 0)), (66, 4, (20, 0))]}
     page = SimpleNamespace(get_texttrace=lambda: [trace])
     maps, ambiguous = _page_program_glyph_maps(page, raw)
     assert maps == {"a" * 64: {66: 4}, "b" * 64: {65: 8}}

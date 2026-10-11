@@ -771,7 +771,7 @@ def main() -> int:
         result["counts_before"] = before
         result["counts_after"] = after
         result["counts_delta"] = delta
-    except (RuntimeError, OSError, ValueError, TypeError, AttributeError, ImportError) as exc:
+    except Exception as exc:
         result["status"] = "FAIL"
         result["message"] = f"{exc.__class__.__name__}: {exc}"
         result["traceback"] = traceback.format_exc()

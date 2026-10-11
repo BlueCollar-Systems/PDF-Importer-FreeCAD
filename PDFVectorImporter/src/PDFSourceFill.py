@@ -381,19 +381,43 @@ def _xyz(point):
     return tuple(float(getattr(point, axis)) for axis in ("x", "y", "z"))
 
 
+def _same_requested_point(actual, expected):
+    """True when a native vertex is the requested point, within OCC roundoff.
+
+    Line and Bezier construction can move a coordinate by a few double
+    ulps (observed around 1e-14 mm). A nanometer is still that same point.
+    Anything larger is a different endpoint and must still be refused.
+    """
+    return all(
+        math.isclose(left, right, rel_tol=0.0, abs_tol=1e-9)
+        for left, right in zip(actual, expected, strict=True)
+    )
+
+
 def _edge_matches(edge, command, points):
     if edge.isNull() or edge.isValid() is not True:
         raise SourceFillError("Invalid native source fill edge")
     if command == "l":
         actual = [_xyz(v.Point) for v in edge.Vertexes]
         expected = [_xyz(p) for p in points]
+        same = False
+        if len(actual) == 2 and len(expected) == 2:
+            same = (
+                _same_requested_point(actual[0], expected[0])
+                and _same_requested_point(actual[1], expected[1])
+            ) or (
+                _same_requested_point(actual[0], expected[1])
+                and _same_requested_point(actual[1], expected[0])
+            )
         if (edge.Curve.__class__.__name__ not in ("Line", "LineSegment")
-                or len(actual) != 2
-                or not (actual == expected or actual == expected[::-1])):
+                or not same):
             raise SourceFillError("Native fill line differs from original transformed endpoints")
     else:
+        poles = [_xyz(p) for p in edge.Curve.getPoles()]
+        expected = [_xyz(p) for p in points]
         if (edge.Curve.__class__.__name__ != "BezierCurve"
-                or [_xyz(p) for p in edge.Curve.getPoles()] != [_xyz(p) for p in points]):
+                or len(poles) != len(expected)
+                or any(not _same_requested_point(pole, point) for pole, point in zip(poles, expected, strict=True))):
             raise SourceFillError("Native fill cubic differs from original transformed controls")
 
 
@@ -476,6 +500,44 @@ def _edge_bijection(source, observed):
         used.add(matches[0])
 
 
+def _geometry_close(left, right):
+    """Same curve identity, allowing a nanometer of kernel roundoff."""
+    if isinstance(left, tuple) or isinstance(right, tuple):
+        return (isinstance(left, tuple) and isinstance(right, tuple)
+                and len(left) == len(right)
+                and all(_geometry_close(a, b) for a, b in zip(left, right, strict=True)))
+    if isinstance(left, str) or isinstance(right, str):
+        return left == right
+    if isinstance(left, bool) or isinstance(right, bool):
+        return left == right
+    if isinstance(left, Real) and isinstance(right, Real):
+        return math.isclose(float(left), float(right), rel_tol=0.0, abs_tol=1e-9)
+    return left == right
+
+
+def _native_edge_bijection(source, observed):
+    """Bijection for real kernel edges.
+
+    MakeWire can move an endpoint by one double ulp. That is not a different
+    line. A tenth of a micron still fails the match, and two edges that land
+    on each other stay ambiguous.
+    """
+    if len(source) != len(observed):
+        raise SourceFillError("Native fill boundary edge count changed")
+    originals = [_boundary_geometry(edge) for edge in source]
+    for i, left in enumerate(originals):
+        for right in originals[i + 1:]:
+            if _geometry_close(left, right):
+                raise SourceFillError("Native fill boundary original geometry is ambiguous")
+    used = set()
+    for edge in observed:
+        geometry = _boundary_geometry(edge)
+        matches = [i for i, original in enumerate(originals) if _geometry_close(geometry, original)]
+        if len(matches) != 1 or matches[0] in used:
+            raise SourceFillError("Native fill boundary source-edge geometry bijection failed")
+        used.add(matches[0])
+
+
 def _native_face(contour, part, transform, scale, cancel):
     _prove_simple(contour, cancel)
     edges = []
@@ -501,7 +563,7 @@ def _native_face(contour, part, transform, scale, cancel):
         wire = part.Wire(edges)
         if not wire.isClosed() or wire.isValid() is not True:
             raise SourceFillError("Native source fill contour is open or invalid")
-        _edge_bijection(edges, list(wire.Edges))
+        _native_edge_bijection(edges, list(wire.Edges))
         face = _region(part.Face(wire), "contour")
     except (RuntimeError, TypeError, ValueError, AttributeError) as exc:
         if isinstance(exc, SourceFillError):
@@ -512,7 +574,7 @@ def _native_face(contour, part, transform, scale, cancel):
         raise SourceFillError("Unproved degenerate or self-crossing source fill contour")
     if len(face.Faces[0].Wires) != 1:
         raise SourceFillError("Native source contour acquired extra wires")
-    _edge_bijection(edges, list(face.Faces[0].Wires[0].Edges))
+    _native_edge_bijection(edges, list(face.Faces[0].Wires[0].Edges))
     if not math.isclose(float(face.Area), float(abs(source_area))*scale*scale,
                         rel_tol=1e-9, abs_tol=1e-9):
         raise SourceFillError("Native fill contour area differs from exact source integral")

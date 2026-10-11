@@ -287,11 +287,21 @@ def _len2d(a: "Vector", b: "Vector") -> float:
     return math.hypot(a.x - b.x, a.y - b.y)
 
 
-# PyMuPDF often omits moveto and stores the next subpath only as the next
-# segment's start point. 0.01 mm is the same gap pdfcadcore uses. A ring that
-# has already returned to its own start is split off, so a hole is not welded
-# onto the outer ring. An open gap is left for the audit step-down, which
-# draws those edges as plain lines and lists the item.
+def _disconnected_stroke_starts_new_subpath(current_pt, start_pt) -> bool:
+    """A self-contained segment that misses the open subpath starts a new one.
+
+    PyMuPDF can put several two-point lines in one path with no moveto between
+    them. A page-sized X is that case. Part.Wire rejects the gap, and that
+    exception used to fail the page and roll every earlier page back with it.
+    """
+    if current_pt is None or start_pt is None:
+        return False
+    return _len2d(current_pt, start_pt) > CLOSE_TOL
+
+
+# 0.01 mm is the same gap pdfcadcore uses. When a disconnected segment starts
+# a new subpath, a ring that has already returned to its own start is closed
+# so a hole is not left as an open outline.
 SUBPATH_BREAK_MM = 0.01
 
 
@@ -13753,14 +13763,20 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
 
         def begin_segment(start, previous_end):
             nonlocal subpath_origin
-            should_flush, closed = _subpath_break(previous_end, start, subpath_origin)
-            # Only a ring that has already returned to its own start is split
-            # off. An open gap stays one item: Part.Wire refuses it, and the
-            # audit step-down draws those plain lines and lists the item.
-            # Splitting the open gap would hide that report.
-            if should_flush and closed:
-                flush_sub(True)
-            if subpath_origin is None or (should_flush and closed):
+            if _disconnected_stroke_starts_new_subpath(previous_end, start):
+                # Any real gap starts a new stroke, so a page-sized X is two
+                # wires instead of one refusal. A ring that already returned
+                # to its own start is closed, including a gap smaller than the
+                # 0.01 mm ring check.
+                should_flush, closed = _subpath_break(previous_end, start, subpath_origin)
+                if not should_flush and subpath_origin is not None:
+                    try:
+                        closed = _len2d(previous_end, subpath_origin) <= SUBPATH_BREAK_MM
+                    except (AttributeError, TypeError, ValueError):
+                        closed = False
+                flush_sub(closed)
+                subpath_origin = start
+            elif subpath_origin is None:
                 subpath_origin = start
 
         for item in (() if source_fill_proof is not None else items):
@@ -14971,6 +14987,7 @@ def _session_state_payload(session_state: Dict[str, Any]) -> Dict[str, Any]:
         "source_sha256": session_state["source_sha256"],
         "options_sha256": session_state["options_sha256"],
         "importer_version": session_state["importer_version"],
+        "importer_content_sha256": session_state["importer_content_sha256"],
         "requested_pages": list(session_state["requested_pages"]),
         "completed_pages": list(session_state["completed_pages"]),
         # Completed, so a resume will not redo them; never certified, so every
@@ -15276,12 +15293,18 @@ def import_pdf(pdf_path: str, opts: Optional[ImportOptions] = None):
                 raise ValueError(f"Resume session {resume_name!r} was not found")
             session_state = read_session_object(session_host)
             validate_completed_page_groups(fc_doc, session_state)
+            if session_state["importer_content_sha256"] != identity["importer_content_sha256"]:
+                raise ValueError(
+                    "Importer code has changed since this checkpoint was created. "
+                    "Start a new import or use its original importer; existing output is kept."
+                )
             identity_fields = (
                 "schema",
                 "source_sha256",
                 "options_json",
                 "options_sha256",
                 "importer_version",
+                "importer_content_sha256",
                 "requested_pages",
             )
             if any(session_state[field] != identity[field] for field in identity_fields):

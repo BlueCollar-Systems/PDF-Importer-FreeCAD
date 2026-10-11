@@ -6,10 +6,38 @@ import math
 from fractions import Fraction
 
 
+def _legacy_analytic_bounds_required():
+    try:
+        import FreeCAD
+
+        return tuple(int(value) for value in FreeCAD.Version()[:2]) <= (0, 21)
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return False
+
+
 def _bounds(shape):
     # BoundBox may use a GUI triangulation and miss curved extrema after the
     # object is displayed. Compare the analytic shape, not its display mesh.
-    box = shape.optimalBoundingBox(False, False)
+    if _legacy_analytic_bounds_required():
+        # FreeCAD 0.21's optional-bool parser has incorrectly ordered C varargs.
+        # Passing ANY argument can corrupt Python's bool type. cleaned() makes
+        # an owned geometry copy and removes cached triangulation; the no-arg
+        # bounding call then uses analytic geometry with shape tolerance=False.
+        # OCC keeps polygon-only topology when no analytic support exists.
+        # Font shapes must retain actual native surfaces/curves; a display mesh
+        # alone is never an analytic containment certificate.
+        for face in shape.Faces:
+            if face.Surface is None:
+                raise ValueError("legacy text bounds require native analytic surfaces")
+        for edge in shape.Edges:
+            if float(edge.Length) > 0.0 and edge.Curve is None:
+                raise ValueError("legacy text bounds require native analytic curves")
+        analytic = shape.cleaned()
+        if analytic is shape:
+            raise ValueError("legacy analytic bounds require an owned clean shape")
+        box = analytic.optimalBoundingBox()
+    else:
+        box = shape.optimalBoundingBox(False, False)
     values = tuple(float(getattr(box, name)) for name in
                    ("XMin", "YMin", "ZMin", "XMax", "YMax", "ZMax"))
     if not all(math.isfinite(value) for value in values) or any(

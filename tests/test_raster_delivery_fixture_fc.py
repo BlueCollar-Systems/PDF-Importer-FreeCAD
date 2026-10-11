@@ -37,7 +37,7 @@ def _find_freecadcmd() -> str:
     return shutil.which("FreeCADCmd") or ""
 
 
-def _probe_env(tmp_path, **paths):
+def _probe_env(tmp_path, user_home, **paths):
     """Hand the probe its paths through the environment, never argv.
 
     FreeCADCmd opens every argument after the script as a file once the
@@ -48,12 +48,13 @@ def _probe_env(tmp_path, **paths):
     for key, value in paths.items():
         env["BCS_PROBE_" + key.upper()] = str(value)
     env["BC_PDF_TEMP_DIR"] = str(tmp_path)
-    # A private FreeCAD user folder: every import copies its report into
+    # A private FreeCAD user folder (the freecad_user_home fixture in
+    # tests/conftest.py): every import copies its report into
     # <user data>/PDF Import Reports, and a test run must not fill the
-    # developer's own FreeCAD profile (it keeps only the newest 50).
-    home = Path(tmp_path) / "freecad_user_home"
-    home.mkdir(exist_ok=True)
-    env["FREECAD_USER_HOME"] = str(home)
+    # developer's own FreeCAD profile (it keeps only the newest 50). It sits
+    # under %TEMP%, not tmp_path, so a long --basetemp cannot push FreeCAD's
+    # own temp and cache paths past the Windows 260-character limit.
+    env["FREECAD_USER_HOME"] = str(user_home)
     return env
 
 
@@ -96,7 +97,9 @@ with open(out_path, "w") as handle:
 """
 
 
-def test_raster_only_fixture_delivers_image_plane_with_honest_report(tmp_path):
+def test_raster_only_fixture_delivers_image_plane_with_honest_report(
+    tmp_path, freecad_user_home
+):
     corpus_root = os.environ.get("BCS_CORPUS_ROOT", "")
     if not corpus_root:
         pytest.skip("BCS_CORPUS_ROOT not set — raster-only fixture unavailable")
@@ -114,7 +117,10 @@ def test_raster_only_fixture_delivers_image_plane_with_honest_report(tmp_path):
 
     completed = subprocess.run(
         [freecadcmd, str(probe_path)],
-        env=_probe_env(tmp_path, out=out_path, report=report_path, pdf=fixture),
+        env=_probe_env(
+            tmp_path, freecad_user_home,
+            out=out_path, report=report_path, pdf=fixture,
+        ),
         capture_output=True,
         text=True,
         timeout=300,

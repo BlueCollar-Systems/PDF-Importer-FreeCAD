@@ -83,18 +83,19 @@ def _make_pdf(path: Path, total: int, bad_page: int, raw: bytes) -> None:
     doc.close()
 
 
-def _run_probe(tmp_path: Path, pdf: Path):
+def _run_probe(tmp_path: Path, pdf: Path, user_home: Path):
     probe = tmp_path / "one_bad_item_probe.py"
     probe.write_text(PROBE, encoding="utf-8")
     out = tmp_path / "probe_result.json"
     report = tmp_path / "probe_import_report.json"
     work = tmp_path / "bc_temp"
     work.mkdir()
-    home = tmp_path / "freecad_user_home"  # private: no report copy lands in your profile
-    home.mkdir()
     env = dict(os.environ, BCS_PROBE_REPO=str(REPO_ROOT), BCS_PROBE_PDF=str(pdf),
                BCS_PROBE_OUT=str(out), BCS_PROBE_REPORT=str(report),
-               BC_PDF_TEMP_DIR=str(work), FREECAD_USER_HOME=str(home))
+               BC_PDF_TEMP_DIR=str(work),
+               # private and short (tests/conftest.py): no report copy lands in
+               # your profile, and a long --basetemp cannot break FreeCAD's paths
+               FREECAD_USER_HOME=str(user_home))
     completed = subprocess.run([FREECADCMD, str(probe)], env=env, stdin=subprocess.DEVNULL,
                                capture_output=True, text=True, timeout=600)
     assert out.is_file(), "probe wrote nothing (rc=%s)\n%s\n%s" % (
@@ -106,10 +107,11 @@ def _run_probe(tmp_path: Path, pdf: Path):
     return result, saved, completed.stdout + completed.stderr
 
 
-def test_a_stroke_occ_cannot_join_costs_that_stroke_not_the_three_sheets(tmp_path):
+def test_a_stroke_occ_cannot_join_costs_that_stroke_not_the_three_sheets(
+        tmp_path, freecad_user_home):
     pdf = tmp_path / "D042_gap_3_sheets.pdf"
     _make_pdf(pdf, 3, 2, GAP_STROKE)
-    result, report, log = _run_probe(tmp_path, pdf)
+    result, report, log = _run_probe(tmp_path, pdf, freecad_user_home)
     assert result["raised"] is None, log[-3000:]
     assert result["import_status"] == "success"
     assert result["page_groups"] == ["PDF_Page_1", "PDF_Page_2", "PDF_Page_3"]
@@ -121,10 +123,11 @@ def test_a_stroke_occ_cannot_join_costs_that_stroke_not_the_three_sheets(tmp_pat
     assert "1 drawing item on page 2 could not be built as requested" in report["extra"]["human_summary"]
 
 
-def test_a_fill_occ_cannot_face_is_drawn_as_its_outline_and_both_sheets_arrive(tmp_path):
+def test_a_fill_occ_cannot_face_is_drawn_as_its_outline_and_both_sheets_arrive(
+        tmp_path, freecad_user_home):
     pdf = tmp_path / "D042_bow_tie_2_sheets.pdf"
     _make_pdf(pdf, 2, 2, BOW_TIE_FILL)
-    result, report, log = _run_probe(tmp_path, pdf)
+    result, report, log = _run_probe(tmp_path, pdf, freecad_user_home)
     assert result["raised"] is None, log[-3000:]
     assert result["page_groups"] == ["PDF_Page_1", "PDF_Page_2"]
     block = report["extra"]["geometry_items_degraded"]

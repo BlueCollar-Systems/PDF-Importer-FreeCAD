@@ -84,6 +84,16 @@ def page_groups(document):
     return sorted(obj.Name.rsplit("_", 1)[0] for obj in document.named("PDF_Page_"))
 
 
+def keep_gapped_stroke_in_one_wire(monkeypatch):
+    """These cases are the step-down that remains when a gap is not split.
+
+    Main now starts a new subpath at every real gap, so the same two-point
+    stroke imports as two wires. Forcing the predicate off keeps the older
+    contract: one wire is refused, and the item is drawn as plain lines.
+    """
+    monkeypatch.setattr(core, "_disconnected_stroke_starts_new_subpath", lambda *_args, **_kwargs: False)
+
+
 def outline_edges(obj):
     """The fake edges inside a step-down outline compound, as (x, y) point pairs."""
     return [[(point.x, point.y) for point in edge[1]] for edge in obj.Shape[1]]
@@ -92,6 +102,7 @@ def outline_edges(obj):
 # (1) a stroke whose edges do not join, on page 2 of 3
 
 def test_a_stroke_that_is_not_one_wire_is_drawn_as_plain_lines_and_every_page_arrives(host, monkeypatch, tmp_path):
+    keep_gapped_stroke_in_one_wire(monkeypatch)
     styles = []
     monkeypatch.setattr(core, "_apply_style", lambda obj, stroke, fill, width, dashes, opts, **_kw:
                         styles.append((obj.Name, stroke, fill, width)))
@@ -188,6 +199,8 @@ def test_a_nan_quad_is_left_out_and_listed_and_the_page_survives(host):
 
 
 def test_when_even_plain_lines_are_refused_the_item_is_left_out_and_listed(host, monkeypatch):
+    keep_gapped_stroke_in_one_wire(monkeypatch)
+
     def refuse(_shapes):
         raise RuntimeError("compound refused")
 
@@ -256,6 +269,7 @@ def test_a_compound_fill_that_fails_after_its_objects_exist_removes_them(monkeyp
 # (5) the written report: warnings, plain sentence, fallback
 
 def test_the_written_report_counts_explains_and_does_not_certify_the_step_down(host, monkeypatch, tmp_path):
+    keep_gapped_stroke_in_one_wire(monkeypatch)
     _document, opts, _result = run_import(monkeypatch, tmp_path, [[plain_row()], [gap_row()]])
     report = json.loads((tmp_path / "D042_import_report.json").read_text(encoding="utf-8"))
     extra = report["extra"]
@@ -284,6 +298,7 @@ def test_a_clean_report_has_no_geometry_block_and_no_extra_sentence(host, monkey
 # (6) the import session never certifies the page
 
 def test_the_session_lists_the_degraded_page(host, monkeypatch, tmp_path):
+    keep_gapped_stroke_in_one_wire(monkeypatch)
     _document, opts, _result = run_import(monkeypatch, tmp_path, [[plain_row()], [gap_row()], [plain_row()]])
     session = opts._report_extra["import_session"]
     assert session["degraded_pages"] == [2]
@@ -292,7 +307,8 @@ def test_the_session_lists_the_degraded_page(host, monkeypatch, tmp_path):
 
 # Console lines are capped; the report keeps them all (up to its own limit).
 
-def test_console_lines_are_capped_and_closed_by_one_overflow_line(host):
+def test_console_lines_are_capped_and_closed_by_one_overflow_line(host, monkeypatch):
+    keep_gapped_stroke_in_one_wire(monkeypatch)
     rows = [gap_row(seqno=index) for index in range(core.GEOMETRY_ITEM_DEGRADE_CONSOLE_LIMIT + 3)]
     _document, opts, _group = fixture.import_page(rows)
     block = opts._report_extra["geometry_items_degraded"]

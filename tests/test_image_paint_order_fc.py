@@ -132,6 +132,16 @@ def native(tmp_path):
     doc.close()
 
 
+def test_float32_corner_roundoff_still_matches_an_upright_plane(native):
+    """A few nanometers of source-quad drift is still the same rectangle."""
+    page, plans, kwargs = native
+    image = kwargs["objects"][0]
+    image.XSize += 1e-5
+    image.YSize -= 1e-5
+    rows = delivery.apply_image_order(page, plans, **kwargs)
+    assert rows[0]["representation_unchanged"] == "embedded_image"
+
+
 def test_native_order_metadata_keeps_source_shapes_text_and_plane_geometry_unchanged(native):
     page, plans, kwargs = native
     before = [delivery._state(obj) for obj in kwargs["objects"]]

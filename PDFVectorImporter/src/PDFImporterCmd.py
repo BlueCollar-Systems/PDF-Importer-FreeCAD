@@ -660,6 +660,10 @@ class ImportPDFDialog(QtWidgets.QDialog):
             mode = grp.GetString("LastMode", "")
             if mode and mode in self.MODES:
                 self.mode_combo.setCurrentText(mode)
+            # The strategy combo only applies while Advanced is checked.
+            # Remember that checkbox, or a saved Vector/Raster choice silently
+            # imports as Auto the next time.
+            self.advanced_group.setChecked(bool(grp.GetBool("LastAdvanced", False)))
             text_mode = grp.GetString("LastTextMode", "")
             if text_mode == "Labels" and not grp.GetBool("TextDefaultMigratedV407", False):
                 text_mode = "3D Text"
@@ -696,6 +700,7 @@ class ImportPDFDialog(QtWidgets.QDialog):
         try:
             grp = FreeCAD.ParamGet(self._PARAM_PATH)
             grp.SetString("LastMode", self.mode_combo.currentText())
+            grp.SetBool("LastAdvanced", self.advanced_group.isChecked())
             grp.SetString("LastTextMode", self.text_combo.currentText())
             grp.SetBool("LastImportText", self.import_text_chk.isChecked())
             grp.SetFloat("LastScale", self.scale_spin.value())

@@ -299,6 +299,35 @@ def _disconnected_stroke_starts_new_subpath(current_pt, start_pt) -> bool:
     return _len2d(current_pt, start_pt) > CLOSE_TOL
 
 
+# 0.01 mm is the same gap pdfcadcore uses. When a disconnected segment starts
+# a new subpath, a ring that has already returned to its own start is closed
+# so a hole is not left as an open outline.
+SUBPATH_BREAK_MM = 0.01
+
+
+def _subpath_break(current_end, segment_start, subpath_origin):
+    """Return ``(flush, closed)`` when ``segment_start`` opens a new subpath.
+
+    ``closed`` is true when the subpath being flushed already returns to its
+    own start, which is how PDF circle pairs are stored.
+    """
+    if current_end is None or segment_start is None:
+        return False, False
+    try:
+        gap = _len2d(current_end, segment_start)
+    except (AttributeError, TypeError, ValueError):
+        return False, False
+    if gap <= SUBPATH_BREAK_MM:
+        return False, False
+    closed = False
+    if subpath_origin is not None:
+        try:
+            closed = _len2d(current_end, subpath_origin) <= SUBPATH_BREAK_MM
+        except (AttributeError, TypeError, ValueError):
+            closed = False
+    return True, closed
+
+
 def _pts_closed(pts: List["Vector"], tol: float = CLOSE_TOL) -> bool:
     return len(pts) > 2 and _len2d(pts[0], pts[-1]) <= tol
 
@@ -13606,6 +13635,18 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             compound_counted = 0
             try:
                 contours = source_contours(path_group, _parse_rect)
+                # A closepath often leaves a zero-length line beside the real
+                # outline. That dot is not a second contour, and treating it
+                # as one used to reject the whole fill (then step it down to
+                # an outline).
+                if contours:
+                    contours = tuple(
+                        contour for contour in contours
+                        if any(
+                            command[0] != "l" or command[1] != command[-1]
+                            for command in contour
+                        )
+                    )
                 if contours is not None and len(contours) > 1:
                     compound_checks = 0
                     def check_compound_cancel(paint_index=pg_idx, drawing_count=n_drawings):
@@ -13710,12 +13751,33 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             # Closure was proved in source space. Never invent a closing edge.
             wires_edges.append((_source_fill_boundary_edges(items, page_h, opts, scale), close_path))
 
+        subpath_origin = None
+
         def flush_sub(close_flag: bool, _wires=wires_edges):
-            nonlocal sub_edges, current_pt
+            nonlocal sub_edges, current_pt, subpath_origin
             if sub_edges:
                 _wires.append((sub_edges[:], close_flag))
             sub_edges = []
             current_pt = None
+            subpath_origin = None
+
+        def begin_segment(start, previous_end):
+            nonlocal subpath_origin
+            if _disconnected_stroke_starts_new_subpath(previous_end, start):
+                # Any real gap starts a new stroke, so a page-sized X is two
+                # wires instead of one refusal. A ring that already returned
+                # to its own start is closed, including a gap smaller than the
+                # 0.01 mm ring check.
+                should_flush, closed = _subpath_break(previous_end, start, subpath_origin)
+                if not should_flush and subpath_origin is not None:
+                    try:
+                        closed = _len2d(previous_end, subpath_origin) <= SUBPATH_BREAK_MM
+                    except (AttributeError, TypeError, ValueError):
+                        closed = False
+                flush_sub(closed)
+                subpath_origin = start
+            elif subpath_origin is None:
+                subpath_origin = start
 
         for item in (() if source_fill_proof is not None else items):
             kind = item[0]
@@ -13725,6 +13787,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                 flush_sub(False)
                 x, y = _parse_point(data)
                 current_pt = _to_fc((x, y), page_h, opts, scale)
+                subpath_origin = current_pt
 
             elif kind == "l":  # lineto
                 # PyMuPDF may give ('l', start_pt, end_pt) with BOTH points,
@@ -13735,8 +13798,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     x1, y1 = _xy(data[1])
                     p_start = _to_fc((x0, y0), page_h, opts, scale)
                     p_end   = _to_fc((x1, y1), page_h, opts, scale)
-                    if _disconnected_stroke_starts_new_subpath(current_pt, p_start):
-                        flush_sub(False)
+                    begin_segment(p_start, current_pt)
                     seg = _len2d(p_start, p_end)
                     if seg > max(ZERO_TOL, opts.min_seg_len):
                         e = _edge_line(p_start, p_end)
@@ -13769,8 +13831,7 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                     p1 = _to_fc((x1, y1), page_h, opts, scale)
                     p2 = _to_fc((x2, y2), page_h, opts, scale)
                     p3 = _to_fc((x3, y3), page_h, opts, scale)
-                    if _disconnected_stroke_starts_new_subpath(current_pt, p0):
-                        flush_sub(False)
+                    begin_segment(p0, current_pt)
                     current_pt = p0  # set current in case it was None
                 else:
                     if current_pt is None:
@@ -13937,6 +13998,11 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
             want_face = (source_fill_proof is not None
                          or (opts.hatch_to_faces and fill is not None)
                          or (opts.make_faces and is_closed))
+            # An open stroke that also carries a fill is not a face. Forcing
+            # one used to fail the item ("open boundary") and step it down
+            # to an outline even though the line itself is fine.
+            if source_fill_proof is None and not is_closed:
+                want_face = False
             if compound_fill_delivered or source_quad_stroke or compound_step_down:
                 want_face = False
             if path_group.get("seqno") in image_order_strokes:

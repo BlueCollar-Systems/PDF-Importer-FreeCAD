@@ -3,6 +3,10 @@
 These notes used to sit at the top of the main [README](../README.md), in the
 same order. Install steps and the feature list are in the README.
 
+## Recent fixes (v4.0.113)
+
+- A page with only a few lines (one to four drawing items) and no text is now imported as editable lines. Before, the default raster fallback replaced such a page with a full-page picture. Only a page with no drawing items at all still takes that scanned-PDF fallback.
+
 ## Recent fixes (v4.0.112)
 
 - The import dialog uses the PDF you picked. Choosing another file no longer imports the previous one, and All still means every page. A page range that is larger than the file is refused before the importer tries to build it.

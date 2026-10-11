@@ -4,7 +4,7 @@
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 ![Version: 4.0.113](https://img.shields.io/badge/Version-4.0.113-blue.svg)
-![Platform: FreeCAD 0.21+ (Python 3.10+)](https://img.shields.io/badge/Platform-FreeCAD%200.21%2B%20%28Python%203.10%2B%29-orange.svg)
+![Platform: FreeCAD 1.0+ (Python 3.10+)](https://img.shields.io/badge/Platform-FreeCAD%201.0%2B%20%28Python%203.10%2B%29-orange.svg)
 
 Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.
 

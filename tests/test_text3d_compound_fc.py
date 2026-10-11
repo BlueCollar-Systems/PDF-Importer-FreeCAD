@@ -57,9 +57,13 @@ class FakeHost:
         self.Shape = None
         self.Placement = None
         self.ViewObject = SimpleNamespace()
+        self.editor_modes = {}
 
     def addProperty(self, property_kind, name, group):
         self.PropertiesList.append(name)
+
+    def setEditorMode(self, name, mode):
+        self.editor_modes[name] = mode
 
 
 class FakeDocument:
@@ -394,7 +398,7 @@ def test_compound_3d_text_failure_removes_half_built_host(monkeypatch):
     assert group.objects == []
 
 
-def test_compound_3d_text_metadata_preserves_editable_source_provenance():
+def test_compound_3d_text_metadata_preserves_read_only_source_provenance():
     document = FakeDocument()
     host = document.addObject("Part::Feature", "PDF_3D_Text")
 
@@ -418,6 +422,20 @@ def test_compound_3d_text_metadata_preserves_editable_source_provenance():
     assert host.PDFTargetAdvance == pytest.approx(30.0)
     assert host.PDFHorizontalScale == pytest.approx(0.5)
     assert host.PDFGeometryEncoding == "exact_glyph_solid_compound_v1"
+    # Editing these would not reshape the solid letters, so the property
+    # editor shows every one of them read-only (mode 1).
+    pdf_import_properties = [
+        "PDFSourceText",
+        "PDFSourceTextSHA256",
+        "PDFFontFile",
+        "PDFFontFileSHA256",
+        "PDFExtrusionDepth",
+        "PDFTargetAdvance",
+        "PDFHorizontalScale",
+        "PDFGeometryEncoding",
+    ]
+    assert host.PropertiesList == pdf_import_properties
+    assert host.editor_modes == {name: 1 for name in pdf_import_properties}
 
 
 def test_text3d_outline_memo_returns_fresh_shapes_and_tracks_hits():

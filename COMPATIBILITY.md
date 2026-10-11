@@ -7,16 +7,20 @@ Modes are extraction **strategy** (Auto / Vector / Raster / Hybrid), not quality
 
 ## Minimum host version
 
-**FreeCAD 0.21** (`package.xml` declares `<freecadmin>0.21</freecadmin>`).
+**A FreeCAD that bundles Python 3.10 or newer**: FreeCAD 1.0+, or a 0.21 build
+with Python 3.10+. `package.xml` still declares `<freecadmin>0.21</freecadmin>`
+so those 0.21 builds can load it; the official 0.21 Windows installer ships
+Python 3.8 and is not supported yet.
 
 ## Oldest tested
 
 | Host | Status |
 |------|--------|
-| FreeCAD 1.1.x | ✅ Verified (Windows installer smoke) |
-| FreeCAD 1.0.x / 0.21.x | ⚠️ Expected |
-| FreeCAD 0.19–0.20 | ⚠️ Expected only after legacy branch testing |
-| FreeCAD 0.18 and earlier | ❌ Not supported |
+| FreeCAD 1.1.x | ✅ Tested by hand on 1.1.4 (no automated FreeCAD test yet) |
+| FreeCAD 1.0.x | ⚠️ Expected (not tested) |
+| FreeCAD 0.21.x | ⚠️ Only builds that bundle Python 3.10+; the official Windows installer (Python 3.8) is not supported yet |
+| FreeCAD 26.x (calendar version numbers) | ⚠️ Not yet tested |
+| FreeCAD 0.20 and earlier | ❌ Not supported (needs Python 3.10+) |
 
 ## Ruby / Python ABI
 
@@ -24,7 +28,7 @@ Modes are extraction **strategy** (Auto / Vector / Raster / Hybrid), not quality
 |---------|-------|
 | **Python 3.10 / 3.11** | Maintained Windows offline bundle (exact ABI selected at runtime) |
 | Python 3.12+ | Source/system packages only; no bundled offline payload |
-| Python 3.8–3.9 | CI compile-only for legacy FreeCAD 0.19–0.20 hosts |
+| Python 3.8–3.9 | Not supported (the importer needs Python 3.10+); CI only byte-compiles on them |
 | Ruby | Not used |
 
 Embedded Python comes from the installed FreeCAD build. Release installs bundle PyMuPDF once under `src/lib/common` and fontTools separately under `src/lib/cp310` and `src/lib/cp311`. The incompatible sibling tree is never added to `sys.path`.
@@ -33,8 +37,8 @@ Embedded Python comes from the installed FreeCAD build. Release installs bundle 
 
 | Dependency | Release installer | Source checkout |
 |------------|-------------------|-----------------|
-| PyMuPDF 1.28.2 | ✅ Shared cp310-abi3 Windows wheel | Workbench **Install / Update PDF Dependencies** or system/user package |
-| fontTools 4.63.0 | ✅ Exact cp310 and cp311 Windows wheels | Same fallback command |
+| PyMuPDF 1.28.2 | ✅ Shared cp310-abi3 Windows wheel | Switching to the workbench offers to install it, or a system/user package |
+| fontTools 4.63.0 | ✅ Exact cp310 and cp311 Windows wheels | Same workbench install offer |
 | Poppler / pdfcadcore | ✅ In workbench | Same |
 
 No system Python, pip, or OS packages required for release users.
@@ -49,13 +53,13 @@ and requires each interpreter to exit normally.
 ## Legacy hardware notes
 
 - Large multi-page PDFs: import page ranges on **&lt; 8 GB RAM** machines; see `import_report.extra.performance_hint`.
-- Use **3D Text** first for Adobe-like visual review. **Glyphs/Geometry** text modes increase sketch complexity, so avoid them on weak PCs unless exact outlines are required.
-- Use **Labels** only when editable FreeCAD text matters more than model-space PDF appearance.
+- **3D Text** (the default) gives the closest look to the PDF, as solid letter shapes that cannot be re-typed. On a slow PC, **Text** or **Labels** imports a text-heavy sheet many times faster, and the words stay editable.
+- **Glyphs/Geometry** text modes increase sketch complexity, so avoid them on weak PCs unless exact outlines are required.
 - Windows SmartScreen may warn — installer is unsigned but functional.
 
 ## Offline install
 
-Release **Inno Setup EXE** works without internet after download on embedded CPython 3.10/3.11. Dev/source installs and other Python versions may use the workbench dependency command once with network access.
+Release **Inno Setup EXE** works without internet after download on embedded CPython 3.10/3.11. Dev/source installs and other Python versions may accept the workbench's dependency install offer once, with network access.
 
 ## Enterprise / roaming
 
@@ -77,21 +81,23 @@ In FreeCAD GUI: select workbench **PDF Vector Importer** → verify toolbar **PD
 
 | FreeCAD | Python | PyMuPDF | Status |
 |---------|--------|---------|--------|
-| 1.1.x | 3.11 | 1.28.2 offline bundle | ⚠️ Runtime update; native validation pending |
-| 1.0.x | 3.11 | 1.28.2 offline bundle | ⚠️ Expected |
-| 0.21.x | 3.10 | 1.28.2 offline bundle | ⚠️ Expected |
+| 1.1.x | 3.11 | 1.28.2 offline bundle | ✅ Tested by hand on 1.1.4 (no automated FreeCAD test yet) |
+| 1.0.x | 3.11 | 1.28.2 offline bundle | ⚠️ Expected (not tested) |
+| 0.21.x | 3.10+ builds only | 1.28.2 offline bundle on 3.10 | ⚠️ Only builds that bundle Python 3.10+; the official Windows installer (Python 3.8) is not supported yet |
+| 26.x | not checked | | ⚠️ Not yet tested |
 | Any host using 3.12+ | 3.12+ | System/user install only | ⚠️ No bundled offline runtime |
-| 0.19–0.20 | 3.8–3.9 | legacy pin | ⚠️ Expected only after legacy branch testing |
-| 0.18 and earlier | | | ❌ Not supported |
+| 0.20 and earlier | 3.8–3.9 | | ❌ Not supported (needs Python 3.10+) |
 
 ### Text rendering
 
 | Option | FreeCAD result |
 |--------|----------------|
-| **3D Text** | Default visual-parity path; ShapeString / extruded text |
-| **Labels** | Editable Draft / native text objects |
-| **Glyphs** | Vector glyph geometry |
+| **Text** | Editable Draft text objects |
+| **Labels** | Editable Draft label objects |
+| **3D Text** | Default; solid letter shapes from the PDF font (closest look; not re-typeable) |
+| **Glyphs** | Vector glyph geometry (not editable as words) |
 | **Geometry** | pdftocairo outlines (non-editable) |
+| **Raster** | One picture patch per text item (not editable) |
 
 ## CI coverage
 

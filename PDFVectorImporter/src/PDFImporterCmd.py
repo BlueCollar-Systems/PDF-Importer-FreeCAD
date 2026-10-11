@@ -117,6 +117,31 @@ class ImportProgressController:
         self.dialog.close()
 
 
+def _ask_resume_choice(parent, prompt, complete):
+    """Ask Resume / Start over / Cancel for a stopped import. Returns the choice."""
+    box = QtWidgets.QMessageBox(parent)
+    box.setWindowTitle("Resume PDF Import")
+    box.setText(prompt)
+    box.setIcon(QtWidgets.QMessageBox.Question)
+    pages = "1 page" if complete == 1 else f"{complete} pages"
+    resume_btn = box.addButton(
+        "Resume remaining pages", QtWidgets.QMessageBox.AcceptRole)
+    restart_btn = box.addButton(
+        f"Start over (replace the {pages} already imported)",
+        QtWidgets.QMessageBox.DestructiveRole)
+    cancel_btn = box.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+    box.setDefaultButton(resume_btn)
+    box.setEscapeButton(cancel_btn)
+    exec_fn = getattr(box, "exec", None) or getattr(box, "exec_", None)
+    exec_fn()
+    clicked = box.clickedButton()
+    if clicked is resume_btn:
+        return "resume"
+    if clicked is restart_btn:
+        return "start_over"
+    return "cancel"
+
+
 def run_interactive_import(core, pdf_path, opts, parent=None):
     """Plan, confirm, run, and report an interactive import truthfully."""
     progress = ImportProgressController(parent)
@@ -130,23 +155,36 @@ def run_interactive_import(core, pdf_path, opts, parent=None):
             complete = len(resumable["completed_pages"])
             requested = len(resumable["requested_pages"])
             prompt = (
-                f"{summary}\n\nA matching import session has {complete} of "
-                f"{requested} pages complete. Resume the remaining pages?"
+                f"{summary}\n\nThis PDF was imported into this document before "
+                f"and stopped with {complete} of {requested} pages done.\n"
+                "Resume the remaining pages, or start over and replace the "
+                "pages already imported?"
             )
-            title = "Resume PDF Import"
+            choice = _ask_resume_choice(parent, prompt, complete)
         else:
             prompt = f"{summary}\n\nStart this import?"
             title = "PDF Import Work Estimate"
-        buttons = QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel
-        answer = QtWidgets.QMessageBox.question(
-            parent, title, prompt, buttons, QtWidgets.QMessageBox.Yes
-        )
-        if answer != QtWidgets.QMessageBox.Yes:
+            buttons = QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel
+            answer = QtWidgets.QMessageBox.question(
+                parent, title, prompt, buttons, QtWidgets.QMessageBox.Yes
+            )
+            choice = "start" if answer == QtWidgets.QMessageBox.Yes else "cancel"
+        if choice == "cancel":
             opts.import_status = "cancelled"
             FreeCAD.Console.PrintMessage("PDF import cancelled before model changes.\n")
             return False
-        if resumable:
+        if choice == "resume":
             opts.resume_session_name = resumable["host"].Name
+        elif choice == "start_over":
+            # One undo step removes only the pages that session recorded (and
+            # the session itself); then a fresh import runs as usual.
+            discarded = core.discard_import_session(resumable)
+            FreeCAD.Console.PrintMessage(
+                f"Removed the {len(discarded.get('page_groups', []))} page(s) from the "
+                "earlier stopped import; Edit > Undo 'Start PDF import over' "
+                "brings them back.\n"
+            )
+            opts.resume_session_name = None
         completed = bool(core.import_pdf(pdf_path, opts))
         if not completed:
             session_info = (getattr(opts, "_report_extra", {}) or {}).get(
@@ -166,6 +204,233 @@ def run_interactive_import(core, pdf_path, opts, parent=None):
     finally:
         opts.progress_callback = None
         progress.close()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Import outcome: every import ends with a plain message
+# ──────────────────────────────────────────────────────────────────────
+# A failed import always shows one box with the reason, the page and where the
+# report is. A finished import shows one warning box only when something was
+# stepped down or left out; a clean import shows none (the drawing appearing
+# is the feedback). With quiet=True, or with no GUI, nothing pops up: the
+# same sentences go to the Report view only (batch and headless runs).
+
+def _is_quiet(quiet):
+    if quiet is not None:
+        return bool(quiet)
+    return not bool(getattr(FreeCAD, "GuiUp", False))
+
+
+def _report_extra(opts):
+    extra = getattr(opts, "_report_extra", None)
+    return extra if isinstance(extra, dict) else {}
+
+
+def _report_folder(report_path):
+    path = str(report_path or "")
+    if not path or not os.path.isfile(path):
+        return ""
+    return os.path.dirname(os.path.abspath(path))
+
+
+def _open_report_folder(folder):
+    """Open the report folder in the system file browser; never raises."""
+    try:
+        try:
+            from PySide6 import QtCore, QtGui
+        except ImportError:
+            from PySide2 import QtCore, QtGui
+        if QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(folder)):
+            return True
+    except Exception:
+        pass
+    try:
+        if hasattr(os, "startfile"):
+            os.startfile(folder)  # noqa: S606 - a local folder the importer wrote
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def _message_enum(name, scope):
+    box = QtWidgets.QMessageBox
+    value = getattr(box, name, None)
+    if value is None:
+        value = getattr(getattr(box, scope), name)
+    return value
+
+
+def _show_outcome_box(kind, title, text, report_path=None, parent=None):
+    """One message box with an 'Open report folder' button when there is one."""
+    box = QtWidgets.QMessageBox(parent)
+    box.setIcon(_message_enum("Critical" if kind == "critical" else "Warning", "Icon"))
+    box.setWindowTitle(title)
+    box.setText(text)
+    folder = _report_folder(report_path)
+    open_button = None
+    if folder:
+        open_button = box.addButton("Open report folder", _message_enum("ActionRole", "ButtonRole"))
+    box.addButton(_message_enum("Ok", "StandardButton"))
+    exec_fn = getattr(box, "exec", None) or getattr(box, "exec_", None)
+    exec_fn()
+    if open_button is not None and box.clickedButton() == open_button:
+        _open_report_folder(folder)
+    return box
+
+
+def _failed_page(exc, opts):
+    for source in (exc, getattr(exc, "__cause__", None)):
+        page = getattr(source, "bcs_failed_page", None)
+        if page is not None:
+            return page
+    failure = _report_extra(opts).get("page_failure")
+    if isinstance(failure, dict):
+        return failure.get("last_evaluated_page")
+    return None
+
+
+def _failure_report_path(exc, opts):
+    for source in (exc, getattr(exc, "__cause__", None)):
+        path = getattr(source, "bcs_report_path", None)
+        if path:
+            return str(path)
+    return str(getattr(opts, "_last_import_report_path", "") or "")
+
+
+def show_import_failure(exc, opts, parent=None, *, title="Import Failed", quiet=None):
+    """Tell the user plainly that the import failed, why, where, and what is left.
+
+    Returns the message text. Shows one critical box unless quiet (or no GUI).
+    """
+    extra = _report_extra(opts)
+    rollback = extra.get("rollback") if isinstance(extra.get("rollback"), dict) else {}
+    if rollback.get("cleanup_complete") is False:
+        lead = ("This PDF could not be imported, and the importer could not remove "
+                "everything it had started. Check the drawing before you save it.")
+    else:
+        lead = "This PDF could not be imported. Nothing was added to your drawing."
+    try:
+        reason = str(exc) or type(exc).__name__
+    except Exception:
+        reason = type(exc).__name__
+    lines = [lead, "", "Reason: %s" % reason]
+    page = _failed_page(exc, opts)
+    if page is not None:
+        lines.append("Page: %s" % page)
+    report_path = _failure_report_path(exc, opts)
+    if report_path:
+        lines.append("Details: %s" % report_path)
+    text = "\n".join(lines)
+    import traceback
+    details = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    FreeCAD.Console.PrintError(
+        "Import failed: %s%s. Report: %s\n%s"
+        % (reason, " (page %s)" % page if page is not None else "",
+           report_path or "not written", details)
+    )
+    if not _is_quiet(quiet):
+        _show_outcome_box("critical", title, text, report_path, parent)
+    return text
+
+
+def _plural(count, word):
+    return "%d %s%s" % (count, word, "" if count == 1 else "s")
+
+
+def _pages_text(pages):
+    pages = sorted({int(page) for page in (pages or [])})
+    if not pages:
+        return ""
+    return " (page%s %s)" % ("" if len(pages) == 1 else "s", ", ".join(str(p) for p in pages))
+
+
+def _degrade_sentences(extra):
+    """One plain sentence per *_items_degraded block that has items in it."""
+    sentences = []
+    text = extra.get("text_items_degraded")
+    if isinstance(text, dict) and int(text.get("total", 0) or 0) > 0:
+        total = int(text.get("total", 0) or 0)
+        lowered = int(text.get("delivered_at_lower_rung", 0) or 0)
+        dropped = int(text.get("dropped", 0) or 0)
+        sentences.append(
+            "%s could not be drawn as requested%s: %d drawn as outlines or "
+            "pictures instead, %d left out."
+            % (_plural(total, "text item"), _pages_text(text.get("pages")), lowered, dropped))
+    geometry = extra.get("geometry_items_degraded")
+    if isinstance(geometry, dict) and int(geometry.get("total", 0) or 0) > 0:
+        total = int(geometry.get("total", 0) or 0)
+        outlined = int(geometry.get("delivered_as_outline", 0) or 0)
+        partial = int(geometry.get("partly_delivered", 0) or 0)
+        skipped = int(geometry.get("skipped", 0) or 0)
+        sentences.append(
+            "%s could not be built as requested%s: %d drawn as plain lines instead%s, "
+            "%d left out."
+            % (_plural(total, "drawing item"), _pages_text(geometry.get("pages")), outlined,
+               ", %d only partly drawn" % partial if partial else "", skipped))
+    pictures = extra.get("picture_items_degraded")
+    if isinstance(pictures, dict) and int(pictures.get("total", 0) or 0) > 0:
+        total = int(pictures.get("total", 0) or 0)
+        sentences.append(
+            "%s could not be placed%s and %s left out."
+            % (_plural(total, "picture"), _pages_text(pictures.get("pages")),
+               "was" if total == 1 else "were"))
+    known = {"text_items_degraded", "geometry_items_degraded", "picture_items_degraded"}
+    for key, block in sorted(extra.items()):
+        if (key.endswith("_items_degraded") and key not in known
+                and isinstance(block, dict) and int(block.get("total", 0) or 0) > 0):
+            sentences.append(
+                "%s could not be delivered as requested%s."
+                % (_plural(int(block["total"]), key[: -len("_items_degraded")].replace("_", " ") + " item"),
+                   _pages_text(block.get("pages"))))
+    crosscheck = extra.get("scale_crosscheck")
+    if isinstance(crosscheck, dict) and crosscheck.get("level") == "warn":
+        # "No scale found" is the normal state of most PDFs, not a step-down.
+        reasons = [reason for reason in (crosscheck.get("reasons") or []) if reason != "no_scale_detected"]
+        banner = str(crosscheck.get("banner") or crosscheck.get("user_message") or "").strip()
+        if reasons and banner:
+            sentences.append("Scale note: %s" % banner)
+    return sentences
+
+
+def _written_report(opts):
+    path = str(getattr(opts, "_last_import_report_path", "") or "")
+    if path and os.path.isfile(path):
+        try:
+            import json
+
+            with open(path, "r", encoding="utf-8") as handle:
+                report = json.load(handle)
+            if isinstance(report, dict):
+                return report, path
+        except (OSError, ValueError):
+            pass
+    return None, path
+
+
+def show_import_result(opts, parent=None, *, quiet=None):
+    """After a finished import: one warning box only when something stepped down.
+
+    Returns the message text, or "" for a clean import (no box at all).
+    """
+    report, report_path = _written_report(opts)
+    if report is not None:
+        extra = report.get("extra") if isinstance(report.get("extra"), dict) else {}
+        pages = (report.get("input") or {}).get("pages")
+    else:
+        extra = _report_extra(opts)
+        pages = len(((extra.get("import_session") or {}).get("completed_pages")) or [])
+    sentences = _degrade_sentences(extra)
+    if not sentences:
+        return ""
+    head = "Imported %s." % _plural(int(pages or 0), "page") if pages else "Import finished."
+    text = " ".join([head] + sentences)
+    if report_path:
+        text += " Details: %s" % report_path
+    FreeCAD.Console.PrintWarning("PDF import: %s\n" % text)
+    if not _is_quiet(quiet):
+        _show_outcome_box("warning", "PDF Import Finished With Warnings", text, report_path, parent)
+    return text
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -257,8 +522,9 @@ class ImportPDFDialog(QtWidgets.QDialog):
         self.text_combo.setToolTip(
             "How text is rendered when Import text is enabled:\n"
             "Text — native FreeCAD annotation text, editable\n"
-            "Labels — FreeCAD Draft Text labels, editable\n"
-            "3D Text — extruded 3D letterforms\n"
+            "Labels — FreeCAD Draft labels, editable\n"
+            "3D Text — solid letter shapes that match the PDF look "
+            "(cannot be retyped; choose Text or Labels to edit words)\n"
             "Glyphs — exact glyph geometry from the PDF font\n"
             "Geometry — raw text-outline edges grouped per source text item\n"
             "Raster — one visually exact raster patch per source text item")
@@ -267,19 +533,26 @@ class ImportPDFDialog(QtWidgets.QDialog):
         self.import_text_chk.toggled.connect(self.text_combo.setEnabled)
 
         # ── Grouping (workflow — kept) ──
+        # Every label is a grouping the core really builds (see
+        # _GROUPING_LAYER_MODE); the list order matches that table.
         self.grouping_combo = QtWidgets.QComboBox()
         self.grouping_combo.addItems([
-            "Single", "Per Page", "Per Layer", "Per Color",
-            "Nested Page>Layer", "Nested Page>Lineweight"])
-        self.grouping_combo.setCurrentText("Per Page")
+            "Page > PDF layers, else colors (recommended)",
+            "Page > colors",
+            "Page > PDF layers",
+            "Page only (no layer or color sub-groups)",
+        ])
+        self.grouping_combo.setCurrentText(self._GROUPING_DEFAULT)
         self.grouping_combo.setToolTip(
-            "How imported objects are grouped in the model tree:\n"
-            "Single = everything in one group\n"
-            "Per Page = one group per PDF page\n"
-            "Per Layer = one group per PDF layer (OCG)\n"
-            "Per Color = one group per stroke/fill color\n"
-            "Nested Page>Layer = pages containing layer sub-groups\n"
-            "Nested Page>Lineweight = pages containing lineweight sub-groups")
+            "How imported lines are grouped in the model tree. Every page gets\n"
+            "its own group; this choice sets the sub-groups inside each page:\n"
+            "Page > PDF layers, else colors = one sub-group per PDF layer when\n"
+            "    the PDF has layers, otherwise one per line color\n"
+            "Page > colors = one sub-group per line color\n"
+            "Page > PDF layers = one sub-group per PDF layer.\n"
+            "    A PDF without layers gets no layer sub-groups.\n"
+            "Page only = lines go straight into the page group\n"
+            "Text, pictures and hatching keep their own sub-groups in every choice.")
 
         # ── Page arrangement (workflow — kept) ──
         self.page_arrangement_combo = QtWidgets.QComboBox()
@@ -403,9 +676,9 @@ class ImportPDFDialog(QtWidgets.QDialog):
             scale = grp.GetFloat("LastScale", 0.0)
             if scale > 0:
                 self.scale_spin.setValue(scale)
-            grouping = grp.GetString("LastGroupingMode", "")
-            if grouping:
-                self.grouping_combo.setCurrentText(grouping)
+            self.grouping_combo.setCurrentText(
+                self._grouping_label_for_saved(grp.GetString("LastGroupingMode", ""))
+            )
             page_arrangement = grp.GetString("LastPageArrangement", "")
             if page_arrangement:
                 self.page_arrangement_combo.setCurrentText(page_arrangement)
@@ -433,12 +706,34 @@ class ImportPDFDialog(QtWidgets.QDialog):
         except (AttributeError, RuntimeError, ValueError):
             pass
 
-    # Mapping tables for combo dropdowns (internal value -> UI label)
-    _GROUPING_MAP = {
-        "single": "Single", "per_page": "Per Page", "per_layer": "Per Layer",
-        "per_color": "Per Color", "nested_page_layer": "Nested Page>Layer",
-        "nested_page_lineweight": "Nested Page>Lineweight",
+    # Grouping label -> core ImportOptions.layer_mode. Only groupings the core
+    # builds are offered. "Everything in one group" is not: create_top_group
+    # False cannot place layer/color sub-groups, and no lineweight grouping
+    # exists in the core.
+    _GROUPING_DEFAULT = "Page > PDF layers, else colors (recommended)"
+    _GROUPING_LAYER_MODE = {
+        "Page > PDF layers, else colors (recommended)": "auto",
+        "Page > colors": "color",
+        "Page > PDF layers": "ocg",
+        "Page only (no layer or color sub-groups)": "none",
     }
+    # Labels saved by earlier versions (whose choices all built the
+    # recommended tree) -> the label that now builds what they asked for.
+    _LEGACY_GROUPING_LABELS = {
+        "Per Color": "Page > colors",
+        "Per Layer": "Page > PDF layers",
+        "Nested Page>Layer": "Page > PDF layers",
+    }
+
+    @classmethod
+    def _grouping_label_for_saved(cls, saved):
+        """Return the dropdown label for a saved (possibly older) grouping."""
+        saved = str(saved or "")
+        if saved in cls._GROUPING_LAYER_MODE:
+            return saved
+        return cls._LEGACY_GROUPING_LABELS.get(saved, cls._GROUPING_DEFAULT)
+
+    # Mapping tables for combo dropdowns (internal value -> UI label)
     _PAGE_ARRANGEMENT_MAP = {
         "spread": "Spread (20% gap)",
         "compact": "Compact gap",
@@ -571,8 +866,9 @@ class ImportPDFDialog(QtWidgets.QDialog):
             text_mode = "none"
 
         # Reverse-map UI labels to internal values for workflow controls
-        _grp_rev = {v: k for k, v in self._GROUPING_MAP.items()}
         _arr_rev = {v: k for k, v in self._PAGE_ARRANGEMENT_MAP.items()}
+        layer_mode = self._GROUPING_LAYER_MODE.get(
+            self.grouping_combo.currentText(), "auto")
 
         # Consolidated defaults per BCS-ARCH-001 parameter table.
         # Quality-tier dials are hardcoded — no UI exposure.
@@ -595,6 +891,7 @@ class ImportPDFDialog(QtWidgets.QDialog):
             strict_text_fidelity=True,
             hatch_mode="import",
             group_by_color=True,
+            layer_mode=layer_mode,
             assign_linewidth=True,
             map_dashes=(import_mode != "raster"),
             detect_arcs=(import_mode != "raster"),
@@ -612,7 +909,6 @@ class ImportPDFDialog(QtWidgets.QDialog):
         opts.arc_mode = "auto"
         opts.cleanup_level = "balanced"
         opts.lineweight_mode = "preserve"
-        opts.grouping_mode = _grp_rev.get(self.grouping_combo.currentText(), "per_page")
         if SHAPE_EXTRUSION_UI_ENABLED:
             _m3d_rev = {v: k for k, v in self._MODEL3D_MAP.items()}
             opts.model3d_mode = _m3d_rev.get(self.model3d_combo.currentText(), "off")
@@ -669,23 +965,22 @@ class ImportPDFVectorCommand:
         import PDFVectorImporter.src.PDFImporterCore as core
         try:
             completed = run_interactive_import(core, pdf_path, opts)
-            if not completed:
-                return
-            if opts.import_mode == "auto" and getattr(opts, "auto_resolved_mode", None):
-                reason = getattr(opts, "auto_reason", "") or ""
-                detail = f" ({reason})" if reason else ""
-                FreeCAD.Console.PrintMessage(
-                    f"PDF import complete. Auto mode used "
-                    f"{opts.auto_resolved_mode} strategy{detail}.\n"
-                )
-            else:
-                FreeCAD.Console.PrintMessage("PDF import complete.\n")
+        except Exception as e:  # the outermost UI layer: every failure gets one plain box
+            show_import_failure(e, opts)
+            return
+        if not completed:
+            return
+        if opts.import_mode == "auto" and getattr(opts, "auto_resolved_mode", None):
+            reason = getattr(opts, "auto_reason", "") or ""
+            detail = f" ({reason})" if reason else ""
+            FreeCAD.Console.PrintMessage(
+                f"PDF import complete. Auto mode used "
+                f"{opts.auto_resolved_mode} strategy{detail}.\n"
+            )
+        else:
+            FreeCAD.Console.PrintMessage("PDF import complete.\n")
+        # Something stepped down or left out: say so once, with the report.
+        show_import_result(opts)
 
-            # The core frames the complete batch in top orthographic view.
-            # Do not replace that imported-sheet framing with a document fitAll.
-
-        except (RuntimeError, ValueError, TypeError, OSError, AttributeError, ImportError) as e:
-            import traceback
-            FreeCAD.Console.PrintError(f"Import failed: {e}\n{traceback.format_exc()}")
-            QtWidgets.QMessageBox.critical(
-                None, "Import Failed", str(e))
+        # The core frames the complete batch in top orthographic view.
+        # Do not replace that imported-sheet framing with a document fitAll.

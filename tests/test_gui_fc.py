@@ -47,13 +47,16 @@ class TestFcGuiProfessionalImport(unittest.TestCase):
         self.assertIn("core.find_resumable_import_session(pdf_path, opts)", self.source)
 
     def test_cancelled_import_never_prints_success(self) -> None:
+        # The failure box moved the success lines out of the try block, so the
+        # early return sits one level shallower; the behaviour itself is
+        # exercised in test_import_outcome_messages_fc.py.
         self.assertIn("completed = run_interactive_import(core, pdf_path, opts)", self.source)
-        self.assertIn("if not completed:\n                return", self.source)
+        self.assertIn("if not completed:\n            return", self.source)
         self.assertIn(
             "completed = run_interactive_import(core, filename, opts)",
             self.handler_source,
         )
-        self.assertIn("if not completed:\n            return", self.handler_source)
+        self.assertIn("if not completed:\n        return False", self.handler_source)
 
     def test_complexity_summary_names_every_work_unit(self) -> None:
         for label in (

@@ -48,7 +48,10 @@ def open(filename, docname=None):
     doc = FreeCAD.newDocument(docname or basename)
     FreeCAD.setActiveDocument(doc.Name)
 
-    _do_import(filename)
+    if not _do_import(filename):
+        # Cancelled, or failed and rolled back: do not leave an empty tab
+        # behind. A document that holds anything (kept pages) stays open.
+        _close_if_empty(doc)
 
 
 def insert(filename, docname):
@@ -66,6 +69,27 @@ def insert(filename, docname):
     FreeCAD.setActiveDocument(doc.Name)
 
     _do_import(filename)
+
+
+def _close_if_empty(doc):
+    """Close a document this handler created when nothing ended up in it."""
+    try:
+        if list(getattr(doc, "Objects", []) or []):
+            return False
+        FreeCAD.closeDocument(doc.Name)
+        return True
+    except (AttributeError, NameError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _outcome_helpers():
+    """The shared outcome messages, when the command module provides them."""
+    try:
+        import PDFImporterCmd as command
+    except ImportError:
+        return None, None
+    return (getattr(command, "show_import_failure", None),
+            getattr(command, "show_import_result", None))
 
 
 def _check_fitz():
@@ -97,11 +121,13 @@ def _check_fitz():
 
 
 def _do_import(filename):
-    """Run the import — show dialog if GUI is up, otherwise use defaults."""
+    """Run the import — show dialog if GUI is up, otherwise use defaults.
+
+    Returns True only when something was imported.
+    """
     if FreeCAD.GuiUp:
-        _import_with_dialog(filename)
-    else:
-        _import_headless(filename)
+        return bool(_import_with_dialog(filename))
+    return bool(_import_headless(filename))
 
 
 def _import_with_dialog(filename):
@@ -116,7 +142,7 @@ def _import_with_dialog(filename):
             from PDFImporterCmd import ImportPDFDialog, run_interactive_import
         except ImportError as e:
             FreeCAD.Console.PrintError(f"Cannot load importer: {e}\n")
-            return
+            return False
 
     dlg = ImportPDFDialog()
     dlg.file_edit.setText(filename)
@@ -142,19 +168,15 @@ def _import_with_dialog(filename):
 
     exec_fn = getattr(dlg, "exec", None) or getattr(dlg, "exec_", None)
     if exec_fn is None or exec_fn() != QtWidgets.QDialog.Accepted:
-        return
+        return False
 
     # The user can choose a different PDF in the prefilled dialog.
     filename = dlg.file_edit.text().strip()
     opts = dlg.build_options()
+    show_failure, show_result = _outcome_helpers()
     try:
         completed = run_interactive_import(core, filename, opts)
-        if not completed:
-            return
-        FreeCAD.Console.PrintMessage("PDF import complete.\n")
-
-        # Keep the core's final top-orthographic fit to the imported sheets.
-    except (RuntimeError, ValueError, TypeError, OSError, AttributeError, ImportError) as e:
+    except Exception as e:  # the outermost UI layer: every failure gets one plain box
         from pdfcadcore.fitz_loader import PdfOpenError
 
         if isinstance(e, PdfOpenError):
@@ -164,15 +186,9 @@ def _import_with_dialog(filename):
             except ImportError:
                 from PySide2 import QtWidgets
             QtWidgets.QMessageBox.warning(None, "PDF Import", str(e))
-            return
-        import traceback
-        FreeCAD.Console.PrintError(f"Import failed: {e}\n{traceback.format_exc()}")
-        try:
-            from PySide6 import QtWidgets
-        except ImportError:
-            from PySide2 import QtWidgets
+            return False
 
-        # Provide targeted error messages for common failure modes
+        # Provide targeted titles for common failure modes
         msg = str(e)
         if "encrypt" in msg.lower():
             title = "Encrypted PDF"
@@ -180,7 +196,24 @@ def _import_with_dialog(filename):
             title = "PyMuPDF Error"
         else:
             title = "Import Failed"
+        if show_failure is not None:
+            show_failure(e, opts, title=title)
+            return False
+        import traceback
+        FreeCAD.Console.PrintError(f"Import failed: {e}\n{traceback.format_exc()}")
+        try:
+            from PySide6 import QtWidgets
+        except ImportError:
+            from PySide2 import QtWidgets
         QtWidgets.QMessageBox.critical(None, title, msg)
+        return False
+    if not completed:
+        return False
+    FreeCAD.Console.PrintMessage("PDF import complete.\n")
+    if show_result is not None:
+        show_result(opts)
+    # Keep the core's final top-orthographic fit to the imported sheets.
+    return True
 
 
 def _import_headless(filename):
@@ -193,8 +226,20 @@ def _import_headless(filename):
     opts = core.ImportOptions()
     try:
         completed = core.import_pdf(filename, opts)
-        if completed:
-            FreeCAD.Console.PrintMessage("PDF import complete.\n")
-    except (RuntimeError, ValueError, TypeError, OSError, AttributeError, ImportError) as e:
+    except Exception as e:  # headless: never a box, always the reason and the report
         import traceback
-        FreeCAD.Console.PrintError(f"Import failed: {e}\n{traceback.format_exc()}")
+        report = (getattr(e, "bcs_report_path", "")
+                  or getattr(opts, "_last_import_report_path", "") or "not written")
+        FreeCAD.Console.PrintError(
+            f"Import failed: {e}. Report: {report}\n{traceback.format_exc()}")
+        return False
+    if not completed:
+        return False
+    FreeCAD.Console.PrintMessage("PDF import complete.\n")
+    _, show_result = _outcome_helpers()
+    if show_result is not None:
+        try:
+            show_result(opts, quiet=True)
+        except Exception as e:  # a summary line must never fail a finished import
+            FreeCAD.Console.PrintWarning(f"Import summary could not be printed: {e}\n")
+    return True

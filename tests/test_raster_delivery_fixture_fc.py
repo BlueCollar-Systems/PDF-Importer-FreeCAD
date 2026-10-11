@@ -37,11 +37,32 @@ def _find_freecadcmd() -> str:
     return shutil.which("FreeCADCmd") or ""
 
 
+def _probe_env(tmp_path, user_home, **paths):
+    """Hand the probe its paths through the environment, never argv.
+
+    FreeCADCmd opens every argument after the script as a file once the
+    script ends, so trailing paths made it import the PDF a second time with
+    whatever copy of the add-on is installed on the PC.
+    """
+    env = dict(os.environ)
+    for key, value in paths.items():
+        env["BCS_PROBE_" + key.upper()] = str(value)
+    env["BC_PDF_TEMP_DIR"] = str(tmp_path)
+    # A private FreeCAD user folder (the freecad_user_home fixture in
+    # tests/conftest.py): every import copies its report into
+    # <user data>/PDF Import Reports, and a test run must not fill the
+    # developer's own FreeCAD profile (it keeps only the newest 50). It sits
+    # under %TEMP%, not tmp_path, so a long --basetemp cannot push FreeCAD's
+    # own temp and cache paths past the Windows 260-character limit.
+    env["FREECAD_USER_HOME"] = str(user_home)
+    return env
+
+
 PROBE_SOURCE = r"""
 import json, os, sys, traceback
-out_path = sys.argv[-3]
-report_path = sys.argv[-2]
-pdf_path = sys.argv[-1]
+out_path = os.environ["BCS_PROBE_OUT"]
+report_path = os.environ["BCS_PROBE_REPORT"]
+pdf_path = os.environ["BCS_PROBE_PDF"]
 result = {"ok": False}
 try:
     import FreeCAD
@@ -76,7 +97,9 @@ with open(out_path, "w") as handle:
 """
 
 
-def test_raster_only_fixture_delivers_image_plane_with_honest_report(tmp_path):
+def test_raster_only_fixture_delivers_image_plane_with_honest_report(
+    tmp_path, freecad_user_home
+):
     corpus_root = os.environ.get("BCS_CORPUS_ROOT", "")
     if not corpus_root:
         pytest.skip("BCS_CORPUS_ROOT not set — raster-only fixture unavailable")
@@ -93,7 +116,11 @@ def test_raster_only_fixture_delivers_image_plane_with_honest_report(tmp_path):
     report_path = tmp_path / "raster_fixture_import_report.json"
 
     completed = subprocess.run(
-        [freecadcmd, str(probe_path), str(out_path), str(report_path), str(fixture)],
+        [freecadcmd, str(probe_path)],
+        env=_probe_env(
+            tmp_path, freecad_user_home,
+            out=out_path, report=report_path, pdf=fixture,
+        ),
         capture_output=True,
         text=True,
         timeout=300,
@@ -103,6 +130,9 @@ def test_raster_only_fixture_delivers_image_plane_with_honest_report(tmp_path):
         % (completed.returncode, completed.stdout[-500:], completed.stderr[-500:])
     )
     result = json.loads(out_path.read_text(encoding="utf-8"))
+    assert "Exception while processing file" not in (
+        completed.stdout + completed.stderr
+    ), "FreeCADCmd opened extra files after the probe (argv leak)"
     assert result.get("ok"), "probe failed: %s" % result.get("error", "")
 
     # --- delivery: the raster rung actually produced a persistent host image ---

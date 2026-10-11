@@ -1,7 +1,8 @@
 # Installing PDF Vector Importer (FreeCAD)
 
 **Version:** see `PDFVectorImporter/package.xml`  
-**Tested:** FreeCAD **1.1.x** on Windows
+**Tested:** by hand on FreeCAD **1.1.4** on Windows (no automated FreeCAD test yet). Needs a FreeCAD with Python 3.10 or newer (FreeCAD 1.0+).  
+**Not listed in FreeCAD's Addon Manager yet:** install with Setup.exe (Windows) or copy the folder by hand, as below.
 
 ## Why the workbench can disappear
 
@@ -11,9 +12,10 @@ FreeCAD **1.1** stores user data under a **versioned profile**, not the legacy `
 
 Professional import — maximum fidelity; Auto picks vector, raster, or hybrid per page.
 
-- **Labels** = editable text (ShapeString / labels path).
-- **Outlines / Glyphs / Geometry** = exact vector fidelity (not editable text).
-- **3D text** = ShapeString extrusion where supported.
+- **Labels** / **Text** = editable FreeCAD text.
+- **3D Text** = solid letter shapes, not editable as words (the default; closest look to the PDF).
+- **Glyphs** / **Geometry** = exact letter outlines, not editable as words.
+- **Raster** = one picture patch per text item, not editable.
 - Scale is detected from title blocks when possible. If `import_report.json` shows a **scale note** in `human_summary` or `extra.scale_crosscheck`, verify one known dimension before takeoff.
 
 **Offline install:** The Windows installer EXE works without internet after download when FreeCAD embeds CPython 3.10 or 3.11. It bundles PyMuPDF and fontTools for both ABIs. Other Python versions need compatible system/user packages.
@@ -100,12 +102,6 @@ Windows blocks **elevated** processes from traversing junctions/symlinks created
 
 Setup builds from this repo resolve/remove Mod junctions before copying files and store uninstall metadata outside the Mod tree.
 
-## FreeCAD Addon Manager
-
-1. **Tools → Addon Manager**
-2. Search **PDF Vector Importer**
-3. **Install** → restart FreeCAD
-
 ## PDF runtime dependencies
 
 Release ZIPs and `FreeCAD-PDF-Importer-Setup_vX.Y.Z.exe` are built with a
@@ -116,9 +112,10 @@ private ABI-selected runtime under:
 `…\Mod\PDFVectorImporter\src\lib\cp310` or `cp311` (fontTools 4.63.0)
 
 That means release users do not need system Python, pip, or any operating
-system Python packages on CPython 3.10/3.11. The **Install / Update PDF
-Dependencies** command installs compatible packages into FreeCAD's user site as
-a source/dev fallback. Release builds
+system Python packages on CPython 3.10/3.11. For a source/dev install without
+that runtime, switching to the **PDF Vector Importer** workbench offers to
+install compatible packages into FreeCAD's user site (the **PDF Vector Importer > Tools > Install / Update PDF Dependencies**
+menu item does the same). Release builds
 intentionally reject `--no-vendor-deps`: ignored local `src/lib` bytes are not
 commit-bound, so the release builder regenerates them from three hashed locks.
 

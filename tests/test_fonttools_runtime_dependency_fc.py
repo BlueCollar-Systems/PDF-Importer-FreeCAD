@@ -106,3 +106,18 @@ def test_installation_docs_name_the_complete_runtime_and_current_menu_command():
         assert "fonttools" in source.lower()
         assert "Install / Update PDF Dependencies" in source
         assert "Install / Update PyMuPDF" not in source
+    # The command the docs name must really be on a workbench menu.
+    import ast
+
+    init_tree = ast.parse(
+        (REPO_ROOT / "PDFVectorImporter" / "InitGui.py").read_text(encoding="utf-8")
+    )
+    menu_commands = set()
+    for node in ast.walk(init_tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "appendMenu" and len(node.args) == 2
+                and isinstance(node.args[1], ast.List)):
+            menu_commands.update(
+                elt.value for elt in node.args[1].elts if isinstance(elt, ast.Constant)
+            )
+    assert "PDF_InstallPyMuPDF" in menu_commands

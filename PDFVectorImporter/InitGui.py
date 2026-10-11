@@ -67,7 +67,44 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
 
         return activate_bundled_runtime_if_available(base)
 
+    @staticmethod
+    def _too_old_python_message(version_info):
+        """Plain message when this FreeCAD's Python is too old, else None.
+
+        The importer needs Python 3.10+ (FreeCAD 1.0 or newer); on older
+        Python it would fail part way, and PyMuPDF 1.28.2 cannot install.
+        """
+        major, minor = int(version_info[0]), int(version_info[1])
+        if (major, minor) >= (3, 10):
+            return None
+        return ("This FreeCAD uses Python %d.%d. PDF Vector Importer needs "
+                "FreeCAD 1.0 or newer (Python 3.10+)." % (major, minor))
+
+    def _stop_if_python_too_old(self):
+        """Tell the user once and return True when this FreeCAD is too old."""
+        message = self._too_old_python_message(sys.version_info)
+        if message is None:
+            return False
+        FreeCAD.Console.PrintError("PDF Vector Importer: " + message + "\n")
+        if getattr(FreeCAD, "GuiUp", False) and not getattr(
+                self.__class__, "_old_python_told", False):
+            self.__class__._old_python_told = True
+            try:
+                try:
+                    from PySide6 import QtWidgets
+                except ImportError:
+                    from PySide2 import QtWidgets
+                QtWidgets.QMessageBox.critical(
+                    None, "PDF Vector Importer", message)
+            except (ImportError, AttributeError, RuntimeError):
+                pass
+        return True
+
     def Initialize(self):
+        # Nothing below can run on an old Python: say so plainly and stop.
+        if self._stop_if_python_too_old():
+            return
+
         # Find workbench root again (Initialize runs in a different context)
         base = ""
         for root in (FreeCAD.getUserAppDataDir(), FreeCAD.getResourceDir()):
@@ -127,11 +164,24 @@ class PDFVectorImporterWorkbench(FreeCADGui.Workbench):
                             import_cmds + scale_cmds)
         except (AttributeError, RuntimeError):
             pass
+        # Menu only (not the toolbar). PDF_BatchImport and PDF_ImportViaConsole
+        # stay registered but off the menu: Batch stacks every file's pages at
+        # one spot until it is fixed, and Console repeats the main dialog.
+        try:
+            self.appendMenu(["PDF Vector Importer", "Tools"],
+                            ["PDF_InstallPyMuPDF", "PDF_CheckEnv"])
+        except (AttributeError, RuntimeError):
+            pass
 
         FreeCAD.Console.PrintMessage(
             "PDF Vector Importer ready — BlueCollar-Systems\n")
 
     def Activated(self):
+        # An old Python cannot run the importer and PyMuPDF cannot install
+        # there, so never offer the dependency install.
+        if self._stop_if_python_too_old():
+            return
+
         # Ensure paths every time (in case this is the first activation)
         base = ""
         for root in (FreeCAD.getUserAppDataDir(), FreeCAD.getResourceDir()):

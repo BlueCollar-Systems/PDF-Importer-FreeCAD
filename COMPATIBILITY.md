@@ -18,9 +18,17 @@ Python 3.8 and is not supported yet.
 |------|--------|
 | FreeCAD 1.1.x | ✅ Tested by hand on 1.1.4 (no automated FreeCAD test yet) |
 | FreeCAD 1.0.x | ⚠️ Expected (not tested) |
-| FreeCAD 0.21.x | ⚠️ Only builds that bundle Python 3.10+; the official Windows installer (Python 3.8) is not supported yet |
+| FreeCAD 0.21.x | 0.21.2 conda Windows x64 Python 3.10: bounded native App/Part checks passed; other builds need Python 3.10+. The Python 3.8 Windows installer is not supported yet |
 | FreeCAD 26.x (calendar version numbers) | ⚠️ Not yet tested |
 | FreeCAD 0.20 and earlier | ❌ Not supported (needs Python 3.10+) |
+
+The 0.21.2 result is for the specific
+`FreeCAD_0.21.2-2023-12-17-conda-Windows-x86_64-py310` build. Its six-mode r6
+native import/save/reopen checks used App/Part APIs, not a complete desktop
+button journey. It does not establish support for the separate Python 3.8
+installer. The 2026-10-12 sweep also checked the repaired Scale by Reference
+transaction handling on that build and 1.1.4. See
+[the bounded sweep record](docs/validation/2026-10-12-reference-scale-sweep.md).
 
 ## Ruby / Python ABI
 
@@ -83,7 +91,7 @@ In FreeCAD GUI: select workbench **PDF Vector Importer** → verify toolbar **PD
 |---------|--------|---------|--------|
 | 1.1.x | 3.11 | 1.28.2 offline bundle | ✅ Tested by hand on 1.1.4 (no automated FreeCAD test yet) |
 | 1.0.x | 3.11 | 1.28.2 offline bundle | ⚠️ Expected (not tested) |
-| 0.21.x | 3.10+ builds only | 1.28.2 offline bundle on 3.10 | ⚠️ Only builds that bundle Python 3.10+; the official Windows installer (Python 3.8) is not supported yet |
+| 0.21.x | 3.10+ builds only | 1.28.2 offline bundle on 3.10 | 0.21.2 conda x64 Python 3.10 native App/Part checks passed; the separate Python 3.8 installer is not supported yet |
 | 26.x | not checked | | ⚠️ Not yet tested |
 | Any host using 3.12+ | 3.12+ | System/user install only | ⚠️ No bundled offline runtime |
 | 0.20 and earlier | 3.8–3.9 | | ❌ Not supported (needs Python 3.10+) |

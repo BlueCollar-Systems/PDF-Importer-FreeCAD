@@ -660,10 +660,14 @@ def apply_scale(measured_mm: float, real_mm: float, target_group_name=None, orig
     # Wrap in undo transaction so the user can Ctrl+Z to undo the scale
     doc.openTransaction("Scale by Reference")
 
-    if origin is None:
-        origin = Vector(0, 0, 0)
-    _scale_objects(objects, factor, origin)
-    doc.recompute()
+    try:
+        if origin is None:
+            origin = Vector(0, 0, 0)
+        _scale_objects(objects, factor, origin)
+        doc.recompute()
+    except Exception:
+        doc.abortTransaction()
+        raise
     doc.commitTransaction()
 
     # Fit view to new extents

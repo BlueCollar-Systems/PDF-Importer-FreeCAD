@@ -4,8 +4,10 @@ Use **your own shop PDFs** for sign-off. There is no fixed public test matrix.
 
 ## Before you start
 
-1. Install the latest workbench release from GitHub Releases.
-2. Confirm the workbench loads under **Tools → Addon Manager** or your install path.
+1. Download and run the latest **Setup EXE** from GitHub Releases; follow
+   [the installation instructions](INSTALL.md) without administrator mode.
+2. Restart FreeCAD, then choose **PDF Vector Importer** from the workbench
+   selector. This workbench is not listed in the Addon Manager.
 
 ## Checklist
 

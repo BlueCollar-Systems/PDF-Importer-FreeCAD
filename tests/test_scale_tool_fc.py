@@ -246,6 +246,35 @@ def test_picture_stays_on_its_frame(tool, origin, factor):
     assert doc.log[-1] == ("commit",)
 
 
+def test_reference_scale_aborts_transaction_when_recompute_fails(tool, monkeypatch):
+    doc = Doc([_picture()])
+    tool.FreeCAD.ActiveDocument = doc
+
+    def refuse_recompute():
+        doc.log.append(("recompute",))
+        raise RuntimeError("host recompute refused")
+
+    monkeypatch.setattr(doc, "recompute", refuse_recompute)
+    with pytest.raises(RuntimeError, match="host recompute refused"):
+        tool.apply_scale(100.0, 200.0)
+
+    assert doc.log == [("open", "Scale by Reference"), ("recompute",), ("abort",)]
+
+
+def test_reference_scale_aborts_transaction_when_transform_raises(tool, monkeypatch):
+    doc = Doc([_picture()])
+    tool.FreeCAD.ActiveDocument = doc
+
+    def refuse_transform(*_args):
+        raise RuntimeError("host transform refused")
+
+    monkeypatch.setattr(tool, "_scale_objects", refuse_transform)
+    with pytest.raises(RuntimeError, match="host transform refused"):
+        tool.apply_scale(100.0, 200.0)
+
+    assert doc.log == [("open", "Scale by Reference"), ("abort",)]
+
+
 def test_picture_doubles_about_global_zero(tool):
     pic = _picture()
     frame = _frame()

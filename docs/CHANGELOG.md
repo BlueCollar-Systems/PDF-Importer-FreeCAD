@@ -3,6 +3,14 @@
 These notes used to sit at the top of the main [README](../README.md), in the
 same order. Install steps and the feature list are in the README.
 
+## Candidate fixes (v4.0.115)
+
+- Inferred word gaps in symbolic subset fonts can use an empty space glyph observed in the PDF's original font program, preserving editable text instead of an unnecessary image fallback. Visible, unobserved, ambiguous or changed source glyphs remain unverified and follow the existing reported fallback.
+- Filled paths that return exactly to their source starting point retain editable faces even when the PDF does not explicitly close the stroke. Original points, separate stroke width, dashes and closing behavior are preserved. Fill-only faces use filled display on import and restoration.
+- Exactly collinear, connected line fills with no painted interior are recorded as nonpainting source items without inventing visible outlines. Near-collinear paths and zero-area self-crossing paths still require the existing delivery checks.
+- A refused face or stroke can fall back only after its own partial objects are verified removed. If removal or its readback fails, import stops and reports transaction rollback rather than accepting leftover geometry as a completed item.
+- Source, independent renderer and synthetic host checks cover these repairs. Native desktop import, save and reopen checks remain pending for this candidate.
+
 ## Recent fixes (v4.0.113)
 
 - A sparse vector page keeps its editable lines even when it contains fewer than five drawing items and no text. Whole-page raster fallback is considered only when the page has no vector drawings.

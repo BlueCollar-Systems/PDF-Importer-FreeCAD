@@ -3,7 +3,7 @@
 **BUILT. NOT BOUGHT.**
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
-![Version: 4.0.114](https://img.shields.io/badge/Version-4.0.114-blue.svg)
+![Version: 4.0.115](https://img.shields.io/badge/Version-4.0.115-blue.svg)
 ![Platform: FreeCAD 1.0+ (Python 3.10+)](https://img.shields.io/badge/Platform-FreeCAD%201.0%2B%20%28Python%203.10%2B%29-orange.svg)
 
 Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.
@@ -24,6 +24,11 @@ Needs FreeCAD 1.0 or newer (a FreeCAD with Python 3.10 or newer). Tested by hand
 Not listed in FreeCAD's Addon Manager yet. Other ways to install (ZIP, manual copy, developer link) are under [Installation](#installation) and in [INSTALL.md](INSTALL.md).
 
 Change notes for each version are in [docs/CHANGELOG.md](docs/CHANGELOG.md).
+
+The v4.0.115 test candidate preserves filled paths that return to their starting
+point, keeps their original strokes separate, and verifies empty font spaces
+before using them. Source checks pass; native import, save and reopen checks
+remain pending before release.
 
 ## Structural Steel Shape Assets
 

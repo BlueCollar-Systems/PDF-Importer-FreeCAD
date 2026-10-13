@@ -1,7 +1,7 @@
 # PDF Vector Importer for FreeCAD
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Version: 4.0.114](https://img.shields.io/badge/Version-4.0.114-green.svg)
+![Version: 4.0.115](https://img.shields.io/badge/Version-4.0.115-green.svg)
 ![Platform: FreeCAD 1.0+ (Python 3.10+)](https://img.shields.io/badge/Platform-FreeCAD%201.0%2B%20%28Python%203.10%2B%29-orange.svg)
 
 **Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.**
@@ -11,6 +11,14 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 > **BlueCollar-Systems** -- BUILT. NOT BOUGHT.
 
 ---
+
+## Candidate fixes (v4.0.115)
+
+- Filled paths that return exactly to their source starting point retain editable faces. Their original strokes keep their own width, dashes and closing behavior.
+- Proven nonpainting line fills are recorded without adding visible outlines. Failed item cleanup must be verified before an outline fallback is delivered.
+- Inferred word gaps can use a verified empty space glyph from the PDF's original embedded font.
+
+Source regression checks pass. Native desktop import, save and reopen acceptance remains pending for this candidate.
 
 ## Changes prepared for v4.0.107
 

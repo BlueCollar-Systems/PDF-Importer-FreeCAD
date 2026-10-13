@@ -12,6 +12,14 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 
 ---
 
+## Candidate fixes (v4.0.115)
+
+- Filled paths that return exactly to their source starting point retain editable faces. Their original strokes keep their own width, dashes and closing behavior.
+- Proven nonpainting line fills are recorded without adding visible outlines. Failed item cleanup must be verified before an outline fallback is delivered.
+- Inferred word gaps can use a verified empty space glyph from the PDF's original embedded font.
+
+Source regression checks pass. Native desktop import, save and reopen acceptance remains pending for this candidate.
+
 ## Changes prepared for v4.0.107
 
 - Qualified round-cap ink, dash-dot dots, opaque image paint order, and source-bound Multiply display from the Codex draft now ship on this cut. Text modes stay in-mode; unproven appearance cases are reported.

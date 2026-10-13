@@ -25,6 +25,11 @@ Not listed in FreeCAD's Addon Manager yet. Other ways to install (ZIP, manual co
 
 Change notes for each version are in [docs/CHANGELOG.md](docs/CHANGELOG.md).
 
+The v4.0.115 test candidate preserves filled paths that return to their starting
+point, keeps their original strokes separate, and verifies empty font spaces
+before using them. Source checks pass; native import, save and reopen checks
+remain pending before release.
+
 ## Structural Steel Shape Assets
 
 The former standalone `Structural-Steel-DXF-DWG-Shapes` repository has been

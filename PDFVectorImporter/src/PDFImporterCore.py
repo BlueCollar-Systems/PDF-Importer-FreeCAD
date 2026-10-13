@@ -2727,6 +2727,102 @@ def _source_fill_without_retraced_bridge(path_group):
     return items[1:stop], proof
 
 
+def _source_closed_fill_boundary(path_group):
+    """Prove an already closed fill independently of its stroke close flag."""
+    items = path_group.get("items", [])
+    if (path_group.get("type") not in ("f", "fs")
+            or path_group.get("fill") is None
+            or (path_group.get("closePath") is not None
+                and path_group.get("closePath") is not False)
+            or type(path_group.get("even_odd")) is not bool):
+        return items, None
+    commands = _source_line_cubic_commands(items)
+    if commands is None or len(commands) < 2:
+        return items, None
+    start = current = commands[0][1][0]
+    visited = {start}
+    for index, (_kind, points) in enumerate(commands):
+        last = index == len(commands) - 1
+        if points[0] != current or (points[-1] in visited
+                                   and not (last and points[-1] == start)):
+            return items, None
+        current = points[-1]
+        visited.add(current)
+    if current != start:
+        return items, None
+    try:
+        from .PDFSourceFill import SourceFillError, _prove_simple, signed_source_area
+    except ImportError:
+        from PDFSourceFill import SourceFillError, _prove_simple, signed_source_area
+    contour = tuple((kind, *points) for kind, points in commands)
+    try:
+        _prove_simple(contour, lambda: None)
+        if signed_source_area(contour) == 0:
+            return items, None
+    except (SourceFillError, TypeError):
+        # Legacy source hosts may lack an API used by the conservative proof.
+        # No proof means the existing per-item fallback, never a page failure.
+        return items, None
+    canonical = json.dumps(commands, separators=(",", ":"), allow_nan=False)
+    return items, {
+        "schema": "bcs.freecad.source-fill-boundary/1",
+        "policy": "retain_exact_closed_pdf_fill",
+        "source_paint_order": path_group.get("seqno"),
+        "fill_rule": "even_odd" if path_group["even_odd"] else "nonzero",
+        "source_commands_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "source_item_count": len(items),
+        "retained_item_range": [0, len(items)],
+        "retained_item_range_convention": "zero_based_half_open",
+        "closure_origin": "explicit_repeated_source_endpoint",
+        "source_stroke_close_path": path_group.get("closePath"),
+        "stroke_closure": "unchanged_source_close_path",
+    }
+
+
+def _source_collinear_zero_ink_fill(path_group):
+    """Only original connected line points on one exact line prove no fill ink.
+
+    Signed area alone cannot prove this: a self-crossing path can have opposite
+    nonempty paint regions. Near-collinear points and cubic controls are refused.
+    """
+    if (path_group.get("type") not in ("f", "fs")
+            or path_group.get("fill") is None
+            or (path_group.get("closePath") is not None
+                and type(path_group.get("closePath")) is not bool)
+            or type(path_group.get("even_odd")) is not bool):
+        return None
+    commands = _source_line_cubic_commands(path_group.get("items", []))
+    if commands is None or any(kind != "l" for kind, _points in commands):
+        return None
+    points = [commands[0][1][0]]
+    for _kind, endpoints in commands:
+        if endpoints[0] != points[-1]:
+            return None
+        points.append(endpoints[-1])
+    from fractions import Fraction
+    anchor = tuple(Fraction(value) for value in points[0])
+    coordinates = [tuple(Fraction(value) for value in point) for point in points]
+    direction = next((point for point in coordinates if point != anchor), anchor)
+    dx, dy = direction[0] - anchor[0], direction[1] - anchor[1]
+    if any((point[0] - anchor[0]) * dy != (point[1] - anchor[1]) * dx
+           for point in coordinates):
+        return None
+    canonical = json.dumps(commands, separators=(",", ":"), allow_nan=False)
+    return {
+        "schema": "bcs.freecad.source-zero-ink-fill/1",
+        "policy": "omit_exact_collinear_line_fill",
+        "source_paint_order": path_group.get("seqno"),
+        "fill_rule": "even_odd" if path_group["even_odd"] else "nonzero",
+        "source_commands_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "source_item_count": len(commands),
+        "source_stroke_close_path": path_group.get("closePath"),
+        "proof_basis": "exact_rational_collinearity_of_all_original_connected_line_points",
+        "visible_fill_ink_expected": False,
+        "fill_omitted": True,
+        "stroke_policy": "unchanged_source_stroke",
+    }
+
+
 def _source_implicit_fill_boundary(path_group):
     """Close one proved connected open PDF fill, without closing its stroke.
 
@@ -13548,6 +13644,24 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         if stroke is None and fill is None:
             continue
 
+        # A collinear fill has no painted interior. Do not manufacture its
+        # outline or send a zero-area face to OCC. Any actual stroke continues
+        # through the original stroke path with its original close/cap rules.
+        zero_ink_fill = _source_collinear_zero_ink_fill(path_group)
+        if zero_ink_fill is not None:
+            report_extra = dict(getattr(opts, "_report_extra", {}) or {})
+            receipt = dict(zero_ink_fill,
+                source_pdf_sha256=source_sha,
+                source_page=int(page_num), source_page_height=float(page_h),
+                coordinate_scale=float(scale), page_rotation_matrix=list(_page_matrix_values(opts)),
+                flip_y=bool(opts.flip_y), source_stroke_present=stroke is not None)
+            report_extra["source_zero_ink_fills"] = list(
+                report_extra.get("source_zero_ink_fills", [])) + [receipt]
+            opts._report_extra = report_extra
+            fill, fill_rgb = None, None
+            if stroke is None:
+                continue
+
         # Bounds cannot distinguish background paint from a border, diagonal,
         # or large filled feature. Preserve every visible source drawing here.
         parent = _parent_for(stroke_rgb or fill_rgb, layer_name)
@@ -13731,15 +13845,19 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         # path dictionary intact and construct its retained boundary exactly.
         source_fill_proof = None
         source_open_stroke_edges = None
-        if (not compound_fill_delivered and not compound_step_down
+        source_open_stroke_items = None
+        if (fill is not None and not compound_fill_delivered and not compound_step_down
                 and (opts.hatch_to_faces or (opts.make_faces and close_path))
                 and path_group.get("seqno") not in image_order_strokes):
             items, source_fill_proof = _source_fill_without_retraced_bridge(path_group)
             if source_fill_proof is None and opts.hatch_to_faces:
-                items, source_fill_proof = _source_implicit_fill_boundary(path_group)
-                if source_fill_proof is not None and path_group.get("type") == "fs":
-                    source_open_stroke_edges = _source_fill_boundary_edges(
-                        path_group["items"], page_h, opts, scale)
+                items, source_fill_proof = _source_closed_fill_boundary(path_group)
+                if source_fill_proof is None:
+                    items, source_fill_proof = _source_implicit_fill_boundary(path_group)
+                if (source_fill_proof is not None and path_group.get("type") == "fs"
+                        and source_fill_proof["policy"] in {
+                            "close_connected_pdf_fill", "retain_exact_closed_pdf_fill"}):
+                    source_open_stroke_items = path_group["items"]
         source_quad_stroke = (fill is None and stroke is not None
                               and any(item[0] == "qu" for item in items))
         preserve_source_edges = bool(path_group.get("bcs_preserve_source_edges") or source_fill_proof
@@ -13751,7 +13869,26 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
         wires_edges: List[List] = []
         if source_fill_proof is not None:
             # Closure was proved in source space. Never invent a closing edge.
-            wires_edges.append((_source_fill_boundary_edges(items, page_h, opts, scale), close_path))
+            try:
+                fill_edges = _source_fill_boundary_edges(items, page_h, opts, scale)
+                if source_open_stroke_items is not None:
+                    source_open_stroke_edges = _source_fill_boundary_edges(
+                        source_open_stroke_items, page_h, opts, scale)
+            except DrawingGeometryFailure as exc:
+                if source_fill_proof["policy"] != "retain_exact_closed_pdf_fill":
+                    raise
+                # A source proof authorizes a request, not a refused host edge.
+                # Keep this one fill out of certification and retain whatever
+                # original outline the normal item fallback can actually build.
+                item_degrade = _note_item_failure(item_degrade, "fill", exc)
+                compound_step_down = True
+                if stroke_rgb is None:
+                    stroke_rgb = fill_rgb
+                fill_rgb = None
+                source_fill_proof = None
+                source_open_stroke_edges = None
+            else:
+                wires_edges.append((fill_edges, close_path))
 
         subpath_origin = None
 
@@ -14057,10 +14194,11 @@ def _import_pdf_page_inner(pdf_doc, pdf_path, page_num, opts, fc_doc):
                             _attach_source_fill_boundary(obj, source_fill_proof, page_num, page_h,
                                                          opts, scale, pdf_path)
                         _bind_image_order_stroke(obj, path_group.get("seqno"))
-                        implicit_fill = (source_fill_proof is not None
-                                         and source_fill_proof["policy"] == "close_connected_pdf_fill")
-                        _apply_style(obj, None if implicit_fill else stroke_rgb, fill_rgb,
-                                     None if implicit_fill else width, None if implicit_fill else dashes, opts)
+                        fill_only_boundary = (source_fill_proof is not None
+                            and source_fill_proof["policy"] in {
+                                "close_connected_pdf_fill", "retain_exact_closed_pdf_fill"})
+                        _apply_style(obj, None if fill_only_boundary else stroke_rgb, fill_rgb,
+                                     None if fill_only_boundary else width, None if fill_only_boundary else dashes, opts)
                         parent.addObject(obj)
                         obj_count += 1
                         owned_counted += 1

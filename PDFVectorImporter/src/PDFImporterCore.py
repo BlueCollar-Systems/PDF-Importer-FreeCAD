@@ -2867,6 +2867,10 @@ class DrawingGeometryFailure(Exception):
     """A requested source drawing could not become valid native geometry."""
 
 
+class DrawingCleanupFailure(RuntimeError):
+    """Failed drawing objects could not be proven absent; roll back the run."""
+
+
 def _require_valid_drawing_shape(shape, context):
     try:
         valid = not shape.isNull() and shape.isValid()
@@ -2933,24 +2937,51 @@ def _make_shape_obj(edges: List, closed: bool, make_face: bool, fc_doc=None):
 
 
 def _discard_host_objects(doc, objects, parent=None) -> List[str]:
-    """Remove objects one failed drawing item created; returns the names removed.
+    """Remove only owned item objects and prove absence before any step-down.
 
-    Best effort and never raises: it runs while a failure is being contained.
+    A refused removal, unreadable absence or changed ownership is fatal. It
+    must escape the geometry fallback into the existing transaction rollback.
     """
     removed = []
+    errors = []
     for host_obj in reversed([obj for obj in (objects or []) if obj is not None]):
-        name = str(getattr(host_obj, "Name", "") or "")
+        try:
+            name = str(getattr(host_obj, "Name", "") or "")
+            if not name:
+                raise ValueError("owned object has no stable name")
+            current = doc.getObject(name)
+        except Exception as exc:
+            errors.append("owned object lookup: %s" % exc)
+            continue
+        if current is not None and current is not host_obj:
+            errors.append("owned object identity changed for %s" % name)
+            continue  # Never remove an original/replacement that reused a name.
         if parent is not None:
             try:
                 if host_obj in list(getattr(parent, "Group", []) or []):
                     parent.removeObject(host_obj)
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append("parent removal(%s): %s" % (name, exc))
+        if current is not None:
+            try:
+                doc.removeObject(name)
+            except Exception as exc:
+                errors.append("document removal(%s): %s" % (name, exc))
         try:
-            doc.removeObject(name)
-            removed.append(name)
-        except Exception:
-            pass
+            if doc.getObject(name) is not None:
+                errors.append("owned object remains live: %s" % name)
+            else:
+                removed.append(name)
+        except Exception as exc:
+            errors.append("absence readback(%s): %s" % (name, exc))
+        if parent is not None:
+            try:
+                if host_obj in list(getattr(parent, "Group", []) or []):
+                    errors.append("owned object remains in parent: %s" % name)
+            except Exception as exc:
+                errors.append("parent absence readback(%s): %s" % (name, exc))
+    if errors:
+        raise DrawingCleanupFailure("Native drawing item cleanup failed: %s" % "; ".join(errors))
     return removed
 
 
@@ -3276,15 +3307,19 @@ def _apply_style(
             if stroke_rgb is None:
                 try:
                     proof = json.loads(getattr(obj, "PDFSourceFillBoundaryJSON", "{}"))
-                    if proof.get("policy") == "close_connected_pdf_fill":
-                        # The PDF-implied fill closer is not a painted stroke.
+                    if proof.get("policy") in {
+                            "close_connected_pdf_fill", "retain_exact_closed_pdf_fill"}:
+                        # This face boundary is fill only; any genuine source
+                        # stroke is a separate styled object, including caps.
                         # Persisted provenance also applies this on GUI reopen.
+                        display_kind = ("implicit fill" if proof["policy"] == "close_connected_pdf_fill"
+                                        else "fill-only")
                         try:
                             vo.DisplayMode = "Shaded"
                             if vo.DisplayMode != "Shaded":
-                                raise DrawingGeometryFailure("Native implicit fill display was not retained")
+                                raise DrawingGeometryFailure("Native %s display was not retained" % display_kind)
                         except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
-                            raise DrawingGeometryFailure("Native implicit fill display could not be set") from exc
+                            raise DrawingGeometryFailure("Native %s display could not be set" % display_kind) from exc
                 except (AttributeError, RuntimeError, TypeError, ValueError):
                     pass
         else:

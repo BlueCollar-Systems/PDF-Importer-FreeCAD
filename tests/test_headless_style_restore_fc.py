@@ -711,6 +711,133 @@ class TestObserver:
 # ---------------------------------------------------------------------------
 
 
+class TestApplicationRestoreGuard:
+    def build(self, *, max_retries=3):
+        import types
+
+        doc, objects = _build_document()
+        busy = [True]
+        scheduled, restored, fits, logged = [], [], [], []
+        host = types.SimpleNamespace(
+            getDocument=lambda name: doc,
+            isRestoring=lambda: busy[0],
+        )
+
+        def worker(current):
+            restored.append(current)
+            return restore.restore_document_styles(current, view_fit=lambda: fits.append(current) or True)
+
+        observer = restore.PDFStyleRestoreObserver(
+            schedule=lambda cb, ms: scheduled.append((cb, ms)) or True,
+            restore=worker, gate=_headless_gate, log=logged.append,
+            max_retries=max_retries, freecad_module=host,
+        )
+        return doc, objects, busy, scheduled, restored, fits, logged, host, observer
+
+    def test_document_flag_clears_before_global_open_without_early_style_or_fit(self):
+        doc, objects, busy, queue, restored, fits, _logged, _host, observer = self.build()
+        assert doc.Restoring is False
+        observer.slotCreatedDocument(doc)
+        queue.pop(0)[0]()
+        assert restored == fits == []
+        assert all(obj.ViewObject.writes == [] for obj in objects.values())
+        assert queue[0][1] == restore._RESTORE_RETRY_DELAY_MS
+        busy[0] = False
+        callback, _delay = queue.pop(0)
+        callback()
+        assert restored == fits == [doc]
+        assert objects['text'].ViewObject.FontSize == pytest.approx(11.52)
+        assert not queue and not observer._pending
+        callback()  # A stale or duplicated delivery cannot restore twice.
+        assert restored == fits == [doc]
+
+    def test_long_global_restore_does_not_spend_doc_only_retry_window(self):
+        doc, _objects, busy, queue, restored, fits, _logged, _host, observer = self.build(max_retries=2)
+        observer.slotCreatedDocument(doc)
+        for _ in range(1200):
+            callback, _delay = queue.pop(0)
+            callback()
+            assert queue[0][1] == restore._RESTORE_RETRY_DELAY_MS
+        assert restored == fits == []
+        busy[0] = False
+        queue.pop(0)[0]()
+        assert restored == fits == [doc]
+
+    def test_deleted_document_cancels_queued_global_wait(self):
+        doc, _objects, _busy, queue, restored, fits, _logged, _host, observer = self.build()
+        observer.slotCreatedDocument(doc)
+        queue.pop(0)[0]()
+        observer.slotDeletedDocument(doc)
+        queue.pop(0)[0]()
+        assert restored == fits == [] and not queue and not observer._pending
+
+    def test_same_named_replacement_document_does_not_receive_old_restore(self):
+        doc, _objects, busy, queue, restored, fits, _logged, host, observer = self.build()
+        observer.slotCreatedDocument(doc)
+        host.getDocument = lambda name: _FakeDocument([])
+        busy[0] = False
+        queue.pop(0)[0]()
+        assert restored == fits == [] and not queue and not observer._pending
+
+    @pytest.mark.parametrize('failure', ['raise', 'not-callable', 'invalid-return', 'document-read'])
+    def test_failed_state_read_cannot_run_style_or_fit(self, failure):
+        doc, _objects, busy, queue, restored, fits, logged, host, observer = self.build(max_retries=2)
+        if failure == 'raise':
+            host.isRestoring = lambda: (_ for _ in ()).throw(RuntimeError('native state read failed'))
+        elif failure == 'not-callable':
+            host.isRestoring = False
+        elif failure == 'invalid-return':
+            host.isRestoring = lambda: None
+        else:
+            class BrokenDocument:
+                Name = doc.Name
+
+                @property
+                def Restoring(self):
+                    raise RuntimeError('native document read failed')
+
+            doc = BrokenDocument()
+            host.getDocument = lambda name: doc
+            busy[0] = False
+        observer.slotCreatedDocument(doc)
+        while queue:
+            queue.pop(0)[0]()
+        assert restored == fits == [] and not observer._pending
+        assert len(logged) == 1 and 'state unavailable' in logged[0]
+
+    def test_transient_state_read_failure_can_recover(self):
+        doc, _objects, busy, queue, restored, fits, _logged, host, observer = self.build()
+        host.isRestoring = lambda: (_ for _ in ()).throw(RuntimeError('transient read'))
+        observer.slotCreatedDocument(doc)
+        queue.pop(0)[0]()
+        host.isRestoring = lambda: False
+        busy[0] = False
+        queue.pop(0)[0]()
+        assert restored == fits == [doc]
+
+    def test_feature_absent_legacy_host_retains_document_guard(self):
+        doc, _objects, _busy, queue, restored, fits, _logged, host, observer = self.build()
+        del host.isRestoring
+        doc.Restoring = True
+        observer.slotCreatedDocument(doc)
+        queue.pop(0)[0]()
+        assert restored == fits == []
+        doc.Restoring = False
+        queue.pop(0)[0]()
+        assert restored == fits == [doc]
+
+    def test_rescheduled_generation_cancels_the_older_created_callback(self):
+        doc, _objects, busy, queue, restored, fits, _logged, _host, observer = self.build()
+        observer.slotCreatedDocument(doc)
+        old = queue.pop(0)[0]
+        observer.slotCreatedDocument(doc)
+        busy[0] = False
+        old()
+        assert restored == []
+        queue.pop(0)[0]()
+        assert restored == fits == [doc]
+
+
 def _write_fcstd(path, members):
     import zipfile
 

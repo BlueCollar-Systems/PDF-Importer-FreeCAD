@@ -8,6 +8,13 @@ import pytest
 import pdfcadcore_sync_check as sync_check
 
 
+@pytest.fixture(autouse=True)
+def fictional_layout_has_no_reviewed_runtime_variants(monkeypatch):
+    # These sample.py-only fixtures test filesystem scope, not full host cores.
+    # Real checked-out host modules and exact pins are tested separately.
+    monkeypatch.setattr(sync_check, "KNOWN_DIVERGENCES", {})
+
+
 def _write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")

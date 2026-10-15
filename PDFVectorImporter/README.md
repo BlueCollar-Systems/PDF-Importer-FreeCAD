@@ -1,7 +1,7 @@
 # PDF Vector Importer for FreeCAD
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Version: 4.0.118](https://img.shields.io/badge/Version-4.0.118-green.svg)
+![Version: 4.0.119](https://img.shields.io/badge/Version-4.0.119-green.svg)
 ![Platform: FreeCAD 1.0+ (Python 3.10+)](https://img.shields.io/badge/Platform-FreeCAD%201.0%2B%20%28Python%203.10%2B%29-orange.svg)
 
 **Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.**
@@ -12,7 +12,12 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 
 ---
 
-## Candidate fixes (v4.0.118)
+## Candidate fixes (v4.0.119)
+
+- Register the Windows image rendering guard at GUI startup and attach it before native image visibility or display mode restoration. Only importer raster images on affected Coin runtimes receive the callback; the deferred display restoration remains available as a fallback.
+- The v4.0.118 normal desktop open and save passed, but fresh reopen still showed the graphics error before the later image guard was observed. Earlier attachment addresses that timing gap without changing pixels, user display settings or editable geometry. Exact v4.0.119 desktop save and fresh reopen acceptance remains pending before release.
+
+## Earlier candidate fixes (v4.0.118)
 
 - Restore the paper's native view when FreeCAD deserializes a Python proxy without its runtime attachment. Initialize an empty paper display mode, reuse a surviving paper node and preserve visibility, material and nonempty user modes.
 - The exact v4.0.117 desktop test displayed and saved the dense drawing without the prior visible graphics warning, then correctly failed the separate paper attachment check. That partial test does not certify save/reopen acceptance; the updated package requires a fresh complete check before release.

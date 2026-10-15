@@ -89,6 +89,7 @@ def host(monkeypatch):
     """No CAD, Qt, OpenGL or Pivy binary is imported by these tests."""
     events = []
     observers = []
+    gui_observers = []
     context = SimpleNamespace(isValid=lambda: True)
     context.functions = lambda: SimpleNamespace(glFinish=lambda: events.append("finish"))
     qtgui = SimpleNamespace(
@@ -113,7 +114,11 @@ def host(monkeypatch):
     )
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setitem(sys.modules, "FreeCAD", app)
-    monkeypatch.setitem(sys.modules, "FreeCADGui", SimpleNamespace())
+    gui = SimpleNamespace(
+        addDocumentObserver=lambda observer: gui_observers.append(observer),
+        removeDocumentObserver=lambda observer: gui_observers.remove(observer),
+    )
+    monkeypatch.setitem(sys.modules, "FreeCADGui", gui)
     monkeypatch.setitem(sys.modules, "pivy", SimpleNamespace(coin=coin))
     monkeypatch.setitem(sys.modules, "pivy.coin", coin)
     for binding in ("PySide6", "PySide2", "PySide"):
@@ -142,11 +147,13 @@ def host(monkeypatch):
         XSize=54.1867, YSize=33.9513, Placement=object(),
         ViewObject=SimpleNamespace(RootNode=root, Visibility=True, DisplayMode="No shading"),
     )
+    obj.ViewObject.Object = obj
     doc.Objects = [obj]
     doc.getObject = lambda name: obj if name == obj.Name else None
     return SimpleNamespace(
         module=module, coin=coin, app=app, qtgui=qtgui, context=context, events=events,
-        observers=observers, obj=obj, doc=doc, root=root, parents=(shading, unlit), texture=texture,
+        observers=observers, gui=gui, gui_observers=gui_observers,
+        obj=obj, doc=doc, root=root, parents=(shading, unlit), texture=texture,
     )
 
 
@@ -494,3 +501,181 @@ def test_gui_saved_display_hook_reattaches_without_reapplying_saved_user_styles(
     assert callback is same and callback.refs == 1 and len(host.observers) == 1
     _render(callback)
     assert host.events == ["finish"]
+
+
+@pytest.mark.parametrize("prop", ["Visibility", "DisplayMode"])
+def test_saved_gui_before_change_attaches_while_global_restore_is_still_active(host, prop):
+    host.app.isRestoring = lambda: True
+    host.doc.Restoring = True
+    host.obj.ViewObject.Visibility = False
+    host.obj.ViewObject.ShapeColor = (0.1, 0.3, 0.9)
+    props = dict(vars(host.obj)); view = dict(vars(host.obj.ViewObject))
+    observer = host.module.register_gui_document_observer(host.gui)
+    observer.slotBeforeChangeObject(host.obj.ViewObject, prop)
+    # Simulate the next native show/mode update: the first texture traversal
+    # already has the guard, without waiting for global/style restoration.
+    _render(_callbacks(host)[0])
+    assert host.events == ["finish"]
+    assert vars(host.obj) == props and vars(host.obj.ViewObject) == view
+
+
+def test_gui_observer_and_late_restore_share_one_binding_without_duplicate_edges(host, monkeypatch):
+    _, restore = _canonical_hooks(host, monkeypatch)
+    observer = host.module.register_gui_document_observer(host.gui)
+    assert host.module.register_gui_document_observer(host.gui) is observer
+    observer.slotBeforeChangeObject(host.obj.ViewObject, "Visibility")
+    binding = next(iter(host.module._BINDINGS.values()))
+    callback = binding.node
+    observer.slotBeforeChangeObject(host.obj.ViewObject, "DisplayMode")
+    restore.restore_document_display_nodes(host.doc)
+    assert next(iter(host.module._BINDINGS.values())) is binding
+    assert _callbacks(host) == [callback, callback]
+    assert len(host.gui_observers) == len(host.observers) == 1
+
+
+@pytest.mark.parametrize("case", ["foreign_type", "native_nonimporter", "no_object", "other_property"])
+def test_gui_before_change_leaves_unrelated_views_untouched(host, case):
+    view = host.obj.ViewObject
+    prop = "Visibility"
+    if case == "foreign_type":
+        host.obj.TypeId = "Part::Feature"
+    elif case == "native_nonimporter":
+        host.obj.PDFRepresentation = ""
+    elif case == "no_object":
+        view = SimpleNamespace()
+    else:
+        prop = "ShapeAppearance"
+    observer = host.module.register_gui_document_observer(host.gui)
+    observer.slotBeforeChangeObject(view, prop)
+    assert not host.module._BINDINGS and not _callbacks(host)
+    assert not host.events
+
+
+@pytest.mark.parametrize("unsupported", ["fixed_coin", "non_windows"])
+def test_early_hook_keeps_unsupported_runtime_rendering_unchanged(host, monkeypatch, unsupported):
+    if unsupported == "non_windows":
+        monkeypatch.setattr(sys, "platform", "linux")
+    else:
+        host.coin.SoDB.getVersion = lambda: "SIM Coin 4.0.8"
+    observer = host.module.register_gui_document_observer(host.gui)
+    if observer is not None:
+        observer.slotBeforeChangeObject(host.obj.ViewObject, "Visibility")
+    assert not host.module._BINDINGS and not _callbacks(host)
+    assert not host.events
+
+
+@pytest.mark.parametrize("missing", ["addDocumentObserver", "removeDocumentObserver"])
+def test_legacy_gui_without_observer_api_keeps_late_attachment_available(host, missing):
+    delattr(host.gui, missing)
+    assert host.module.register_gui_document_observer(host.gui) is None
+    assert not host.gui_observers
+    assert host.module.ensure_image_render_sync(host.obj)[0]
+    _render(_callbacks(host)[0])
+    assert host.events[-1] == "finish"
+
+
+def test_gui_callback_error_cannot_abort_native_property_restoration(host):
+    observer = host.module.register_gui_document_observer(host.gui)
+    class DeletedView:
+        @property
+        def Object(self):
+            raise RuntimeError("provider was deleted")
+    observer.slotBeforeChangeObject(DeletedView(), "Visibility")
+    observer.slotBeforeChangeObject(DeletedView(), "Visibility")
+    assert not host.module._BINDINGS
+    assert len(host.events) == 1 and "provider was deleted" in host.events[0][1]
+
+
+def test_gui_registration_failure_is_nonfatal_and_can_retry(host):
+    original = host.gui.addDocumentObserver
+    def failed(_observer):
+        raise RuntimeError("observer API refused registration")
+    host.gui.addDocumentObserver = failed
+    assert host.module.register_gui_document_observer(host.gui) is None
+    assert host.module._GUI_OBSERVER is None and not host.gui_observers
+    host.gui.addDocumentObserver = original
+    assert host.module.register_gui_document_observer(host.gui) is not None
+
+
+def test_shutdown_releases_native_links_and_both_observers_and_can_register_again(host):
+    observer = host.module.register_gui_document_observer(host.gui)
+    observer.slotBeforeChangeObject(host.obj.ViewObject, "Visibility")
+    binding = next(iter(host.module._BINDINGS.values()))
+    host.module.unregister_document_observer()
+    assert not host.gui_observers and not host.observers and not host.module._BINDINGS
+    assert not binding.active and not binding.retained_node and not binding.retained_parents
+    assert host.module._GUI_OBSERVER_HOST is None
+    assert host.module.register_gui_document_observer() is not observer
+
+
+def test_gui_remove_failure_retains_observer_identity_for_cleanup_retry(host):
+    observer = host.module.register_gui_document_observer(host.gui)
+    remove = host.gui.removeDocumentObserver
+    def failed(_observer):
+        raise RuntimeError("GUI observer removal unavailable")
+    host.gui.removeDocumentObserver = failed
+    host.module.unregister_document_observer()
+    assert host.module._GUI_OBSERVER is observer and host.gui_observers == [observer]
+    host.gui.removeDocumentObserver = remove
+    host.module.unregister_document_observer()
+    assert host.module._GUI_OBSERVER is None and not host.gui_observers
+
+
+def test_gui_host_replacement_removes_only_old_observer_without_detaching_image(host):
+    old = host.module.register_gui_document_observer(host.gui)
+    old.slotBeforeChangeObject(host.obj.ViewObject, "Visibility")
+    binding = next(iter(host.module._BINDINGS.values()))
+    new_observers = []
+    other_gui = SimpleNamespace(
+        addDocumentObserver=new_observers.append,
+        removeDocumentObserver=new_observers.remove,
+    )
+    new = host.module.register_gui_document_observer(other_gui)
+    assert new is not old and not host.gui_observers and new_observers == [new]
+    assert host.module._GUI_OBSERVER_HOST is other_gui
+    assert next(iter(host.module._BINDINGS.values())) is binding and binding.linked()
+
+
+def test_document_deletion_keeps_startup_observer_ready_for_the_next_restore(host):
+    observer = host.module.register_gui_document_observer(host.gui)
+    observer.slotBeforeChangeObject(host.obj.ViewObject, "Visibility")
+    binding = next(iter(host.module._BINDINGS.values()))
+    host.observers[0].slotDeletedDocument(host.doc)
+    assert not host.module._BINDINGS and not binding.retained_node
+    assert host.gui_observers == [observer]
+    observer.slotBeforeChangeObject(host.obj.ViewObject, "Visibility")
+    assert next(iter(host.module._BINDINGS.values())) is not binding
+    assert host.module._BINDINGS and len(host.observers) == 1
+
+
+@pytest.mark.parametrize("style_hook_fails", [False, True])
+def test_gui_startup_registers_canonical_helper_without_loading_core(host, monkeypatch, tmp_path, style_hook_fails):
+    import ast
+    import os
+    addon = tmp_path / "Mod" / "PDFVectorImporter"
+    addon.mkdir(parents=True)
+    host.app.getUserAppDataDir = lambda: str(tmp_path)
+    host.app.getResourceDir = lambda: str(tmp_path / "unused")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setitem(sys.modules, "PDFImageRenderSync", host.module)
+    monkeypatch.delitem(sys.modules, "PDFImporterCore", raising=False)
+    def register_style(_app):
+        if style_hook_fails:
+            raise RuntimeError("style hook unavailable")
+        return object()
+    monkeypatch.setitem(sys.modules, "PDFStyleRestore", SimpleNamespace(register_document_observer=register_style))
+    def wrong_alias(_gui):
+        raise AssertionError("GUI startup must share the canonical image helper")
+    monkeypatch.setitem(sys.modules, "PDFVectorImporter.src.PDFImageRenderSync", SimpleNamespace(register_gui_document_observer=wrong_alias))
+    source = SOURCE.parents[1] / "InitGui.py"
+    tree = ast.parse(source.read_text(encoding="utf8"))
+    startup = tree.body[-1]
+    assert isinstance(startup, ast.Try)
+    code = compile(ast.Module(body=[startup], type_ignores=[]), str(source), "exec")
+    namespace = {"os": os, "sys": sys, "FreeCAD": host.app, "FreeCADGui": host.gui}
+    exec(code, namespace)
+    exec(code, namespace)
+    assert len(host.gui_observers) == 1
+    assert "PDFImporterCore" not in sys.modules
+    host.gui_observers[0].slotBeforeChangeObject(host.obj.ViewObject, "Visibility")
+    assert host.module._BINDINGS and len(host.observers) == 1

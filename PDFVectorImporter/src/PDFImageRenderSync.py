@@ -18,6 +18,8 @@ import sys
 _BINDINGS = {}
 _OBSERVER = None
 _OBSERVER_HOST = None
+_GUI_OBSERVER = None
+_GUI_OBSERVER_HOST = None
 _NOTES = set()
 _SERIAL = 0
 _MAX_NODES = 256
@@ -192,6 +194,61 @@ class _CleanupObserver:
         release_document(doc)
 
 
+class _ImageRestoreObserver:
+    def slotBeforeChangeObject(self, view, prop):
+        # GuiDocument.xml restores visibility while App.isRestoring() is still
+        # true.  Install the render-only guard before show/setActiveMode, not
+        # from the deferred worker that restores PDF styles after loading.
+        if prop not in ("Visibility", "DisplayMode"):
+            return
+        try:
+            obj = getattr(view, "Object", None)
+            if obj is not None and str(getattr(obj, "TypeId", "")) == "Image::ImagePlane" and str(
+                getattr(obj, "PDFRepresentation", "")
+            ) == "raster":
+                ensure_image_render_sync(obj)
+        except Exception as exc:
+            _warn("early image attachment: " + str(exc))
+
+
+def _unregister_gui_observer():
+    global _GUI_OBSERVER, _GUI_OBSERVER_HOST
+    if _GUI_OBSERVER is not None:
+        try:
+            _GUI_OBSERVER_HOST.removeDocumentObserver(_GUI_OBSERVER)
+        except Exception as exc:
+            _warn("GUI image observer cleanup: " + str(exc))
+            return False
+    _GUI_OBSERVER, _GUI_OBSERVER_HOST = None, None
+    return True
+
+
+def register_gui_document_observer(gui=None):
+    """Watch native image visibility before saved GUI properties expose it."""
+    global _GUI_OBSERVER, _GUI_OBSERVER_HOST
+    if sys.platform != "win32":
+        return None
+    try:
+        if gui is None:
+            import FreeCADGui as gui
+        if not callable(getattr(gui, "addDocumentObserver", None)) or not callable(
+            getattr(gui, "removeDocumentObserver", None)
+        ):
+            _warn("GUI image observer API unavailable; deferred attachment retained")
+            return None
+        if _GUI_OBSERVER is not None and _GUI_OBSERVER_HOST is gui:
+            return _GUI_OBSERVER
+        if not _unregister_gui_observer():
+            return None
+        observer = _ImageRestoreObserver()
+        gui.addDocumentObserver(observer)
+        _GUI_OBSERVER, _GUI_OBSERVER_HOST = observer, gui
+        return observer
+    except Exception as exc:
+        _warn("GUI image observer registration: " + str(exc))
+        return None
+
+
 def _register_observer(host):
     global _OBSERVER, _OBSERVER_HOST
     if _OBSERVER is not None and _OBSERVER_HOST is host:
@@ -222,6 +279,7 @@ def unregister_document_observer():
         except Exception:
             return
     _OBSERVER, _OBSERVER_HOST = None, None
+    _unregister_gui_observer()
 
 
 def ensure_image_render_sync(obj):

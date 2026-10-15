@@ -3,10 +3,16 @@
 These notes used to sit at the top of the main [README](../README.md), in the
 same order. Install steps and the feature list are in the README.
 
-## Candidate fixes (v4.0.118)
+## Candidate fixes (v4.0.119)
+
+- Register an image-only GUI observer at startup. Before an importer raster image's native Visibility or DisplayMode property changes, attach the existing Windows/Coin render guard synchronously, including while saved GUI properties are restoring. The deferred style worker keeps its application-wide readiness check and remains a fallback for image attachment.
+- Preserve source pixels, geometry, visibility, display modes and user styles. Registration is idempotent, unavailable legacy observer APIs leave the fallback available, and shutdown releases owned native links and both observers.
+- The exact v4.0.118 desktop open, save and natural close passed; fresh reopen still showed an access violation and missing embedded image before its later callback binding was observed. This candidate targets that attachment window. Exact v4.0.119 desktop save and fresh reopen acceptance remains pending; the failed v4.0.118 result is unchanged.
+
+## Earlier candidate fixes (v4.0.118)
 
 - Reconstruct the paper's native view when a restored Python proxy has no attached runtime state. Select the source-declared Paper mode only when its native enumeration is empty, preserve nonempty user modes and visibility, and reuse an existing authored node without appending duplicate display masks.
-- Regression checks cover deserialized proxies, FreeCAD's one-time proxy attachment, repeated restoration, surviving native nodes and user display settings. The v4.0.117 desktop trial displayed and saved the drawing but failed its strict paper attachment check. Exact v4.0.118 desktop save and fresh reopen acceptance remains pending before release.
+- Regression checks cover deserialized proxies, FreeCAD's one-time proxy attachment, repeated restoration, surviving native nodes and user display settings. The v4.0.117 desktop trial displayed and saved the drawing but failed its strict paper attachment check. Exact v4.0.118 normal open, save and natural close subsequently passed; its fresh reopen failed with the image rendering error described above.
 
 ## Earlier candidate fixes (v4.0.117)
 

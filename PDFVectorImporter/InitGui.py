@@ -331,6 +331,15 @@ try:
         ):
             if _pdfvi_path not in sys.path:
                 sys.path.insert(0, _pdfvi_path)
+        # Saved GUI files restore visibility before the deferred style worker.
+        # Register the image-only before-change guard at startup as well.
+        try:
+            import PDFImageRenderSync
+            PDFImageRenderSync.register_gui_document_observer(FreeCADGui)
+        except Exception as _pdfvi_image_exc:
+            FreeCAD.Console.PrintWarning(
+                "PDF Vector Importer: image-restore hook unavailable: "
+                + str(_pdfvi_image_exc) + "\n")
         import PDFStyleRestore
         if PDFStyleRestore.register_document_observer(FreeCAD) is None:
             FreeCAD.Console.PrintWarning(

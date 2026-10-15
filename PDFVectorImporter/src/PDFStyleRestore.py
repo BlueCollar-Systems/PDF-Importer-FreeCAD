@@ -468,11 +468,39 @@ def restore_object_style(
 
 
 def _gui_view_fit() -> bool:
-    """Fit the active 3D view; False when there is no GUI.  Never raises."""
+    """Fit without a nested animated render; restore the view's animation flag.
+
+    FreeCAD's animated ViewFit pumps GUI events while restoring the view.  A
+    temporary per-view flag avoids that reentrancy without changing preferences
+    or the normal ViewFit routing.  Missing/failed native APIs safely skip the
+    convenience fit.  Never raises.
+    """
     try:
         import FreeCADGui  # type: ignore
 
-        FreeCADGui.SendMsgToActiveView("ViewFit")
+        view = FreeCADGui.activeDocument().activeView()
+        read_animation = getattr(view, "isAnimationEnabled", None)
+        write_animation = getattr(view, "setAnimationEnabled", None)
+        if not callable(read_animation) or not callable(write_animation):
+            return False
+        enabled = read_animation()
+        if type(enabled) is not bool:
+            return False
+        restore_animation = False
+        try:
+            if enabled:
+                # A native setter can mutate before it raises, so arrange
+                # restoration before attempting the first change.
+                restore_animation = True
+                write_animation(False)
+                if read_animation() is not False:
+                    return False
+            FreeCADGui.SendMsgToActiveView("ViewFit")
+        finally:
+            if restore_animation:
+                write_animation(enabled)
+                if read_animation() is not enabled:
+                    raise RuntimeError("ViewFit animation state did not restore")
     except Exception:
         return False
     return True

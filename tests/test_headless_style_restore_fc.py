@@ -43,6 +43,44 @@ import PDFImporterCore as core  # noqa: E402
 import PDFStyleRestore as restore  # noqa: E402
 
 
+class _FitAnimationView:
+    """The small public view API also exposed by FreeCAD 0.17/0.18."""
+
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self.writes = []
+
+    def isAnimationEnabled(self):
+        return self.enabled
+
+    def setAnimationEnabled(self, enabled):
+        self.writes.append(enabled)
+        self.enabled = enabled
+
+
+def _install_fit_gui(monkeypatch, *, enabled=True, sender=None):
+    import types
+
+    view = _FitAnimationView(enabled)
+    sent = []
+
+    def send(message):
+        sent.append((message, view.enabled))
+        if sender is not None:
+            sender(message)
+
+    def forbid_preferences(*_args):
+        pytest.fail("ViewFit must not change application preferences")
+
+    gui = types.SimpleNamespace(
+        activeDocument=lambda: types.SimpleNamespace(activeView=lambda: view),
+        SendMsgToActiveView=send,
+        ParamGet=forbid_preferences,
+    )
+    monkeypatch.setitem(sys.modules, "FreeCADGui", gui)
+    return view, sent, gui
+
+
 # ---------------------------------------------------------------------------
 # Fakes: the smallest FreeCAD surface the code under test touches.
 # ---------------------------------------------------------------------------
@@ -560,21 +598,86 @@ class TestRestoreDocumentStyles:
         third = restore.restore_document_styles(doc2, view_fit=boom)
         assert third["view_fit"] is False and third["errors"] == []
 
-    def test_gui_view_fit_sends_viewfit_and_never_raises(self, monkeypatch):
-        import types
-
-        sent = []
-        fake_gui = types.SimpleNamespace(SendMsgToActiveView=lambda msg: sent.append(msg))
-        monkeypatch.setitem(sys.modules, "FreeCADGui", fake_gui)
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_gui_view_fit_legacy_view_api_sends_same_command_without_animation(self, monkeypatch, enabled):
+        view, sent, _gui = _install_fit_gui(monkeypatch, enabled=enabled)
         assert restore._gui_view_fit() is True
-        assert sent == ["ViewFit"]
+        assert sent == [("ViewFit", False)]
+        assert view.enabled is enabled
+        assert view.writes == ([False, True] if enabled else [])
 
+    def test_gui_view_fit_restores_enabled_flag_when_original_sender_raises(self, monkeypatch):
         def raising(_msg):
             raise RuntimeError("no active view")
 
-        monkeypatch.setitem(
-            sys.modules, "FreeCADGui", types.SimpleNamespace(SendMsgToActiveView=raising)
-        )
+        view, sent, _gui = _install_fit_gui(monkeypatch, sender=raising)
+        assert restore._gui_view_fit() is False
+        assert sent == [("ViewFit", False)]
+        assert view.enabled is True and view.writes == [False, True]
+
+    def test_gui_view_fit_restores_if_disabling_setter_mutates_then_raises(self, monkeypatch):
+        view, sent, _gui = _install_fit_gui(monkeypatch)
+        original = view.setAnimationEnabled
+
+        def mutate_then_raise(flag):
+            original(flag)
+            if flag is False:
+                raise RuntimeError("native setter failed after changing its flag")
+
+        view.setAnimationEnabled = mutate_then_raise
+        assert restore._gui_view_fit() is False
+        assert sent == [] and view.enabled is True and view.writes == [False, True]
+
+    def test_gui_view_fit_requires_actual_disabled_readback(self, monkeypatch):
+        view, sent, _gui = _install_fit_gui(monkeypatch)
+        view.setAnimationEnabled = lambda flag: view.writes.append(flag)
+        assert restore._gui_view_fit() is False
+        assert sent == [] and view.enabled is True and view.writes == [False, True]
+
+    @pytest.mark.parametrize("bad_value", [None, 0, 1, "true"])
+    def test_gui_view_fit_invalid_native_flag_skips_command_without_mutation(self, monkeypatch, bad_value):
+        view, sent, _gui = _install_fit_gui(monkeypatch, enabled=bad_value)
+        assert restore._gui_view_fit() is False
+        assert sent == [] and view.writes == []
+
+    def test_gui_view_fit_native_flag_read_error_skips_command(self, monkeypatch):
+        view, sent, _gui = _install_fit_gui(monkeypatch)
+
+        def bad_read():
+            raise RuntimeError("native flag unavailable")
+
+        view.isAnimationEnabled = bad_read
+        assert restore._gui_view_fit() is False
+        assert sent == [] and view.writes == []
+
+    @pytest.mark.parametrize("raises", [False, True])
+    def test_gui_view_fit_failed_restoration_never_claims_success(self, monkeypatch, raises):
+        view, sent, _gui = _install_fit_gui(monkeypatch)
+
+        def failed_restore(flag):
+            view.writes.append(flag)
+            if flag is False:
+                view.enabled = False
+            elif raises:
+                raise RuntimeError("native restore setter failed")
+
+        view.setAnimationEnabled = failed_restore
+        assert restore._gui_view_fit() is False
+        assert sent == [("ViewFit", False)] and view.writes == [False, True]
+        assert view.enabled is False
+
+    @pytest.mark.parametrize("missing", ["isAnimationEnabled", "setAnimationEnabled"])
+    def test_gui_view_fit_missing_native_API_safely_skips_convenience_fit(self, monkeypatch, missing):
+        view, sent, _gui = _install_fit_gui(monkeypatch)
+        setattr(view, missing, None)
+        assert restore._gui_view_fit() is False
+        assert sent == [] and view.writes == []
+
+    def test_gui_view_fit_no_active_document_or_no_GUI_remains_safe(self, monkeypatch):
+        _view, sent, gui = _install_fit_gui(monkeypatch)
+        gui.activeDocument = lambda: None
+        assert restore._gui_view_fit() is False and sent == []
+        monkeypatch.setitem(sys.modules, "FreeCADGui", None)
         assert restore._gui_view_fit() is False
 
     def test_geometry_style_uses_the_importer_apply_style_rule(self):

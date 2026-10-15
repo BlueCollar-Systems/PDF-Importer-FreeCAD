@@ -3,7 +3,14 @@
 These notes used to sit at the top of the main [README](../README.md), in the
 same order. Install steps and the feature list are in the README.
 
-## Candidate fixes (v4.0.115)
+## Candidate fixes (v4.0.116)
+
+- Headless-saved imports wait for FreeCAD's application-wide restoration to finish, including the interval after the document's own restoring flag has cleared. Closed documents and failed state reads cannot start stale restoration work.
+- View fitting temporarily disables animation only on the active view, then restores its original flag even when fitting fails. The original ViewFit command, geometry, style workers and restoration order are retained; application preferences are unchanged.
+- Qualified opaque rectangle restoration no longer exports and hashes BREP data that its identity check does not use. Placement, text, custom text and source identity checks are retained.
+- Focused source checks and a controlled native SDK contrast pass without the previous access-violation/cyclic-render warnings. Normal desktop import, save and reopen checks remain pending for the exact v4.0.116 package before release.
+
+## Earlier candidate fixes (v4.0.115)
 
 - Inferred word gaps in symbolic subset fonts can use an empty space glyph observed in the PDF's original font program, preserving editable text instead of an unnecessary image fallback. Visible, unobserved, ambiguous or changed source glyphs remain unverified and follow the existing reported fallback.
 - Filled paths that return exactly to their source starting point retain editable faces even when the PDF does not explicitly close the stroke. Original points, separate stroke width, dashes and closing behavior are preserved. Fill-only faces use filled display on import and restoration.

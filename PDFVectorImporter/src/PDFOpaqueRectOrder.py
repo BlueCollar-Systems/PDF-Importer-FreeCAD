@@ -56,7 +56,10 @@ def restore_display(obj):
     depth = data["display_offset_z_mm"]
     if data["schema"] != SCHEMA or not math.isfinite(depth) or depth <= 0:
         raise ValueError("invalid persisted rectangle display schema/depth")
-    actual = _state(obj)
+    # Restore checks content/placement below, and rectangle geometry separately.
+    # Its saved BREP hash is not compared: native save/open can reserialize the
+    # same shape. Avoid exporting every later text shape just to discard it.
+    actual = _state(obj, include_brep=False)
     if any(
         not _same(actual[key], data["native_state"][key])
         for key in ("type", "placement", "text", "custom_text", "source_id")

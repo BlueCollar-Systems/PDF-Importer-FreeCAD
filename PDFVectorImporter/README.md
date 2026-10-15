@@ -1,7 +1,7 @@
 # PDF Vector Importer for FreeCAD
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Version: 4.0.115](https://img.shields.io/badge/Version-4.0.115-green.svg)
+![Version: 4.0.119](https://img.shields.io/badge/Version-4.0.119-green.svg)
 ![Platform: FreeCAD 1.0+ (Python 3.10+)](https://img.shields.io/badge/Platform-FreeCAD%201.0%2B%20%28Python%203.10%2B%29-orange.svg)
 
 **Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.**
@@ -12,7 +12,32 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 
 ---
 
-## Candidate fixes (v4.0.115)
+## Candidate fixes (v4.0.119)
+
+- Register the Windows image rendering guard at GUI startup and attach it before native image visibility or display mode restoration. Only importer raster images on affected Coin runtimes receive the callback; the deferred display restoration remains available as a fallback.
+- The v4.0.118 normal desktop open and save passed, but fresh reopen still showed the graphics error before the later image guard was observed. Earlier attachment addresses that timing gap without changing pixels, user display settings or editable geometry. Exact v4.0.119 desktop save and fresh reopen acceptance remains pending before release.
+
+## Earlier candidate fixes (v4.0.118)
+
+- Restore the paper's native view when FreeCAD deserializes a Python proxy without its runtime attachment. Initialize an empty paper display mode, reuse a surviving paper node and preserve visibility, material and nonempty user modes.
+- The exact v4.0.117 desktop test displayed and saved the dense drawing without the prior visible graphics warning, then correctly failed the separate paper attachment check. That partial test does not certify save/reopen acceptance; the updated package requires a fresh complete check before release.
+
+## Earlier candidate fixes (v4.0.117)
+
+- Native PDF images synchronize pending graphics work before texture rendering on Windows with Coin older than 4.0.8, working around the reported Intel graphics fault. New imports and restored documents retain their original pixels, geometry and user styles. Fixed Coin versions and other platforms keep their existing rendering path.
+- The callback covers later image uploads as well as first display and is removed when its image or document closes. Older hosts without the required Qt APIs retain native rendering and receive a compatibility note.
+
+The controlled full-sheet first display and zoom test passed without the reported errors. Exact-package desktop import, save and reopen acceptance remains pending before release.
+
+## Earlier candidate fixes (v4.0.116)
+
+- Headless-saved imports wait for application-wide restoration to finish before restoring PDF styles and visibility.
+- View fitting temporarily disables animation on the current view and restores its original setting afterward, without changing preferences or source geometry.
+- Qualified rectangle display restoration avoids exporting unused geometry while retaining its placement, text identity and source checks.
+
+Source regression checks and a controlled native restore diagnostic pass. Normal desktop import, save and reopen acceptance remains pending for the updated package.
+
+## Earlier candidate fixes (v4.0.115)
 
 - Filled paths that return exactly to their source starting point retain editable faces. Their original strokes keep their own width, dashes and closing behavior.
 - Proven nonpainting line fills are recorded without adding visible outlines. Failed item cleanup must be verified before an outline fallback is delivered.

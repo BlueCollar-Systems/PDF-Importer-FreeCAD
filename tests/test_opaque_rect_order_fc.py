@@ -339,6 +339,72 @@ def test_live_order_keeps_all_physical_shapes_and_requested_text_type(
             assert len(obj.ViewObject.RootNode.children) == 1
 
 
+def test_restore_avoids_unused_brep_export_but_keeps_original_geometry_proof(
+    native, monkeypatch
+):
+    from fake_image_view_fc import Root, Translation
+
+    page, plans, kwargs = native
+    monkeypatch.setitem(sys.modules, "pivy", NS(coin=NS(SoTranslation=Translation)))
+    for obj in kwargs["objects"]:
+        obj.ViewObject = NS(
+            RootNode=Root(), DisplayMode="Flat Lines", ShapeAppearance=[],
+            Transparency=0, LineColor=(1, 0, 0),
+        )
+    consumer.apply_rectangle_order(page, plans, **kwargs)
+    restored = [obj for obj in kwargs["objects"] if getattr(obj, consumer.PROPERTY, None)]
+    saved = {obj.Name: getattr(obj, consumer.PROPERTY) for obj in restored}
+    assert all(json.loads(saved[obj.Name])["native_state"]["brep"] for obj in restored)
+
+    def unused_export():
+        raise AssertionError("restore must not serialize an unused BREP")
+
+    for obj in restored:
+        obj.Shape.exportBrepToString = unused_export
+        assert consumer.restore_display(obj)
+        assert getattr(obj, consumer.PROPERTY) == saved[obj.Name]
+        # Full state capture used during creation still requests the BREP.
+        with pytest.raises(AssertionError, match="unused BREP"):
+            consumer._state(obj)
+
+
+@pytest.mark.parametrize("mutation", ["type", "placement", "text", "custom-text", "source-id"])
+def test_later_text_restore_retains_every_content_identity_check(
+    native, monkeypatch, mutation
+):
+    from fake_image_view_fc import Root, Translation
+
+    page, plans, kwargs = native
+    monkeypatch.setitem(sys.modules, "pivy", NS(coin=NS(SoTranslation=Translation)))
+    for obj in kwargs["objects"]:
+        obj.ViewObject = NS(
+            RootNode=Root(), DisplayMode="Flat Lines", ShapeAppearance=[],
+            Transparency=0, LineColor=(1, 0, 0),
+        )
+    consumer.apply_rectangle_order(page, plans, **kwargs)
+    obj = next(
+        obj for obj in kwargs["objects"]
+        if getattr(obj, consumer.PROPERTY, None)
+        and json.loads(getattr(obj, consumer.PROPERTY))["representation_unchanged"] != "source_opaque_rectangle"
+    )
+    if mutation == "type":
+        obj.TypeId = "Part::FeaturePython"
+    elif mutation == "placement":
+        obj.Placement.toMatrix = lambda: NS(A=[2] * 16)
+    elif mutation == "text":
+        obj.Text = ["User edit"]
+    elif mutation == "custom-text":
+        obj.CustomText = "User edit"
+    else:
+        obj.PDFSourceItemId = "wrong"
+    before = dict(vars(obj.ViewObject))
+    nodes = list(obj.ViewObject.RootNode.children)
+    with pytest.raises(ValueError, match="native placement/text/source identity changed"):
+        consumer.restore_display(obj)
+    assert vars(obj.ViewObject) == before
+    assert obj.ViewObject.RootNode.children == nodes
+
+
 @pytest.mark.parametrize(
     "mutation",
     ["source", "proof", "face", "point", "text-owner", "missing-text", "other-owner"],

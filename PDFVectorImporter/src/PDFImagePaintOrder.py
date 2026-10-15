@@ -25,9 +25,9 @@ def _xyz(p):
     return [float(p.x), float(p.y), float(p.z)]
 
 
-def _state(obj):
-    """Immutable native geometry/content; custom display metadata is separate."""
-    shape = getattr(obj, "Shape", None)
+def _state(obj, *, include_brep=True):
+    """Native state; omit BREP export only for content-only restore checks."""
+    shape = getattr(obj, "Shape", None) if include_brep else None
     placement = getattr(obj, "Placement", None)
     return dict(type=obj.TypeId,
                 brep=hashlib.sha256(shape.exportBrepToString().encode()).hexdigest() if shape else None,

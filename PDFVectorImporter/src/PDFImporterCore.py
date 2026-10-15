@@ -6737,6 +6737,11 @@ def _annotate_text_host_object(obj, source_item_id: str, representation: str) ->
             # Source pixels already contain the PDF renderer's colors. Native
             # material lighting would turn white image backgrounds gray.
             view.DisplayMode = "No shading"
+            try:
+                from PDFImageRenderSync import ensure_image_render_sync
+            except ImportError:
+                from .PDFImageRenderSync import ensure_image_render_sync
+            ensure_image_render_sync(obj)
 
 
 def _format_color_metadata(

@@ -3,7 +3,31 @@
 These notes used to sit at the top of the main [README](../README.md), in the
 same order. Install steps and the feature list are in the README.
 
-## Candidate fixes (v4.0.115)
+## Candidate fixes (v4.0.119)
+
+- Register an image-only GUI observer at startup. Before an importer raster image's native Visibility or DisplayMode property changes, attach the existing Windows/Coin render guard synchronously, including while saved GUI properties are restoring. The deferred style worker keeps its application-wide readiness check and remains a fallback for image attachment.
+- Preserve source pixels, geometry, visibility, display modes and user styles. Registration is idempotent, unavailable legacy observer APIs leave the fallback available, and shutdown releases owned native links and both observers.
+- The exact v4.0.118 desktop open, save and natural close passed; fresh reopen still showed an access violation and missing embedded image before its later callback binding was observed. This candidate targets that attachment window. Exact v4.0.119 desktop save and fresh reopen acceptance remains pending; the failed v4.0.118 result is unchanged.
+
+## Earlier candidate fixes (v4.0.118)
+
+- Reconstruct the paper's native view when a restored Python proxy has no attached runtime state. Select the source-declared Paper mode only when its native enumeration is empty, preserve nonempty user modes and visibility, and reuse an existing authored node without appending duplicate display masks.
+- Regression checks cover deserialized proxies, FreeCAD's one-time proxy attachment, repeated restoration, surviving native nodes and user display settings. The v4.0.117 desktop trial displayed and saved the drawing but failed its strict paper attachment check. Exact v4.0.118 normal open, save and natural close subsequently passed; its fresh reopen failed with the image rendering error described above.
+
+## Earlier candidate fixes (v4.0.117)
+
+- Work around the native image-texture fault reported in [Coin issue 609](https://github.com/coin3d/coin/issues/609). On Windows with Coin older than 4.0.8, an image-local callback synchronizes graphics work before each native texture traversal, including later uploads. Coin 4.0.8 includes the upstream fix and needs no callback.
+- Preserve source pixels, native image placement, editable geometry and user display settings. Reconstruct the runtime callback on fresh imports and reopening, and release its native references when the image or document closes.
+- A controlled full-sheet first display and normal zoom redraw passed with every original restore worker and no access-violation or cyclic-scene-graph messages. Exact-package desktop import, save and reopen checks remain pending before release.
+
+## Earlier candidate fixes (v4.0.116)
+
+- Headless-saved imports wait for FreeCAD's application-wide restoration to finish, including the interval after the document's own restoring flag has cleared. Closed documents and failed state reads cannot start stale restoration work.
+- View fitting temporarily disables animation only on the active view, then restores its original flag even when fitting fails. The original ViewFit command, geometry, style workers and restoration order are retained; application preferences are unchanged.
+- Qualified opaque rectangle restoration no longer exports and hashes BREP data that its identity check does not use. Placement, text, custom text and source identity checks are retained.
+- Focused source checks and a controlled native SDK contrast pass without the previous access-violation/cyclic-render warnings. Normal desktop import, save and reopen checks remain pending for the exact v4.0.116 package before release.
+
+## Earlier candidate fixes (v4.0.115)
 
 - Inferred word gaps in symbolic subset fonts can use an empty space glyph observed in the PDF's original font program, preserving editable text instead of an unnecessary image fallback. Visible, unobserved, ambiguous or changed source glyphs remain unverified and follow the existing reported fallback.
 - Filled paths that return exactly to their source starting point retain editable faces even when the PDF does not explicitly close the stroke. Original points, separate stroke width, dashes and closing behavior are preserved. Fill-only faces use filled display on import and restoration.

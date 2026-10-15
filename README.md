@@ -3,7 +3,7 @@
 **BUILT. NOT BOUGHT.**
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
-![Version: 4.0.115](https://img.shields.io/badge/Version-4.0.115-blue.svg)
+![Version: 4.0.119](https://img.shields.io/badge/Version-4.0.119-blue.svg)
 ![Platform: FreeCAD 1.0+ (Python 3.10+)](https://img.shields.io/badge/Platform-FreeCAD%201.0%2B%20%28Python%203.10%2B%29-orange.svg)
 
 Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.
@@ -25,10 +25,14 @@ Not listed in FreeCAD's Addon Manager yet. Other ways to install (ZIP, manual co
 
 Change notes for each version are in [docs/CHANGELOG.md](docs/CHANGELOG.md).
 
-The v4.0.115 test candidate preserves filled paths that return to their starting
-point, keeps their original strokes separate, and verifies empty font spaces
-before using them. Source checks pass; native import, save and reopen checks
-remain pending before release.
+The v4.0.119 test candidate attaches the Windows image rendering guard before
+FreeCAD restores native image visibility or display mode. The v4.0.118 desktop
+test displayed and saved the drawing, but its fresh reopen still reported the
+graphics error before the deferred image attachment. The earlier attachment
+targets that timing gap while preserving source pixels, native geometry,
+visibility and user styles. Paper attachment and earlier restoration fixes
+are retained. Exact v4.0.119 desktop save and fresh reopen checks remain
+pending before release.
 
 ## Structural Steel Shape Assets
 

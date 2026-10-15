@@ -468,11 +468,39 @@ def restore_object_style(
 
 
 def _gui_view_fit() -> bool:
-    """Fit the active 3D view; False when there is no GUI.  Never raises."""
+    """Fit without a nested animated render; restore the view's animation flag.
+
+    FreeCAD's animated ViewFit pumps GUI events while restoring the view.  A
+    temporary per-view flag avoids that reentrancy without changing preferences
+    or the normal ViewFit routing.  Missing/failed native APIs safely skip the
+    convenience fit.  Never raises.
+    """
     try:
         import FreeCADGui  # type: ignore
 
-        FreeCADGui.SendMsgToActiveView("ViewFit")
+        view = FreeCADGui.activeDocument().activeView()
+        read_animation = getattr(view, "isAnimationEnabled", None)
+        write_animation = getattr(view, "setAnimationEnabled", None)
+        if not callable(read_animation) or not callable(write_animation):
+            return False
+        enabled = read_animation()
+        if type(enabled) is not bool:
+            return False
+        restore_animation = False
+        try:
+            if enabled:
+                # A native setter can mutate before it raises, so arrange
+                # restoration before attempting the first change.
+                restore_animation = True
+                write_animation(False)
+                if read_animation() is not False:
+                    return False
+            FreeCADGui.SendMsgToActiveView("ViewFit")
+        finally:
+            if restore_animation:
+                write_animation(enabled)
+                if read_animation() is not enabled:
+                    raise RuntimeError("ViewFit animation state did not restore")
     except Exception:
         return False
     return True
@@ -643,6 +671,20 @@ def _console_log(message: str) -> None:
 def restore_document_display_nodes(doc: Any) -> None:
     """Rebuild explicit source/display transforms without reverting GUI styles."""
     objects = getattr(doc, "Objects", ())
+    # Runtime callbacks are not serialized. Reattach on GUI-saved files too,
+    # without changing the user's material, lighting or visibility choices.
+    if any(
+        str(getattr(obj, "TypeId", "")) == "Image::ImagePlane"
+        and str(getattr(obj, "PDFRepresentation", "")) == "raster"
+        for obj in objects
+    ):
+        try:
+            from PDFImageRenderSync import ensure_image_render_sync
+        except ImportError:
+            from .PDFImageRenderSync import ensure_image_render_sync
+        for obj in objects:
+            if str(getattr(obj, "TypeId", "")) == "Image::ImagePlane":
+                ensure_image_render_sync(obj)
     if any(getattr(obj, "PDFNonTextCompositeJSON", None) for obj in objects):
         try:
             from .PDFNonTextComposite import restore_document_displays
@@ -687,9 +729,10 @@ class PDFStyleRestoreObserver:
     ``slotCreatedDocument`` fires from ``App::Application::newDocument`` before
     the file is restored, and FreeCAD's Python observers have no
     "finished restoring" slot; so the work is deferred to the Qt event loop,
-    which only resumes after the synchronous open completes.  If the document
-    still reports ``Restoring`` (a progress bar pumped events mid-load) the
-    callback re-arms itself a bounded number of times.
+    which can also run during progress updates inside a synchronous open.
+    ``FreeCAD.isRestoring()`` covers application-wide open/postprocessing after
+    ``doc.Restoring`` clears; wait for both before touching views or fitting.
+    Older hosts without that API retain the document-state guard.
 
     Once the document has loaded, ``gate`` (default
     ``document_needs_style_restore``) decides whether it is a headless-saved
@@ -706,43 +749,91 @@ class PDFStyleRestoreObserver:
         gate: Optional[Callable[[Any], Tuple[bool, str]]] = None,
         log: Optional[Callable[[str], None]] = None,
         max_retries: int = _RESTORE_MAX_RETRIES,
+        freecad_module: Any = None,
     ):
         self._schedule = schedule or _qt_schedule
         self._restore = restore or (lambda doc: restore_document_styles(doc, log=self._log))
         self._gate = gate or document_needs_style_restore
         self._log = log or _console_log
         self._max_retries = int(max_retries)
+        self._host = freecad_module
+        self._pending: Dict[int, object] = {}
 
     # -- FreeCAD slots ---------------------------------------------------
     def slotCreatedDocument(self, doc: Any) -> None:
         try:
+            self._pending[id(doc)] = object()
             self._arm(doc, attempt=0)
         except Exception:
             pass
 
     def slotDeletedDocument(self, doc: Any) -> None:  # noqa: D401 - FreeCAD slot
-        return None
+        self._pending.pop(id(doc), None)
 
     # -- internals ---------------------------------------------------------
     def _arm(self, doc: Any, attempt: int) -> None:
+        token = self._pending.get(id(doc))
+        if token is None:
+            return
+
         def run() -> None:
-            self._run(doc, attempt)
+            if self._pending.get(id(doc)) is token:
+                self._run(doc, attempt)
 
         delay = 0 if attempt == 0 else _RESTORE_RETRY_DELAY_MS
         try:
-            self._schedule(run, delay)
+            scheduled = self._schedule(run, delay)
         except Exception:
-            pass
+            scheduled = False
+        if not scheduled and self._pending.get(id(doc)) is token:
+            self._pending.pop(id(doc), None)
 
     def _run(self, doc: Any, attempt: int) -> None:
+        if id(doc) not in self._pending:
+            return
+        # A scheduled closure may outlive its document or registration.
         try:
-            still_restoring = bool(getattr(doc, "Restoring", False))
+            get_document = getattr(self._host, "getDocument", None)
+            if callable(get_document) and get_document(str(doc.Name)) is not doc:
+                self._pending.pop(id(doc), None)
+                return
         except Exception:
-            still_restoring = False
+            self._pending.pop(id(doc), None)
+            return
+        try:
+            still_restoring = bool(doc.Restoring)
+            query = getattr(self._host, "isRestoring", None)
+            if query is None:
+                application_restoring = False  # Feature-absent legacy host.
+            elif callable(query):
+                application_restoring = query()
+                if type(application_restoring) is not bool:
+                    raise TypeError("FreeCAD.isRestoring() did not return bool")
+            else:
+                raise TypeError("FreeCAD.isRestoring is not callable")
+        except Exception:
+            # A failed native state read cannot establish that views are ready.
+            if attempt < self._max_retries:
+                self._arm(doc, attempt + 1)
+            else:
+                self._pending.pop(id(doc), None)
+                try:
+                    self._log("PDF Vector Importer: restore state unavailable; view restore skipped\n")
+                except Exception:
+                    pass
+            return
+        if application_restoring:
+            # Large restores may legitimately take longer than the doc-only
+            # retry window. Keep waiting without spending it or using delay0.
+            self._arm(doc, max(1, attempt))
+            return
         if still_restoring:
             if attempt < self._max_retries:
                 self._arm(doc, attempt + 1)
+            else:
+                self._pending.pop(id(doc), None)
             return
+        self._pending.pop(id(doc), None)
         try:
             needs_restore, reason = self._gate(doc)
         except Exception as exc:
@@ -789,7 +880,7 @@ def register_document_observer(freecad_module: Any = None) -> Optional[PDFStyleR
             return None
     if _OBSERVER is not None and _OBSERVER_HOST is host:
         return _OBSERVER
-    observer = PDFStyleRestoreObserver()
+    observer = PDFStyleRestoreObserver(freecad_module=host)
     try:
         host.addDocumentObserver(observer)
     except Exception:
@@ -804,6 +895,7 @@ def unregister_document_observer(freecad_module: Any = None) -> None:
     global _OBSERVER, _OBSERVER_HOST
     if _OBSERVER is None:
         return
+    _OBSERVER._pending.clear()
     host = freecad_module if freecad_module is not None else _OBSERVER_HOST
     try:
         host.removeDocumentObserver(_OBSERVER)

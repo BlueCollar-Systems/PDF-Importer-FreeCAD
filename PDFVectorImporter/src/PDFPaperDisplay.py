@@ -26,9 +26,50 @@ def validate(data):
 class ViewProviderPaper:
     def __init__(self, view):
         view.Proxy = self
+        # A native provider only auto-attaches its first Python proxy. Restored
+        # proxies can replace it later, leaving this instance without nodes.
+        self.attach(view)
 
     def attach(self, view):
         from pivy import coin
+        switch = view.SwitchNode
+        matches = []
+        for index in range(switch.getNumChildren()):
+            node = switch.getChild(index)
+            name = node.getName()
+            if str(name.getString() if hasattr(name, "getString") else name) == "BCSPDFPaperDisplay":
+                matches.append(node)
+        if len(matches) > 1:
+            raise RuntimeError("Paper display contains ambiguous duplicate nodes")
+        if matches:
+            node = matches[0]
+            children = [node.getChild(index) for index in range(node.getNumChildren())]
+            if (
+                getattr(self, "view", None) is view
+                and int(getattr(getattr(self, "node", None), "this", 0)) == int(node.this)
+                and all(
+                    any(int(child.this) == int(getattr(getattr(self, name, None), "this", 0)) for child in children)
+                    for name in ("transform", "coords")
+                )
+            ):
+                if not str(view.DisplayMode):
+                    self._initialize_mode(view)
+                return
+            kinds = (coin.SoTransform, coin.SoPickStyle, coin.SoMaterial, coin.SoDrawStyle,
+                     coin.SoCoordinate3, coin.SoFaceSet)
+            if (not node.isOfType(coin.SoSeparator.getClassTypeId()) or len(children) != len(kinds)
+                    or not all(children[index].isOfType(kind.getClassTypeId()) for index, kind in enumerate(kinds))
+                    or children[4].point.getNum() != 4 or children[5].numVertices.getNum() != 1
+                    or int(children[5].numVertices[0]) != 4):
+                raise RuntimeError("Existing Paper display cannot be safely reattached")
+            # Reuse a surviving native display rather than append another mask.
+            self.view = view
+            self.node = node
+            self.transform, self.coords = children[0], children[4]
+            self.updateData(view.Object, PROPERTY)
+            self.updateData(view.Object, "Placement")
+            self._initialize_mode(view)
+            return
         self.view = view
         self.node = coin.SoSeparator()
         self.node.setName("BCSPDFPaperDisplay")
@@ -49,6 +90,18 @@ class ViewProviderPaper:
         view.addDisplayMode(self.node, "Paper")
         self.updateData(view.Object, PROPERTY)
         self.updateData(view.Object, "Placement")
+        self._initialize_mode(view)
+
+    @staticmethod
+    def _initialize_mode(view):
+        mode = str(view.DisplayMode)
+        if not mode:
+            # Initialize the actual source-declared enum, not an empty host
+            # fallback left by a provider that never ran attach().
+            view.DisplayMode = ["Paper"]
+            view.DisplayMode = "Paper"
+        elif mode == "Paper":
+            view.DisplayMode = mode  # Select a newly attached native mask.
 
     def updateData(self, obj, prop):
         if prop == "Placement" and hasattr(self, "transform") and hasattr(obj, "Placement"):
@@ -103,8 +156,11 @@ def restore_document_paper(doc):
     for obj in getattr(doc, "Objects", ()):
         if getattr(obj, PROPERTY, None) and getattr(obj, "ViewObject", None) is not None:
             validate(json.loads(getattr(obj, PROPERTY)))
-            if not isinstance(getattr(obj.ViewObject, "Proxy", None), ViewProviderPaper):
-                ViewProviderPaper(obj.ViewObject)
+            proxy = getattr(obj.ViewObject, "Proxy", None)
+            if not isinstance(proxy, ViewProviderPaper):
+                proxy = ViewProviderPaper(obj.ViewObject)
+            else:
+                proxy.attach(obj.ViewObject)
             count += 1
     return count
 

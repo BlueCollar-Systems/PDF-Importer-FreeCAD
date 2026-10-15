@@ -3,7 +3,7 @@
 **BUILT. NOT BOUGHT.**
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
-![Version: 4.0.117](https://img.shields.io/badge/Version-4.0.117-blue.svg)
+![Version: 4.0.118](https://img.shields.io/badge/Version-4.0.118-blue.svg)
 ![Platform: FreeCAD 1.0+ (Python 3.10+)](https://img.shields.io/badge/Platform-FreeCAD%201.0%2B%20%28Python%203.10%2B%29-orange.svg)
 
 Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.
@@ -25,7 +25,10 @@ Not listed in FreeCAD's Addon Manager yet. Other ways to install (ZIP, manual co
 
 Change notes for each version are in [docs/CHANGELOG.md](docs/CHANGELOG.md).
 
-The v4.0.117 test candidate adds image rendering synchronization on Windows
+The v4.0.118 test candidate restores the missing paper view attachment and
+initializes its display mode when FreeCAD restores an empty Python proxy.
+Existing paper nodes, visibility and user styles are preserved. It retains
+image rendering synchronization on Windows
 with Coin older than 4.0.8. This works around the reported Intel graphics fault
 while preserving native images and editable drawing content. It also retains
 the restoration timing, view fitting and rectangle performance fixes from

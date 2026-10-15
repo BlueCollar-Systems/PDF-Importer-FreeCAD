@@ -3,7 +3,12 @@
 These notes used to sit at the top of the main [README](../README.md), in the
 same order. Install steps and the feature list are in the README.
 
-## Candidate fixes (v4.0.117)
+## Candidate fixes (v4.0.118)
+
+- Reconstruct the paper's native view when a restored Python proxy has no attached runtime state. Select the source-declared Paper mode only when its native enumeration is empty, preserve nonempty user modes and visibility, and reuse an existing authored node without appending duplicate display masks.
+- Regression checks cover deserialized proxies, FreeCAD's one-time proxy attachment, repeated restoration, surviving native nodes and user display settings. The v4.0.117 desktop trial displayed and saved the drawing but failed its strict paper attachment check. Exact v4.0.118 desktop save and fresh reopen acceptance remains pending before release.
+
+## Earlier candidate fixes (v4.0.117)
 
 - Work around the native image-texture fault reported in [Coin issue 609](https://github.com/coin3d/coin/issues/609). On Windows with Coin older than 4.0.8, an image-local callback synchronizes graphics work before each native texture traversal, including later uploads. Coin 4.0.8 includes the upstream fix and needs no callback.
 - Preserve source pixels, native image placement, editable geometry and user display settings. Reconstruct the runtime callback on fresh imports and reopening, and release its native references when the image or document closes.

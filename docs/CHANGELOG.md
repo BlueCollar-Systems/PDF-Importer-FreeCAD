@@ -3,7 +3,13 @@
 These notes used to sit at the top of the main [README](../README.md), in the
 same order. Install steps and the feature list are in the README.
 
-## Candidate fixes (v4.0.116)
+## Candidate fixes (v4.0.117)
+
+- Work around the native image-texture fault reported in [Coin issue 609](https://github.com/coin3d/coin/issues/609). On Windows with Coin older than 4.0.8, an image-local callback synchronizes graphics work before each native texture traversal, including later uploads. Coin 4.0.8 includes the upstream fix and needs no callback.
+- Preserve source pixels, native image placement, editable geometry and user display settings. Reconstruct the runtime callback on fresh imports and reopening, and release its native references when the image or document closes.
+- A controlled full-sheet first display and normal zoom redraw passed with every original restore worker and no access-violation or cyclic-scene-graph messages. Exact-package desktop import, save and reopen checks remain pending before release.
+
+## Earlier candidate fixes (v4.0.116)
 
 - Headless-saved imports wait for FreeCAD's application-wide restoration to finish, including the interval after the document's own restoring flag has cleared. Closed documents and failed state reads cannot start stale restoration work.
 - View fitting temporarily disables animation only on the active view, then restores its original flag even when fitting fails. The original ViewFit command, geometry, style workers and restoration order are retained; application preferences are unchanged.

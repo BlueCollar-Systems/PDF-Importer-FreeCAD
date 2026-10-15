@@ -1,7 +1,7 @@
 # PDF Vector Importer for FreeCAD
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Version: 4.0.116](https://img.shields.io/badge/Version-4.0.116-green.svg)
+![Version: 4.0.117](https://img.shields.io/badge/Version-4.0.117-green.svg)
 ![Platform: FreeCAD 1.0+ (Python 3.10+)](https://img.shields.io/badge/Platform-FreeCAD%201.0%2B%20%28Python%203.10%2B%29-orange.svg)
 
 **Import vector geometry, text, and images from PDF files into FreeCAD as editable Part objects.**
@@ -12,7 +12,14 @@ Arc reconstruction, dash mapping, color grouping, OCG layer support, and referen
 
 ---
 
-## Candidate fixes (v4.0.116)
+## Candidate fixes (v4.0.117)
+
+- Native PDF images synchronize pending graphics work before texture rendering on Windows with Coin older than 4.0.8, working around the reported Intel graphics fault. New imports and restored documents retain their original pixels, geometry and user styles. Fixed Coin versions and other platforms keep their existing rendering path.
+- The callback covers later image uploads as well as first display and is removed when its image or document closes. Older hosts without the required Qt APIs retain native rendering and receive a compatibility note.
+
+The controlled full-sheet first display and zoom test passed without the reported errors. Exact-package desktop import, save and reopen acceptance remains pending before release.
+
+## Earlier candidate fixes (v4.0.116)
 
 - Headless-saved imports wait for application-wide restoration to finish before restoring PDF styles and visibility.
 - View fitting temporarily disables animation on the current view and restores its original setting afterward, without changing preferences or source geometry.

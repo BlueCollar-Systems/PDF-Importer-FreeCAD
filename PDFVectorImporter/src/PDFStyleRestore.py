@@ -671,6 +671,20 @@ def _console_log(message: str) -> None:
 def restore_document_display_nodes(doc: Any) -> None:
     """Rebuild explicit source/display transforms without reverting GUI styles."""
     objects = getattr(doc, "Objects", ())
+    # Runtime callbacks are not serialized. Reattach on GUI-saved files too,
+    # without changing the user's material, lighting or visibility choices.
+    if any(
+        str(getattr(obj, "TypeId", "")) == "Image::ImagePlane"
+        and str(getattr(obj, "PDFRepresentation", "")) == "raster"
+        for obj in objects
+    ):
+        try:
+            from PDFImageRenderSync import ensure_image_render_sync
+        except ImportError:
+            from .PDFImageRenderSync import ensure_image_render_sync
+        for obj in objects:
+            if str(getattr(obj, "TypeId", "")) == "Image::ImagePlane":
+                ensure_image_render_sync(obj)
     if any(getattr(obj, "PDFNonTextCompositeJSON", None) for obj in objects):
         try:
             from .PDFNonTextComposite import restore_document_displays

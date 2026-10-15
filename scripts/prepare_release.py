@@ -3,7 +3,7 @@
 
 WHY THIS EXISTS
 ---------------
-auto-release reads the version from committed files and mints a tag for it. The
+The manual auto-release workflow reads the version from committed files. The
 same number lives in four places, and every one of them is verified:
 
     PDFVectorImporter/package.xml   <version>X.Y.Z</version>
@@ -22,9 +22,9 @@ USAGE
     python scripts/prepare_release.py --check    # verify they agree
     python scripts/prepare_release.py --current  # print the current version
 
-Then commit the result and push. auto-release sees a version with no tag and
-mints it. A push whose version is unchanged is skipped, not failed -- that is
-the normal state for ordinary product commits.
+Then commit the result and push to validate the source. Publishing requires an
+explicit manual auto-release run with publish_release=true. Use
+publish_release=false to build test artifacts without creating a tag or release.
 """
 from __future__ import annotations
 
@@ -155,9 +155,9 @@ def bump(new_version: str) -> int:
     for path in changed:
         print("  %s" % path.relative_to(ROOT).as_posix())
     print()
-    print("Now commit and push:")
-    print('  git commit -am "chore: release FreeCAD importer v%s"' % new_version)
-    print("  git push")
+    print("Review and stage the intended changes, then commit and push.")
+    print("Publishing requires a manual auto-release run with publish_release=true.")
+    print("Use publish_release=false to build test artifacts without publishing.")
     return check()
 
 

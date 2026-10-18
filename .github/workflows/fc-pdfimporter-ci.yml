@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   sketchup-harness-syntax:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -29,7 +29,7 @@ jobs:
         run: ruby -c PDFVectorImporter/adapters/sketchup_harness.rb
 
   version-check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -55,7 +55,7 @@ jobs:
   # so legacy 3.8/3.9 hosts remain outside the offline bundle.
   legacy-syntax:
     name: syntax-check (${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     strategy:
       matrix:
         python-version: ["3.8", "3.9"]
@@ -93,7 +93,7 @@ jobs:
         run: python -m pytest tests/test_runtime_path_selection_fc.py tests/test_release_runtime_matrix_fc.py -q --basetemp "${{ runner.temp }}/pytest-runtime-matrix"
 
   syntax-check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
@@ -233,3 +233,49 @@ jobs:
               sys.exit(1)
           print(f'PASS: {len(mode_builders)} BCS-ARCH-001 modes x 2 pages + auto-mode verified')
           "
+
+  # Temporary ubuntu-26.04 probe. release-safety-audit.yml has no
+  # workflow_dispatch, so these steps are copied here for one run and removed
+  # before any lasting change. Same checkout, Python, and audit command.
+  release-safety-audit-probe:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Audit product delta past the committed version's tag
+        run: |
+          set -e
+          VERSION="$(python - <<'PY'
+          import pathlib
+          import re
+
+          text = pathlib.Path("PDFVectorImporter/package.xml").read_text(encoding="utf-8")
+          match = re.search(r"<version>(\d+\.\d+\.\d+)</version>", text)
+          if not match:
+              raise SystemExit("Could not find <version> in PDFVectorImporter/package.xml")
+          print(match.group(1))
+          PY
+          )"
+          TAG="v${VERSION}"
+          if ! git rev-parse --verify "refs/tags/${TAG}^{commit}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} does not exist yet — this push carries a version bump; auto-release owns the mint." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python scripts/release_safety.py audit-existing-tag \
+            --repo "${GITHUB_REPOSITORY}" \
+            --tag "${TAG}" \
+            --before "${{ github.event.before }}" \
+            --head "$GITHUB_SHA" \
+            --session-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --mode report \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            --warnings-file .release-safety/warnings.json

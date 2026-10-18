@@ -55,7 +55,8 @@ jobs:
   # so legacy 3.8/3.9 hosts remain outside the offline bundle.
   legacy-syntax:
     name: syntax-check (${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    # ubuntu-26.04 cannot install CPython 3.8 or 3.9 (actions/setup-python).
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         python-version: ["3.8", "3.9"]

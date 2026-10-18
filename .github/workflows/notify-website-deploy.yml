@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   trigger-website:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     steps:
       - name: Check dispatch token secret
         id: token_check
@@ -30,10 +30,30 @@ jobs:
           echo "::warning::Skipping website dispatch because no valid dispatch token secret is configured."
           echo "Set WEBSITE_DISPATCH_TOKEN (or BLUECOLLAR_WEBSITE_DISPATCH_TOKEN / REPO_DISPATCH_TOKEN) to enable cross-repo dispatch."
 
-      # Probe only: load github-script on ubuntu-26.04 without POSTing to
-      # BlueCollar-Website. Revert this step before any lasting change.
-      - name: Probe github-script without dispatching the website
+      - name: Trigger BlueCollar-Website deployment
+        if: steps.token_check.outputs.has_token == 'true'
         uses: actions/github-script@v9
         with:
+          github-token: ${{ secrets.WEBSITE_DISPATCH_TOKEN || secrets.BLUECOLLAR_WEBSITE_DISPATCH_TOKEN || secrets.REPO_DISPATCH_TOKEN }}
           script: |
-            core.info('ubuntu-26.04 probe: github-script ran; BlueCollar-Website was not dispatched');
+            const release = context.payload?.release ?? null;
+            const payload = {
+              source_repo: context.repo.owner + '/' + context.repo.repo,
+              source_event: context.eventName,
+              source_ref: context.ref,
+              source_sha: context.sha,
+              release_tag: release?.tag_name ?? null,
+              release_name: release?.name ?? null,
+              release_url: release?.html_url ?? null,
+            };
+
+            const eventType = payload.release_tag ? 'product-release' : 'product-update';
+
+            await github.request('POST /repos/{owner}/{repo}/dispatches', {
+              owner: 'BlueCollar-Systems',
+              repo: 'BlueCollar-Website',
+              event_type: eventType,
+              client_payload: payload,
+            });
+
+            core.info(`Dispatched ${eventType} to BlueCollar-Website`);

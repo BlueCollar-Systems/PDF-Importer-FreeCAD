@@ -34,6 +34,34 @@ visibility and user styles. Paper attachment and earlier restoration fixes
 are retained. Exact v4.0.119 desktop save and fresh reopen checks remain
 pending before release.
 
+
+## Dated validation update — October 18, 2026
+
+The pending sentence above records the v4.0.119 candidate's pre-test state.
+The later local r14 operator guide records October 15 checks in FreeCAD 1.1.4
+on Windows: retained foundation-document Open, normal Save As, fresh process
+reopen, animated Fit All, public-API image refresh and normal close. It records
+that the previous access violation/cyclic-scene error did not recur, two
+347,008-node scenes had zero cycles, and all 4,683 shapes passed the unchanged
+geometry checks. Original image bytes and decoded samples were retained.
+
+That guide also preserves the strict raw-value comparison failure: 3,831 color
+components reflect native 8-bit saved channels, and two temporary image paths
+differ. Its separate geometry/saved-byte review does not turn strict raw
+equality into a pass or establish whole-page rendered pixel equality.
+
+This dated update reconciles existing operator records; no new native test was
+run on October 18 for this note. The candidate guide and current package index
+are available, but the later raw native receipts were not located in the
+targeted durable package/validation inventory. Locate and bind them, or repeat
+the bounded exact-package checks, before claiming independently reverified
+native acceptance. The retained October 12 scale-tool receipt concerns older
+source and synthetic App/Part controls, not the 4.0.119 restoration session.
+
+New PDF imports, additional text modes, full visual comparison and other hosts
+remain separate checks. Local r14 is 4.0.119; GitHub Latest remains 4.0.115.
+Old candidates, build-time pending records and original failures remain.
+
 ## Structural Steel Shape Assets
 
 The former standalone `Structural-Steel-DXF-DWG-Shapes` repository has been

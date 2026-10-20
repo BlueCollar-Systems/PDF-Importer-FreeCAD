@@ -1,0 +1,1491 @@
+{
+  "packet_status": "LOCAL_REVIEW_SEED_NOT_CANONICAL",
+  "fixture_provenance": "Every value, reader, locator and evidence item is invented. All SHA256 strings are labelled dummy values, not hashes of any document. No PDF exists for these fixtures.",
+  "kind": "positive",
+  "cases": [
+    {
+      "fixture_id": "P01_exact_case_job_and_mixed_kind",
+      "wholly_fictional": true,
+      "all_sha256_values_are_dummy_not_content_hashes": true,
+      "expected": {
+        "schema_valid": true,
+        "semantic_contract_valid": true,
+        "reason_codes": [
+          "CASE_DISTINCT_MAIN_MARKS",
+          "LOSSLESS_JOB_IDENTITIES_DISTINCT"
+        ]
+      },
+      "record": {
+        "format_version": "bcs.drawing_page_contract/1-draft",
+        "content": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "byte_length": 12000,
+          "page_count": 2
+        },
+        "occurrences": [
+          {
+            "occurrence_id": "occ-fiction-1",
+            "locator": "fixture://invented/print-1.pdf",
+            "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        ],
+        "interpretation": {
+          "id": "interp-fiction-1",
+          "source_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "reader": {
+            "id": "FictionalReader",
+            "build": "invented-build-1"
+          },
+          "options": {
+            "text_mode": "literal",
+            "page_selection": "all"
+          },
+          "reader_output_schema_version": "fictional-reader/1",
+          "contract_version": "bcs.drawing_page_contract/1-draft",
+          "coverage": "complete"
+        },
+        "pages": [
+          {
+            "page_index": 1,
+            "kinds": {
+              "state": "identified",
+              "values": [
+                "drawing",
+                "bill_of_materials"
+              ]
+            },
+            "read_quality": "text_available",
+            "fields": {
+              "job_name": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "job_name",
+                    "label_literal": "JOB_NAME",
+                    "literal": "FICTIONAL NORTH TEST"
+                  }
+                ],
+                "literal": "FICTIONAL NORTH TEST"
+              },
+              "job_number": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "job_number",
+                    "label_literal": "JOB_NUMBER",
+                    "literal": "AB-0042-a"
+                  }
+                ],
+                "literal": "AB-0042-a"
+              },
+              "drawing_number": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "drawing_number",
+                    "label_literal": "DRAWING_NUMBER",
+                    "literal": "D-17"
+                  }
+                ],
+                "literal": "D-17"
+              },
+              "main_mark": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "main_mark",
+                    "label_literal": "MAIN_MARK",
+                    "literal": "M7"
+                  }
+                ],
+                "literal": "M7"
+              },
+              "revision": {
+                "state": "missing",
+                "evidence": []
+              }
+            },
+            "other_evidence": []
+          },
+          {
+            "page_index": 2,
+            "kinds": {
+              "state": "identified",
+              "values": [
+                "drawing"
+              ]
+            },
+            "read_quality": "text_available",
+            "fields": {
+              "job_name": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "job_name",
+                    "label_literal": "JOB_NAME",
+                    "literal": "FICTIONAL NORTH TEST"
+                  }
+                ],
+                "literal": "FICTIONAL NORTH TEST"
+              },
+              "job_number": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "job_number",
+                    "label_literal": "JOB_NUMBER",
+                    "literal": "AB-0042-A"
+                  }
+                ],
+                "literal": "AB-0042-A"
+              },
+              "drawing_number": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "drawing_number",
+                    "label_literal": "DRAWING_NUMBER",
+                    "literal": "D-17"
+                  }
+                ],
+                "literal": "D-17"
+              },
+              "main_mark": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "main_mark",
+                    "label_literal": "MAIN_MARK",
+                    "literal": "m7"
+                  }
+                ],
+                "literal": "m7"
+              },
+              "revision": {
+                "state": "missing",
+                "evidence": []
+              }
+            },
+            "other_evidence": []
+          }
+        ],
+        "rule_decisions": [
+          {
+            "format_version": "bcs.drawing_rule_decision/1-draft",
+            "rule_id": "fictional-name-proposal",
+            "rule_version": "0.1",
+            "interpretation_id": "interp-fiction-1",
+            "outcome": "needs_review",
+            "reason_codes": [
+              "CASE_DISTINCT_MAIN_MARKS",
+              "LOSSLESS_JOB_IDENTITIES_DISTINCT"
+            ]
+          }
+        ],
+        "human_reviews": []
+      }
+    },
+    {
+      "fixture_id": "P02_revision_missing_empty_zero",
+      "wholly_fictional": true,
+      "all_sha256_values_are_dummy_not_content_hashes": true,
+      "expected": {
+        "schema_valid": true,
+        "semantic_contract_valid": true,
+        "reason_codes": [
+          "REVISION_MISSING",
+          "REVISION_EMPTY_LITERAL",
+          "REVISION_ZERO_LITERAL"
+        ]
+      },
+      "record": {
+        "format_version": "bcs.drawing_page_contract/1-draft",
+        "content": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "byte_length": 12000,
+          "page_count": 3
+        },
+        "occurrences": [
+          {
+            "occurrence_id": "occ-fiction-1",
+            "locator": "fixture://invented/print-1.pdf",
+            "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        ],
+        "interpretation": {
+          "id": "interp-fiction-1",
+          "source_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "reader": {
+            "id": "FictionalReader",
+            "build": "invented-build-1"
+          },
+          "options": {
+            "text_mode": "literal",
+            "page_selection": "all"
+          },
+          "reader_output_schema_version": "fictional-reader/1",
+          "contract_version": "bcs.drawing_page_contract/1-draft",
+          "coverage": "complete"
+        },
+        "pages": [
+          {
+            "page_index": 1,
+            "kinds": {
+              "state": "identified",
+              "values": [
+                "drawing"
+              ]
+            },
+            "read_quality": "text_available",
+            "fields": {
+              "job_name": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "job_name",
+                    "label_literal": "JOB_NAME",
+                    "literal": "FICTIONAL NORTH TEST"
+                  }
+                ],
+                "literal": "FICTIONAL NORTH TEST"
+              },
+              "job_number": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "job_number",
+                    "label_literal": "JOB_NUMBER",
+                    "literal": "AB-0042-a"
+                  }
+                ],
+                "literal": "AB-0042-a"
+              },
+              "drawing_number": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "drawing_number",
+                    "label_literal": "DRAWING_NUMBER",
+                    "literal": "D-17"
+                  }
+                ],
+                "literal": "D-17"
+              },
+              "main_mark": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "main_mark",
+                    "label_literal": "MAIN_MARK",
+                    "literal": "M7"
+                  }
+                ],
+                "literal": "M7"
+              },
+              "revision": {
+                "state": "missing",
+                "evidence": []
+              }
+            },
+            "other_evidence": []
+          },
+          {
+            "page_index": 2,
+            "kinds": {
+              "state": "identified",
+              "values": [
+                "drawing"
+              ]
+            },
+            "read_quality": "text_available",
+            "fields": {
+              "job_name": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "job_name",
+                    "label_literal": "JOB_NAME",
+                    "literal": "FICTIONAL NORTH TEST"
+                  }
+                ],
+                "literal": "FICTIONAL NORTH TEST"
+              },
+              "job_number": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "job_number",
+                    "label_literal": "JOB_NUMBER",
+                    "literal": "AB-0042-a"
+                  }
+                ],
+                "literal": "AB-0042-a"
+              },
+              "drawing_number": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "drawing_number",
+                    "label_literal": "DRAWING_NUMBER",
+                    "literal": "D-17"
+                  }
+                ],
+                "literal": "D-17"
+              },
+              "main_mark": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "main_mark",
+                    "label_literal": "MAIN_MARK",
+                    "literal": "M7"
+                  }
+                ],
+                "literal": "M7"
+              },
+              "revision": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "revision",
+                    "label_literal": "REVISION",
+                    "literal": ""
+                  }
+                ],
+                "literal": ""
+              }
+            },
+            "other_evidence": []
+          },
+          {
+            "page_index": 3,
+            "kinds": {
+              "state": "identified",
+              "values": [
+                "drawing"
+              ]
+            },
+            "read_quality": "text_available",
+            "fields": {
+              "job_name": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "job_name",
+                    "label_literal": "JOB_NAME",
+                    "literal": "FICTIONAL NORTH TEST"
+                  }
+                ],
+                "literal": "FICTIONAL NORTH TEST"
+              },
+              "job_number": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "job_number",
+                    "label_literal": "JOB_NUMBER",
+                    "literal": "AB-0042-a"
+                  }
+                ],
+                "literal": "AB-0042-a"
+              },
+              "drawing_number": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "drawing_number",
+                    "label_literal": "DRAWING_NUMBER",
+                    "literal": "D-17"
+                  }
+                ],
+                "literal": "D-17"
+              },
+              "main_mark": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "main_mark",
+                    "label_literal": "MAIN_MARK",
+                    "literal": "M7"
+                  }
+                ],
+                "literal": "M7"
+              },
+              "revision": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "revision",
+                    "label_literal": "REVISION",
+                    "literal": "0"
+                  }
+                ],
+                "literal": "0"
+              }
+            },
+            "other_evidence": []
+          }
+        ],
+        "rule_decisions": [
+          {
+            "format_version": "bcs.drawing_rule_decision/1-draft",
+            "rule_id": "fictional-name-proposal",
+            "rule_version": "0.1",
+            "interpretation_id": "interp-fiction-1",
+            "outcome": "needs_review",
+            "reason_codes": [
+              "REVISION_MISSING",
+              "REVISION_EMPTY_LITERAL",
+              "REVISION_ZERO_LITERAL"
+            ]
+          }
+        ],
+        "human_reviews": []
+      }
+    },
+    {
+      "fixture_id": "P03_read_quality_states_distinct",
+      "wholly_fictional": true,
+      "all_sha256_values_are_dummy_not_content_hashes": true,
+      "expected": {
+        "schema_valid": true,
+        "semantic_contract_valid": true,
+        "reason_codes": [
+          "READABLE_UNRECOGNIZED",
+          "NO_EXTRACTABLE_TEXT",
+          "READ_ERROR",
+          "UNSUPPORTED",
+          "NOT_EVALUATED",
+          "COVERAGE_PARTIAL"
+        ]
+      },
+      "record": {
+        "format_version": "bcs.drawing_page_contract/1-draft",
+        "content": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "byte_length": 12000,
+          "page_count": 5
+        },
+        "occurrences": [
+          {
+            "occurrence_id": "occ-fiction-1",
+            "locator": "fixture://invented/print-1.pdf",
+            "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        ],
+        "interpretation": {
+          "id": "interp-fiction-1",
+          "source_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "reader": {
+            "id": "FictionalReader",
+            "build": "invented-build-1"
+          },
+          "options": {
+            "text_mode": "literal",
+            "page_selection": "all"
+          },
+          "reader_output_schema_version": "fictional-reader/1",
+          "contract_version": "bcs.drawing_page_contract/1-draft",
+          "coverage": "partial"
+        },
+        "pages": [
+          {
+            "page_index": 1,
+            "kinds": {
+              "state": "unknown",
+              "values": []
+            },
+            "read_quality": "text_available",
+            "fields": {
+              "job_name": {
+                "state": "unknown",
+                "evidence": []
+              },
+              "job_number": {
+                "state": "unknown",
+                "evidence": []
+              },
+              "drawing_number": {
+                "state": "unknown",
+                "evidence": []
+              },
+              "main_mark": {
+                "state": "unknown",
+                "evidence": []
+              },
+              "revision": {
+                "state": "unknown",
+                "evidence": []
+              }
+            },
+            "other_evidence": []
+          },
+          {
+            "page_index": 2,
+            "kinds": {
+              "state": "unknown",
+              "values": []
+            },
+            "read_quality": "no_extractable_text",
+            "fields": {
+              "job_name": {
+                "state": "unknown",
+                "evidence": []
+              },
+              "job_number": {
+                "state": "unknown",
+                "evidence": []
+              },
+              "drawing_number": {
+                "state": "unknown",
+                "evidence": []
+              },
+              "main_mark": {
+                "state": "unknown",
+                "evidence": []
+              },
+              "revision": {
+                "state": "unknown",
+                "evidence": []
+              }
+            },
+            "other_evidence": []
+          },
+          {
+            "page_index": 3,
+            "kinds": {
+              "state": "not_evaluated",
+              "values": []
+            },
+            "read_quality": "read_error",
+            "fields": {
+              "job_name": {
+                "state": "not_evaluated",
+                "evidence": []
+              },
+              "job_number": {
+                "state": "not_evaluated",
+                "evidence": []
+              },
+              "drawing_number": {
+                "state": "not_evaluated",
+                "evidence": []
+              },
+              "main_mark": {
+                "state": "not_evaluated",
+                "evidence": []
+              },
+              "revision": {
+                "state": "not_evaluated",
+                "evidence": []
+              }
+            },
+            "other_evidence": []
+          },
+          {
+            "page_index": 4,
+            "kinds": {
+              "state": "unsupported",
+              "values": []
+            },
+            "read_quality": "unsupported",
+            "fields": {
+              "job_name": {
+                "state": "unsupported",
+                "evidence": []
+              },
+              "job_number": {
+                "state": "unsupported",
+                "evidence": []
+              },
+              "drawing_number": {
+                "state": "unsupported",
+                "evidence": []
+              },
+              "main_mark": {
+                "state": "unsupported",
+                "evidence": []
+              },
+              "revision": {
+                "state": "unsupported",
+                "evidence": []
+              }
+            },
+            "other_evidence": []
+          },
+          {
+            "page_index": 5,
+            "kinds": {
+              "state": "not_evaluated",
+              "values": []
+            },
+            "read_quality": "not_evaluated",
+            "fields": {
+              "job_name": {
+                "state": "not_evaluated",
+                "evidence": []
+              },
+              "job_number": {
+                "state": "not_evaluated",
+                "evidence": []
+              },
+              "drawing_number": {
+                "state": "not_evaluated",
+                "evidence": []
+              },
+              "main_mark": {
+                "state": "not_evaluated",
+                "evidence": []
+              },
+              "revision": {
+                "state": "not_evaluated",
+                "evidence": []
+              }
+            },
+            "other_evidence": []
+          }
+        ],
+        "rule_decisions": [
+          {
+            "format_version": "bcs.drawing_rule_decision/1-draft",
+            "rule_id": "fictional-name-proposal",
+            "rule_version": "0.1",
+            "interpretation_id": "interp-fiction-1",
+            "outcome": "needs_review",
+            "reason_codes": [
+              "READABLE_UNRECOGNIZED",
+              "NO_EXTRACTABLE_TEXT",
+              "READ_ERROR",
+              "UNSUPPORTED",
+              "NOT_EVALUATED",
+              "COVERAGE_PARTIAL"
+            ]
+          }
+        ],
+        "human_reviews": []
+      }
+    },
+    {
+      "fixture_id": "P04_drawing_number_and_bom_are_not_main_mark",
+      "wholly_fictional": true,
+      "all_sha256_values_are_dummy_not_content_hashes": true,
+      "expected": {
+        "schema_valid": true,
+        "semantic_contract_valid": true,
+        "reason_codes": [
+          "MAIN_MARK_MISSING"
+        ]
+      },
+      "record": {
+        "format_version": "bcs.drawing_page_contract/1-draft",
+        "content": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "byte_length": 12000,
+          "page_count": 1
+        },
+        "occurrences": [
+          {
+            "occurrence_id": "occ-fiction-1",
+            "locator": "fixture://invented/print-1.pdf",
+            "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        ],
+        "interpretation": {
+          "id": "interp-fiction-1",
+          "source_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "reader": {
+            "id": "FictionalReader",
+            "build": "invented-build-1"
+          },
+          "options": {
+            "text_mode": "literal",
+            "page_selection": "all"
+          },
+          "reader_output_schema_version": "fictional-reader/1",
+          "contract_version": "bcs.drawing_page_contract/1-draft",
+          "coverage": "complete"
+        },
+        "pages": [
+          {
+            "page_index": 1,
+            "kinds": {
+              "state": "identified",
+              "values": [
+                "drawing",
+                "bill_of_materials"
+              ]
+            },
+            "read_quality": "text_available",
+            "fields": {
+              "job_name": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "job_name",
+                    "label_literal": "JOB_NAME",
+                    "literal": "FICTIONAL NORTH TEST"
+                  }
+                ],
+                "literal": "FICTIONAL NORTH TEST"
+              },
+              "job_number": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "job_number",
+                    "label_literal": "JOB_NUMBER",
+                    "literal": "AB-0042-a"
+                  }
+                ],
+                "literal": "AB-0042-a"
+              },
+              "drawing_number": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "drawing_number",
+                    "label_literal": "DRAWING_NUMBER",
+                    "literal": "D-17"
+                  }
+                ],
+                "literal": "D-17"
+              },
+              "main_mark": {
+                "state": "missing",
+                "evidence": []
+              },
+              "revision": {
+                "state": "missing",
+                "evidence": []
+              }
+            },
+            "other_evidence": [
+              {
+                "origin": "synthetic_fixture",
+                "method": "explicit_label",
+                "context": "bom",
+                "role": "bom_item",
+                "label_literal": "PART",
+                "literal": "b9"
+              }
+            ]
+          }
+        ],
+        "rule_decisions": [
+          {
+            "format_version": "bcs.drawing_rule_decision/1-draft",
+            "rule_id": "fictional-name-proposal",
+            "rule_version": "0.1",
+            "interpretation_id": "interp-fiction-1",
+            "outcome": "needs_review",
+            "reason_codes": [
+              "MAIN_MARK_MISSING"
+            ]
+          }
+        ],
+        "human_reviews": []
+      }
+    },
+    {
+      "fixture_id": "P05_duplicate_bytes_separate_occurrences",
+      "wholly_fictional": true,
+      "all_sha256_values_are_dummy_not_content_hashes": true,
+      "expected": {
+        "schema_valid": true,
+        "semantic_contract_valid": true,
+        "reason_codes": [
+          "DUPLICATE_BYTES_MULTIPLE_OCCURRENCES"
+        ]
+      },
+      "record": {
+        "format_version": "bcs.drawing_page_contract/1-draft",
+        "content": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "byte_length": 12000,
+          "page_count": 1
+        },
+        "occurrences": [
+          {
+            "occurrence_id": "occ-fiction-1",
+            "locator": "fixture://invented/print-1.pdf",
+            "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          {
+            "occurrence_id": "occ-fiction-2",
+            "locator": "fixture://invented/second-copy.pdf",
+            "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        ],
+        "interpretation": {
+          "id": "interp-fiction-1",
+          "source_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "reader": {
+            "id": "FictionalReader",
+            "build": "invented-build-1"
+          },
+          "options": {
+            "text_mode": "literal",
+            "page_selection": "all"
+          },
+          "reader_output_schema_version": "fictional-reader/1",
+          "contract_version": "bcs.drawing_page_contract/1-draft",
+          "coverage": "complete"
+        },
+        "pages": [
+          {
+            "page_index": 1,
+            "kinds": {
+              "state": "identified",
+              "values": [
+                "drawing"
+              ]
+            },
+            "read_quality": "text_available",
+            "fields": {
+              "job_name": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "job_name",
+                    "label_literal": "JOB_NAME",
+                    "literal": "FICTIONAL NORTH TEST"
+                  }
+                ],
+                "literal": "FICTIONAL NORTH TEST"
+              },
+              "job_number": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "job_number",
+                    "label_literal": "JOB_NUMBER",
+                    "literal": "AB-0042-a"
+                  }
+                ],
+                "literal": "AB-0042-a"
+              },
+              "drawing_number": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "drawing_number",
+                    "label_literal": "DRAWING_NUMBER",
+                    "literal": "D-17"
+                  }
+                ],
+                "literal": "D-17"
+              },
+              "main_mark": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "main_mark",
+                    "label_literal": "MAIN_MARK",
+                    "literal": "M7"
+                  }
+                ],
+                "literal": "M7"
+              },
+              "revision": {
+                "state": "missing",
+                "evidence": []
+              }
+            },
+            "other_evidence": []
+          }
+        ],
+        "rule_decisions": [
+          {
+            "format_version": "bcs.drawing_rule_decision/1-draft",
+            "rule_id": "fictional-name-proposal",
+            "rule_version": "0.1",
+            "interpretation_id": "interp-fiction-1",
+            "outcome": "not_evaluated",
+            "reason_codes": [
+              "DUPLICATE_BYTES_MULTIPLE_OCCURRENCES"
+            ]
+          }
+        ],
+        "human_reviews": []
+      }
+    },
+    {
+      "fixture_id": "P06_review_bound_to_current_interpretation",
+      "wholly_fictional": true,
+      "all_sha256_values_are_dummy_not_content_hashes": true,
+      "expected": {
+        "schema_valid": true,
+        "semantic_contract_valid": true,
+        "reason_codes": [
+          "EXPLICIT_MAIN_MARK_PRESENT"
+        ]
+      },
+      "record": {
+        "format_version": "bcs.drawing_page_contract/1-draft",
+        "content": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "byte_length": 12000,
+          "page_count": 1
+        },
+        "occurrences": [
+          {
+            "occurrence_id": "occ-fiction-1",
+            "locator": "fixture://invented/print-1.pdf",
+            "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        ],
+        "interpretation": {
+          "id": "interp-fiction-1",
+          "source_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "reader": {
+            "id": "FictionalReader",
+            "build": "invented-build-1"
+          },
+          "options": {
+            "text_mode": "literal",
+            "page_selection": "all"
+          },
+          "reader_output_schema_version": "fictional-reader/1",
+          "contract_version": "bcs.drawing_page_contract/1-draft",
+          "coverage": "complete"
+        },
+        "pages": [
+          {
+            "page_index": 1,
+            "kinds": {
+              "state": "identified",
+              "values": [
+                "drawing"
+              ]
+            },
+            "read_quality": "text_available",
+            "fields": {
+              "job_name": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "job_name",
+                    "label_literal": "JOB_NAME",
+                    "literal": "FICTIONAL NORTH TEST"
+                  }
+                ],
+                "literal": "FICTIONAL NORTH TEST"
+              },
+              "job_number": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "job_number",
+                    "label_literal": "JOB_NUMBER",
+                    "literal": "AB-0042-a"
+                  }
+                ],
+                "literal": "AB-0042-a"
+              },
+              "drawing_number": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "drawing_number",
+                    "label_literal": "DRAWING_NUMBER",
+                    "literal": "D-17"
+                  }
+                ],
+                "literal": "D-17"
+              },
+              "main_mark": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "main_mark",
+                    "label_literal": "MAIN_MARK",
+                    "literal": "M7"
+                  }
+                ],
+                "literal": "M7"
+              },
+              "revision": {
+                "state": "missing",
+                "evidence": []
+              }
+            },
+            "other_evidence": []
+          }
+        ],
+        "rule_decisions": [
+          {
+            "format_version": "bcs.drawing_rule_decision/1-draft",
+            "rule_id": "fictional-name-proposal",
+            "rule_version": "0.1",
+            "interpretation_id": "interp-fiction-1",
+            "outcome": "proposal_ready",
+            "reason_codes": [
+              "EXPLICIT_MAIN_MARK_PRESENT"
+            ]
+          }
+        ],
+        "human_reviews": [
+          {
+            "review_id": "review-fiction-1",
+            "interpretation_id": "interp-fiction-1",
+            "reviewer_ref": "fictional-reviewer",
+            "scope": [
+              "field_literals"
+            ],
+            "verdict": "confirmed"
+          }
+        ]
+      }
+    },
+    {
+      "fixture_id": "P07_ambiguous_exact_case_alternatives",
+      "wholly_fictional": true,
+      "all_sha256_values_are_dummy_not_content_hashes": true,
+      "expected": {
+        "schema_valid": true,
+        "semantic_contract_valid": true,
+        "reason_codes": [
+          "MAIN_MARK_AMBIGUOUS"
+        ]
+      },
+      "record": {
+        "format_version": "bcs.drawing_page_contract/1-draft",
+        "content": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "byte_length": 12000,
+          "page_count": 1
+        },
+        "occurrences": [
+          {
+            "occurrence_id": "occ-fiction-1",
+            "locator": "fixture://invented/print-1.pdf",
+            "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        ],
+        "interpretation": {
+          "id": "interp-fiction-1",
+          "source_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "reader": {
+            "id": "FictionalReader",
+            "build": "invented-build-1"
+          },
+          "options": {
+            "text_mode": "literal",
+            "page_selection": "all"
+          },
+          "reader_output_schema_version": "fictional-reader/1",
+          "contract_version": "bcs.drawing_page_contract/1-draft",
+          "coverage": "complete"
+        },
+        "pages": [
+          {
+            "page_index": 1,
+            "kinds": {
+              "state": "identified",
+              "values": [
+                "drawing"
+              ]
+            },
+            "read_quality": "text_available",
+            "fields": {
+              "job_name": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "job_name",
+                    "label_literal": "JOB_NAME",
+                    "literal": "FICTIONAL NORTH TEST"
+                  }
+                ],
+                "literal": "FICTIONAL NORTH TEST"
+              },
+              "job_number": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "job_number",
+                    "label_literal": "JOB_NUMBER",
+                    "literal": "AB-0042-a"
+                  }
+                ],
+                "literal": "AB-0042-a"
+              },
+              "drawing_number": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "drawing_number",
+                    "label_literal": "DRAWING_NUMBER",
+                    "literal": "D-17"
+                  }
+                ],
+                "literal": "D-17"
+              },
+              "main_mark": {
+                "state": "ambiguous",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "main_mark",
+                    "label_literal": "MAIN_MARK",
+                    "literal": "M7"
+                  },
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "main_mark",
+                    "label_literal": "MAIN_MARK",
+                    "literal": "m7"
+                  }
+                ],
+                "alternatives": [
+                  "M7",
+                  "m7"
+                ]
+              },
+              "revision": {
+                "state": "missing",
+                "evidence": []
+              }
+            },
+            "other_evidence": []
+          }
+        ],
+        "rule_decisions": [
+          {
+            "format_version": "bcs.drawing_rule_decision/1-draft",
+            "rule_id": "fictional-name-proposal",
+            "rule_version": "0.1",
+            "interpretation_id": "interp-fiction-1",
+            "outcome": "needs_review",
+            "reason_codes": [
+              "MAIN_MARK_AMBIGUOUS"
+            ]
+          }
+        ],
+        "human_reviews": []
+      }
+    },
+    {
+      "fixture_id": "P08_known_letter_kind",
+      "wholly_fictional": true,
+      "all_sha256_values_are_dummy_not_content_hashes": true,
+      "expected": {
+        "schema_valid": true,
+        "semantic_contract_valid": true,
+        "reason_codes": [
+          "MAIN_MARK_UNKNOWN"
+        ]
+      },
+      "record": {
+        "format_version": "bcs.drawing_page_contract/1-draft",
+        "content": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "byte_length": 12000,
+          "page_count": 1
+        },
+        "occurrences": [
+          {
+            "occurrence_id": "occ-fiction-1",
+            "locator": "fixture://invented/print-1.pdf",
+            "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        ],
+        "interpretation": {
+          "id": "interp-fiction-1",
+          "source_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "reader": {
+            "id": "FictionalReader",
+            "build": "invented-build-1"
+          },
+          "options": {
+            "text_mode": "literal",
+            "page_selection": "all"
+          },
+          "reader_output_schema_version": "fictional-reader/1",
+          "contract_version": "bcs.drawing_page_contract/1-draft",
+          "coverage": "complete"
+        },
+        "pages": [
+          {
+            "page_index": 1,
+            "kinds": {
+              "state": "identified",
+              "values": [
+                "letter"
+              ]
+            },
+            "read_quality": "text_available",
+            "fields": {
+              "job_name": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "job_name",
+                    "label_literal": "JOB_NAME",
+                    "literal": "FICTIONAL NORTH TEST"
+                  }
+                ],
+                "literal": "FICTIONAL NORTH TEST"
+              },
+              "job_number": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "job_number",
+                    "label_literal": "JOB_NUMBER",
+                    "literal": "AB-0042-a"
+                  }
+                ],
+                "literal": "AB-0042-a"
+              },
+              "drawing_number": {
+                "state": "present",
+                "evidence": [
+                  {
+                    "origin": "synthetic_fixture",
+                    "method": "explicit_label",
+                    "context": "title_block",
+                    "role": "drawing_number",
+                    "label_literal": "DRAWING_NUMBER",
+                    "literal": "D-17"
+                  }
+                ],
+                "literal": "D-17"
+              },
+              "main_mark": {
+                "state": "unknown",
+                "evidence": []
+              },
+              "revision": {
+                "state": "missing",
+                "evidence": []
+              }
+            },
+            "other_evidence": []
+          }
+        ],
+        "rule_decisions": [
+          {
+            "format_version": "bcs.drawing_rule_decision/1-draft",
+            "rule_id": "fictional-name-proposal",
+            "rule_version": "0.1",
+            "interpretation_id": "interp-fiction-1",
+            "outcome": "needs_review",
+            "reason_codes": [
+              "MAIN_MARK_UNKNOWN"
+            ]
+          }
+        ],
+        "human_reviews": []
+      }
+    },
+    {
+      "fixture_id": "P09_known_printed_tag_sheet_no_text",
+      "wholly_fictional": true,
+      "all_sha256_values_are_dummy_not_content_hashes": true,
+      "expected": {
+        "schema_valid": true,
+        "semantic_contract_valid": true,
+        "reason_codes": [
+          "NO_EXTRACTABLE_TEXT"
+        ]
+      },
+      "record": {
+        "format_version": "bcs.drawing_page_contract/1-draft",
+        "content": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "byte_length": 12000,
+          "page_count": 1
+        },
+        "occurrences": [
+          {
+            "occurrence_id": "occ-fiction-1",
+            "locator": "fixture://invented/print-1.pdf",
+            "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        ],
+        "interpretation": {
+          "id": "interp-fiction-1",
+          "source_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "reader": {
+            "id": "FictionalReader",
+            "build": "invented-build-1"
+          },
+          "options": {
+            "text_mode": "literal",
+            "page_selection": "all"
+          },
+          "reader_output_schema_version": "fictional-reader/1",
+          "contract_version": "bcs.drawing_page_contract/1-draft",
+          "coverage": "complete"
+        },
+        "pages": [
+          {
+            "page_index": 1,
+            "kinds": {
+              "state": "identified",
+              "values": [
+                "printed_tag_sheet"
+              ]
+            },
+            "read_quality": "no_extractable_text",
+            "fields": {
+              "job_name": {
+                "state": "unknown",
+                "evidence": []
+              },
+              "job_number": {
+                "state": "unknown",
+                "evidence": []
+              },
+              "drawing_number": {
+                "state": "unknown",
+                "evidence": []
+              },
+              "main_mark": {
+                "state": "unknown",
+                "evidence": []
+              },
+              "revision": {
+                "state": "unknown",
+                "evidence": []
+              }
+            },
+            "other_evidence": []
+          }
+        ],
+        "rule_decisions": [
+          {
+            "format_version": "bcs.drawing_rule_decision/1-draft",
+            "rule_id": "fictional-name-proposal",
+            "rule_version": "0.1",
+            "interpretation_id": "interp-fiction-1",
+            "outcome": "needs_review",
+            "reason_codes": [
+              "NO_EXTRACTABLE_TEXT"
+            ]
+          }
+        ],
+        "human_reviews": []
+      }
+    }
+  ]
+}

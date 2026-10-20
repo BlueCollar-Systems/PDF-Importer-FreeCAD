@@ -1,0 +1,167 @@
+{
+  "status": "OPTIONAL_SEPARATE_PROTOCOL_SKETCH_NOT_PART_OF_PAGE_SCHEMA",
+  "warning": "No writer, permission, locking or recovery implementation is supplied. A fictional committed example is not evidence of any actual operation.",
+  "cases": [
+    {
+      "wholly_fictional": true,
+      "all_sha256_values_are_dummy_not_content_hashes": true,
+      "record": {
+        "protocol_version": "bcs.drawing_operation_record/0-draft",
+        "operation_id": "op-fiction-planned",
+        "kind": "rename",
+        "state": "planned",
+        "occurrence_id": "occ-fiction-1",
+        "bound_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bound_interpretation_id": "interp-fiction-1",
+        "rule_ref": {
+          "id": "fictional-name-proposal",
+          "version": "0.1"
+        },
+        "before_locator": "fixture://invented/before.pdf",
+        "intended_after_locator": "fixture://invented/after.pdf",
+        "verification": {
+          "state": "not_evaluated"
+        },
+        "bound_content_fixture_id": "P06_review_bound_to_current_interpretation",
+        "expected_byte_length": 12000
+      },
+      "expected": {
+        "is_complete": false,
+        "reason_codes": [
+          "OP_PLANNED_NOT_COMMITTED"
+        ],
+        "grants_mutation_authority": false
+      }
+    },
+    {
+      "wholly_fictional": true,
+      "all_sha256_values_are_dummy_not_content_hashes": true,
+      "record": {
+        "protocol_version": "bcs.drawing_operation_record/0-draft",
+        "operation_id": "op-fiction-committed",
+        "kind": "rename",
+        "state": "committed",
+        "occurrence_id": "occ-fiction-1",
+        "bound_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bound_interpretation_id": "interp-fiction-1",
+        "rule_ref": {
+          "id": "fictional-name-proposal",
+          "version": "0.1"
+        },
+        "before_locator": "fixture://invented/before.pdf",
+        "intended_after_locator": "fixture://invented/after.pdf",
+        "verification": {
+          "state": "verified",
+          "observed_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "observed_byte_length": 12000,
+          "observed_after_locator": "fixture://invented/after.pdf"
+        },
+        "bound_content_fixture_id": "P06_review_bound_to_current_interpretation",
+        "expected_byte_length": 12000
+      },
+      "expected": {
+        "is_complete": true,
+        "reason_codes": [
+          "OP_COMMITTED_BOUND_PROOF_MATCH"
+        ],
+        "grants_mutation_authority": false
+      }
+    },
+    {
+      "wholly_fictional": true,
+      "all_sha256_values_are_dummy_not_content_hashes": true,
+      "record": {
+        "protocol_version": "bcs.drawing_operation_record/0-draft",
+        "operation_id": "op-fiction-interrupted",
+        "kind": "rename",
+        "state": "interrupted",
+        "occurrence_id": "occ-fiction-1",
+        "bound_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bound_interpretation_id": "interp-fiction-1",
+        "rule_ref": {
+          "id": "fictional-name-proposal",
+          "version": "0.1"
+        },
+        "before_locator": "fixture://invented/before.pdf",
+        "intended_after_locator": "fixture://invented/after.pdf",
+        "verification": {
+          "state": "not_evaluated"
+        },
+        "bound_content_fixture_id": "P06_review_bound_to_current_interpretation",
+        "expected_byte_length": 12000
+      },
+      "expected": {
+        "is_complete": false,
+        "reason_codes": [
+          "OP_INTERRUPTED_RECONCILIATION_REQUIRED"
+        ],
+        "grants_mutation_authority": false
+      }
+    },
+    {
+      "wholly_fictional": true,
+      "all_sha256_values_are_dummy_not_content_hashes": true,
+      "record": {
+        "protocol_version": "bcs.drawing_operation_record/0-draft",
+        "operation_id": "op-fiction-unresolved",
+        "kind": "rename",
+        "state": "unresolved",
+        "occurrence_id": "occ-fiction-1",
+        "bound_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bound_interpretation_id": "interp-fiction-1",
+        "rule_ref": {
+          "id": "fictional-name-proposal",
+          "version": "0.1"
+        },
+        "before_locator": "fixture://invented/before.pdf",
+        "intended_after_locator": "fixture://invented/after.pdf",
+        "verification": {
+          "state": "not_evaluated"
+        },
+        "bound_content_fixture_id": "P06_review_bound_to_current_interpretation",
+        "expected_byte_length": 12000
+      },
+      "expected": {
+        "is_complete": false,
+        "reason_codes": [
+          "OP_OUTCOME_UNRESOLVED"
+        ],
+        "grants_mutation_authority": false
+      }
+    },
+    {
+      "wholly_fictional": true,
+      "all_sha256_values_are_dummy_not_content_hashes": true,
+      "record": {
+        "protocol_version": "bcs.drawing_operation_record/0-draft",
+        "operation_id": "op-fiction-committed-size-mismatch",
+        "kind": "rename",
+        "state": "committed",
+        "occurrence_id": "occ-fiction-1",
+        "bound_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bound_interpretation_id": "interp-fiction-1",
+        "rule_ref": {
+          "id": "fictional-name-proposal",
+          "version": "0.1"
+        },
+        "before_locator": "fixture://invented/before.pdf",
+        "intended_after_locator": "fixture://invented/after.pdf",
+        "verification": {
+          "state": "verified",
+          "observed_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "observed_byte_length": 11999,
+          "observed_after_locator": "fixture://invented/after.pdf"
+        },
+        "bound_content_fixture_id": "P06_review_bound_to_current_interpretation",
+        "expected_byte_length": 12000
+      },
+      "expected": {
+        "is_complete": false,
+        "reason_codes": [
+          "OP_EXPECTED_BYTE_LENGTH_MISMATCH"
+        ],
+        "grants_mutation_authority": false
+      }
+    }
+  ]
+}

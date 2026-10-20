@@ -1,0 +1,523 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:bcs:drawing-page-contract:1-draft",
+  "title": "Drawing page contract v1 — local review seed",
+  "description": "Draft interchange facts only. No filesystem writer, parser, geometry or mutation authority is defined.",
+  "type": "object",
+  "properties": {
+    "format_version": {
+      "const": "bcs.drawing_page_contract/1-draft"
+    },
+    "content": {
+      "type": "object",
+      "properties": {
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "byte_length": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "page_count": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "sha256",
+        "byte_length",
+        "page_count"
+      ],
+      "additionalProperties": false
+    },
+    "occurrences": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "occurrence_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "locator": {
+            "type": "string",
+            "minLength": 1
+          },
+          "content_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "required": [
+          "occurrence_id",
+          "locator",
+          "content_sha256"
+        ],
+        "additionalProperties": false
+      },
+      "minItems": 1
+    },
+    "interpretation": {
+      "$ref": "#/$defs/interpretation"
+    },
+    "pages": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/page"
+      }
+    },
+    "rule_decisions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/decision"
+      }
+    },
+    "human_reviews": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/review"
+      }
+    }
+  },
+  "required": [
+    "format_version",
+    "content",
+    "occurrences",
+    "interpretation",
+    "pages",
+    "rule_decisions",
+    "human_reviews"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "evidence": {
+      "type": "object",
+      "properties": {
+        "origin": {
+          "enum": [
+            "reader_text",
+            "human_assertion",
+            "synthetic_fixture"
+          ]
+        },
+        "method": {
+          "enum": [
+            "explicit_label",
+            "inferred",
+            "human_assertion"
+          ]
+        },
+        "context": {
+          "enum": [
+            "title_block",
+            "member_callout",
+            "bom",
+            "other",
+            "unknown"
+          ]
+        },
+        "role": {
+          "enum": [
+            "job_name",
+            "job_number",
+            "drawing_number",
+            "main_mark",
+            "revision",
+            "bom_item",
+            "unknown"
+          ]
+        },
+        "label_literal": {
+          "type": "string"
+        },
+        "literal": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "origin",
+        "method",
+        "context",
+        "role",
+        "label_literal",
+        "literal"
+      ],
+      "additionalProperties": false
+    },
+    "field": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "enum": [
+            "present",
+            "missing",
+            "unknown",
+            "ambiguous",
+            "unsupported",
+            "not_evaluated"
+          ]
+        },
+        "literal": {
+          "type": "string"
+        },
+        "alternatives": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 2,
+          "uniqueItems": true
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/evidence"
+          }
+        }
+      },
+      "required": [
+        "state",
+        "evidence"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "present"
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence": {
+                "minItems": 1
+              }
+            },
+            "required": [
+              "literal"
+            ],
+            "not": {
+              "required": [
+                "alternatives"
+              ]
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "literal"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "ambiguous"
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence": {
+                "minItems": 2
+              }
+            },
+            "required": [
+              "alternatives"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "alternatives"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "kinds": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "enum": [
+            "identified",
+            "unknown",
+            "ambiguous",
+            "unsupported",
+            "not_evaluated"
+          ]
+        },
+        "values": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "drawing",
+              "bill_of_materials",
+              "cover",
+              "notes",
+              "letter",
+              "printed_tag_sheet",
+              "other"
+            ]
+          },
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "state",
+        "values"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "identified"
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "properties": {
+              "values": {
+                "minItems": 1
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "values": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ]
+    },
+    "page": {
+      "type": "object",
+      "properties": {
+        "page_index": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "kinds": {
+          "$ref": "#/$defs/kinds"
+        },
+        "read_quality": {
+          "enum": [
+            "text_available",
+            "no_extractable_text",
+            "read_error",
+            "unsupported",
+            "unknown",
+            "not_evaluated"
+          ]
+        },
+        "fields": {
+          "type": "object",
+          "properties": {
+            "job_name": {
+              "$ref": "#/$defs/field"
+            },
+            "job_number": {
+              "$ref": "#/$defs/field"
+            },
+            "drawing_number": {
+              "$ref": "#/$defs/field"
+            },
+            "main_mark": {
+              "$ref": "#/$defs/field"
+            },
+            "revision": {
+              "$ref": "#/$defs/field"
+            }
+          },
+          "required": [
+            "job_name",
+            "job_number",
+            "drawing_number",
+            "main_mark",
+            "revision"
+          ],
+          "additionalProperties": false
+        },
+        "other_evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/evidence"
+          }
+        }
+      },
+      "required": [
+        "page_index",
+        "kinds",
+        "read_quality",
+        "fields",
+        "other_evidence"
+      ],
+      "additionalProperties": false
+    },
+    "interpretation": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_content_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "reader": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "build": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "id",
+            "build"
+          ],
+          "additionalProperties": false
+        },
+        "options": {
+          "type": "object"
+        },
+        "reader_output_schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "contract_version": {
+          "const": "bcs.drawing_page_contract/1-draft"
+        },
+        "coverage": {
+          "enum": [
+            "complete",
+            "partial"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "source_content_sha256",
+        "reader",
+        "options",
+        "reader_output_schema_version",
+        "contract_version",
+        "coverage"
+      ],
+      "additionalProperties": false
+    },
+    "decision": {
+      "type": "object",
+      "properties": {
+        "format_version": {
+          "const": "bcs.drawing_rule_decision/1-draft"
+        },
+        "rule_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rule_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "interpretation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "outcome": {
+          "enum": [
+            "proposal_ready",
+            "needs_review",
+            "rejected",
+            "not_evaluated"
+          ]
+        },
+        "reason_codes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "format_version",
+        "rule_id",
+        "rule_version",
+        "interpretation_id",
+        "outcome",
+        "reason_codes"
+      ],
+      "additionalProperties": false
+    },
+    "review": {
+      "type": "object",
+      "properties": {
+        "review_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "interpretation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reviewer_ref": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "field_literals",
+              "page_kinds",
+              "read_quality"
+            ]
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "verdict": {
+          "enum": [
+            "confirmed",
+            "rejected",
+            "needs_review"
+          ]
+        }
+      },
+      "required": [
+        "review_id",
+        "interpretation_id",
+        "reviewer_ref",
+        "scope",
+        "verdict"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

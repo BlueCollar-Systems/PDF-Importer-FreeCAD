@@ -4,11 +4,11 @@
   "host_profile_id": "pdfcadcore_freecad_win_py3.12_default",
   "workloads": [
     {
-      "workload_id": "1011_1of2",
-      "path": "workloads/1011_1of2.pdf",
+      "workload_id": "bench_a",
+      "path": "workloads/bench_a.pdf",
       "category": "short",
       "notes": "Single-page engineering detail. Baseline: import in <=30s with 100% canonical-IR fidelity.",
-      "baseline_report": "baseline_1011_1of2.json"
+      "baseline_report": "baseline_bench_a.json"
     }
   ]
 }

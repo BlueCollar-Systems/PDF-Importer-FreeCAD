@@ -13,15 +13,19 @@
       "properties": {
         "sha256": {
           "type": "string",
-          "pattern": "^[0-9a-f]{64}$"
+          "pattern": "^[0-9a-f]{64}$",
+          "minLength": 64,
+          "maxLength": 64
         },
         "byte_length": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "maximum": 9007199254740991
         },
         "page_count": {
           "type": "integer",
-          "minimum": 1
+          "minimum": 1,
+          "maximum": 9007199254740991
         }
       },
       "required": [
@@ -46,7 +50,9 @@
           },
           "content_sha256": {
             "type": "string",
-            "pattern": "^[0-9a-f]{64}$"
+            "pattern": "^[0-9a-f]{64}$",
+            "minLength": 64,
+            "maxLength": 64
           }
         },
         "required": [
@@ -196,6 +202,7 @@
           "then": {
             "properties": {
               "evidence": {
+                "type": "array",
                 "minItems": 1
               }
             },
@@ -230,6 +237,7 @@
           "then": {
             "properties": {
               "evidence": {
+                "type": "array",
                 "minItems": 2
               }
             },
@@ -242,6 +250,29 @@
               "required": [
                 "alternatives"
               ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "enum": [
+                  "missing",
+                  "not_evaluated"
+                ]
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence": {
+                "type": "array",
+                "maxItems": 0
+              }
             }
           }
         }
@@ -295,6 +326,7 @@
           "then": {
             "properties": {
               "values": {
+                "type": "array",
                 "minItems": 1
               }
             }
@@ -302,6 +334,7 @@
           "else": {
             "properties": {
               "values": {
+                "type": "array",
                 "maxItems": 0
               }
             }
@@ -314,7 +347,8 @@
       "properties": {
         "page_index": {
           "type": "integer",
-          "minimum": 1
+          "minimum": 1,
+          "maximum": 9007199254740991
         },
         "kinds": {
           "$ref": "#/$defs/kinds"
@@ -382,7 +416,9 @@
         },
         "source_content_sha256": {
           "type": "string",
-          "pattern": "^[0-9a-f]{64}$"
+          "pattern": "^[0-9a-f]{64}$",
+          "minLength": 64,
+          "maxLength": 64
         },
         "reader": {
           "type": "object",

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from copy import deepcopy
+from decimal import Decimal, localcontext
 import hashlib
 import json
 import math
@@ -20,6 +21,7 @@ from unittest.mock import patch
 import urllib.request
 
 from jsonschema import Draft202012Validator
+from jsonschema.validators import extend
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = Path(os.environ.get(
@@ -32,6 +34,7 @@ FIXTURE_DIR = Path(os.environ.get(
 ))
 VERSION = "bcs.drawing_page_contract/1-draft"
 MAX_JSON_BYTES = 2 * 1024 * 1024
+MAX_SAFE_INTEGER = 9007199254740991
 
 # Golden outcomes are authored here independently of fixture wrapper values.
 GOLDEN = {
@@ -96,16 +99,18 @@ def _nonfinite(_value):
     raise ValueError("NONFINITE_JSON_NUMBER")
 
 
-def _finite_float(token):
-    value = float(token)
-    if not math.isfinite(value):
+def _finite_decimal(token):
+    # Keep the existing finite binary-range rejection; never use its rounded
+    # value as the parsed JSON number. Decimal(token) preserves all digits,
+    # including finite underflow, without applying the arithmetic context.
+    if not math.isfinite(float(token)):
         raise ValueError("NONFINITE_JSON_NUMBER")
-    return value
+    return Decimal(token)
 
 
 def _json_text(text):
     return json.loads(text, object_pairs_hook=_unique_object,
-                      parse_constant=_nonfinite, parse_float=_finite_float)
+                      parse_constant=_nonfinite, parse_float=_finite_decimal)
 
 
 def _load(path):
@@ -147,6 +152,25 @@ def _local_schema(schema):
     return schema
 
 
+def _is_integral_number(value):
+    """JSON mathematical integer, exact and independent of Decimal context."""
+    if type(value) is int:
+        return True
+    if not isinstance(value, Decimal) or not value.is_finite():
+        return False
+    _sign, digits, exponent = value.as_tuple()
+    if exponent >= 0:
+        return True
+    # Inspect digits only; no rounding, division, normalize or quantize.
+    fractional_digits = min(-exponent, len(digits))
+    return not any(digits[-fractional_digits:])
+
+
+def _bounded_integer(value, minimum=0):
+    return (_is_integral_number(value)
+            and minimum <= value <= MAX_SAFE_INTEGER)
+
+
 def _audit(record, validator):
     """Test-only invariant errors and observed reason facts; no value inference."""
     errors, facts = set(), set()
@@ -156,6 +180,9 @@ def _audit(record, validator):
     interpretation = record["interpretation"]
     pages = record["pages"]
     occurrences = record["occurrences"]
+    if (not _bounded_integer(content["byte_length"], 0)
+            or not _bounded_integer(content["page_count"], 1)):
+        errors.add("INTEGER_METADATA_OUT_OF_RANGE")
     if record["format_version"] != VERSION:
         errors.add("UNKNOWN_FORMAT_VERSION")
     if interpretation["contract_version"] != VERSION:
@@ -171,15 +198,18 @@ def _audit(record, validator):
     if stale:
         errors.add("INTERPRETATION_CONTENT_MISMATCH")
     indices = [page["page_index"] for page in pages]
-    if any(type(index) is not int or index < 1 for index in indices):
+    if any(not _is_integral_number(index) or index < 1 for index in indices):
         errors.add("PAGE_INDEX_NOT_ONE_BASED")
-    if any(type(index) is int and index > content["page_count"] for index in indices):
+    if any(_is_integral_number(index)
+           and (index > MAX_SAFE_INTEGER or index > content["page_count"])
+           for index in indices):
         errors.add("PAGE_INDEX_OUT_OF_RANGE")
     if len(indices) != len(set(indices)):
         errors.add("DUPLICATE_PAGE_INDEX")
-    complete = (len(indices) == content["page_count"]
+    complete = (_bounded_integer(content["page_count"], 1)
+                and len(indices) == content["page_count"]
                 and len(indices) == len(set(indices))
-                and all(type(index) is int and 1 <= index <= content["page_count"]
+                and all(_bounded_integer(index, 1) and index <= content["page_count"]
                         for index in indices)
                 and all(page["read_quality"] != "not_evaluated"
                         and page["kinds"]["state"] != "not_evaluated"
@@ -202,6 +232,10 @@ def _audit(record, validator):
             facts.add(quality_codes[quality])
         for role, field in page["fields"].items():
             state, evidence = field["state"], field["evidence"]
+            if any(item["role"] != role for item in evidence):
+                errors.add("FIELD_ROLE_EVIDENCE_MISMATCH")
+            if state in ("missing", "not_evaluated") and evidence:
+                errors.add("FIELD_STATE_EVIDENCE_FORBIDDEN")
             if state == "present" and not evidence:
                 errors.add("PRESENT_EVIDENCE_REQUIRED")
             if state == "ambiguous":
@@ -281,17 +315,45 @@ def _audit(record, validator):
     return errors, facts
 
 
+def _same_json_value(left, right):
+    """Test-only JSON value equality, not canonical serialization or hashing."""
+    if left is None or right is None:
+        return left is None and right is None
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is bool and type(right) is bool and left == right
+    left_number = type(left) is int or isinstance(left, Decimal)
+    right_number = type(right) is int or isinstance(right, Decimal)
+    if left_number or right_number:
+        if not (left_number and right_number):
+            return False
+        if any(isinstance(value, Decimal) and not value.is_finite()
+               for value in (left, right)):
+            raise ValueError("NONFINITE_JSON_NUMBER")
+        # Decimal/int equality is exact and does not round through the current
+        # Decimal arithmetic context. Equal numeric spellings compare equal.
+        return left == right
+    if isinstance(left, str) or isinstance(right, str):
+        return type(left) is str and type(right) is str and left == right
+    if isinstance(left, list) or isinstance(right, list):
+        return (isinstance(left, list) and isinstance(right, list)
+                and len(left) == len(right)
+                and all(_same_json_value(a, b) for a, b in zip(left, right)))
+    if isinstance(left, dict) or isinstance(right, dict):
+        return (isinstance(left, dict) and isinstance(right, dict)
+                and left.keys() == right.keys()
+                and all(_same_json_value(left[key], right[key]) for key in left))
+    raise TypeError("NON_JSON_VALUE")
+
+
 def _same_interpretation_id_conflicts(old, new):
     """Immutable payload equality only; not an ID/hash minting algorithm."""
     def binding(record):
         item = {key: value for key, value in record["interpretation"].items()
                 if key != "id"}
-        value = {"content": record["content"], "interpretation": item,
-                 "pages": record["pages"]}
-        return json.dumps(value, sort_keys=True, ensure_ascii=False,
-                          separators=(",", ":"), allow_nan=False)
+        return {"content": record["content"], "interpretation": item,
+                "pages": record["pages"]}
     return (old["interpretation"]["id"] == new["interpretation"]["id"]
-            and binding(old) != binding(new))
+            and not _same_json_value(binding(old), binding(new)))
 
 
 def _materialize(baseline, replacements):
@@ -323,7 +385,7 @@ def _operation_claim(record, content_record):
     """Evaluate fictional claim metadata only, never actual file proof."""
     content = content_record["content"]
     if (record["bound_content_sha256"] != content["sha256"]
-            or type(record["expected_byte_length"]) is not int
+            or not _bounded_integer(record["expected_byte_length"], 0)
             or record["expected_byte_length"] != content["byte_length"]
             or record["bound_interpretation_id"] != content_record["interpretation"]["id"]):
         return False, {"OP_BOUND_CONTENT_MISMATCH"}
@@ -338,7 +400,7 @@ def _operation_claim(record, content_record):
             or proof.get("observed_content_sha256") != content["sha256"]
             or proof.get("observed_after_locator") != record["intended_after_locator"]):
         return False, {"OP_COMMITTED_PROOF_MISMATCH"}
-    if (type(proof.get("observed_byte_length")) is not int
+    if (not _bounded_integer(proof.get("observed_byte_length"), 0)
             or proof["observed_byte_length"] != record["expected_byte_length"]):
         return False, {"OP_EXPECTED_BYTE_LENGTH_MISMATCH"}
     return True, {"OP_COMMITTED_BOUND_PROOF_MATCH"}
@@ -365,7 +427,9 @@ class DrawingPageContractTests(unittest.TestCase):
         cls.addClassCleanup(unchanged)
         cls.schema = _local_schema(_load(SCHEMA_PATH))
         Draft202012Validator.check_schema(cls.schema)
-        cls.validator = Draft202012Validator(cls.schema)
+        integer_checker = Draft202012Validator.TYPE_CHECKER.redefine(
+            "integer", lambda _checker, value: _is_integral_number(value))
+        cls.validator = extend(Draft202012Validator, type_checker=integer_checker)(cls.schema)
         cls.cases = {}
         for filename, count, prefix in (("fixtures-positive.json", 9, "P"),
                                         ("fixtures-negative.json", 16, "N")):
@@ -472,6 +536,175 @@ class DrawingPageContractTests(unittest.TestCase):
                 changed = deepcopy(old)
                 changed["interpretation"]["options"]["value"] = value
                 self.assertTrue(_same_interpretation_id_conflicts(old, changed))
+
+    def test_lossless_decimal_values_and_spelling(self):
+        # These independently authored controls exercise parsing and the actual
+        # immutable-payload comparison, under deliberately low precision.
+        controls = (
+            ("0.1", "0.10000000000000001", False, "decimal-tenths-distinct"),
+            ("1.0", "1.00000000000000001", False, "near-one-distinct"),
+            ("1e100", "1.0000000000000000000000000000000000001e100", False, "large-exponent-distinct"),
+            ("1e-400", "0", False, "finite-underflow-not-zero"),
+            ("1e-400", "2e-400", False, "finite-underflows-distinct"),
+            ("0.10", "0.1", True, "equal-decimal-spelling"),
+            ("1e0", "1.000", True, "equal-integral-spelling"),
+            ("-0.0", "0", True, "equal-signed-zero-value"),
+            ("1e100", "10e99", True, "equal-exponent-spelling"),
+            ("0.10000000000000001", "0.10000000000000001", True, "unchanged-exact-decimal"),
+            ("0.1", '\"0.1\"', False, "number-not-string"),
+            ("1.0", "true", False, "number-not-boolean"),
+            ('{\"a\":0.1,\"b\":[1.0,true]}', '{\"b\":[1,true],\"a\":0.10}', True, "object-order-ignored"),
+            ("[0.1,0.2]", "[0.2,0.1]", False, "list-order-preserved"),
+            ("9007199254740992.0", "9007199254740993.0", False, "above-safe-integer-decimals-distinct"),
+            ('{"\U00010000":0.1,"\uE000":[1,true]}', '{"\uE000":[1.0,true],"\U00010000":0.10}', True, "unicode-object-order-ignored"),
+        )
+        with localcontext() as context:
+            context.prec = 2
+            for left_json, right_json, equal, case_id in controls:
+                with self.subTest(case_id=case_id):
+                    left = self.positive()
+                    right = self.positive()
+                    left["interpretation"]["options"] = _json_text('{\"value\":' + left_json + '}')
+                    right["interpretation"]["options"] = _json_text('{\"value\":' + right_json + '}')
+                    self.assertFalse(list(self.validator.iter_errors(left)))
+                    self.assertFalse(list(self.validator.iter_errors(right)))
+                    self.assertIs(_same_interpretation_id_conflicts(left, right), not equal)
+
+    def test_hash_slot_exact_width_and_alphabet(self):
+        faults = (
+            ("valid64", "a" * 64, True),
+            ("lf", "a" * 64 + "\n", False),
+            ("crlf", "a" * 64 + "\r\n", False),
+            ("space", "a" * 63 + " ", False),
+            ("short63", "a" * 63, False),
+            ("long65", "a" * 65, False),
+            ("nonhex", "g" + "a" * 63, False),
+        )
+        for group in ("content", "occurrence", "interpretation", "coherent"):
+            for fault, value, valid in faults:
+                with self.subTest(case_id=group + "-" + fault):
+                    record = self.positive()
+                    if group in ("content", "coherent"):
+                        record["content"]["sha256"] = value
+                    if group in ("occurrence", "coherent"):
+                        record["occurrences"][0]["content_sha256"] = value
+                    if group in ("interpretation", "coherent"):
+                        record["interpretation"]["source_content_sha256"] = value
+                    self.assertIs(not list(self.validator.iter_errors(record)), valid)
+                    self.assertIs(not _audit(record, self.validator)[0], valid)
+        # Conditional array-size keywords remain portable to strict validators.
+        pending = [self.schema]
+        while pending:
+            node = pending.pop()
+            if isinstance(node, dict):
+                if "minItems" in node or "maxItems" in node:
+                    self.assertEqual(node.get("type"), "array")
+                pending.extend(node.values())
+            elif isinstance(node, list):
+                pending.extend(node)
+
+    def test_bounded_integer_metadata(self):
+        fields = (("byte_length", ["content", "byte_length"], 0),
+                  ("page_count", ["content", "page_count"], 1),
+                  ("page_index", ["pages", 0, "page_index"], 1))
+        for name, path, minimum in fields:
+            values = (("zero", 0, minimum == 0), ("one", 1, True),
+                      ("maximum", MAX_SAFE_INTEGER, True),
+                      ("above-maximum", MAX_SAFE_INTEGER + 1, False),
+                      ("negative", -1, False), ("fraction", Decimal("1.5"), False),
+                      ("near-bound-fraction", _json_text("9007199254740990.1"), False),
+                      ("boolean", True, False), ("integral-decimal", Decimal("1.0"), True))
+            for label, value, valid in values:
+                with self.subTest(case_id=name + "-" + label):
+                    record = _materialize(self.positive(), [{"path": path, "value": value}])
+                    self.assertIs(not list(self.validator.iter_errors(record)), valid)
+                    self.assertIs(_bounded_integer(value, minimum), valid)
+
+    def test_whole_valued_metadata_and_page_audit(self):
+        record = _materialize(self.positive(), [
+            {"path": ["content", "byte_length"], "value": Decimal("12000.0")},
+            {"path": ["content", "page_count"], "value": Decimal("1.0")},
+            {"path": ["pages", 0, "page_index"], "value": Decimal("1e0")},
+        ])
+        with localcontext() as context:
+            context.prec = 1
+            self.assertFalse(list(self.validator.iter_errors(record)))
+            self.assertFalse(_audit(record, self.validator)[0])
+            self.assertTrue(_bounded_integer(Decimal("9007199254740991.0")))
+            self.assertFalse(_is_integral_number(Decimal("1.00000000000000001")))
+
+    def test_evidence_state_role_rules(self):
+        raw = deepcopy(self.positive()["pages"][0]["fields"]["main_mark"]["evidence"][0])
+        for state in ("present", "ambiguous", "missing", "not_evaluated", "unknown", "unsupported"):
+            record = self.positive()
+            record["interpretation"]["coverage"] = "partial"
+            record["rule_decisions"][0]["outcome"] = "needs_review"
+            record["human_reviews"] = []
+            if state == "present":
+                field = deepcopy(record["pages"][0]["fields"]["main_mark"])
+            elif state == "ambiguous":
+                field = deepcopy(self.positive("P07_ambiguous_exact_case_alternatives")["pages"][0]["fields"]["main_mark"])
+            else:
+                field = {"state": state, "evidence": []}
+                if state in ("unknown", "unsupported"):
+                    observation = deepcopy(raw)
+                    observation["literal"] = "EX?"
+                    field["evidence"] = [observation]
+            record["pages"][0]["fields"]["main_mark"] = field
+            with self.subTest(case_id=state + "-valid"):
+                self.assertFalse(list(self.validator.iter_errors(record)))
+                errors, facts = _audit(record, self.validator)
+                self.assertFalse(errors)
+                if state in ("unknown", "unsupported"):
+                    self.assertEqual(field["evidence"][0]["literal"], "EX?")
+                    self.assertNotIn("literal", field)
+                    self.assertNotIn("alternatives", field)
+                    self.assertNotIn("EXPLICIT_MAIN_MARK_PRESENT", facts)
+            with self.subTest(case_id=state + "-wrong-role"):
+                changed = deepcopy(record)
+                wrong = changed["pages"][0]["fields"]["main_mark"]
+                if not wrong["evidence"]:
+                    wrong["evidence"] = [deepcopy(raw)]
+                wrong["evidence"][0]["role"] = "drawing_number"
+                shape_valid = state not in ("missing", "not_evaluated")
+                self.assertIs(not list(self.validator.iter_errors(changed)), shape_valid)
+                self.assertIn("FIELD_ROLE_EVIDENCE_MISMATCH", _audit(changed, self.validator)[0])
+            if state in ("missing", "not_evaluated"):
+                with self.subTest(case_id=state + "-forbidden-observation"):
+                    changed = deepcopy(record)
+                    changed["pages"][0]["fields"]["main_mark"]["evidence"] = [deepcopy(raw)]
+                    self.assertTrue(list(self.validator.iter_errors(changed)))
+                    self.assertIn("FIELD_STATE_EVIDENCE_FORBIDDEN", _audit(changed, self.validator)[0])
+        with self.subTest(case_id="unclear-is-not-v1-state"):
+            record = self.positive()
+            record["pages"][0]["fields"]["main_mark"] = {"state": "unclear", "evidence": []}
+            self.assertTrue(list(self.validator.iter_errors(record)))
+
+    def test_optional_integer_lengths(self):
+        base = self.operations["op-fiction-committed"]["record"]
+        content = self.positive()
+        values = (("whole-valued", Decimal("12000.0"), True),
+                  ("boolean", True, False), ("fraction", Decimal("12000.5"), False),
+                  ("above-maximum", MAX_SAFE_INTEGER + 1, False))
+        for field in ("expected", "observed"):
+            for label, value, valid in values:
+                with self.subTest(case_id=field + "-" + label):
+                    operation = deepcopy(base)
+                    if field == "expected":
+                        operation["expected_byte_length"] = value
+                    else:
+                        operation["verification"]["observed_byte_length"] = value
+                    self.assertIs(_operation_claim(operation, content)[0], valid)
+        for label, value, valid in (("zero", 0, True), ("maximum", MAX_SAFE_INTEGER, True),
+                                    ("above-maximum", MAX_SAFE_INTEGER + 1, False),
+                                    ("boolean", True, False), ("fraction", Decimal("1.5"), False)):
+            with self.subTest(case_id="coherent-" + label):
+                operation = deepcopy(base)
+                bound = deepcopy(content)
+                bound["content"]["byte_length"] = value
+                operation["expected_byte_length"] = value
+                operation["verification"]["observed_byte_length"] = value
+                self.assertIs(_operation_claim(operation, bound)[0], valid)
 
     def test_nonlocal_or_unresolved_schema_refs_are_rejected(self):
         for reference, case_id in (("https://invalid.example/schema", "https"),

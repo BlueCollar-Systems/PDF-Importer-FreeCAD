@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Regression: a both-sides weld symbol is TWO stacked fractions, not one.
 
-Geometry is the pdfcadcore extraction of a private fabrication sheet (page 1),
-weld symbol at PDF pt (953.9, 937.8): '316' [949.5,927.5,966.8,941.5] + '/'
-above the reference line and '316' [949.5,940.5,966.8,954.6] + '/' below it
-(14 such stacked-over-stacked pairs on that sheet, 96 across the local
-corpus).  Before this fix ``_merge_stacked_fractions`` Pattern A let the first
+Geometry is a synthetic both-sides weld symbol in model mm: a '316' span and
+a '/' span above the reference line and the same pair below it, laid out the
+way the pdfcadcore extractor reports stacked fractions.  Before this fix
+``_merge_stacked_fractions`` Pattern A let the first
 slash swallow both '316' spans (nearest_distance + _FRAC_Y_SPREAD_MM window)
 and ``_dedupe_fraction_overlays`` then deleted the second, now bare, slash
 (5.0/5.5 mm centre tolerance), so one '3/16' survived per symbol.
@@ -24,7 +23,7 @@ from pdfcadcore.primitives import NormalizedText, TextCharLayout  # noqa: E402
 
 
 _MM_PER_PT = 25.4 / 72.0
-_PDF_PAGE_HEIGHT_PT = 1726.3
+_PDF_PAGE_HEIGHT_PT = 792.0
 
 
 def _model_quad(box: tuple[float, float, float, float]):
@@ -123,13 +122,13 @@ def _producer_layout(
     )
 
 
-def _both_sides_1011_items(rotate90: bool = False) -> list[NormalizedText]:
-    # (text, insertion, bbox, font_size) -- model mm, 1011 p1 as extracted
+def _both_sides_weld_items(rotate90: bool = False) -> list[NormalizedText]:
+    # (text, insertion, bbox, font_size) -- model mm, synthetic weld symbol
     raw = [
-        ("316", (334.95, 279.05), (334.95, 276.86, 341.06, 281.81), 3.55),
-        ("/", (336.51, 278.16), (336.51, 277.22, 337.69, 281.45), 4.23),
-        ("316", (334.95, 274.44), (334.95, 272.25, 341.06, 277.20), 3.55),
-        ("/", (336.51, 273.51), (336.51, 272.56, 337.69, 276.79), 4.23),
+        ("316", (34.95, 29.05), (34.95, 26.86, 41.06, 31.81), 3.55),
+        ("/", (36.51, 28.16), (36.51, 27.22, 37.69, 31.45), 4.23),
+        ("316", (34.95, 24.44), (34.95, 22.25, 41.06, 27.20), 3.55),
+        ("/", (36.51, 23.51), (36.51, 22.56, 37.69, 26.79), 4.23),
     ]
     items = []
     for idx, (text, ins, box, size) in enumerate(raw, start=1):
@@ -194,7 +193,7 @@ def _assert_refused_without_mutation(items: list[NormalizedText]) -> None:
 
 
 def test_layout_free_both_sides_weld_items_are_refused_identity_preserved() -> None:
-    items = _both_sides_1011_items()
+    items = _both_sides_weld_items()
     for item in items:
         item.source_char_layout = ()
         item.requires_individual_positioning = False
@@ -203,33 +202,33 @@ def test_layout_free_both_sides_weld_items_are_refused_identity_preserved() -> N
 
 
 def test_partial_character_layout_is_refused_identity_preserved() -> None:
-    items = _both_sides_1011_items()
+    items = _both_sides_weld_items()
     items[0].source_char_layout = items[0].source_char_layout[:1]
 
     _assert_refused_without_mutation(items)
 
 
 def test_both_sides_weld_symbol_keeps_both_stacked_fractions() -> None:
-    merged = _merge_stacked_fractions(_both_sides_1011_items())
+    merged = _merge_stacked_fractions(_both_sides_weld_items())
     assert [item.text for item in merged] == ["3/16", "3/16"]
     top, bottom = sorted(merged, key=lambda it: -it.insertion[1])
     # Each fraction sits at its own slash; its bbox does not span the other half.
-    assert top.insertion == (336.51, 278.16)
-    assert bottom.insertion == (336.51, 273.51)
-    assert top.bbox[1] >= 276.8 and bottom.bbox[3] <= 277.3
+    assert top.insertion == (36.51, 28.16)
+    assert bottom.insertion == (36.51, 23.51)
+    assert top.bbox[1] >= 26.8 and bottom.bbox[3] <= 27.3
     # Both retain the same observed slash font size; no synthetic 0.6x clamp.
     assert abs(top.font_size - bottom.font_size) < 1e-6
 
 
 def test_both_sides_weld_symbol_rotated_90_keeps_both() -> None:
-    merged = _merge_stacked_fractions(_both_sides_1011_items(rotate90=True))
+    merged = _merge_stacked_fractions(_both_sides_weld_items(rotate90=True))
     assert [item.text for item in merged] == ["3/16", "3/16"]
 
 
 def test_coincident_overlay_stack_still_merges_once() -> None:
     # A printer that draws the SAME stack twice at the SAME place is an overlay;
     # that (and only that) still collapses to one fraction.
-    a = _both_sides_1011_items()[:2]
+    a = _both_sides_weld_items()[:2]
     b = [
         replace(
             item,
@@ -242,7 +241,7 @@ def test_coincident_overlay_stack_still_merges_once() -> None:
 
 
 def test_leftover_slash_inside_its_own_fraction_is_dropped_but_not_a_neighbour() -> None:
-    all_items = _both_sides_1011_items()
+    all_items = _both_sides_weld_items()
     top = all_items[:2]
     dup_slash = replace(
         top[1],

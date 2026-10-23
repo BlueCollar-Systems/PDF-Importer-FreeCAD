@@ -3,11 +3,16 @@
 These notes used to sit at the top of the main [README](../README.md), in the
 same order. Install steps and the feature list are in the README.
 
-## Candidate fixes (v4.0.119)
+## Released fixes (v4.0.119)
+
+Published 2026-10-23 together with the 4.0.116, 4.0.117 and 4.0.118 fixes
+below, which were never published on their own. Plain release notes and the
+known limits are in [release-notes/v4.0.119.md](release-notes/v4.0.119.md).
 
 - Register an image-only GUI observer at startup. Before an importer raster image's native Visibility or DisplayMode property changes, attach the existing Windows/Coin render guard synchronously, including while saved GUI properties are restoring. The deferred style worker keeps its application-wide readiness check and remains a fallback for image attachment.
 - Preserve source pixels, geometry, visibility, display modes and user styles. Registration is idempotent, unavailable legacy observer APIs leave the fallback available, and shutdown releases owned native links and both observers.
 - The exact v4.0.118 desktop open, save and natural close passed; fresh reopen still showed an access violation and missing embedded image before its later callback binding was observed. This candidate targets that attachment window. Exact v4.0.119 desktop save and fresh reopen acceptance remains pending; the failed v4.0.118 result is unchanged.
+- Release check: FreeCAD 1.1.4 FreeCADCmd imported two fictional drawings and one shop sheet with the exact release ZIP, saved, closed and reopened them in the same and in a fresh process, and every object, shape count, size and picture came back unchanged. This headless check does not exercise the desktop picture path.
 
 ## Earlier candidate fixes (v4.0.118)
 

@@ -1,0 +1,411 @@
+{
+  "packet_status": "LOCAL_REVIEW_SEED_NOT_CANONICAL",
+  "fixture_provenance": "Every value, reader, locator and evidence item is invented. All SHA256 strings are labelled dummy values, not hashes of any document. No PDF exists for these fixtures.",
+  "wholly_fictional": true,
+  "all_sha256_values_are_dummy_not_content_hashes": true,
+  "kind": "paired_interpretation_identity",
+  "materialization": "Deep-copy baseline_record as left and right. For right only, replace exact existing path components listed in right_replacements; numeric components select zero-based JSON array positions, unrelated to 1-based document page_index. No file operations are defined.",
+  "comparison": "Immutable interpretation payload is content plus interpretation except id plus pages. Compare JSON objects structurally with exact scalar values and arrays; occurrences, decisions and reviews are outside this payload. Changed payload with same id conflicts. A new id does not carry an old review.",
+  "baseline_record": {
+    "format_version": "bcs.drawing_page_contract/1-draft",
+    "content": {
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "byte_length": 12000,
+      "page_count": 1
+    },
+    "occurrences": [
+      {
+        "occurrence_id": "occ-fiction-1",
+        "locator": "fixture://invented/print-1.pdf",
+        "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ],
+    "interpretation": {
+      "id": "interp-fiction-1",
+      "source_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "reader": {
+        "id": "FictionalReader",
+        "build": "invented-build-1"
+      },
+      "options": {
+        "text_mode": "literal",
+        "page_selection": "all"
+      },
+      "reader_output_schema_version": "fictional-reader/1",
+      "contract_version": "bcs.drawing_page_contract/1-draft",
+      "coverage": "complete"
+    },
+    "pages": [
+      {
+        "page_index": 1,
+        "kinds": {
+          "state": "identified",
+          "values": [
+            "drawing"
+          ]
+        },
+        "read_quality": "text_available",
+        "fields": {
+          "job_name": {
+            "state": "present",
+            "evidence": [
+              {
+                "origin": "synthetic_fixture",
+                "method": "explicit_label",
+                "context": "title_block",
+                "role": "job_name",
+                "label_literal": "JOB_NAME",
+                "literal": "FICTIONAL NORTH TEST"
+              }
+            ],
+            "literal": "FICTIONAL NORTH TEST"
+          },
+          "job_number": {
+            "state": "present",
+            "evidence": [
+              {
+                "origin": "synthetic_fixture",
+                "method": "explicit_label",
+                "context": "title_block",
+                "role": "job_number",
+                "label_literal": "JOB_NUMBER",
+                "literal": "AB-0042-a"
+              }
+            ],
+            "literal": "AB-0042-a"
+          },
+          "drawing_number": {
+            "state": "present",
+            "evidence": [
+              {
+                "origin": "synthetic_fixture",
+                "method": "explicit_label",
+                "context": "title_block",
+                "role": "drawing_number",
+                "label_literal": "DRAWING_NUMBER",
+                "literal": "D-17"
+              }
+            ],
+            "literal": "D-17"
+          },
+          "main_mark": {
+            "state": "present",
+            "evidence": [
+              {
+                "origin": "synthetic_fixture",
+                "method": "explicit_label",
+                "context": "title_block",
+                "role": "main_mark",
+                "label_literal": "MAIN_MARK",
+                "literal": "M7"
+              }
+            ],
+            "literal": "M7"
+          },
+          "revision": {
+            "state": "missing",
+            "evidence": []
+          }
+        },
+        "other_evidence": []
+      }
+    ],
+    "rule_decisions": [
+      {
+        "format_version": "bcs.drawing_rule_decision/1-draft",
+        "rule_id": "fictional-name-proposal",
+        "rule_version": "0.1",
+        "interpretation_id": "interp-fiction-1",
+        "outcome": "proposal_ready",
+        "reason_codes": [
+          "EXPLICIT_MAIN_MARK_PRESENT"
+        ]
+      }
+    ],
+    "human_reviews": [
+      {
+        "review_id": "review-fiction-1",
+        "interpretation_id": "interp-fiction-1",
+        "reviewer_ref": "fictional-reviewer",
+        "scope": [
+          "field_literals"
+        ],
+        "verdict": "confirmed"
+      }
+    ]
+  },
+  "cases": [
+    {
+      "fixture_id": "I00_unchanged_immutable_identity",
+      "right_replacements": [],
+      "expected": {
+        "left_schema_valid": true,
+        "right_schema_valid": true,
+        "right_semantic_contract_valid": true,
+        "pair_identity_valid": true,
+        "interpretation_id_conflict": false,
+        "old_human_review_applicable": true,
+        "reason_codes": [
+          "INTERPRETATION_IDENTITY_UNCHANGED"
+        ]
+      }
+    },
+    {
+      "fixture_id": "I01_same_id_changed_reader",
+      "right_replacements": [
+        {
+          "path": [
+            "interpretation",
+            "reader",
+            "id"
+          ],
+          "value": "AnotherFictionalReader"
+        }
+      ],
+      "expected": {
+        "left_schema_valid": true,
+        "right_schema_valid": true,
+        "right_semantic_contract_valid": true,
+        "pair_identity_valid": false,
+        "interpretation_id_conflict": true,
+        "old_human_review_applicable": false,
+        "reason_codes": [
+          "IMMUTABLE_INTERPRETATION_ID_CONFLICT"
+        ]
+      }
+    },
+    {
+      "fixture_id": "I02_same_id_changed_build",
+      "right_replacements": [
+        {
+          "path": [
+            "interpretation",
+            "reader",
+            "build"
+          ],
+          "value": "invented-build-2"
+        }
+      ],
+      "expected": {
+        "left_schema_valid": true,
+        "right_schema_valid": true,
+        "right_semantic_contract_valid": true,
+        "pair_identity_valid": false,
+        "interpretation_id_conflict": true,
+        "old_human_review_applicable": false,
+        "reason_codes": [
+          "IMMUTABLE_INTERPRETATION_ID_CONFLICT"
+        ]
+      }
+    },
+    {
+      "fixture_id": "I03_same_id_changed_options",
+      "right_replacements": [
+        {
+          "path": [
+            "interpretation",
+            "options",
+            "text_mode"
+          ],
+          "value": "another-literal-mode"
+        }
+      ],
+      "expected": {
+        "left_schema_valid": true,
+        "right_schema_valid": true,
+        "right_semantic_contract_valid": true,
+        "pair_identity_valid": false,
+        "interpretation_id_conflict": true,
+        "old_human_review_applicable": false,
+        "reason_codes": [
+          "IMMUTABLE_INTERPRETATION_ID_CONFLICT"
+        ]
+      }
+    },
+    {
+      "fixture_id": "I04_same_id_changed_output_schema",
+      "right_replacements": [
+        {
+          "path": [
+            "interpretation",
+            "reader_output_schema_version"
+          ],
+          "value": "fictional-reader/2"
+        }
+      ],
+      "expected": {
+        "left_schema_valid": true,
+        "right_schema_valid": true,
+        "right_semantic_contract_valid": true,
+        "pair_identity_valid": false,
+        "interpretation_id_conflict": true,
+        "old_human_review_applicable": false,
+        "reason_codes": [
+          "IMMUTABLE_INTERPRETATION_ID_CONFLICT"
+        ]
+      }
+    },
+    {
+      "fixture_id": "I05_same_id_changed_content",
+      "right_replacements": [
+        {
+          "path": [
+            "content",
+            "sha256"
+          ],
+          "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        {
+          "path": [
+            "interpretation",
+            "source_content_sha256"
+          ],
+          "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        {
+          "path": [
+            "occurrences",
+            0,
+            "content_sha256"
+          ],
+          "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      ],
+      "expected": {
+        "left_schema_valid": true,
+        "right_schema_valid": true,
+        "right_semantic_contract_valid": true,
+        "pair_identity_valid": false,
+        "interpretation_id_conflict": true,
+        "old_human_review_applicable": false,
+        "reason_codes": [
+          "IMMUTABLE_INTERPRETATION_ID_CONFLICT"
+        ]
+      }
+    },
+    {
+      "fixture_id": "I06_same_id_changed_page_facts",
+      "right_replacements": [
+        {
+          "path": [
+            "pages",
+            0,
+            "fields",
+            "main_mark",
+            "literal"
+          ],
+          "value": "M8"
+        },
+        {
+          "path": [
+            "pages",
+            0,
+            "fields",
+            "main_mark",
+            "evidence",
+            0,
+            "literal"
+          ],
+          "value": "M8"
+        }
+      ],
+      "expected": {
+        "left_schema_valid": true,
+        "right_schema_valid": true,
+        "right_semantic_contract_valid": true,
+        "pair_identity_valid": false,
+        "interpretation_id_conflict": true,
+        "old_human_review_applicable": false,
+        "reason_codes": [
+          "IMMUTABLE_INTERPRETATION_ID_CONFLICT"
+        ]
+      }
+    },
+    {
+      "fixture_id": "I07_new_id_reader_replacement_without_old_review",
+      "right_replacements": [
+        {
+          "path": [
+            "interpretation",
+            "id"
+          ],
+          "value": "interp-fiction-2"
+        },
+        {
+          "path": [
+            "interpretation",
+            "reader",
+            "id"
+          ],
+          "value": "AnotherFictionalReader"
+        },
+        {
+          "path": [
+            "rule_decisions",
+            0,
+            "interpretation_id"
+          ],
+          "value": "interp-fiction-2"
+        },
+        {
+          "path": [
+            "human_reviews"
+          ],
+          "value": []
+        }
+      ],
+      "expected": {
+        "left_schema_valid": true,
+        "right_schema_valid": true,
+        "right_semantic_contract_valid": true,
+        "pair_identity_valid": true,
+        "interpretation_id_conflict": false,
+        "old_human_review_applicable": false,
+        "reason_codes": [
+          "NEW_INTERPRETATION_ID",
+          "OLD_HUMAN_REVIEW_NOT_APPLICABLE"
+        ]
+      }
+    },
+    {
+      "fixture_id": "I08_new_id_cannot_carry_old_human_review",
+      "right_replacements": [
+        {
+          "path": [
+            "interpretation",
+            "id"
+          ],
+          "value": "interp-fiction-2"
+        },
+        {
+          "path": [
+            "interpretation",
+            "reader",
+            "id"
+          ],
+          "value": "AnotherFictionalReader"
+        },
+        {
+          "path": [
+            "rule_decisions",
+            0,
+            "interpretation_id"
+          ],
+          "value": "interp-fiction-2"
+        }
+      ],
+      "expected": {
+        "left_schema_valid": true,
+        "right_schema_valid": true,
+        "right_semantic_contract_valid": false,
+        "pair_identity_valid": false,
+        "interpretation_id_conflict": false,
+        "old_human_review_applicable": false,
+        "reason_codes": [
+          "HUMAN_REVIEW_INTERPRETATION_MISMATCH",
+          "OLD_HUMAN_REVIEW_NOT_APPLICABLE"
+        ]
+      }
+    }
+  ]
+}

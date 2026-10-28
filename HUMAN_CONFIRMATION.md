@@ -26,7 +26,7 @@ For each representative shop drawing you import:
 - Save the import report: the Report view prints `Import report: <path>`, and a copy is kept in the
   FreeCAD user data folder under `PDF Import Reports` (the warning or failure box has an
   **Open report folder** button)
-- If something looks wrong: use [Report Doctor](https://bluecollarsystems.com/report-doctor) or **Send Feedback** with screenshots and your report JSON
+- If something looks wrong: use [Report Doctor](https://bluecollar-systems.com/report-doctor) or **Send Feedback** with screenshots and your report JSON
 
 ## Sign-off
 

@@ -1,6 +1,6 @@
 """Headless style persistence + GUI restore contract for FreeCAD imports.
 
-Root cause (1011 side-by-side triage, 2026-08-16): the importer stored every
+Root cause (benchmark-sheet side-by-side triage, 2026-08-16): the importer stored every
 geometry style only on ``obj.ViewObject`` (``_apply_style``) and text style on
 the view plus App metadata.  A FreeCADCmd (headless) save has no view
 providers and writes no ``GuiDocument.xml``; on GUI open Draft recreates the

@@ -50,7 +50,10 @@ def diff_reports(baseline_path: Path, candidate_path: Path) -> List[str]:
         if b.get("status") != "ok":
             continue
 
-        if b.get("sha256_pdf") != c.get("sha256_pdf"):
+        # The committed baseline leaves sha256_pdf empty: the private workload
+        # PDF is only fingerprinted on the machine that has it. The page IR
+        # digests below still decide equivalence.
+        if b.get("sha256_pdf") and b.get("sha256_pdf") != c.get("sha256_pdf"):
             errors.append(f"{wid}: source PDF hash differs (file changed between runs?)")
             continue
 
